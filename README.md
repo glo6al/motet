@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: PolyForm Noncommercial 1.0.0" src="https://img.shields.io/badge/license-PolyForm_Noncommercial_1.0.0-36D879?style=flat-square"></a> <a href="COMMERCIAL.md"><img alt="Commercial license available" src="https://img.shields.io/badge/commercial-license_available-36D879?style=flat-square"></a> <img alt="Platform: macOS; Windows untested outside CI" src="https://img.shields.io/badge/platform-macOS_%C2%B7_Windows_(CI_only)-informational?style=flat-square"> <img alt="Python 3.9 or later, standard library only" src="https://img.shields.io/badge/python-3.9%2B_%C2%B7_standard_library_only-informational?style=flat-square"> <img alt="Reads Claude Code, Codex CLI and Cursor session logs, and Codex cloud commands from the process list" src="https://img.shields.io/badge/reads-Claude_Code_%C2%B7_Codex_%C2%B7_Cursor_%C2%B7_Codex_cloud-informational?style=flat-square"> <a href="#status"><img alt="Status: working study" src="https://img.shields.io/badge/status-working_study-orange?style=flat-square"></a>
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache_2.0-36D879?style=flat-square"></a> <img alt="Platform: macOS; Windows untested outside CI" src="https://img.shields.io/badge/platform-macOS_%C2%B7_Windows_(CI_only)-informational?style=flat-square"> <img alt="Python 3.9 or later, standard library only" src="https://img.shields.io/badge/python-3.9%2B_%C2%B7_standard_library_only-informational?style=flat-square"> <img alt="Reads Claude Code, Codex CLI and Cursor session logs, and Codex cloud commands from the process list" src="https://img.shields.io/badge/reads-Claude_Code_%C2%B7_Codex_%C2%B7_Cursor_%C2%B7_Codex_cloud-informational?style=flat-square"> <a href="#status"><img alt="Status: working study" src="https://img.shields.io/badge/status-working_study-orange?style=flat-square"></a>
 </p>
 
 <p align="center">
@@ -414,6 +414,4 @@ Built by its owner with AI coding agents, and reviewed before each release by a 
 
 ## License
 
-Free for personal and other noncommercial use, under the [PolyForm Noncommercial License 1.0.0](LICENSE). That covers you, your side projects, charities, schools and public bodies, and lets you read, run, change and share the code for those purposes.
-
-Any use that is not a noncommercial purpose under the license's own terms needs a commercial license. See [COMMERCIAL.md](COMMERCIAL.md) for what that covers and how to ask. This is source-available, not open source in the OSI sense, and that is a deliberate choice.
+Motet is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution and [Third-party notices](THIRD_PARTY_NOTICES.md) for bundled third-party terms.
