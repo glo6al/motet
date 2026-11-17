@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Install only owner-opted native-parent PostToolUse observations. Never changes hook trust."""
+"""Remove owned legacy reply hooks without changing unrelated hooks or trust."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
-import shlex
 import stat
 import sys
 
@@ -102,7 +100,9 @@ def remove_owned(value,owned):
 
 
 def configure(provider,path,store,credential_file,accepted=False,remove=False,journal=None):
-    hook.require(provider in hook.TOOLS and (accepted or remove))
+    if not remove:
+        raise ValueError('Automatic reply notices have been removed; only --remove is supported.')
+    hook.require(provider in hook.TOOLS)
     def write(path,raw,mode,expected):
         replace(path,raw,mode,expected)
         if journal is not None:journal[str(path)]=raw
@@ -122,39 +122,17 @@ def configure(provider,path,store,credential_file,accepted=False,remove=False,jo
         # Retain the private manifest/backup as rollback evidence, marked disabled.
         write(manifest,encoded(dict(old,enabled=False)),0o600,previous)
         return True
-    hook.credential(str(credential_file))
-    stable=store/'watch_reply_hook.py'
-    script=Path(__file__).with_name('watch_reply_hook.py').read_bytes()
-    stable_before,_=snapshot(stable)
-    if stable_before!=script:write(stable,script,0o600,stable_before)
-    command=shlex.join([sys.executable,str(stable),'--provider',provider,'--credential-file',str(credential_file)])+' #'+MARK
-    owned={'matcher':'^'+hook.TOOLS[provider]+'$','hooks':[{'type':'command','command':command}]}
-    hooks=value.setdefault('hooks',{});hook.require(type(hooks) is dict)
-    groups=hooks.setdefault('PostToolUse',[]);hook.require(type(groups) is list);groups.append(owned)
-    after=encoded(value)
-    if before==after:return False
-    backup=store/('backup-'+provider+'-'+secrets.token_hex(8)+'.json')
-    replace(backup,before or b'',0o600,None)
-    record=dict(version=1,provider=provider,path=str(path),owned=owned,enabled=True,backup=str(backup),
-                before_sha256=hashlib.sha256(before or b'').hexdigest(),script_sha256=hashlib.sha256(script).hexdigest())
-    write(path,after,mode,before)
-    try:write(manifest,encoded(record),0o600,previous)
-    except BaseException:
-        # Restore only our exact write; never overwrite a concurrent owner's edit.
-        if snapshot(path)[0]==after:
-            restore(path,before,mode,after)
-            if journal is not None:journal[str(path)]=before
-        raise
-    return True
 
 
 def main():
-    parser=argparse.ArgumentParser(description='One user-level opt-in: worker replies notify the hook-reported supervising native parent, not the worker. Notices use normal model turns, get_reply once, and grant no permissions. Replies remain visible to all shared WATCH clients; the hook does not verify caller identity.')
+    parser=argparse.ArgumentParser(description='Remove legacy Motet reply-notice hooks. Automatic reply notices are no longer supported.')
     parser.add_argument('--provider',choices=('codex','claude','both'),required=True)
     parser.add_argument('--credential-file');parser.add_argument('--setup',action='store_true')
-    parser.add_argument('--remove',action='store_true');parser.add_argument('--revoke',action='store_true',help='Offline global reply-consent revocation; use with --remove while WATCH is stopped');parser.add_argument('--accept-native-parent-return',action='store_true')
+    parser.add_argument('--remove',action='store_true');parser.add_argument('--revoke',action='store_true',help='Offline global reply-consent revocation; use with --remove while Motet is stopped');parser.add_argument('--accept-native-parent-return',action='store_true')
     parser.add_argument('--port',type=int,default=8793)
     args=parser.parse_args()
+    if not args.remove or args.setup or args.credential_file:
+        raise ValueError('Automatic reply notices have been removed; use --remove, optionally with --revoke.')
     hook.require(os.name=='posix' and (args.remove or args.accept_native_parent_return))
     home=Path.home();state=home/'.live-room';store=state/'reply-hook';private_directory(state);private_directory(store)
     providers=['codex','claude'] if args.provider=='both' else [args.provider]
@@ -184,17 +162,12 @@ def main():
         sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
         import peer_reply_delivery
         peer_reply_delivery.revoke_offline(str(state),install=lambda:install(''))
-    elif args.setup:
-        hook.require(not args.remove and not args.credential_file)
-        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
-        import peer_reply_delivery
-        peer_reply_delivery.provision(str(state),providers,port=args.port,install=install)
     else:
         hook.require(args.remove or args.credential_file)
         install(str(Path(args.credential_file).absolute()) if args.credential_file else '')
-    print('Removed owned reply hooks.' if args.remove else 'Installed exact PostToolUse hooks. Review the exact new Codex definition in the native Hooks settings before relying on it. No trust state or permissions were changed.')
+    print('Removed owned reply hooks.')
 
 
 if __name__=='__main__':
     try:main()
-    except Exception:raise SystemExit('Reply hook setup failed safely. Stop WATCH for offline --setup; preserve/review the private backup and retry. No hook trust was changed.')
+    except Exception:raise SystemExit('Reply notices are retired. Only --remove (optionally --revoke while Motet is stopped) is supported. If removal failed, preserve the private backup and review configuration.')

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add (or with --remove, take out) W.A.T.C.H.'s Claude Code hooks in ~/.claude/settings.json.
+"""Add (or with --remove, take out) Motet's Claude Code hooks in ~/.claude/settings.json.
 
   Notification       tells the room a session wants attention. Observes only.
   Stop, SubagentStop tell the room Claude, or a sub-agent, is about to stop. That is provisional, not a finished
@@ -16,7 +16,7 @@ marker are ever touched; other hooks in the same group are left alone. The file 
 uniquely named backup is written first. PORT is honoured (default 8793).
 
 The hooks trust whatever process is listening on that port: they send it the key, and the PermissionRequest hook
-passes on its Allow or Deny. Nothing here proves that process is W.A.T.C.H. While the server is not running, another
+passes on its Allow or Deny. Nothing here proves that process is Motet. While the server is not running, another
 local program able to bind the port could collect the key and answer prompts. Stopping other local programs from
 binding it is outside what this tool protects against; remove the hooks (--remove) if that matters on this machine.
 """
@@ -25,7 +25,7 @@ import json, os, shutil, sys, tempfile, time
 if os.name == 'nt':
     # The hooks are POSIX shell (curl, $HOME, case). How Claude Code runs hook commands on Windows has not been
     # checked, and a hook that half-works could pass on a wrong answer, so none is installed there.
-    sys.exit('The hooks are not available on Windows yet. W.A.T.C.H. watches without them; Claude asks in its own app.')
+    sys.exit('The hooks are not available on Windows yet. Motet watches without them; Claude asks in its own app.')
 P = os.path.expanduser('~/.claude/settings.json')
 PORT = os.environ.get('PORT', '8793')
 if not PORT.isdigit():
@@ -42,7 +42,7 @@ TELL = "%s -m 1 -X POST %s --data-binary @- %s/hook >/dev/null 2>&1 || true %s" 
 # decisions the server sends (see permission() in src/server.py). Anything else, such as a reply cut part-way, an
 # error page or some other JSON, prints nothing, which leaves the prompt to Claude.
 REPLIES = [json.dumps({'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': d}}) for d in
-           ({'behavior': 'allow'}, {'behavior': 'deny', 'message': 'Denied by the user from W.A.T.C.H.'})]
+           ({'behavior': 'allow'}, {'behavior': 'deny', 'message': 'Denied by the user from Motet.'})]
 ASK = ("r=$(%s -m 320 -X POST %s --data-binary @- %s/permission 2>/dev/null) && case \"$r\" in "
        "'%s'|'%s') printf '%%s' \"$r\";; esac; true %s" % (CURL, HEAD, URL, REPLIES[0], REPLIES[1], MARK))
 

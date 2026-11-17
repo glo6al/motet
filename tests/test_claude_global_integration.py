@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import officer_messaging
 import server
@@ -25,7 +26,9 @@ NATIVE = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-22222
 class GlobalModIntegration(unittest.TestCase):
     def test_two_loaded_chats_one_authorization_isolated_request_and_reply(self):
         previous = server.MESSAGING, server.KEY, server.PORT, dict(server.AGENTS)
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.multiple(server, HOME=temp, CLAUDE_MANAGED=None,
+                               CLAUDE_MANAGED_ENABLED=False, CLAUDE_MANAGED_FAILED=False):
             store = officer_messaging.MessagingStore(str(Path(temp)/'state'), str(Path(temp)/'sessions'))
             store.codex_available = False
             server.MESSAGING, server.KEY = store, 'fictional-owner-credential'

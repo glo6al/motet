@@ -211,8 +211,9 @@ def records(source):
     fail('Native transcript exceeds the record bound.')
 
 
-def compact_envelope(tid, sender, text, *, ensure_ascii=False):
-    return peer_bridge.shared_envelope(tid, sender, text, 'codex', ensure_ascii=ensure_ascii)
+def compact_envelope(tid, sender, text, *, ensure_ascii=False, legacy_brand=False):
+    return peer_bridge.shared_envelope(tid, sender, text, 'codex', ensure_ascii=ensure_ascii,
+                                       legacy_brand=legacy_brand)
 
 
 def legacy_envelope(tid, sender, text):
@@ -260,9 +261,14 @@ def envelope_proof(ledger, key, envelope, *, trailing_lf=False):
             for sender in senders:
                 if sender is not None and not isinstance(sender, str):
                     continue
-                variants = [make(ledger['transport_id'], sender, text)]
+                # Match exact historical and current text. The immutable payload MAC
+                # below still binds the intended sender, target, identity and message.
                 if make is compact_envelope:
-                    variants.append(make(ledger['transport_id'], sender, text, ensure_ascii=True))
+                    variants = [make(ledger['transport_id'], sender, text, ensure_ascii=ascii_only,
+                                     legacy_brand=legacy_brand)
+                                for legacy_brand in (False, True) for ascii_only in (False, True)]
+                else:
+                    variants = [make(ledger['transport_id'], sender, text)]
                 if original not in variants:
                     continue
                 digest = peer_bridge.mac(key, 'watch-bridge-dedupe-v2', json.dumps(

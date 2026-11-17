@@ -72,7 +72,7 @@ class LifecycleTests(unittest.TestCase):
         retired = life.retire(self.db, self.tid, life.RETIRE_REASON, expected_agent='x:'+native)
         self.assertEqual(retired['execution'], 'retired')
         bridge = peer_bridge.PeerBridge.__new__(peer_bridge.PeerBridge)
-        bridge.store = SimpleNamespace(db=self.db)
+        bridge.store = SimpleNamespace(db=self.db, _peer_payload=lambda transport_id: ('clear', None))
         result = bridge.result(sender, client_id)
         self.assertEqual(result['state'], 'unknown'); self.assertEqual(result['reply'], '')
         self.assertIn('retired by the owner', result['error'])
@@ -93,6 +93,8 @@ class LifecycleTests(unittest.TestCase):
         for state in ('completed', 'dropped'):
             self.db.execute('DELETE FROM peer_execution')
             terminal = dict(row, state='failed' if state == 'dropped' else 'unknown', execution_outcome=state)
+            if state == 'dropped':
+                terminal.pop('mod_turn')  # A verified pre-start drop has no native turn.
             life.reconcile(self.db, terminal)
             with self.assertRaisesRegex(ValueError, 'terminal'):
                 life.retire(self.db, self.tid, life.RETIRE_REASON)
@@ -125,6 +127,35 @@ class LifecycleTests(unittest.TestCase):
         life.migrate(self.db)
         self.assertIsNone(life.capacity_error(self.db, self.target, time.time(), 900))
         self.assertEqual(life.get(self.db, self.tid)['execution'], 'completed')
+
+    def test_dropped_execution_projects_over_stale_save_and_survives_pruning(self):
+        row = self.admitted(); row.pop('mod_turn')
+        row.update(state='failed', execution_outcome='dropped', settled=True)
+        life.reconcile(self.db, row)
+        self.assertEqual(life.get(self.db, self.tid)['capture'], 'withheld')
+        for state in ('queued', 'awaiting_reply', 'quarantined', 'unknown', 'expired', 'answered'):
+            stale = dict(row, state=state, settled=False, execution_outcome='',
+                         reply='Fictional late answer', candidate_reply='Fictional candidate', capture_disposition='captured')
+            # The real Codex saver writes JSON first, then reconciles its durable receipt.
+            self.db.execute('INSERT OR REPLACE INTO requests VALUES (?,?)', (self.tid, json.dumps(stale)))
+            life.reconcile(self.db, stale)
+            saved = json.loads(self.db.execute('SELECT data FROM requests WHERE id=?', (self.tid,)).fetchone()[0])
+            self.assertEqual(saved['state'], 'failed'); self.assertEqual(saved['reply'], '')
+            self.assertEqual(saved['candidate_reply'], ''); self.assertTrue(saved['tracking_stopped'])
+            self.assertTrue(saved['settled']); self.assertEqual(saved['capture_disposition'], 'withheld')
+        self.db.execute('DELETE FROM requests'); life.migrate(self.db)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM requests').fetchone()[0], 0)
+        self.assertEqual(life.get(self.db, self.tid)['execution'], 'dropped')
+        self.assertEqual(life.blockers(self.db, self.target), [])
+
+    def test_drop_contradicts_immutable_turn_even_after_public_unknown(self):
+        row = self.admitted(); life.reconcile(self.db, row)
+        stale = dict(row, state='failed', execution_outcome='dropped', settled=True)
+        stale.pop('mod_turn')
+        with self.assertRaisesRegex(ValueError, 'execution evidence'):
+            life.reconcile(self.db, stale)
+        self.assertEqual(life.get(self.db, self.tid)['execution'], 'uncertain')
+        self.assertEqual(len(life.blockers(self.db, self.target)), 1)
 
     def test_migration_distinguishes_never_launched_from_missing_launched_payload(self):
         self.admitted(launched=False)
@@ -214,6 +245,72 @@ class LifecycleTests(unittest.TestCase):
         record = life.get(self.db, self.tid)
         self.assertEqual((record['execution'], record['capture']), ('completed', 'captured'))
         self.assertIsNone(life.capacity_error(self.db, self.target, time.time(), 900))
+
+    def test_completed_withheld_projects_stale_answer_and_preserves_later_protocol_receipts(self):
+        row = dict(self.admitted(), state='unknown', settled=True, capture_disposition='withheld')
+        life.reconcile(self.db, row)
+        completed = life.get(self.db, self.tid)
+        self.assertEqual((completed['execution'], completed['capture']), ('completed', 'withheld'))
+        completion_id, answer_id = uid(), uid()
+        late = dict(row, state='answered', reply='PRIVATE LATE ANSWER', candidate_reply='PRIVATE',
+                    final='PRIVATE', final_turn='fictional-turn', lifecycle_protocol=2,
+                    completion_event_id=completion_id, completion_fingerprint='a'*64,
+                    answer_event_id=answer_id, answer_fingerprint='b'*64)
+        # This covers write-before-reconcile callers as well as normal migration.
+        self.db.execute('INSERT INTO requests VALUES (?,?)', (self.tid, json.dumps(late)))
+        life.reconcile(self.db, late)
+        record = life.get(self.db, self.tid)
+        self.assertEqual((record['execution'], record['capture']), ('completed', 'withheld'))
+        expected = dict(completion_event_id=completion_id, completion_fingerprint='a'*64,
+                        answer_event_id=answer_id, answer_fingerprint='b'*64)
+        for name, value in expected.items():
+            self.assertEqual(record['evidence'][name], value)
+        saved = json.loads(self.db.execute('SELECT data FROM requests').fetchone()[0])
+        self.assertEqual(saved['state'], 'unknown'); self.assertTrue(saved['settled'])
+        for field in ('reply', 'candidate_reply', 'final', 'final_turn'):
+            self.assertEqual(saved[field], '')
+        life.migrate(self.db)
+        self.assertEqual(life.get(self.db, self.tid), record)
+        for name in expected:
+            conflicting = uid() if name.endswith('_id') else 'c'*64
+            with self.subTest(receipt=name), self.assertRaisesRegex(ValueError, 'original attempt'):
+                life.reconcile(self.db, dict(row, **{name: conflicting}))
+            self.assertEqual(life.get(self.db, self.tid), record)
+        self.db.execute('DELETE FROM requests')
+        life.reconcile(self.db, late)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM requests').fetchone()[0], 0)
+
+    def test_projection_does_not_change_completed_captured_or_pending(self):
+        for capture in ('captured', 'pending'):
+            row = self.admitted()
+            self.db.execute('DELETE FROM shared_bridge_requests WHERE transport_id=?', (self.tid,))
+            self.db.execute('INSERT OR REPLACE INTO peer_execution VALUES (?,?,?,?,?,?)',
+                            (self.tid, self.target, self.created, 'completed', capture, '{}'))
+            public = dict(row, state='answered', reply='Fictional clean answer')
+            self.assertFalse(life.project_terminal(self.db, self.tid, public))
+            self.assertEqual(public['state'], 'answered')
+            self.assertEqual(public['reply'], 'Fictional clean answer')
+
+    def test_retirement_source_is_fixed_and_original_decision_is_preserved(self):
+        self.admitted()
+        with self.assertRaisesRegex(ValueError, 'source'):
+            life.retire(self.db, self.tid, life.RETIRE_REASON, source='arbitrary text')
+        record = life.retire(self.db, self.tid, life.RETIRE_REASON, source='online_owner_decision')
+        self.assertEqual(record['evidence']['owner_retirement']['source'], 'online_owner_decision')
+        self.assertEqual(life.retire(self.db, self.tid, life.RETIRE_REASON), record)
+
+    def test_completed_withheld_preserves_gap_evidence_over_pre_gap_save(self):
+        self.target = 'x:' + uid()
+        row = dict(self.admitted(), runtime='codex', bound_turn='fictional-bound-turn',
+                   codex_gap_needs_envelope=True, state='unknown', settled=True,
+                   capture_disposition='withheld')
+        life.reconcile(self.db, row)
+        self.assertTrue(life.get(self.db, self.tid)['evidence']['codex_gap_seen'])
+        stale = dict(row, state='answered', reply='PRIVATE', codex_gap_needs_envelope=False)
+        life.reconcile(self.db, stale)
+        self.assertTrue(stale['codex_gap_needs_envelope'])
+        self.assertIn('transcript gaps', stale['error'])
+        self.assertTrue(life.get(self.db, self.tid)['evidence']['codex_gap_seen'])
 
     def test_journal_is_bounded_and_duplicate_ack_does_not_grow_it(self):
         life.record_event(self.db, self.tid, 'completed', 'unusable', 'running', 'completed', event_id='same')

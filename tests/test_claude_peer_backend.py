@@ -90,6 +90,70 @@ class ClaudePeerBackendTests(unittest.TestCase):
         fields.update(extra)
         return self.event(claim, 'completed', **fields)
 
+    def install_owner_guards(self):
+        from attachments_owner_guards import OwnerAttachmentGuard, install_for_test
+        from attachments_owner_transport import OwnerAttachmentLedger
+        OwnerAttachmentLedger(self.store.db, self.store.lock)
+        with peer_bridge.transaction(self.store.db, self.store.lock):
+            install_for_test(self.store.db)
+        self.store._attachment_guard = OwnerAttachmentGuard.probe(self.store.db, lock=self.store.lock)
+
+    def check_held_completion(self, *, installed):
+        import peer_lifecycle as life
+        self.enable_lifecycle()
+        sent = self.send()
+        claim = self.global_poll(self.body['client_id'])[1]['claim']
+        self.assertEqual(self.event(claim, 'started', turn_id='fictional-turn')[0], 200)
+        identity = claim['request_id']
+        row = self.peer_row(sent['request_id'])
+        damaged = json.dumps(dict(row, question='Fictional café.'), ensure_ascii=False)
+        with self.store.lock, self.store.db:
+            self.store.db.execute('UPDATE requests SET data=? WHERE id=?', (damaged, identity))
+        if installed:
+            self.install_owner_guards()
+        db = self.store.db
+        before = tuple(db.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall()
+                       for table in ('shared_bridge_requests', 'peer_execution', 'peer_execution_events'))
+        self.assertEqual(self.store._peer_payload(identity), ('uncertain', None))
+        status, response = self.completion(claim, 'withheld')
+        self.assertEqual(status, 409, response)
+        self.assertIn('does not match its original claim', response['error'])
+        self.assertEqual(tuple(db.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall()
+                               for table in ('shared_bridge_requests', 'peer_execution', 'peer_execution_events')), before)
+        self.assertEqual(db.execute('SELECT data FROM requests WHERE id=?', (identity,)).fetchone(), (damaged,))
+        self.assertEqual([entry[:2] for entry in life.blockers(db, self.aid)], [(identity, 'running')])
+        public = self.store.shared.result(sent['request_id'])
+        self.assertEqual((public['state'], public['reply']), ('unknown', ''))
+        with self.assertRaises(peer_bridge.PeerError) as blocker:
+            self.send('Fictional follow-up must remain blocked.')
+        self.assertIn(identity, str(blocker.exception))
+        self.assertEqual(db.execute('SELECT count(*) FROM shared_bridge_requests').fetchone(), (1,))
+
+    def test_held_body_cannot_be_reconstructed_as_pruned_uninstalled(self):
+        self.check_held_completion(installed=False)
+
+    def test_held_body_cannot_be_reconstructed_as_pruned_installed(self):
+        self.check_held_completion(installed=True)
+
+    def test_installed_genuinely_pruned_completion_keeps_existing_receipt_path(self):
+        import peer_lifecycle as life
+        self.install_owner_guards()
+        self.enable_lifecycle()
+        sent = self.send()
+        claim = self.global_poll(self.body['client_id'])[1]['claim']
+        self.assertEqual(self.event(claim, 'started', turn_id='fictional-turn')[0], 200)
+        identity = claim['request_id']
+        with self.store.lock, self.store.db:
+            self.store.db.execute('DELETE FROM requests WHERE id=?', (identity,))
+        self.assertEqual(self.store._peer_payload(identity), ('clear', None))
+        status, response = self.completion(claim, 'withheld')
+        self.assertEqual(status, 200, response)
+        self.assertEqual(self.store._peer_payload(identity), ('clear', None))
+        self.assertEqual(life.get(self.store.db, identity)['execution'], 'completed')
+        self.assertEqual(life.blockers(self.store.db, self.aid), [])
+        public = self.store.shared.result(sent['request_id'])
+        self.assertEqual((public['state'], public['reply']), ('unknown', ''))
+
     def test_owner_retirement_v1_late_answer_is_acknowledged_without_capture_or_reclaim(self):
         import peer_lifecycle as life
         self.setup_global(); sent = self.send()
@@ -202,6 +266,111 @@ class ClaudePeerBackendTests(unittest.TestCase):
         self.assertEqual(self.store.shared.result(sent['request_id'])['state'], 'failed')
         self.assertEqual(self.store.shared.result(sent['request_id'])['reply'], '')
 
+    def test_drop_after_started_then_unknown_is_rejected_using_original_turn(self):
+        import peer_lifecycle as life
+        self.enable_lifecycle(); sent = self.send()
+        claim = self.global_poll(self.body['client_id'])[1]['claim']
+        self.assertEqual(self.event(claim, 'started', turn_id='fictional-turn')[0], 200)
+        self.assertEqual(self.event(claim, 'unknown')[0], 200)
+        self.assertEqual(self.peer_row(sent['request_id'])['state'], 'unknown')
+        self.assertEqual(self.event(claim, 'dropped')[0], 409)
+        self.assertEqual(life.get(self.store.db, claim['request_id'])['execution'], 'uncertain')
+        with self.assertRaises(peer_bridge.PeerError): self.send()
+        self.assertEqual(self.completion(claim, 'withheld')[0], 200)
+        self.assertEqual(self.event(claim, 'dropped')[0], 409)
+        self.assertEqual(life.get(self.store.db, claim['request_id'])['execution'], 'completed')
+
+    def test_dropped_late_ack_preserves_full_payload_on_v1_v2_and_restart(self):
+        import peer_lifecycle as life
+        for v2 in (False, True):
+            with self.subTest(v2=v2):
+                if v2: self.enable_lifecycle()
+                else: self.setup_global()
+                sent = self.send(); claim = self.global_poll(self.body['client_id'])[1]['claim']
+                original = self.peer_row(sent['request_id'])
+                self.assertEqual(self.event(claim, 'dropped')[0], 200)
+                preserved = self.peer_row(sent['request_id'])
+                for field in ('question', 'envelope', 'name', 'identity_revision', 'target_identity', 'mod_peer_envelope_limit'):
+                    self.assertIn(field, original)
+                    self.assertEqual(preserved[field], original[field])
+                for kind in ('dropped', 'dropped', 'submitted', 'unknown'):
+                    self.assertEqual(self.event(claim, kind)[0], 200)
+                    self.assertEqual(self.peer_row(sent['request_id']), preserved)
+                # Startup migration may project terminal state, but must preserve
+                # every original request field used for exact identity/correlation.
+                with self.store.lock, self.store.db:
+                    life.migrate(self.store.db)
+                restarted = self.peer_row(sent['request_id'])
+                for field in original:
+                    if field not in ('state', 'reply', 'error'):
+                        self.assertEqual(restarted[field], original[field], field)
+                for kind in ('unknown', 'submitted', 'dropped'):
+                    self.assertEqual(self.event(claim, kind)[0], 200)
+                    self.assertEqual(self.peer_row(sent['request_id']), restarted)
+                self.assertEqual(self.store.shared.result(sent['request_id'])['state'], 'failed')
+                self.assertEqual(life.get(self.store.db, claim['request_id'])['execution'], 'dropped')
+
+    def test_authentic_prestart_drop_after_expiry_or_prune_releases_without_resubmit(self):
+        import peer_lifecycle as life
+        self.enable_lifecycle()
+        for pruned in (False, True):
+            with self.subTest(pruned=pruned):
+                sent = self.send(); claim = self.global_poll(self.body['client_id'])[1]['claim']
+                with self.store.lock, self.store.db:
+                    row = self.peer_row(sent['request_id']); row['created'] -= 86410 if pruned else 1000
+                    self.store.db.execute('UPDATE shared_bridge_requests SET created=? WHERE client_id=?',
+                                          (row['created'], sent['request_id']))
+                    row['state'] = 'expired'; self.store.mods.put(row)
+                    if pruned: self.store._prune(self.store._rows(), time.time())
+                with self.assertRaises(peer_bridge.PeerError): self.send()
+                self.assertEqual(self.event(dict(claim, attempt_id=uid()), 'dropped')[0], 409)
+                self.assertTrue(life.blockers(self.store.db, self.aid))
+                for _ in range(2):
+                    status, response = self.event(claim, 'dropped')
+                    self.assertEqual(status, 200, response); self.assertEqual(response['state'], 'failed')
+                record = life.get(self.store.db, claim['request_id'])
+                self.assertEqual((record['execution'], record['capture']), ('dropped', 'withheld'))
+                self.assertFalse(life.blockers(self.store.db, self.aid))
+                self.assertEqual(self.event(claim, 'started', turn_id='fictional-turn')[0], 409)
+                self.assertEqual(self.event(claim)[0], 409)
+                self.assertEqual(self.completion(claim)[0], 409)
+                result = self.store.shared.result(sent['request_id'])
+                self.assertEqual(result['state'], 'failed'); self.assertEqual(result['reply'], '')
+                self.assertIn('dropped before it started', result['error'])
+                count = self.store.db.execute('SELECT count(*) FROM shared_bridge_requests').fetchone()[0]
+                duplicate = self.send(request_id=sent['request_id'])
+                self.assertTrue(duplicate['duplicate']); self.assertEqual(duplicate['state'], 'failed')
+                self.assertEqual(self.store.db.execute('SELECT count(*) FROM shared_bridge_requests').fetchone()[0], count)
+                self.assertIsNone(self.global_poll(self.body['client_id'])[1]['claim'])
+                if pruned:
+                    self.assertIsNone(self.store.db.execute('SELECT data FROM requests WHERE id=?', (claim['request_id'],)).fetchone())
+
+    def test_dropped_receipt_overrules_stale_tick_and_public_payload(self):
+        import peer_lifecycle as life
+        self.setup_global(); sent = self.send(); claim = self.global_poll(self.body['client_id'])[1]['claim']
+        stale = self.peer_row(sent['request_id'])
+        self.assertEqual(self.event(claim, 'dropped')[0], 200)
+        # Simulate an already-running tracker persisting its old copied row.
+        with self.store.lock:
+            self.store._save(dict(stale, state='quarantined', candidate_reply='Fictional late reply'))
+        saved = self.peer_row(sent['request_id'])
+        self.assertEqual(saved['state'], 'failed'); self.assertTrue(saved['settled'])
+        self.assertEqual(saved['candidate_reply'], '')
+        # Public reads also obey the durable terminal even if external/stale JSON
+        # bypassed the normal saver. This must not recapture or reclaim the input.
+        with self.store.lock, self.store.db:
+            self.store.db.execute('UPDATE requests SET data=? WHERE id=?',
+                                  (json.dumps(dict(stale, state='answered', mod_turn='fictional-stale', reply='Fictional leak')), claim['request_id']))
+        self.assertEqual(self.store.shared.result(sent['request_id'])['state'], 'failed')
+        self.assertEqual(self.store.shared.result(sent['request_id'])['reply'], '')
+        for kind in ('submitted', 'unknown', 'dropped'):
+            self.assertEqual(self.event(claim, kind)[0], 200)
+        self.assertEqual(life.get(self.store.db, claim['request_id'])['capture'], 'withheld')
+        followup = self.send('A distinct fictional request.')
+        next_claim = self.global_poll(self.body['client_id'])[1]['claim']
+        self.assertEqual(next_claim['request_id'], self.peer_row(followup['request_id'])['request_id'])
+        self.assertNotEqual(next_claim['request_id'], claim['request_id'])
+
     def test_v2_protocol_requires_negotiation_and_downgrade_preflight(self):
         import peer_lifecycle
         self.setup_global(); sent = self.send(); claim = self.global_poll(self.body['client_id'])[1]['claim']
@@ -246,7 +415,7 @@ class ClaudePeerBackendTests(unittest.TestCase):
         self.assertEqual(facts['supported_transport'],'claude_mod')
         self.assertEqual(facts['mod_enrollment'],self.registration['enrollment_id'])
         self.assertEqual(facts['project'],self.project)
-        self.assertIn('explicit WATCH setup',facts['reason'])
+        self.assertIn('explicit Motet setup',facts['reason'])
         target=self.target();self.assertEqual(target['supported_transport'],'claude_mod')
         self.assertEqual(target['capability'],'unavailable')
         self.assertIn('compatible live official plugin',target['reason'])

@@ -10,7 +10,7 @@ import antigravity_navigation as navigation
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Connect or disconnect WATCH Navigation. No app restart or agent work is started.')
+    parser = argparse.ArgumentParser(description='Connect or disconnect Motet Navigation. No app restart or agent work is started.')
     parser.add_argument('action', choices=('install', 'disconnect', 'remove', 'status'))
     args = parser.parse_args()
     try:

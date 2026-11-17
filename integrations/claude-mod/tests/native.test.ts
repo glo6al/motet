@@ -51,7 +51,7 @@ test('one official mod submits attributed full owner envelope and observes its e
   on('turn.complete',($,e)=>({text:e.answer}));
   await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
   const connected=await $.command.run({command:'watch-connect',args:'8793:fictional_pair_code_1234',origin:{kind:'composer'}});
-  expect(connected.text.includes('WATCH connected')).toBe(true);
+  expect(connected.text.includes('Motet connected')).toBe(true);
   await clock.advance(2000);
   await clock.advance(2000);
   expect(submissions.length).toBe(1);
@@ -70,7 +70,7 @@ test('nonowner enrollment refuses before HTTP or native identity access',async($
   on('http.fetch',()=>{throw Error('must not contact service');});
   on('session.id',()=>{throw Error('must not read identity');});
   const result=await $.command.run({command:'watch-connect',args:'8793:fictional_pair_code_1234',origin:{kind:'plugin',name:'other-mod'}});
-  expect(result.text).toBe('WATCH connection commands require direct owner input.');
+  expect(result.text).toBe('Motet connection commands require direct owner input.');
 });
 
 test('official runtime accepts one shared setup and detached automatic registration with isolated receipts',async($,on)=>{

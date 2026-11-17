@@ -1,11 +1,9 @@
-// Real MCP, signed hook HTTP, SQLite and plugin; native turns are simulated.
+// Real MCP, signed HTTP, SQLite and plugin; explicit retrieval, no reply notices.
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
-import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {register} from '../hooks/register.js';
-import {replyNoticeText} from '../hooks/protocol.js';
 const {Client}=await import('../../claude/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js');
 const {StdioClientTransport}=await import('../../claude/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js');
 let input='';for await(const part of process.stdin)input+=part;
@@ -19,30 +17,6 @@ async function rpc(name,args={}) {
  const raw=await client.callTool({name,arguments:args});
  assert(!raw.isError,JSON.stringify(raw));
  return {raw,value:JSON.parse(raw.content[0].text).untrusted_peer_data};
-}
-async function receiveNotice(text,provider) {
- assert(current,'a notice must belong to a live fixture case');
- assert.equal(current.source_provider,provider);
- assert.equal(text,replyNoticeText(current.public_request_id),'notice must use the public lookup ID');
- assert(current.source_finished,'native return must follow completion of the asking turn');
- if(provider==='claude') {
-  const questions=(await fs.readFile(config.codex_question_file,'utf8')).trim().split('\n').map(JSON.parse);
-  assert.equal(questions.length,current.reverse_index+1);
-  assert(questions.every(q=>q.thread===config.codex_source));
-  current.question_submissions=questions.filter(q=>q.request_id===questions.at(-1).request_id).length;
-  assert.equal(current.question_submissions,1);
-  current.events.push('target_answer');
- }
- current.events.push('native_notice');
- current.notice_submissions++;
- assert.equal(current.notice_submissions,1,'only one native return admission');
- current.get_reply_calls++;
- const {value}=await rpc('get_reply',{request_id:current.public_request_id});
- current.events.push('get_reply');
- assert.equal(value.request_id,current.public_request_id);
- assert.equal(value.state,'answered');
- assert.equal(value.reply,'Fictional '+provider+' answer.');
- current.reply=value.reply;
 }
 async function runtime(native,index) {
  const hooks=new Map(),timers=[],submissions=[],polls=[];
@@ -65,13 +39,8 @@ async function runtime(native,index) {
    assert.deepEqual(surfaces,[],'background chats must remain usable without a room tile');
    submissions.push(value.text);
    const turn='fictional-'+crypto.randomUUID();
-   if(value.text.startsWith('WATCH_PEER_REPLY ')) {
-    assert.equal(index,1,'same-project sibling cannot receive a return notice');
-    await api.call('turn.start',{text:value.text,turnId:turn});
-    await receiveNotice(value.text,'claude');
-    // A notice's main turn is not a new peer request to fulfill.
-    await api.call('turn.complete',{turnId:turn,answer:current.reply,isAborted:false,reason:'answer'});
-   }else{
+   assert(!value.text.startsWith('WATCH_PEER_REPLY '),'retired notice must never reach native submit');
+   {
     assert.equal(index,0,'only the pinned target receives the question');
     const match=/^WATCH_PEER_REQUEST ([0-9a-f-]+)\n/.exec(value.text);
     assert(match);
@@ -133,30 +102,28 @@ try {
   assert.equal(sent.value.duplicate,false);
   current.public_request_id=sent.value.request_id;
   current.events.push('send_complete');
-  const observed=spawnSync(config.python,[config.hook_script,'--provider',provider,'--credential-file',config.hook_credential],{
-   input:JSON.stringify({hook_event_name:'PostToolUse',session_id:provider==='codex'?config.codex_source:config.native[1],
-    tool_use_id:'fictional-'+crypto.randomUUID(),tool_name:provider==='codex'?'mcp__watch_peer__send_message':'mcp__watch-peer__send_message',
-    tool_input:args,tool_response:sent.raw}),encoding:'utf8',timeout:6000});
-  assert.equal(observed.status,0);assert.equal(observed.stdout,'');assert.equal(observed.stderr,'');
   current.source_finished=true;
   current.events.push('source_turn_complete');
   await fs.writeFile(config.source_ready_file,'ready');
-  let readCodexNotice=false;
+  // The harness waits for durable target completion, then models one explicit lookup.
+  // No hook, injected prompt, or automatic source turn is involved.
   await until(async()=>{
-   if(provider==='codex'&&!readCodexNotice) {
-    let data='';try{data=await fs.readFile(config.codex_notice_file,'utf8')}catch(error){if(error.code!=='ENOENT')throw error;}
-    if(data.trim()) {
-     const messages=data.trim().split('\n').map(JSON.parse);
-     assert.equal(messages.length,1);
-     assert.equal(messages[0].thread,config.codex_source);
-     readCodexNotice=true;
-     await receiveNotice(messages[0].message,'codex');
-    }
-   }
-   const noticeReceipts=[...storage.values()].filter(v=>v?.kind==='peer_reply_notice').flatMap(v=>Object.values(v.requests));
-   return !!current.reply&&(provider==='codex'||noticeReceipts.some(r=>r.public_request_id===current.public_request_id&&r.phase==='submitted'&&r.events.length===0));
+   const listing=(await rpc('list_requests')).value;
+   return listing.requests.some(r=>r.request_id===current.public_request_id&&r.state==='answered');
   });
-  assert.deepEqual(current.events,['send_complete','source_turn_complete','target_answer','native_notice','get_reply']);
+  if(provider==='claude') {
+   const questions=(await fs.readFile(config.codex_question_file,'utf8')).trim().split('\n').map(JSON.parse);
+   assert.equal(questions.length,current.reverse_index+1);
+   assert(questions.every(q=>q.thread===config.codex_source));
+   current.question_submissions=questions.filter(q=>q.request_id===questions.at(-1).request_id).length;
+   current.events.push('target_answer');
+  }
+  current.get_reply_calls++;
+  const result=(await rpc('get_reply',{request_id:current.public_request_id})).value;
+  assert.equal(result.state,'answered');assert.equal(result.reply,'Fictional '+provider+' answer.');
+  current.reply=result.reply;current.events.push('get_reply');
+  assert.deepEqual(current.events,['send_complete','source_turn_complete','target_answer','get_reply']);
+  assert.equal(current.notice_submissions,0);
   assert.equal(current.get_reply_calls,1);
   assert.equal(runtimes[2].submissions.length,0);
   const duplicate=(await rpc('send_message',{...args,request_id:current.public_request_id})).value;
@@ -166,7 +133,7 @@ try {
    get_reply_calls:current.get_reply_calls,source_turn_finished_before_answer:true,sibling_notice_submissions:runtimes[2].submissions.length});
  }
  assert.equal(runtimes[0].submissions.length,2);
- assert.equal(runtimes[1].submissions.length,2);
+ assert.equal(runtimes[1].submissions.length,0);
  assert.equal(runtimes[2].submissions.length,0);
  console.log(JSON.stringify({cases}));
 }finally{await client.close()}

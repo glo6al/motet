@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import threading
 import time
+from officer_history import OfficerHistoryMixin
 
 DEFAULTS = dict(enabled=False, paused=False, retention_days=30,
                 excluded_chats=[], excluded_projects=[])
@@ -179,7 +180,7 @@ def _windows_security(path, directory=False, create=False):
         kernel.CloseHandle(token)
 
 
-class DeckLog:
+class DeckLog(OfficerHistoryMixin):
     def __init__(self, state_dir, *, clock=time.time, limits=None):
         self.clock, self.limits = clock, dict(LIMITS, **(limits or {}))
         self.path = os.path.join(os.path.abspath(state_dir), 'deck-log.sqlite3')
@@ -243,13 +244,26 @@ class DeckLog:
             raise OSError('nonprivate storage')
         return st.st_dev, st.st_ino
 
-    def _private_open(self):
+    def _unlinked_ancestors(self):
         ancestor = os.path.dirname(self.root)
         while ancestor != os.path.dirname(ancestor):
             st = os.lstat(ancestor)
             if stat.S_ISLNK(st.st_mode) or getattr(st, 'st_file_attributes', 0) & 0x400:
                 raise OSError('linked storage parent')
             ancestor = os.path.dirname(ancestor)
+
+    def _fresh_storage(self):
+        """Read-only: Memory could open its storage here, and no archive exists yet."""
+        try:
+            self._unlinked_ancestors()
+            if os.path.lexists(self.root):
+                self._private(self.root, True)
+            return not os.path.lexists(self.path)
+        except OSError:
+            return False
+
+    def _private_open(self):
+        self._unlinked_ancestors()
         if not os.path.lexists(self.root):
             if os.name == 'nt':
                 _windows_security(self.root, True, True)
@@ -290,7 +304,7 @@ class DeckLog:
         CREATE TABLE IF NOT EXISTS coverage(id INTEGER PRIMARY KEY,reason TEXT NOT NULL,started REAL NOT NULL,ended REAL NOT NULL,count INTEGER NOT NULL);
         ''')
         existing = {r['key']: json.loads(r['value']) for r in self.db.execute('SELECT * FROM settings')}
-        if existing.get('schema_version', 1) not in (1, 2, 3):
+        if existing.get('schema_version', 1) not in (1, 2, 3, 4):
             raise ValueError('unsupported archive schema')
         if 'certainty' not in {r[1] for r in self.db.execute('PRAGMA table_info(events)')}:
             self.db.execute("ALTER TABLE events ADD COLUMN certainty TEXT NOT NULL DEFAULT 'recorded'")
@@ -303,7 +317,8 @@ class DeckLog:
         if type(generation) is not int or generation < 0:
             raise ValueError('invalid erasure generation')
         self._save_setting('erasure_generation', generation)
-        self._save_setting('schema_version', 3)
+        self._save_setting('schema_version', 4)
+        self._officer_schema()
         for key in DEFAULTS:
             if key in existing:
                 self.settings[key] = existing[key]
@@ -407,10 +422,21 @@ class DeckLog:
                 self.queue.clear()
             try:
                 self._verify()
+                officer_cleanup = bool(value['excluded_chats'] or value['excluded_projects'] or self._officer_cleanup_pending())
+                if officer_cleanup:
+                    # Durable fail-closed intent survives cleanup failure/restart.
+                    self._save_setting('officer_cleanup_pending', True)
+                    self.db.commit()
                 for key, val in value.items():
                     self._save_setting(key, val)
                 self.db.commit()
                 self.settings = value
+                if officer_cleanup:
+                    self._officer_erase('excluded_scope')
+                    self._cleanup()
+                    self._save_setting('officer_cleanup_pending', False)
+                    self.db.commit()
+                self._officer_gap('policy_changed')
                 self._purge()
                 self._gap('policy_changed')
                 self.reason = ''
@@ -591,6 +617,7 @@ class DeckLog:
         self._verify()
 
     def _erased(self):
+        self._officer_erase('source_erased_or_expired')
         row = self.db.execute("SELECT value FROM settings WHERE key='erasure_generation'").fetchone()
         generation = json.loads(row[0]) if row else 0
         if type(generation) is not int or generation < 0:
@@ -613,6 +640,11 @@ class DeckLog:
 
     def _purge(self):
         cutoff = self.clock() - self.settings['retention_days'] * 86400
+        expired = self.db.execute('SELECT MIN(started),MAX(updated) FROM officer_entries WHERE started<?', (cutoff,)).fetchone()
+        if expired and expired[0] is not None:
+            self._officer_gap('officer_history_expired', expired[0], expired[1])
+            self.db.execute('DELETE FROM officer_entries WHERE started<?', (cutoff,))
+            self.db.commit()
         count = self.db.execute('SELECT COUNT(*) FROM source_records WHERE age_ts<?', (cutoff,)).fetchone()[0]
         if count:
             self._erased()

@@ -1,28 +1,28 @@
-# WATCH Navigation for Antigravity
+# Motet Navigation for Antigravity
 
-This user-level native extension lets WATCH request opening an existing
+This user-level native extension lets Motet request opening an existing
 Antigravity desktop chat. It never sends a message, starts work, creates a chat,
 changes permissions or calls a model. It uses a small adapter to the installed
 native UI navigation contract; it does not replace the vendor SDK.
 
 On macOS with Antigravity 2.31.2, choose **Connection → Install connector**
-on an Antigravity desk in WATCH. This installs the reviewed package once as the global `watch-navigation`
+on an Antigravity desk in Motet. This installs the reviewed package once as the global `watch-navigation`
 sidecar and explicitly authorizes navigation to existing desktop chats. There
-are no per-chat installations, target lists or pairing codes. Enable **WATCH
+are no per-chat installations, target lists or pairing codes. Enable **Motet
 Navigation** once in Antigravity's **Customizations → Installed**. In any existing
-chat, open **Extensions → WATCH Navigation** once. You can hide the
-panel after it connects. WATCH offers Open only while a live connection exists.
+chat, open **Extensions → Motet Navigation** once. You can hide the
+panel after it connects. An existing installation may still show its earlier label. Motet offers Open only while a live connection exists.
 If it becomes unavailable, reopen that panel. Cold startup and retention after
 many chat switches are not guaranteed. No hidden flags or app restart are used.
 
 The command-line equivalent is `python3 scripts/install_antigravity_open.py install`;
 use `status`, `disconnect` or `remove` for the other lifecycle actions.
 Disconnect revokes navigation immediately. A loaded panel can reconnect when you
-connect again in WATCH; the idle extension gains no navigation authority. An
+connect again in Motet; the idle extension gains no navigation authority. An
 in-flight native navigation cannot be recalled. To remove or update installed
-files, first turn WATCH Navigation off in Antigravity. Remove waits for the
+files, first turn the Navigation extension off in Antigravity. Remove waits for the
 sidecar to stop and deletes only verified owned files; changed or foreign files
-are preserved. WATCH never writes Antigravity's shared configuration, so native
+are preserved. Motet never writes Antigravity's shared configuration, so native
 settings and concurrent native edits remain untouched. A private ownership stamp
 is retained to recognize a later reinstall.
 
@@ -30,7 +30,7 @@ is retained to recognize a later reinstall.
 
 Owner authorization and ephemeral connection data live under
 `~/.live-room/antigravity-open/` in owner-only directories and files. The owner
-capability is distinct from both WATCH's API key and the native UI capability.
+capability is distinct from both the Motet room key and the native UI capability.
 It never appears in URLs, the extension page, public status, logs or model
 context. The native UI uses Antigravity's own token bootstrap. Its proxy can
 forward a canonical `localhost:<port>` Host and omit Origin; UI requests always
@@ -56,5 +56,5 @@ or losing a lease prevents further admission and claim.
 
 The native contract has no selection acknowledgment. A successful response means
 **Opening requested**, not independently confirmed selection or foreground.
-WATCH never interprets that response as completed work. Process-exit races remain
+Motet never interprets that response as completed work. Process-exit races remain
 possible. Reconnect when the current generation or its native process changes.

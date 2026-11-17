@@ -963,11 +963,11 @@ async function boot(change=()=>{},contextChange=()=>{}){
     w=>{w.location.search='?token=one&token=two'},(w,d,m)=>{m['watch-native-parent']='https://example.invalid'}]){
     const bad=await boot(change);assert.equal(bad.posts.length,0,'An unowned or incompatible iframe must not contact the native host.');
     assert.equal(bad.requests.length,0,'Missing bootstrap must fail before contacting the broker.');
-    assert.match(bad.status.textContent,/Open WATCH Navigation/);
+    assert.match(bad.status.textContent,/Open Motet Navigation/);
   }
   for(const breakCrypto of [ctx=>{ctx.crypto=undefined},ctx=>{ctx.crypto={randomUUID(){throw Error('fictional bootstrap detail '+token)}}}]){
     const failed=await boot(()=>{},breakCrypto);assert.equal(failed.posts.length,0);assert.equal(failed.requests.length,0);
-    assert.equal(failed.status.textContent,'Connection unavailable. Reopen WATCH Navigation to try again.');
+    assert.equal(failed.status.textContent,'Connection unavailable. Reopen Motet Navigation to try again.');
     assert.ok(!failed.status.textContent.includes(token));assert.ok(!failed.status.textContent.includes('fictional bootstrap detail'));
   }
   console.log('actual native frame/navigation checks passed');

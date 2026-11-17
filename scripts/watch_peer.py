@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Set up shared WATCH service access. Never edits host configuration."""
+"""Set up shared Motet service access. Never edits host configuration."""
 import argparse
 import glob
 import json
@@ -31,7 +31,7 @@ def parser():
     init.add_argument('--history', default='14', help='History in days, or all')
     init.add_argument('--allow-project', action='append', default=[])
     init.add_argument('--deny-project', action='append', default=[])
-    policy = sub.add_parser('policy', help='Update discovery scope while WATCH is stopped; restart required')
+    policy = sub.add_parser('policy', help='Update discovery scope while Motet is stopped; restart required')
     policy.add_argument('--providers', help='Replace the comma-separated provider selection')
     policy.add_argument('--history', help='History in days, or all')
     allow = policy.add_mutually_exclusive_group()
@@ -89,7 +89,7 @@ def transcript_identity(sessions, session, project):
 
 def write_credential(state, credential, port):
     if type(port) is not int or not 1 <= port <= 65535:
-        raise ValueError('Use a valid WATCH port.')
+        raise ValueError('Use a valid Motet port.')
     directory = p.private_directory(os.path.join(state, 'bridge-credentials' if credential['version'] == 2 else 'peer-credentials'), True)
     path = os.path.join(directory, credential.get('credential_id', credential.get('endpoint_id')) + '.json')
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -187,7 +187,7 @@ def status(db, state):
 def main(argv=None):
     args = parser().parse_args(argv)
     if not 1 <= args.port <= 65535:
-        raise ValueError('Use a valid WATCH port.')
+        raise ValueError('Use a valid Motet port.')
     if args.command == 'config':
         settings = config(args.credential_file, args.node)['mcpServers']['watch-peer']
         if args.client == 'claude':
@@ -290,5 +290,5 @@ if __name__ == '__main__':
     try:
         main()
     except Exception:
-        print('WATCH setup failed. Check the command, selected policy, and private state files.', file=sys.stderr)
+        print('Motet setup failed. Check the command, selected policy, and private state files.', file=sys.stderr)
         sys.exit(1)

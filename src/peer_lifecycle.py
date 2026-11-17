@@ -14,6 +14,7 @@ TERMINAL = ('completed', 'dropped', 'retired')
 RETIRE_REASON = 'owner_requested_clear_unresolved_attempt'
 RETIRE_MESSAGE = ('This attempt was retired by the owner. Provider outcome remains unknown; '
                   'late replies are withheld. Nothing was cancelled or resent.')
+DROP_MESSAGE = 'The native input was dropped before it started. Nothing was resubmitted.'
 MAX_RESERVATIONS = 200000  # Both immutable ledgers are individually capped at 100000.
 MAX_EVENTS, EVENT_RETENTION = 2048, 86400
 
@@ -44,6 +45,16 @@ def metadata(db, request_id=None):
     return result
 
 
+def exact_admission(db, request_id):
+    admission = metadata(db, request_id).get(request_id)
+    if admission is None:
+        return None
+    other = 'peer_requests' if admission[3] == 2 else 'shared_bridge_requests'
+    if db.execute(f'SELECT 1 FROM {other} WHERE transport_id=?', (request_id,)).fetchone():
+        return None
+    return admission
+
+
 def get(db, request_id):
     r = db.execute('SELECT agent,created,execution,capture,evidence FROM peer_execution WHERE request_id=?', (request_id,)).fetchone()
     return dict(request_id=request_id, agent=r[0], created=r[1], execution=r[2], capture=r[3], evidence=json.loads(r[4])) if r else None
@@ -54,25 +65,54 @@ def is_retired(db, request_id):
     return bool(row and row['execution'] == 'retired')
 
 
+def is_terminal(db, request_id):
+    row = get(db, request_id)
+    return bool(row and row['execution'] in TERMINAL)
+
+
+def project_terminal(db, request_id, row):
+    """A stale transport copy cannot revive released, permanently withheld input."""
+    record = get(db, request_id)
+    if record and record['execution'] == 'completed' and record['capture'] == 'withheld':
+        gap = record['evidence'].get('codex_gap_seen') is True
+        row.update(state='unknown', reply='', candidate_reply='', final='', final_turn='', tracking_stopped=True,
+                   execution_outcome='completed', settled=True, capture_disposition='withheld',
+                   error=('The identified turn ended, but transcript gaps prevent a trustworthy reply; its reply is withheld.'
+                          if gap else 'The identified turn ended, but its reply could not be safely captured and is withheld.'))
+        if gap:
+            row['codex_gap_needs_envelope'] = True
+        return True
+    if record and record['execution'] == 'dropped':
+        # A row that already failed before dispatch keeps its own reason; the general wording is for rows without one.
+        reason = row['error'] if row.get('state') == 'failed' and isinstance(row.get('error'), str) and row['error'] else DROP_MESSAGE
+        row.update(state='failed', reply='', candidate_reply='', final='', final_turn='', tracking_stopped=True,
+                   execution_outcome='dropped', settled=True,
+                   capture_disposition='withheld', error=reason)
+        return True
+    return project_retired(db, request_id, row)
+
+
 def project_retired(db, request_id, row):
     """Suppress mutable payload state without asserting provider completion."""
     if not is_retired(db, request_id):
         return False
-    row.update(state='unknown', reply='', candidate_reply='', tracking_stopped=True,
+    row.update(state='unknown', reply='', candidate_reply='', final='', final_turn='', tracking_stopped=True,
                capture_disposition='withheld', error=RETIRE_MESSAGE)
     row.pop('settled', None)
     row.pop('execution_outcome', None)
     return True
 
 
-def retire(db, transport_id, owner_reason, *, expected_agent=None):
-    """Offline owner action; caller holds exclusive service lock and transaction.
+def retire(db, transport_id, owner_reason, *, expected_agent=None, source='offline_owner_decision'):
+    """Owner action; caller holds the service lock and an exclusive transaction.
 
     Preserve immutable admission/launch and attempt receipts. No native I/O and
     no completion claim. The explicit reason is a metadata code, never user text.
     """
     if owner_reason != RETIRE_REASON:
         raise ValueError('Retirement requires the explicit owner decision code.')
+    if source not in ('offline_owner_decision', 'online_owner_decision'):
+        raise ValueError('Retirement requires a fixed owner decision source.')
     identities = db.execute('SELECT target,created,launched FROM shared_bridge_requests WHERE transport_id=?',
                             (transport_id,)).fetchall()
     legacy = db.execute('SELECT transport_id FROM peer_requests WHERE transport_id=?', (transport_id,)).fetchall()
@@ -105,7 +145,7 @@ def retire(db, transport_id, owner_reason, *, expected_agent=None):
         raise ValueError('A verified terminal attempt cannot be retired.')
     evidence = dict(old['evidence'])
     evidence['owner_retirement'] = dict(reason=owner_reason, decided_at=time.time(),
-                                        source='offline_owner_decision', provider_outcome='unknown')
+                                        source=source, provider_outcome='unknown')
     db.execute("UPDATE peer_execution SET execution='retired',capture='withheld',evidence=? WHERE request_id=?",
                (json.dumps(evidence, sort_keys=True), transport_id))
     if raw:
@@ -115,9 +155,14 @@ def retire(db, transport_id, owner_reason, *, expected_agent=None):
     return get(db, transport_id)
 
 
-def reconcile(db, row, meta=None, *, missing_payload=False):
+def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
     """Called inside the caller's request-write transaction. No payload retained."""
+    payload = row
     tid = row.get('request_id')
+    if not write_payload and (meta is None or missing_payload or not isinstance(tid, str)
+                              or exact_admission(db, tid) != meta
+                              or row != dict(request_id=tid, agent=meta[0], state='unknown')):
+        raise ValueError('Metadata-only recovery requires an exact uncertain peer admission.')
     if not isinstance(tid, str):
         return
     old = get(db, tid)
@@ -128,20 +173,30 @@ def reconcile(db, row, meta=None, *, missing_payload=False):
     target, created, launched, version = meta
     if not target or row.get('agent', target) != target:
         raise ValueError('Peer execution identity requires owner recovery before migration.')
-    if old and old['agent'] != target:
+    if old and (old['agent'] != target or not write_payload and old['created'] != created):
         raise ValueError('Peer execution identity conflicts with its immutable admission.')
-    if old and old['execution'] == 'retired':
-        project_retired(db, tid, row)
+    if not write_payload and old and old['execution'] in TERMINAL:
+        return  # Held bodies cannot revise an already terminal lifecycle.
+    if old and old['execution'] in ('retired', 'dropped'):
+        project_terminal(db, tid, row)
         # Some callers persist JSON before reconciliation; overwrite that retained
         # copy too. Never recreate an expired payload merely to project retirement.
         db.execute('UPDATE requests SET data=? WHERE id=?', (json.dumps(row), tid))
+        if old['execution'] == 'dropped' and old['capture'] != 'withheld':
+            db.execute("UPDATE peer_execution SET capture='withheld' WHERE request_id=?", (tid,))
         return
-    if not missing_payload and not valid_payload(tid, row, meta):
+    if write_payload and not missing_payload and not valid_payload(tid, row, meta):
         row = dict(request_id=tid, agent=target, state='unknown')
+    if row.get('execution_outcome') == 'dropped' and old and (
+            old['execution'] in ('running', 'completed')
+            or old['evidence'].get('mod_turn') or old['evidence'].get('bound_turn')):
+        raise ValueError('A dropped submission contradicts recorded execution evidence.')
 
     if not old and db.execute('SELECT COUNT(*) FROM peer_execution').fetchone()[0] >= MAX_RESERVATIONS:
         raise ValueError('Peer execution history is full; owner maintenance is required.')
     evidence = dict(old['evidence']) if old else {}
+    if row.get('runtime') == 'codex' and row.get('codex_gap_needs_envelope') is True:
+        evidence['codex_gap_seen'] = True
     for key in ('mod_enrollment', 'mod_attempt_id', 'mod_generation', 'mod_turn', 'bound_turn', 'lifecycle_protocol',
                 'completion_event_id', 'completion_fingerprint', 'answer_event_id', 'answer_fingerprint'):
         value = row.get(key)
@@ -173,7 +228,9 @@ def reconcile(db, row, meta=None, *, missing_payload=False):
             execution = 'running'
         elif launched is not None:
             execution = 'submitted'
-    if capture != 'withheld':
+    if execution == 'dropped':
+        capture = 'withheld'
+    elif capture != 'withheld':
         if row.get('capture_disposition') == 'withheld' or row.get('peer_mixed_input') is True or row.get('peer_context_overflow') is True:
             capture = 'withheld'
         elif row.get('state') == 'answered':
@@ -182,6 +239,11 @@ def reconcile(db, row, meta=None, *, missing_payload=False):
             capture = 'unusable'
     db.execute('INSERT OR REPLACE INTO peer_execution VALUES (?,?,?,?,?,?)',
                (tid, target, created, execution, capture, json.dumps(evidence, sort_keys=True)))
+    if write_payload and execution == 'completed' and capture == 'withheld':
+        # Merge and validate later protocol receipts above before suppressing the
+        # public payload. Unlike retirement, completion can gain native receipts.
+        project_terminal(db, tid, payload)
+        db.execute('UPDATE requests SET data=? WHERE id=?', (json.dumps(payload), tid))
 
 
 def valid_payload(tid, row, meta):
@@ -234,7 +296,7 @@ def valid_payload(tid, row, meta):
                 or row['mod_project'] != row.get('target_project')):
             return False
     if row.get('execution_outcome') == 'dropped':
-        return row['state'] == 'failed'
+        return row['state'] == 'failed' and not row.get('mod_turn') and not row.get('bound_turn')
     if row['state'] == 'failed' and launched is None:
         return True  # Immutable ledger proves no native dispatch was authorized.
     completed = row.get('settled') is True or row.get('execution_outcome') == 'completed' or row['state'] in ('answered', 'quarantined')
@@ -254,8 +316,11 @@ def valid_payload(tid, row, meta):
     return True
 
 
-def migrate(db):
+def migrate(db, *, peer_payload_readable=None):
     for tid, meta in metadata(db).items():
+        if peer_payload_readable is not None and not peer_payload_readable(tid):
+            reconcile(db, dict(request_id=tid, agent=meta[0], state='unknown'), meta, write_payload=False)
+            continue
         raw = db.execute('SELECT data FROM requests WHERE id=?', (tid,)).fetchone()
         try:
             row = json.loads(raw[0]) if raw else None

@@ -9,6 +9,10 @@ archive/
 
 # local investigation evidence may contain personal paths and session metadata
 docs/investigations/
+/docs/plans/
+/docs/attachments/
+/docs/bridge/*
+!/docs/bridge/RECOVERY.md
 
 # brand process notes and the AI-generated reference images they describe (carry C2PA provenance manifests); the production SVG/PNG set in brand/ ships
 brand/reference/
@@ -17,3 +21,13 @@ brand/studies/
 
 # screen recordings are sources for the GIF, never published
 *.mov
+
+# local agent directories and machine-local configurations
+/.claude/
+/.gemini/
+.env
+.env.*
+*.local
+*.pem
+*.key
+*.log

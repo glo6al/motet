@@ -27,6 +27,10 @@ class ClaudeModTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name)
+        legacy_host = patch.multiple(server, HOME=str(self.base), CLAUDE_MANAGED=None,
+                                     CLAUDE_MANAGED_ENABLED=False, CLAUDE_MANAGED_FAILED=False)
+        legacy_host.start()
+        self.addCleanup(legacy_host.stop)
         self.project = os.path.realpath(self.temp.name)
         self.sid, self.aid = uid(), None
         self.aid = 'c:'+self.sid

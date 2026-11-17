@@ -64,6 +64,10 @@ def read_settings(conversation_id, *, host_id='local'):
     labels are not identities. No catalog means both selection capabilities stay
     false, including when a native settings read succeeds.
     """
+    return _read_settings(conversation_id, host_id=host_id, verify_build=_transport._verify_build)
+
+
+def _read_settings(conversation_id, *, host_id, verify_build):
     result = {'provider': 'codex', 'hostId': None, 'nativeThreadId': None,
               'state': 'unavailable', 'settings': None, 'catalog': None,
               'capability': {'read': False, 'selectModel': False, 'selectEffort': False,
@@ -77,7 +81,7 @@ def read_settings(conversation_id, *, host_id='local'):
             return result
         result['hostId'] = 'local'
         result['capability']['reason'] = 'incompatible_desktop'
-        _transport._verify_build()
+        verify_build()
         result['capability']['reason'] = 'transport_unavailable'
         connection = _ReadConnection(_transport._endpoint(), conversation_id)
         init = connection.request('initialize', {'clientType': 'watch-model-settings-reader'},

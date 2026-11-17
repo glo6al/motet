@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect or delete retained Officer usage records; never call an API."""
+"""Inspect or delete retained Motet usage records; never call an API."""
 import argparse
 import json
 from pathlib import Path
@@ -12,7 +12,7 @@ from officer_usage import UsageLedger
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--days', type=int, default=30, help='Retained period to summarise, one to ninety days.')
-    parser.add_argument('--delete', action='store_true', help='Delete retained usage records; recording continues if WATCH is running.')
+    parser.add_argument('--delete', action='store_true', help='Delete retained usage records; recording continues if Motet is running.')
     args = parser.parse_args()
     ledger = UsageLedger(Path.home() / '.live-room')
     try:

@@ -22,6 +22,10 @@ class OwnerActionsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
+        legacy_host = patch.multiple(server, HOME=str(self.base), CLAUDE_MANAGED=None,
+                                     CLAUDE_MANAGED_ENABLED=False, CLAUDE_MANAGED_FAILED=False)
+        legacy_host.start()
+        self.addCleanup(legacy_host.stop)
         self.sessions = self.base / 'sessions'; self.sessions.mkdir()
         self.aid = 'x:' + str(uuid.uuid4()); self.cid = 'c:' + str(uuid.uuid4())
         self.turn = str(uuid.uuid4())
@@ -94,9 +98,9 @@ class OwnerActionsTests(unittest.TestCase):
         before = self.store.db.total_changes
         with patch.object(messaging.claude_channel,'discover',side_effect=AssertionError('discovery')), patch.object(self.store,'_save',side_effect=AssertionError('request write')):
             status,out,_ = self.request('POST','/agent-message',self.payload(self.cid))
-            self.assertEqual(status,503); self.assertIn('Set up Claude once in WATCH',out['error'])
+            self.assertEqual(status,503); self.assertIn('Set up Claude once in Motet',out['error'])
             status,out,_ = self.request('POST','/ask',body)
-            self.assertEqual(status,200); self.assertIn('Set up Claude once in WATCH',out['error'])
+            self.assertEqual(status,200); self.assertIn('Set up Claude once in Motet',out['error'])
         self.assertEqual(self.store.db.total_changes,before)
         self.assertEqual(self.store._rows(),[])
 
@@ -107,7 +111,7 @@ class OwnerActionsTests(unittest.TestCase):
         server.officer_ask.__defaults__ = (model,)+old[1:]
         try:
             out = self.request('POST','/ask',{'turns':[{'role':'user','content':'Ask Mira for progress'}],'request_id':str(uuid.uuid4())})[1]
-            self.assertIn('Set up Claude once in WATCH',out['error'])
+            self.assertIn('Set up Claude once in Motet',out['error'])
         finally: server.officer_ask.__defaults__ = old
         self.assertEqual(self.store._rows(),[])
 

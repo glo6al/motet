@@ -43,7 +43,10 @@ class ClaudePeerIntegration(unittest.TestCase):
             store.codex_available=False
             agents={}  # Genuine idle receivers: no room row or activity poke at any phase.
             httpd=server.Server(('127.0.0.1',0),server.H)
-            with patch.multiple(server,MESSAGING=store,KEY='fictional-owner-key',PORT=httpd.server_port,AGENTS=agents):
+            with patch.multiple(server, MESSAGING=store, KEY='fictional-owner-key',
+                                PORT=httpd.server_port, AGENTS=agents, HOME=str(root),
+                                CLAUDE_MANAGED=None, CLAUDE_MANAGED_ENABLED=False,
+                                CLAUDE_MANAGED_FAILED=False):
                 store.shared.directory=chat_directory.ChatDirectory(str(codex),str(claude),policy={'providers':['claude'],'history_days':'all'},live_snapshot=lambda:server.shared_directory_snapshot(store),cache_seconds=0)
                 for _ in range(40):
                     if store.shared.directory.refresh(force=True)['complete']:

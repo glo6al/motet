@@ -14,7 +14,7 @@ def main():
     parser.add_argument('--state-dir', required=True, help='Existing private bridge state directory')
     parser.add_argument('--codex-sessions', help='Owner-selected native Codex sessions root')
     parser.add_argument('--claude-projects', help='Owner-selected native Claude projects root')
-    parser.add_argument('--claude-store', help='Exact private WATCH plugin store JSON file')
+    parser.add_argument('--claude-store', help='Exact private Motet plugin store JSON file')
     parser.add_argument('--client-id', action='append', dest='selected', help='Client request UUID; repeat for a reviewed allowlist')
     parser.add_argument('--retire-client-id', action='append', dest='retire_selected',
                         help='Explicit owner retirement of an unresolved request; does not claim native completion or cancellation')

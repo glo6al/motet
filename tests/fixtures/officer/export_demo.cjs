@@ -7,8 +7,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 const html = fs.readFileSync(path.resolve(__dirname, '../../..', 'src/web/index.html'), 'utf8').replace(/\r\n?/g, '\n');
 const start = html.indexOf('function demo(){');
-const end = html.indexOf('\nsetInterval(render,', start);
-if (start < 0 || end <= start) throw new Error('demo function boundaries changed; review exporter');
+// The demo function itself, up to its closing brace at the start of a line; the page defines workspace code after it.
+const end = html.indexOf('\n}\n', start) + 2;
+if (start < 0 || end <= start + 1 || !html.slice(start, end).endsWith('\n}')) throw new Error('demo function boundaries changed; review exporter');
 const now = 1794412800; // Fixed fictional observation clock; no machine/session data.
 const records = [];
 const context = {

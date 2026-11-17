@@ -6,11 +6,15 @@ size, and in the stored text of links. It exits 1 naming the file if one is foun
 examined (a folder that could not be listed, a file that could not be read, a pipe, socket or device: not clean until
 it is).
 Run before any commit: python3 scripts/check_secrets.py   (the test suite runs it, and the server runs the same
-scan, for Anthropic keys only and with nothing but .git skipped, before it switches the Officer of the Watch on).
+scan, for Anthropic keys only and with nothing but .git skipped, before it switches Motet on).
 
 What it does not see, so you know: a key inside .git's own objects (committed earlier and since removed from the
 working tree: rewrite history for that), and a key that is encoded or split across lines. Links are not followed,
-to a file or a folder: git stores the link's text, which is what is scanned."""
+to a file or a folder: git stores the link's text, which is what is scanned.
+
+Run as a script it also refuses any tracked or staged image file whose own name contains claude, anthropic, codex,
+openai, chatgpt, antigravity, gemini or cursor, in any letter case: Motet ships no company's logo. An owner's own
+app icons live in a private folder outside the project; tests and docs use fictional names."""
 import os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +30,20 @@ INDEX_CLEANUP = 10                  # seconds to stop/reap this scan after a rea
 INDEX_DEADLINE = 300                # seconds for the whole staged-content read; past it git is killed and the index counts as unread
 CHUNK, KEEP = 1 << 20, 512          # files are read a megabyte at a time, whatever their size; the last 512 bytes of
                                     # each piece are kept in front of the next, so a key cut by the piece boundary is still seen
+
+
+LOGO_WORDS = re.compile(r'claude|anthropic|codex|openai|chatgpt|antigravity|gemini|cursor', re.I)
+IMAGE_EXT = ('.svg', '.png', '.ico', '.icns', '.jpg', '.jpeg', '.webp', '.gif')
+
+
+def logo_names(rows):
+    """Paths among git index rows [(mode, blob, path)] that are image files named for an AI company or app."""
+    out = []
+    for _mode, _blob, path in rows:
+        name = path.replace('\\', '/').rsplit('/', 1)[-1]
+        if name.lower().endswith(IMAGE_EXT) and LOGO_WORDS.search(name):
+            out.append(path)
+    return out
 
 
 def shape_in(data, shapes):
@@ -271,14 +289,27 @@ def scan(root=ROOT, shapes=SHAPES, skip=SKIP):
 
 
 
+def run(root=ROOT):
+    """The pre-commit check: (hits, unread, icon_paths). The logo-name rule reads its own index inventory; if that read
+    fails, it is reported as unread rather than clean. Outside a git checkout nothing is staged, so no logo is listed."""
+    hits, unread = scan(root)
+    index = git_index(root)
+    if isinstance(index, str):
+        unread.append(('the staged files (logo-name check)', index))
+        index = []
+    return hits, unread, logo_names(index or [])
+
+
 if __name__ == '__main__':
-    hits, unread = scan(sys.argv[1] if len(sys.argv) > 1 else ROOT)
+    hits, unread, icon_paths = run(sys.argv[1] if len(sys.argv) > 1 else ROOT)
+    for path in icon_paths:
+        print('LOGO    %s  is an image named for an AI company or app; no logo may be in the project (keep your own icons outside it)' % redact(path))
     for path, what in hits:
         print('SECRET  %s  looks like %s' % (redact(path), what))
     for path, why in unread:
         print('UNREAD  %s  could not be read (%s), so it is not known to be clean' % (redact(path), why))
-    if hits or unread:
-        print('%d file(s) must be cleaned or made readable before anything is committed' % (len(hits) + len(unread)))
+    if hits or unread or icon_paths:
+        print('%d file(s) must be cleaned, made readable or removed before anything is committed' % (len(hits) + len(unread) + len(icon_paths)))
     else:
         print('clean: no secret-shaped string in any name, link, file or staged content under the project (node_modules only as staged), and everything could be examined')
-    sys.exit(1 if hits or unread else 0)
+    sys.exit(1 if hits or unread or icon_paths else 0)

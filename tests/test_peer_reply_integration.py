@@ -28,7 +28,7 @@ CODEX_SOURCE = '44444444-4444-4444-8444-444444444444'
 @unittest.skipIf(os.name == 'nt' or not shutil.which('node') or not SDK.is_dir(),
                  'Requires POSIX, Node and optional MCP dependencies')
 class PeerReplyIntegration(unittest.TestCase):
-    def test_both_directions_and_followups_return_after_the_first_turn(self):
+    def test_both_directions_preserve_explicit_reply_retrieval_without_notices(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             root.chmod(0o700)
@@ -150,67 +150,30 @@ class PeerReplyIntegration(unittest.TestCase):
                     shared_file = private_file('shared.json', credential)
                     http_thread.start()
                     setup = owner_post('/claude-mod-setup', {'peer_receive': True})
-                    hook = owner_post('/peer-reply-setup', {'enabled': True,
-                        'providers': ['codex', 'claude'], 'source_scope': 'native_parent',
-                        'consent_version': 1})
-                    hook_file = private_file('reply-hook.json', hook)
                     worker.start()
-                    prepare = store.reply_delivery.prepare
-                    cold_source = []
-
-                    def prepare_with_cold_selected_cache(agent, *args, **kwargs):
-                        if agent == 'c:' + NATIVE[1] and not cold_source:
-                            directory = store.shared.directory
-                            with directory._file_lock(str(source_path)):
-                                broad = directory._files[str(source_path)]
-                                self.assertTrue(broad['done'])
-                                self.assertTrue(broad['native_id_verified'])
-                                # A caller already in the room can register without
-                                # warming this separate selected-path cache.
-                                directory._claude_selected.pop(str(source_path), None)
-                                cold_source.append(True)
-                        return prepare(agent, *args, **kwargs)
-
-                    with patch.object(store.reply_delivery, 'prepare', side_effect=prepare_with_cold_selected_cache):
-                        process = subprocess.run(['node', str(ROOT / 'integrations/claude-mod/tests/reply.integration.mjs')],
-                            input=json.dumps({'port': httpd.server_port, 'code': setup['pair_code'],
-                                'project': str(project), 'native': NATIVE, 'codex_source': CODEX_SOURCE,
-                                'credential': shared_file, 'hook_credential': hook_file,
-                                'hook_script': str(ROOT / 'scripts/watch_reply_hook.py'),
-                                'python': sys.executable, 'codex_notice_file': str(notices),
-                                'source_ready_file': str(source_ready), 'codex_question_file': str(questions)}),
-                            text=True, capture_output=True, timeout=60)
+                    process = subprocess.run(['node', str(ROOT / 'integrations/claude-mod/tests/reply.integration.mjs')],
+                        input=json.dumps({'port': httpd.server_port, 'code': setup['pair_code'],
+                            'project': str(project), 'native': NATIVE, 'codex_source': CODEX_SOURCE,
+                            'credential': shared_file, 'codex_notice_file': str(notices),
+                            'source_ready_file': str(source_ready), 'codex_question_file': str(questions)}),
+                        text=True, capture_output=True, timeout=60)
                     self.assertEqual(process.returncode, 0, process.stdout + '\n' + process.stderr)
-                    self.assertEqual(cold_source, [True])
                     result = json.loads(process.stdout)
                     self.assertEqual(len(result['cases']), 4)
                     for case, provider in zip(result['cases'], ['codex', 'claude', 'codex', 'claude']):
                         self.assertEqual(case['source_provider'], provider)
                         self.assertEqual(case['reply'], 'Fictional ' + provider + ' answer.')
                         self.assertEqual(case['question_submissions'], 1)
-                        self.assertEqual(case['notice_submissions'], 1)
+                        self.assertEqual(case['notice_submissions'], 0)
                         self.assertEqual(case['get_reply_calls'], 1)
                         self.assertIs(case['source_turn_finished_before_answer'], True)
                         self.assertEqual(case['sibling_notice_submissions'], 0)
                     self.assertFalse(errors, errors)
                     self.assertEqual(server.AGENTS, {})
                     with store.lock:
-                        deliveries = store.db.execute('SELECT request_id,notice_id,state,data FROM peer_reply_deliveries').fetchall()
-                        self.assertEqual({row[0] for row in deliveries},
-                                         {case['public_request_id'] for case in result['cases']})
-                        self.assertEqual(len({row[1] for row in deliveries}), 4)
-                        sources = set()
-                        attempts = set()
-                        for public_id, notice_id, state, raw in deliveries:
-                            delivery = json.loads(raw)
-                            self.assertNotEqual(public_id, notice_id)
-                            self.assertEqual(state, 'queued')
-                            self.assertTrue(delivery['attempt_id'])
-                            self.assertTrue(delivery['attempted_at'])
-                            attempts.add(delivery['attempt_id'])
-                            sources.add(delivery['source']['agent_id'])
-                        self.assertEqual(len(attempts), 4)
-                        self.assertEqual(sources, {'x:' + CODEX_SOURCE, 'c:' + NATIVE[1]})
+                        self.assertEqual(store.db.execute('SELECT COUNT(*) FROM peer_reply_deliveries').fetchone()[0],0)
+                        self.assertEqual(store.db.execute('SELECT COUNT(*) FROM peer_reply_admissions').fetchone()[0],0)
+                        self.assertFalse(notices.exists(),'no native Codex reply notice was queued')
                         self.assertEqual(store.db.execute('SELECT COUNT(*) FROM shared_bridge_requests').fetchone()[0], 4)
                     self.assertEqual(store.snapshot()['requests'], [])
                 finally:

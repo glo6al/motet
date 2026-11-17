@@ -1,4 +1,4 @@
-"""Owner-only WATCH gateway to the local native navigation connector.
+"""Owner-only Motet gateway to the local native navigation connector.
 
 No peer or model tool can invoke this adapter. Connection capabilities stay in
 private files and HTTP headers; public state contains only availability facts.
@@ -17,11 +17,11 @@ STATES = frozenset(('unsupported', 'unsupported_version', 'setup_needed', 'disco
                     'waiting_app', 'waiting_panel', 'ready', 'unavailable'))
 MESSAGES = {
     'unsupported': 'Antigravity navigation currently requires macOS.',
-    'unsupported_version': 'This Antigravity version is not supported by WATCH Navigation.',
-    'setup_needed': 'Connect Antigravity to install WATCH Navigation once.',
+    'unsupported_version': 'This Antigravity version is not supported by Motet Navigation.',
+    'setup_needed': 'Connect Antigravity to install Motet Navigation once.',
     'disconnected': 'Antigravity navigation is disconnected.',
-    'waiting_app': 'Open Antigravity to connect WATCH Navigation.',
-    'waiting_panel': 'Open WATCH Navigation from Extensions in any existing Antigravity chat.',
+    'waiting_app': 'Open Antigravity to connect its Navigation extension.',
+    'waiting_panel': 'Open the Navigation panel from Extensions in any existing Antigravity chat.',
     'ready': 'Antigravity navigation is connected.',
     'unavailable': 'Antigravity navigation is unavailable. Refresh or reconnect it.',
 }

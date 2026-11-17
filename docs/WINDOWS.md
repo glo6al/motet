@@ -1,6 +1,6 @@
-# W.A.T.C.H. on Windows: install, try it, tell us how it went
+# Installing and trying Motet on Windows
 
-W.A.T.C.H. shows your coding agents (Claude Code, Codex, Cursor) as a room of monitors in your browser, one per agent, as they work. This guide takes you from a Windows PC with nothing installed to that room. It also lists what we would like you to check, because **nobody has run it on a real Windows desktop yet**. So far the tests have passed on Windows in automated CI, but only in CI. Your report is the first real one.
+Motet shows your coding agents (Claude Code, Codex, Cursor) as a room of monitors in your browser, one per agent, as they work. This guide takes you from a Windows PC with nothing installed to that room. It also lists what we would like you to check, because **nobody has run it on a real Windows desktop yet**. So far the tests have passed on Windows in automated CI, but only in CI. Your report is the first real one.
 
 Allow about fifteen minutes. You need no administrator rights unless your installer asks for them, and you install nothing besides Python and Git.
 
@@ -83,34 +83,21 @@ Then **close PowerShell and open a new one**.
 
 ---
 
-## Step 3: Download W.A.T.C.H.
+## Step 3: Download Motet
 
 ```powershell
 cd $HOME
-git clone https://github.com/glo6al/project-watch.git
-cd project-watch
-```
-
-If what you downloaded has no `docs\WINDOWS.md`, Windows support has not been merged yet: it is in [pull request 2](https://github.com/glo6al/project-watch/pull/2). Check that out instead:
-
-```powershell
-git fetch origin pull/2/head:windows
-git checkout windows
+git clone https://github.com/glo6al/motet.git
+cd motet
 ```
 
 **Without Git:**
-1. Open <https://github.com/glo6al/project-watch>, click the green **Code** button, then **Download ZIP**. (If Windows support is not merged yet, download <https://github.com/glo6al/project-watch/archive/refs/pull/2/head.zip> instead.)
-2. Right-click the downloaded file and choose **Extract All…**, extracting to your home folder (`C:\Users\<you>`).
-3. Then go into the folder it made. For the main ZIP:
+1. Open <https://github.com/glo6al/motet>, click **Code**, then **Download ZIP**.
+2. Right-click the archive and choose **Extract All…**. Extract it to your home folder.
+3. Open the extracted folder.
 
 ```powershell
-cd "$HOME\project-watch-main"
-```
-
-For the pull-request ZIP:
-
-```powershell
-cd "$HOME\project-watch-refs-pull-2-head"
+cd "$HOME\motet-main"
 ```
 
 **Check you are in the right place:**
@@ -144,7 +131,7 @@ py src\server.py
 You should see:
 
 ```
-W.A.T.C.H. on http://127.0.0.1:8793/  — open it and press Unlock (sessions active in the last 20 min)
+Motet on http://127.0.0.1:8793/  — open it and press Unlock (sessions active in the last 20 min)
 ```
 
 **Leave this window open.** The server runs until you close the window or press **Ctrl+C** in it.
@@ -204,7 +191,7 @@ py src\watch_tty.py --once     # one line, e.g. "2 waiting · 3 working"
 | Codex's logs (read) | `%USERPROFILE%\.codex\sessions\` |
 | Cursor's transcripts (read) | `%USERPROFILE%\.cursor\projects\<project>\agent-transcripts\` |
 
-W.A.T.C.H. only **reads** the agents' folders, and it reports nothing anywhere. To check that a tool has logs it can read:
+Motet only **reads** the agents' folders, and it reports nothing anywhere. To check that a tool has logs it can read:
 
 ```powershell
 dir "$env:USERPROFILE\.claude\projects"
@@ -214,7 +201,7 @@ dir "$env:USERPROFILE\.cursor\projects"
 
 **Agents running inside WSL** (Linux on Windows) keep their logs in the Linux home folder, not in `C:\Users\<you>`, so a server started from PowerShell will not see them. Running the server inside WSL has not been tried.
 
-**Codex with `CODEX_HOME` set** keeps its logs elsewhere. W.A.T.C.H. only looks in `%USERPROFILE%\.codex`.
+**Codex with `CODEX_HOME` set** keeps its logs elsewhere. Motet only looks in `%USERPROFILE%\.codex`.
 
 ---
 
@@ -233,24 +220,24 @@ dir "$env:USERPROFILE\.cursor\projects"
 | `py` is not recognised | Install Python (step 1), then open a **new** PowerShell window. |
 | `Port 8793 is busy …` | Another copy is running (look for its window), or one just stopped and Windows is still holding the port. Wait a minute, or use `$env:PORT = "8794"`. |
 | The room is empty | Use an agent, then reload the page within 20 minutes, or set `$env:WINDOW_MIN = "120"`. Check the agent's log folder exists (see "Where things are"). |
-| "W.A.T.C.H. is locked" | Press **Unlock**, and use the **new** tab it opens. |
+| "Motet is locked" | Press **Unlock**, and use the **new** tab it opens. |
 | Unlock opens an editor | See step 5: set your browser as the default for `.html`. |
 | A preview says not found, or a page looks unstyled | See "What does not work on Windows yet": the page alone is served, without the files beside it, and only from Python 3.12. Tell us which folder kind it was in. |
 | Odd characters in the terminal view | Use Windows Terminal. |
 | `~/.live-room is a link` | `%USERPROFILE%\.live-room` is a link or junction. Remove it; the server creates a fresh one. |
 
-**To stop the server**, press **Ctrl+C** in its window (or close the window). **To remove W.A.T.C.H. completely**, delete the project folder and `%USERPROFILE%\.live-room`. It changes nothing else on your PC.
+**To stop the server**, press **Ctrl+C** in its window (or close the window). **To remove Motet completely**, delete the project folder and `%USERPROFILE%\.live-room`. It changes nothing else on your PC.
 
 ---
 
 ## Your feedback
 
-Please tell us what happened, even if it was "everything worked". Comment on [the pull request](https://github.com/glo6al/project-watch/pull/2) while it is open, or [open an issue](https://github.com/glo6al/project-watch/issues/new) titled `Windows: …`.
+Please tell us what happened, even if it was "everything worked". [Open an issue](https://github.com/glo6al/motet/issues/new) titled `Windows: …`.
 
 **Please include:**
 
 1. Windows version (**Settings → System → About**: for example "Windows 11 23H2"), and the output of `py --version`.
-2. Which agents you use: Claude Code (terminal, desktop app, or IDE), Codex, or Cursor.
+2. Which agents you use: Claude Code (terminal, desktop app, or IDE), Codex, Cursor, or Antigravity.
 3. The last line of `py tests\test_parsers.py` (step 4).
 4. What happened at each step, and where it went wrong, with the exact error text. Copy text rather than screenshots where you can.
 
@@ -268,6 +255,6 @@ Please tell us what happened, even if it was "everything worked". Comment on [th
 - [ ] Did the terminal view draw properly in Windows Terminal?
 - [ ] Did "Open in Claude" or "Open in Codex" at a desk open the app?
 
-**Security:** if you find a way for an agent, a page it wrote, or another program to reach something this guide or the README says it cannot (the key in `%USERPROFILE%\.live-room`, files outside a preview's folder, the port), please **do not post it publicly**. Report it privately through the repository's [security advisory page](https://github.com/glo6al/project-watch/security/advisories/new).
+**Security:** if you find a way for an agent, a page it wrote, or another program to reach something this guide or the README says it cannot (the key in `%USERPROFILE%\.live-room`, files outside a preview's folder, the port), please **do not post it publicly**. Report it privately through the repository's [security advisory page](https://github.com/glo6al/motet/security/advisories/new).
 
 Thank you for trying it.

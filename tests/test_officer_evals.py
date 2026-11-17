@@ -73,7 +73,8 @@ class OfficerEvidenceEvals(unittest.TestCase):
         self.assertEqual(self.seed, demo_fixture())
         names = [row['name'] for row in self.seed['records'] if row['kind'] == 'agent']
         self.assertEqual(names, ['Ada', 'Bram', 'Cleo', 'Dov', 'Esme', 'Codex cloud', 'Fen'])
-        self.assertEqual(len(self.seed['records']), 49)
+        self.assertEqual(len(self.seed['records']), 50)   # 49 on main, plus the demo's idle-time health record
+        self.assertTrue(any(row.get('kind') == 'health' and row.get('idle_ready') is True for row in self.seed['records']))
         self.assertEqual(max(row.get('seq', 0) for row in self.seed['records']), 42)
         self.assertFalse(any(row.get('kind') == 'officer_answer' for row in self.seed['records']))
 

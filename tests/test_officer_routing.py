@@ -135,7 +135,7 @@ class RoutingTests(unittest.TestCase):
             server.AGENTS.clear()
             replay = server.officer_dispatch('Steer Aster now: focus on tests', self.rid, lambda *a,**k:self.fail('replanned'))
             self.assertEqual(replay, {key: value for key, value in result.items()
-                                      if key not in ('model', 'job', 'usage_tracking')})
+                                      if key not in ('model', 'job', 'usage_tracking', 'request_id', 'history_status')})
         self.assertFalse(self.store.snapshot()['requests'])
 
     def test_control_tools_unavailable_to_log_loop(self):

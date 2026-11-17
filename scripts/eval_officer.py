@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in, bounded real-model Officer evaluation using only the fictional demo.
+"""Opt-in, bounded real-model Motet evaluation using only the fictional demo.
 
 Default: list questions, without reading credentials or calling an API.
 Live: explicit models, cases, and a new private output file under the temporary
@@ -111,8 +111,8 @@ def main():
         # checks. No model preferences, owner settings, watcher, or HTTP UI starts.
         server.load_officer_key()
         if not server.OFFICER_KEY:
-            report['error'] = 'Officer key unavailable: ' + server.OFFICER_WHY
-            print('Officer key unavailable; no model calls made. See the private report.')
+            report['error'] = 'Motet key unavailable: ' + server.OFFICER_WHY
+            print('Motet key unavailable; no model calls made. See the private report.')
             return 1
         with patch.object(server, 'HISTORY', None), patch.object(server, 'MESSAGING', None), \
              patch.object(server, 'time', FixtureClock(fixture['now'])), \

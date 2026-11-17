@@ -1,29 +1,29 @@
-# Officer capability design
+# Motet capability design
 
-Status: implemented locally, independently reviewed and tested. This document does not describe a published release.
+This document describes how Motet’s evidence tools are designed to work.
 
-The Officer should answer natural questions about recorded work by composing a small set of read capabilities. Questions are acceptance tests, not a fixed menu. The shared design must support narrow lookups, comparisons, quantitative questions, retrospective reports and follow-ups without adding a separate implementation for each wording.
+Motet should answer natural questions about recorded work by composing a small set of read capabilities. Questions are acceptance tests, not a fixed menu. The shared design must support narrow lookups, comparisons, quantitative questions, retrospective reports and follow-ups without adding a separate implementation for each wording.
 
 The central requirement is evidence sufficiency: establish the intended scope, gather suitable evidence within a budget, explain what is missing, and keep the answer within what the evidence supports. Retrieving every matching retained record does not prove that capture was complete or that the model interpreted it correctly.
 
 ## Existing foundations and gaps
 
-The current Officer already has model-led tool selection, scoped live and historical queries, multiple tool rounds, citations, model routing and API usage accounting. The missing pieces are broader access, connected context, useful reductions and explicit coverage checks.
+Motet already has model-led tool selection, scoped live and historical queries, multiple tool rounds, citations, model routing and API usage accounting. The missing pieces are broader access, connected context, useful reductions and explicit coverage checks.
 
-The baseline for this design is the Officer implementation at `f006ad5`. Relevant components are `src/server.py`, `src/deck_log.py`, `src/officer_instructions.py`, `src/officer_policy.py`, `src/officer_usage.py`, `src/web/index.html` and their tests.
+Relevant components are `src/server.py`, `src/deck_log.py`, `src/officer_instructions.py`, `src/officer_policy.py`, `src/officer_usage.py`, `src/web/index.html` and their tests.
 
 Examples of the current limits:
 
-- Archive chat/project directories and exact-event lookup exist, but are not offered to the Officer.
+- Archive chat/project directories and exact-event lookup exist, but are not offered to Motet.
 - The daily digest counts a bounded prefix, then its evidence is reduced again for delivery. Broad live queries can favor busy chats. Live search can return a short prefix that excludes the matching words.
-- Operation starts and results have linking identities, but the Officer lacks a direct lifecycle lookup. Historical assignments, relationships and task transitions are often not retained.
-- Current model, context and branch observations may exist in WATCH without being exposed through the Officer's tools.
-- Follow-ups preserve answer prose but lose the tool evidence. The Officer's conversation history is separate from native-agent history and currently resets daily.
+- Operation starts and results have linking identities, but Motet lacks a direct lifecycle lookup. Historical assignments, relationships and task transitions are often not retained.
+- Current model, context and branch observations may appear in the workspace without being available to the assistant.
+- Follow-ups preserve answer prose but lose the tool evidence. Motet's conversation history is separate from native-agent history and currently resets daily.
 - The answer loop has fixed limits and no explicit check that the requested agents or periods were covered. Usage accounting measures cost; it is not a request budget or an answer-quality check.
 
 ## Intended experience
 
-The owner asks normally. The Officer resolves the subject and time period, chooses appropriate read operations, and answers with relevant sources. It asks a clarification only when ambiguity materially changes the answer.
+The owner asks normally. Motet resolves the subject and time period, chooses appropriate read operations, and answers with relevant sources. It asks a clarification only when ambiguity materially changes the answer.
 
 A short answer needs no diagnostic dashboard. A broad answer gives a compact description of its scope and the meaningful limits, such as an overview of saved activity across the requested chats, with selected detail and a known recording gap. Full scope inspection remains available with the sources.
 
@@ -59,12 +59,12 @@ They are composable capabilities, not a mandatory three-call sequence. Python es
 
 ### Discover subjects and inspect current facts
 
-`room_snapshot` combines a paginated catalog of retained chats/projects with a bounded view of live subjects. It reuses archive directories and existing WATCH state.
+`room_snapshot` combines a paginated catalog of retained chats/projects with a bounded view of live subjects. It reuses archive directories and existing Motet state.
 
 - Identity is based on provider/session/project IDs. Display names are labels; duplicate names and worktrees are not silently merged. Departed sessions remain discoverable in retained history.
 - Current-fact requests specify a field allowlist, such as observed model, context, branch, parent relation, last activity or held owner request. Default catalog results stay small.
 - Every fact carries its source, source time where known, observation time, qualification and freshness. A last-recorded model is not proof of a current native selection. An archived session has no invented current state.
-- Safe runtime metadata can expose WATCH's build, recording availability, selected Officer policy and supported capabilities. Paths, credentials, capability tokens and raw configuration are excluded.
+- Safe runtime metadata can expose Motet's build, recording availability, the assistant’s selected policy and supported capabilities. Paths, credentials, capability tokens and raw configuration are excluded.
 - Material ambiguity produces candidates for clarification. Read discovery may find additional relevant subjects; that discovery does not grant messaging authority.
 
 ### Query records, counts and overviews
@@ -79,7 +79,7 @@ Initial filters cover stored identity, source/observation time basis, kind, role
 
 Unsupported metrics return an explicit unavailable result. For example, generic run outcomes cannot establish a count of successful deployments or completed goals when their semantic classification was never retained.
 
-Overview selection must not silently substitute earliest or latest rows for a requested population. Inventory coverage and semantic detail coverage remain separate: one record per chat is not proof that all important work was represented. If an overview cannot provide sufficient detail, the Officer can expand, narrow, or state the limit within the same question.
+Overview selection must not silently substitute earliest or latest rows for a requested population. Inventory coverage and semantic detail coverage remain separate: one record per chat is not proof that all important work was represented. If an overview cannot provide sufficient detail, Motet can expand, narrow, or state the limit within the same question.
 
 ### Expand connected evidence
 
@@ -154,9 +154,9 @@ The first continuity change keeps bounded evidence references and retrieval scop
 
 Browser-supplied references and historical labels are untrusted. Validate ownership/scope, live boot identity, retention and deletion on each use. Changed or unavailable sources are explained explicitly. A pronoun or prior reference cannot authorize a send/control or silently alter the current subject.
 
-Citations are deduplicated before display limits and selected for their relevance to the answer's claims. The UI should let the owner inspect the same supporting context the Officer received. Display limits must disclose additional sources rather than hiding the only support for an important claim.
+Citations are deduplicated before display limits and selected for their relevance to the answer's claims. The UI should let the owner inspect the same supporting context Motet received. Display limits must disclose additional sources rather than hiding the only support for an important claim.
 
-Cross-day retention of Officer conversations is a separate optional feature. Deck Log recording does not imply consent to persist those conversations or to promote the Officer's answers into facts.
+Cross-day retention of Motet conversations is a separate optional feature. Deck Log recording does not imply consent to persist those conversations or to promote Motet's answers into facts.
 
 ## Capture policy and future enrichment
 
@@ -186,7 +186,7 @@ Hard limits on calls, time and supplied bytes/rows are enforceable independently
 
 Under an explicitly selected strict monetary limit, unknown pricing, an unavailable input bound or insufficient remaining reservation blocks further paid calls. A warning cannot override that decision, and there is no automatic model substitution. Non-monetary bounded operation is a separate explicit policy mode; it is not a fallback silently selected when a strict limit cannot be evaluated. Dollar estimates are based on known rates, not a guarantee about the provider's final invoice.
 
-If the budget prevents sufficient evidence gathering, return a clearly partial answer with its coverage or a focused clarification. Do not silently drop agents or claim completeness. Account for all calls through the existing Officer ledger; native fleet spend is separate.
+If the budget prevents sufficient evidence gathering, return a clearly partial answer with its coverage or a focused clarification. Do not silently drop agents or claim completeness. Account for all calls through the existing Motet ledger; native fleet spend is separate.
 
 No background summaries, mandatory model call per agent, persistent semantic cache, new external memory service or vector store is required for the first delivery. Additional compression or caching should follow measured need, with its own deletion and cost review.
 
@@ -223,13 +223,13 @@ Offline tests establish filtering, counting, joins, scope, provenance, deletion 
 
 ## Scope boundaries
 
-This design changes read access and evidence handling. It grants no action authority, native control, historical import, autonomous missions, scheduling or cross-provider messaging capability. Existing dispatch, permission and privacy boundaries remain in Python. The shared peer MCP does not gain access to the Officer's archive or new read tools.
+This design changes read access and evidence handling. It grants no action authority, native control, historical import, autonomous missions, scheduling or cross-provider messaging capability. Existing dispatch, permission and privacy boundaries remain in Python. The shared peer MCP does not gain access to Motet's archive or new read tools.
 
-Implementation areas are archive queries/provenance, Officer schemas and execution, skills, current-day conversation metadata, source/citation display and tests. Local verification uses fictional archives. Deployment and publication are separate steps.
+Implementation areas are archive queries/provenance, Motet schemas and execution, skills, current-day conversation metadata, source/citation display and tests. Local verification uses fictional archives. Deployment and publication are separate steps.
 
 ## Local implementation verification
 
-The first delivery implements the shared read layer, request budgets, typed assertions, source continuity and publication checks. Prospective capture enrichment and cross-day Officer conversations remain separate options. Action dispatch and the shared peer MCP gain no new capabilities.
+The first delivery implements the shared read layer, request budgets, typed assertions, source continuity and publication checks. Prospective capture enrichment and cross-day Motet conversations remain separate options. Action dispatch and the shared peer MCP gain no new capabilities.
 
 Offline verification covers full retained counts at 50,000 events, scope-first retrieval, sparse prose among operations, paging and size fitting, exact operation links, missing identities, post-fit source coverage, deletion/expiry during calls, signed replay, publication ordering, budget admission and Python 3.9 startup. The complete regression run passed 722 tests with six platform-specific skips; the final additional admission regression also passed. Browser-handler tests cover bounded history, delayed arrivals and source navigation without claiming atomic network display.
 

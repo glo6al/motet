@@ -16,6 +16,156 @@ def test_import_is_quiet():
     check('import does not load a key', server.KEY == '')
 
 
+def test_static_brand_assets():
+    """Exercise the real GET handler without a key, including its exact allowlist."""
+    import gzip
+    import http.client
+    import re
+    import threading
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    assets = {
+        'watch-lookout-mark.svg': ('svg/mark-charcoal.svg', 'image/svg+xml'),
+        'watch-lookout-lockup.svg': ('svg/watch-charcoal.svg', 'image/svg+xml'),
+        'watch-lookout-favicon.ico': ('icons/light/favicon.ico', 'image/x-icon'),
+        'watch-lookout-favicon-32.png': ('icons/light/favicon-32.png', 'image/png'),
+        'watch-lookout-apple-touch-icon-180.png': ('icons/light/app-icon-180.png', 'image/png'),
+        'watch-lookout-favicon-light.svg': ('svg/favicon-light.svg', 'image/svg+xml'),
+        'watch-lookout-favicon-dark.svg': ('svg/favicon-dark.svg', 'image/svg+xml'),
+        'icon.svg': ('svg/mark-charcoal.svg', 'image/svg+xml'),
+        'favicon.ico': ('icons/light/favicon.ico', 'image/x-icon'),
+        'favicon-32.png': ('icons/light/favicon-32.png', 'image/png'),
+        'apple-touch-icon-180.png': ('icons/light/app-icon-180.png', 'image/png'),
+    }
+    check('static exact names', set(server.STATIC) == set(assets))
+    previous_port = server.PORT
+    httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+    server.PORT = httpd.server_port
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    def get(path, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', server.PORT, timeout=5)
+        try:
+            conn.request('GET', path, headers=headers or {})
+            reply = conn.getresponse()
+            return reply.status, dict(reply.getheaders()), reply.read()
+        finally:
+            conn.close()
+
+    try:
+        for name, (source, mime) in assets.items():
+            expected = (root / 'brand/lookout' / source).read_bytes()
+            check('static source copy ' + name,
+                  (root / 'src/web/static' / name).read_bytes() == expected)
+            for query in ('', '?v=asset-test'):
+                status, headers, body = get('/static/' + name + query)
+                check('static GET ' + name + query,
+                      status == 200 and body == expected and
+                      headers.get('Content-Type') == mime and
+                      headers.get('Cache-Control') == 'max-age=86400')
+        for path in ('/static/unknown.svg', '/static/',
+                     '/static/../index.html', '/static/%2e%2e/index.html',
+                     '/static/lookout/watch-lookout-mark.svg'):
+            status, _, body = get(path)
+            check('static denied ' + path, status == 404 and body == b'not found')
+
+        markers = (b'function createOfficerDocumentPending(', b'function createOfficerDocumentsClient(')
+
+        def page(path, accept, encoding):
+            status, headers, body = get(path, {'Accept-Encoding': accept})
+            check('root transfer ' + path + ' ' + accept,
+                  status == 200 and headers.get('Content-Encoding') == encoding and
+                  headers.get('Vary') == 'Accept-Encoding' and
+                  int(headers['Content-Length']) == len(body) and headers.get('Cache-Control') == 'no-store')
+            decoded = gzip.decompress(body) if encoding == 'gzip' else body
+            nonce = re.search(rb'<script nonce="([^"]+)">', decoded)[1].decode()
+            check('root retains the response nonce and policy',
+                  decoded.count(b'<script nonce=') == 1 and decoded.count(b'</script>') == 1 and
+                  ("'nonce-" + nonce + "'") in headers['Content-Security-Policy'])
+            return body, decoded
+
+        identity, workspace = page('/', 'identity', None)
+        zipped, compressed = page('/', 'br, gzip', 'gzip')
+        check('gzip preserves the default workspace while shrinking transfer',
+              len(zipped) * 2 < len(identity) and
+              re.sub(rb'nonce="[^"]+"', b'nonce=""', workspace) ==
+              re.sub(rb'nonce="[^"]+"', b'nonce=""', compressed))
+        for path in ('/?ui=classic', '/?demo&ui=classic', '/?ui=classic&ui=workspace', '/?ui=cla%73sic'):
+            _, html = page(path, 'gzip;q=0, *;q=1', None)
+            check('Classic page omits workspace-only Officer modules', all(marker not in html for marker in markers))
+        page('/', 'gzip; q = 1', None)
+        page('/', 'gzip\xa0', None)
+        for path in ('/', '/?demo', '/?ui=workspace', '/?demo&ui=workspace',
+                     '/?ui=&ui=classic', '/?ui=unknown', '/?sample=plain;ui=classic',
+                     '/?ui=workspace&ui=classic'):
+            _, html = page(path, '*;q=0.5', 'gzip')
+            check('Workspace retains both Officer modules', all(marker in html for marker in markers))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        server.PORT = previous_port
+
+
+def test_pair_keeps_only_supported_view_flags():
+    import http.client
+    import re
+    import threading
+    import urllib.parse
+    from pathlib import Path
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, '.live-room').mkdir()
+        redirects = []
+
+        def launch(path):
+            document = Path(path).read_text(encoding='utf-8')
+            redirects.append(json.loads(re.search(r'location\.replace\((.+)\)</script>', document)[1]))
+
+        with server.ThreadingHTTPServer(('127.0.0.1', 0), server.H) as httpd:
+            with patch.multiple(server, PORT=httpd.server_port, HOME=home, KEY='fictional-pairing-key',
+                                CODES={}, LAST_PAIR=0.0, launch=launch), patch.object(threading, 'Timer'):
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                conn = http.client.HTTPConnection('127.0.0.1', httpd.server_port, timeout=5)
+
+                def post(path, body):
+                    conn.request('POST', path, json.dumps(body), {'Content-Type': 'application/json'})
+                    response = conn.getresponse()
+                    return response.status, response.read()
+
+                try:
+                    for flags, query in (
+                        ({}, ''),
+                        ({'steady': True}, 'steady'),
+                        ({'workspace': True}, ''),
+                        ({'steady': True, 'workspace': True, 'demo': True}, 'steady'),
+                        ({'workspace': False}, 'ui=classic'),
+                        ({'steady': True, 'workspace': False, 'demo': True}, 'steady&ui=classic'),
+                        ({'steady': 1, 'workspace': '//invalid.example'}, ''),
+                        ({'workspace': 0}, ''),
+                        ({'workspace': None}, ''),
+                    ):
+                        server.LAST_PAIR = 0.0
+                        check('pair accepts the view request', post('/pair', flags) == (200, b'ok'))
+                        redirect = urllib.parse.urlsplit(redirects[-1])
+                        check('pair preserves only supported flags ' + repr(query),
+                              redirect.scheme == 'http' and redirect.hostname == '127.0.0.1' and
+                              redirect.port == httpd.server_port and redirect.path == '/' and
+                              redirect.query == query and redirect.fragment.startswith('p='))
+                        code = redirect.fragment[2:]
+                        check('pair code can be claimed once',
+                              post('/claim', {'code': code}) == (200, b'fictional-pairing-key') and
+                              post('/claim', {'code': code})[0] == 403)
+                finally:
+                    conn.close()
+                    httpd.shutdown()
+                    thread.join(timeout=5)
+
+
 def test_shell():
     check('push', server.risk('git push origin main') == 'push')
     check('echo is not a push', server.risk('echo git push origin main') == '')
@@ -684,7 +834,7 @@ time.sleep(60)
 
 
 def test_officer():
-    """The Officer of the Watch: the key file policy (owner-only, a plain file opened without following links, no key
+    """Motet: the key file policy (owner-only, a plain file opened without following links, no key
     anywhere in the project, every file there readable), the scanner's fail-closed rules, the read-only tools over
     room state with the record's own qualifications kept, the bounded tool loop with a stand-in for the API, refusal,
     the refused redirect, and the room actions carried back to the page. The API is never called here."""
@@ -1027,9 +1177,9 @@ def test_officer():
         out = server.officer_ask([{'role': 'user', 'content': 'x'}], call=lambda b, end=None: ({'stop_reason': 'refusal', 'content': []}, ''))
         check('a refusal is said plainly', out['text'] == "I can't answer that one.")
         out = server.officer_ask([{'role': 'user', 'content': 'x'}], call=lambda b, end=None: (None, 'the API refused the key'))
-        check('an API error is reported in fixed words', out['error'] == 'The Officer could not answer: the API refused the key')
+        check('an API error is reported in fixed words', out['error'] == 'Motet could not answer: the API refused the key')
         out = server.officer_ask([{'role': 'user', 'content': 'x'}], call=lambda b, end=None: ({'content': 'nonsense'}, ''))
-        check('a malformed API reply is an error, not a crash', out['error'].startswith('The Officer could not answer'))
+        check('a malformed API reply is an error, not a crash', out['error'].startswith('Motet could not answer'))
         out = server.officer_ask([{'role': 'user', 'content': 'x'}], call=lambda b, end=None: ({'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'w' * 9000}]}, ''))
         check('an answer longer than a turn is cut and says so', len(out['text']) <= server.OFFICER_TURN_CHARS and out['text'].endswith('[cut short here]'))
         check('the API\'s own words are never repeated', server.API_SAID[401] == 'the API refused the key' and all('%' not in v for v in server.API_SAID.values()))
@@ -1336,8 +1486,74 @@ def test_session_context_facts():
         server.KNOWN_NAMES.clear(); server.KNOWN_NAMES.update(saved[3])
 
 
+def test_idle_stream_fence():
+    from io import BytesIO
+    class Output(BytesIO):
+        def write(self, data):
+            result = super().write(data)
+            if b'"kind": "health"' in data:
+                raise OSError('fixture stops after health')
+            return result
+    class Connection:
+        def settimeout(self, seconds):
+            pass
+    saved = (server.LOG[:], server.BASE, dict(server.IDLE_FENCE), server.apply_watch, server.project_names, server.STREAMS)
+    try:
+        server.apply_watch = lambda *_: None
+        server.project_names = lambda: {}
+        for watermark, expected in [(0, True), (1, False)]:
+            with server.COND:
+                server.BASE = 0
+                server.LOG[:] = [dict(seq=0, boot=server.BOOT, agent='', kind='fixture')]
+                server.IDLE_FENCE.update(ready=True, through=watermark, at=1234)
+            h = server.H.__new__(server.H)
+            h.connection = Connection(); h.wfile = Output(); h.headers = {}
+            h.send_response = lambda *_: None; h.send_header = lambda *_: None; h.end_headers = lambda: None
+            h.events()
+            lines = h.wfile.getvalue().decode().splitlines()
+            health = next(json.loads(x[6:]) for x in lines if x.startswith('data: ') and '"kind": "health"' in x)
+            check('idle stream fence covers its actual batch', health['idle_ready'] is expected and health['idle_through'] == watermark and health['idle_at'] == 1234)
+    finally:
+        server.LOG[:] = saved[0]; server.BASE = saved[1]; server.IDLE_FENCE.clear(); server.IDLE_FENCE.update(saved[2])
+        server.apply_watch, server.project_names, server.STREAMS = saved[3:]
+
+
+def test_idle_tail_catchup():
+    class Reader(server.Tail):
+        def handle(self, record, old):
+            pass
+    saved = server.MAX_POLL
+    try:
+        server.MAX_POLL = 4
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'events.jsonl')
+            with open(path, 'wb') as f:
+                f.write(b'{}\n{}\n')
+            tail = Reader(path)
+            tail.poll()
+            check('idle fence refuses a partial poll', not tail.caught_up)
+            tail.poll()
+            check('idle fence accepts a completed poll', tail.caught_up)
+            with open(path, 'ab') as f:
+                f.write(b'{}\n{}\n')
+            tail.poll()
+            check('idle fence refuses later growth beyond poll limit', not tail.caught_up)
+            tail.poll()
+            check('idle fence catches up after growth', tail.caught_up)
+            with open(path, 'wb') as f:
+                f.write(b'')
+            tail.poll()
+            check('idle fence refuses replaced or truncated tail', tail.replaced and not tail.caught_up)
+    finally:
+        server.MAX_POLL = saved
+
+
 if __name__ == '__main__':
+    test_idle_stream_fence()
+    test_idle_tail_catchup()
     test_import_is_quiet()
+    test_static_brand_assets()
+    test_pair_keeps_only_supported_view_flags()
     test_session_facts()
     test_session_facts_recovery()
     test_session_context_facts()

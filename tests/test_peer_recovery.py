@@ -38,11 +38,15 @@ class EnvelopeEncodingTests(unittest.TestCase):
             ledger=dict(transport_id=tid,target=target,snapshot={'identity_revision':revision},
                 payload_hash=peer_bridge.mac(key,'watch-bridge-dedupe-v2',json.dumps([target,revision,text,sender],ensure_ascii=True)))
             current=recovery.compact_envelope(tid,sender,text)
-            self.assertEqual(recovery.envelope_proof(ledger,key,current),current)
+            original_watch = recovery.compact_envelope(tid, sender, text, legacy_brand=True)
+            self.assertIn('this Motet MCP', current)
+            self.assertIn('this WATCH MCP', original_watch)
+            for envelope in (current, original_watch):
+                self.assertEqual(recovery.envelope_proof(ledger, key, envelope), envelope)
             # Historical ASCII envelopes were admitted under the old 2000-point raw cap.
             old_text=text[:1000]
             old=dict(ledger,payload_hash=peer_bridge.mac(key,'watch-bridge-dedupe-v2',json.dumps([target,revision,old_text,sender],ensure_ascii=True)))
-            historical=recovery.compact_envelope(tid,sender,old_text,ensure_ascii=True)
+            historical=recovery.compact_envelope(tid,sender,old_text,ensure_ascii=True,legacy_brand=True)
             self.assertEqual(recovery.envelope_proof(old,key,historical),historical)
             with self.assertRaises(recovery.RecoveryError):
                 recovery.envelope_proof(dict(ledger,payload_hash='c'*64),key,current)

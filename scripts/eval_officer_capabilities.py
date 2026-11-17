@@ -149,7 +149,7 @@ def main(argv=None):
         # during default listing or synthetic corpus setup.
         server.load_officer_key()
         if not server.OFFICER_KEY:
-            report['error'] = 'The configured Officer key is unavailable. No model calls were made.'
+            report['error'] = 'The configured Motet key is unavailable. No model calls were made.'
             print(report['error'])
             return 1
         real_clock = server.officer_local_clock

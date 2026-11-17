@@ -1,4 +1,4 @@
-"""Bounded, request-local read capabilities over already captured WATCH evidence.
+"""Bounded, request-local read capabilities over already captured Motet evidence.
 
 No original-log, filesystem, native-provider or model access is performed here.
 Snapshots keep cutoffs and metadata, never a second durable copy of source prose.
@@ -271,9 +271,9 @@ class EvidenceSession:
             if len(encoded) > 1200 or SECRET.search(encoded) or re.search(r'"(?:/|[A-Za-z]:[\\/])', encoded):
                 continue
             fact = dict(ref='fact:' + self.boot + ':' + subject + ':' + item['field'], subject=subject,
-                        field=item['field'], value=copy.deepcopy(value), source='live', observation_source=_text(item.get('source', 'WATCH observation')),
+                        field=item['field'], value=copy.deepcopy(value), source='live', observation_source=_text(item.get('source', 'Motet observation')),
                         source_ts=item.get('source_ts'), observed_ts=item.get('observed_ts'),
-                        qualification=_text(item.get('qualification', 'Recorded WATCH state'), 240),
+                        qualification=_text(item.get('qualification', 'Recorded Motet state'), 240),
                         freshness=item.get('freshness') if item.get('freshness') in ('fresh', 'stale', 'unknown', 'observed_now', 'last_recorded') else 'unknown')
             for field in ('source_ts', 'observed_ts'):
                 if type(fact[field]) not in (float, int) or not math.isfinite(fact[field]):

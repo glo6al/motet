@@ -130,7 +130,7 @@ class Broker:
             raise ProtocolError(503, 'The native desktop connection is unavailable.') from None
         self._advance()
         if not self.page:
-            raise ProtocolError(503, 'Open WATCH Navigation from Extensions in an existing Antigravity chat.')
+            raise ProtocolError(503, 'Open Motet Navigation from Extensions in an existing Antigravity chat.')
         if any(r['state'] in ('queued', 'claimed') for r in self.requests.values()):
             raise ProtocolError(409, 'A navigation request is already unresolved.')
         if len(self.requests) >= MAX_REQUESTS:
@@ -253,7 +253,7 @@ class BoundedReader:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
-    server_version, sys_version = 'WATCH Navigation', ''
+    server_version, sys_version = 'Motet Navigation', ''
 
     def log_message(self, *args):
         pass
@@ -449,4 +449,4 @@ if __name__ == '__main__':
     try:
         main()
     except (OSError, ValueError, navigation.NavigationError):
-        raise SystemExit('WATCH Navigation could not start. Reconnect it from WATCH.')
+        raise SystemExit('Motet Navigation could not start. Reconnect it from Motet.')

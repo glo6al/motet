@@ -116,5 +116,5 @@ async function ownerQuestionCheck(){
 }
 (async()=>{await navigationChecks();await failures();await erasureChecks();await identityChecks();await legacyCompatibilityCheck();historyChecks();await sourceChecks();await ownerQuestionCheck();
   for(const [name,from,to] of [['sticky filtered','OFE.filtered.get(original)||original','original'],['later erasure','OFE.generation>packet.erasure_generation','false']]){assert.ok(acceptance.includes(from));let failed=false;try{await erasureChecks(acceptance.replace(from,to))}catch(err){failed=true}assert.ok(failed,name+' mutation must be caught')}
-  assert.ok(html.includes("if(e.kind==='memory_changed'){ofEvidenceChanged(e);return}"));console.log('ok Officer repair: real navigation/erasure races, bounded validation failures, sticky filtering, identity/auth, qualified history and owner question; two mutations detected');
+  assert.ok(html.includes("if(e.kind==='memory_changed'){ofEvidenceChanged(e);return}"));console.log('ok Motet repair: real navigation/erasure races, bounded validation failures, sticky filtering, identity/auth, qualified history and owner question; two mutations detected');
 })().catch(err=>{console.error(err);process.exitCode=1});

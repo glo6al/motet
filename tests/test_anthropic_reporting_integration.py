@@ -112,7 +112,7 @@ class AnthropicReportingIntegrationTests(unittest.TestCase):
         def finish(results):
             seen.extend(results)
             return ('Anthropic reports $' + results[0]['cost']['totals']['amount_usd'] +
-                    ' for the organization. WATCH Officer has a separate local estimate of $' +
+                    ' for the organization. Motet has a separate local estimate of $' +
                     results[1]['estimated_usd'] + '.')
         budget = RequestBudget()
         with patch.object(server, 'anthropic_report', return_value=provider) as report:
@@ -297,7 +297,7 @@ class AnthropicReportingIntegrationTests(unittest.TestCase):
             content = body['messages'][-1]['content']
             if isinstance(content, str):
                 if 'ordinary room question' in content:
-                    return response([{'type': 'text', 'text': 'The Officer can still answer ordinary room questions.'}])
+                    return response([{'type': 'text', 'text': 'Motet can still answer ordinary room questions.'}])
                 return response([tool('anthropic_spend', {'period': 'yesterday'})], 'tool_use')
             report = json.loads(content[0]['content'])
             supplied.append(report)
@@ -354,7 +354,7 @@ class AnthropicReportingIntegrationTests(unittest.TestCase):
                     self.assertEqual(supplied[-1]['error'], 'credential_unavailable')
                     status, ordinary = post('Please answer an ordinary room question.')
                     self.assertEqual(status, 200)
-                    self.assertEqual(ordinary['text'], 'The Officer can still answer ordinary room questions.')
+                    self.assertEqual(ordinary['text'], 'Motet can still answer ordinary room questions.')
                 self.assertEqual(request.call_count, 2)
                 public = json.dumps({'responses': [published, unavailable, ordinary], 'model_requests': model_calls})
                 for forbidden in (key, marker, 'workspace_id', 'api_key_id', 'organization_id'):

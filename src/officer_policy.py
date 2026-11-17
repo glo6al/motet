@@ -1,4 +1,4 @@
-"""Fixed local Officer routing policy; policy text never enters a model request."""
+"""Fixed local Motet routing policy; policy text never enters a model request."""
 import os
 from pathlib import Path
 import re
@@ -10,7 +10,7 @@ POLICY_PATH = Path(__file__).resolve().parents[1] / 'officer' / 'MODEL_POLICY.md
 MAX_POLICY_BYTES = 4096
 _MODEL_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z')
 _KEY_SHAPE = re.compile(rb'sk-ant-[A-Za-z0-9_-]{20,}')
-POLICY_ERROR = 'Automatic Officer routing is unavailable. Check MODEL_POLICY.md or choose a model manually.'
+POLICY_ERROR = 'Automatic Motet routing is unavailable. Check MODEL_POLICY.md or choose a model manually.'
 
 
 @dataclass(frozen=True)

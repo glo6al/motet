@@ -1,4 +1,4 @@
-"""Private Officer API usage metadata, independent of logs and message delivery.
+"""Private Motet API usage metadata, independent of logs and message delivery.
 
 No prompts, replies, tool results, provider error text, or credentials are stored.
 Token counts are provider-reported usage. Dollar figures are dated estimates,
@@ -300,7 +300,7 @@ class UsageLedger:
                           estimate_is_partial=True, rates_date=self.pricing['verified_date'] if self.pricing else None,
                           estimate_rate_dates=[],
                           rates_source=PRICE_SOURCE,
-                          qualification='Provider-reported token usage; USD amounts are dated estimates, not an invoice. Missing usage and unsettled calls are unknown, not zero. In-flight counts include attempts left unsettled by a crash. Cache creation totals include the separate five-minute and one-hour components; do not add those components twice. Totals cover only retained Officer calls; tracking failures may omit calls.')
+                          qualification='Provider-reported token usage; USD amounts are dated estimates, not an invoice. Missing usage and unsettled calls are unknown, not zero. In-flight counts include attempts left unsettled by a crash. Cache creation totals include the separate five-minute and one-hour components; do not add those components twice. Totals cover only retained Motet calls; tracking failures may omit calls.')
             if not self.available:
                 return result
             if type(days) is not int or not 1 <= days <= self.retention_days:

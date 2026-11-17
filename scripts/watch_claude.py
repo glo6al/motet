@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start a new interactive Claude Code session connected to WATCH. No global settings edits."""
+"""Start a new interactive Claude Code session connected to Motet. No global settings edits."""
 import argparse
 import json
 import os
@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    p.add_argument('--peer', metavar='LABEL', help='Removed: configure the shared WATCH MCP separately from the inbound channel')
+    p.add_argument('--peer', metavar='LABEL', help='Removed: configure the shared Motet MCP separately from the inbound channel')
     p.add_argument('--name', help='Display name for the new Claude session')
     p.add_argument('--claude', help='Claude executable path (defaults to ~/.local/bin/claude, then PATH)')
     p.add_argument('--node', help='Node.js executable path (defaults to PATH)')
@@ -68,21 +68,21 @@ def check_runtime(claude, node):
     version = subprocess.run([claude, '--version'], capture_output=True, text=True, timeout=10, check=True).stdout
     match = re.search(r'(\d+)\.(\d+)\.(\d+)', version)
     if not match or tuple(map(int, match.groups())) < (2, 1, 310):
-        raise ValueError('Use Claude Code 2.1.310 or newer; this is the version tested with WATCH channels.')
+        raise ValueError('Use Claude Code 2.1.310 or newer; this is the version tested with Motet channels.')
     help_text = subprocess.run([claude, '--help'], capture_output=True, text=True, timeout=10, check=True).stdout
     if not all(flag in help_text for flag in ('--session-id', '--mcp-config', '--name')):
         raise ValueError('This Claude executable does not support the required session options.')
     node_version = subprocess.run([node, '--version'], capture_output=True, text=True, timeout=5, check=True).stdout
     if not re.match(r'v(2[0-9]|[3-9][0-9])\.', node_version):
-        raise ValueError('Use Node.js 20 or newer for the optional WATCH channel.')
+        raise ValueError('Use Node.js 20 or newer for the optional Motet channel.')
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     if args.peer is not None:
-        raise ValueError('--peer is no longer supported. Configure the shared WATCH MCP separately; this launcher only creates the inbound channel for a new session.')
+        raise ValueError('--peer is no longer supported. Configure the shared Motet MCP separately; this launcher only creates the inbound channel for a new session.')
     if sys.platform != 'darwin':
-        raise ValueError('This first WATCH Claude launcher supports macOS only.')
+        raise ValueError('This first Motet Claude launcher supports macOS only.')
     if not sys.stdin.isatty():
         raise ValueError('Run this launcher in an interactive terminal; Claude requires channel development consent.')
     claude = executable(args.claude, Path.home() / '.local/bin/claude', 'claude')
@@ -98,8 +98,8 @@ def main(argv=None):
     # Validate options before creating even the session directory.
     cmd = command(claude, node, channel, state, session_id, instance_id, args.name)
     state.mkdir(mode=0o700)  # Exclusive: no existing session is claimed or resumed.
-    print('Starting a new WATCH-connected Claude session. Accept Claude’s local development channel notice to enable it.', flush=True)
-    print('This launcher adds the WATCH channel and a new session ID. It does not override tool, permission or model flags; this does not preserve a prior session’s transient settings.', flush=True)
+    print('Starting a new Motet-connected Claude session. Accept Claude’s local development channel notice to enable it.', flush=True)
+    print('This launcher adds the Motet channel and a new session ID. It does not override tool, permission or model flags; this does not preserve a prior session’s transient settings.', flush=True)
     print('Owner messages go to the conversation currently open in this process. After /clear, /resume or a fork, close and relaunch to restore targeting. Shared peer receiving is unavailable because native conversation identity is not bound to the channel.', flush=True)
     os.execv(claude, cmd)
 
@@ -108,5 +108,5 @@ if __name__ == '__main__':
     try:
         main()
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        print('WATCH Claude launcher: ' + str(error), file=sys.stderr)
+        print('Motet Claude launcher: ' + str(error), file=sys.stderr)
         sys.exit(1)

@@ -157,7 +157,7 @@ def iterm_open(args, beside='', pane=False):
     new agent never takes it."""
     cmd = ' '.join(map(shlex.quote, ['/usr/bin/env', 'PORT=%d' % PORT, sys.executable, os.path.join(HERE, 'watch_tty.py')] + args))
     cmd = cmd.replace('\\', '\\\\').replace('"', '\\"')            # inside an AppleScript string
-    with_ = 'with profile "W.A.T.C.H." command "%s"' % cmd
+    with_ = 'with profile "Motet" command "%s"' % cmd
     script = '''on find(sid)
   tell application "iTerm2"
     repeat with w in windows
@@ -220,7 +220,7 @@ def current(agents, window):
 def draw(rows, note):       # on each server batch (the stream's 'health' line), so a burst draws once
     w = shutil.get_terminal_size().columns
     rows = sorted(rows, key=lambda a: (not state(a).startswith('WAIT'), -a['ts']))
-    out = [('\x1b[H\x1b[2J' if TTY else '\n') + ' W.A.T.C.H.  %d agents  %s' % (len(rows), time.strftime('%H:%M:%S')), '']
+    out = [('\x1b[H\x1b[2J' if TTY else '\n') + ' Motet  %d agents  %s' % (len(rows), time.strftime('%H:%M:%S')), '']
     for a in rows:
         age = '%4dm' % ((time.time() - a['ts']) // 60) if a['ts'] else '    -'
         out.append(('%-20s %-16s %-19s %s %s' % (a['name'], a['where'], clean(state(a), 19) or '-', age, a['doing']))[:w])
@@ -244,7 +244,7 @@ def main():
     if tabs and not (ITERM and me):
         tabs = False        # outside iTerm2 (or inside tmux) there is no tab to open beside: show the board only
     if ITERM and not one:
-        sys.stdout.write('\x1b]1;W.A.T.C.H.\a')
+        sys.stdout.write('\x1b]1;Motet\a')
     agents, opened, skipped, shown, window, live = {}, set(), set(), None, 1200, False
     for e in stream():
         k, aid = e.get('kind'), e.get('agent')
@@ -321,9 +321,9 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         pass
     except urllib.error.HTTPError as e:
-        raise SystemExit('W.A.T.C.H. on port %d said %d %s' % (PORT, e.code, clean(e.read().decode(errors='replace'))))
+        raise SystemExit('Motet on port %d said %d %s' % (PORT, e.code, clean(e.read().decode(errors='replace'))))
     except OSError as e:            # no server, no key, or the stream dropped
-        raise SystemExit('W.A.T.C.H. not reachable on port %d (%s); start src/server.py first' % (PORT, e))
+        raise SystemExit('Motet not reachable on port %d (%s); start src/server.py first' % (PORT, e))
     finally:
         if 'amber' in TOUCHED:      # leave the tab as it was found, and only undo what this process did
             sys.stdout.write(amber(False) + ('' if '--agent' in sys.argv else badge('')))

@@ -28,14 +28,14 @@ ASSETS = ('broker.py', 'connector.js', 'index.html', 'sidecar.json', 'README.md'
 LIMIT = 1024 * 1024
 MESSAGES = {
     'unsupported': 'Native Antigravity opening currently supports macOS only.',
-    'unsupported_version': 'This Antigravity version does not support WATCH Navigation.',
+    'unsupported_version': 'This Antigravity version does not support Motet Navigation.',
     'setup_needed': 'Connect Antigravity to enable opening its existing chats.',
     'disconnected': 'Antigravity navigation is disconnected.',
     'waiting_app': 'Open the supported Antigravity desktop app, then try again.',
-    'waiting_panel': 'Enable WATCH Navigation in Antigravity Customizations, then open it from Extensions in any existing chat.',
+    'waiting_panel': 'Enable the Navigation extension in Antigravity Customizations, then open it from Extensions in any existing chat.',
     'unavailable': 'Antigravity navigation is unavailable. Reconnect it before trying again.',
     'changed': 'Navigation setup changed. Refresh its connection before trying again.',
-    'busy': 'Turn off WATCH Navigation in Antigravity before changing or removing its files.',
+    'busy': 'Turn off the Navigation extension in Antigravity before changing or removing its files.',
     'collision': 'Existing navigation files were changed or belong to another installation.',
 }
 

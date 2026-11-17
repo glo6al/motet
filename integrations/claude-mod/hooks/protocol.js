@@ -1,5 +1,5 @@
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-export const LIMITATION = 'Avoid clearing, switching or resuming this conversation until queued WATCH work settles; reconnect the intended chat afterward. Disconnect does not cancel native queued input.';
+export const LIMITATION = 'Avoid clearing, switching or resuming this conversation until queued Motet work settles; reconnect the intended chat afterward. Disconnect does not cancel native queued input.';
 export const TRANSITIONS = new Set(['clear', 'reset', 'new', 'resume', 'branch', 'fork', 'logout', 'exit']);
 
 export function pairing(value) {

@@ -217,14 +217,14 @@ test('explicit reconnect recovers unknown receipt without replay and busy promis
   const failed=await harness({submit:()=>{throw Error('lost admission receipt');}});
   await failed.enroll();await failed.tick();await failed.waitSubmission();await failed.waitAck('unknown');
   const cursor=failed.calls.length;await failed.drive(()=>failed.calls.slice(cursor).some(c=>c.url.endsWith('/poll')&&c.body.accept),'failed submit released');
-  assert.match((await failed.command('watch-connect')).text,/WATCH connected/);
+  assert.match((await failed.command('watch-connect')).text,/Motet connected/);
   await failed.tick();assert.equal(failed.submissions.length,1);
   let release;const busy=await harness({submit:()=>new Promise(resolve=>{release=resolve;})});
   try{
   await busy.enroll();await busy.tick();await busy.waitSubmission();await busy.command('watch-disconnect');
   assert.match((await busy.command('watch-connect')).text,/unresolved/);
   release({text:ENVELOPE});await busy.waitSettlement();await busy.drive(async()=>JSON.parse((await busy.command('watch-status')).text).pending===null,'disconnected native admission cleanup');
-  assert.match((await busy.command('watch-connect')).text,/WATCH connected/);
+  assert.match((await busy.command('watch-connect')).text,/Motet connected/);
   assert.equal(busy.submissions.length,1);
   }finally{release?.({text:ENVELOPE});}
 });
@@ -1005,21 +1005,19 @@ test('new registration probes legacy shape then strictly higher notice episode; 
  assert.equal(h.submissions.length,0);
 });
 
-test('notice persists one attempt before attributed admission and never tracks a model answer',async()=>{
+test('legacy notice claim is acknowledged dropped without native admission',async()=>{
  let offered=false;
- const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,submit:()=>({}),fetch:(url,body)=>{
+ const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,submit:()=>{throw Error('notice must never submit')},fetch:(url,body)=>{
   if(url.endsWith('/poll')){const claim=!offered&&body.accept?noticeClaim():null;if(claim)offered=true;return responseJSON({version:1,native_id:NATIVE,generation:GENERATION,reply_notice_protocol:1,claim,requests:[]})}
   return supportedFetch(url,body);
  }});
- await h.tick();await h.tick();await h.waitSubmission();await h.waitForEvent('submitted');
- await h.drive(()=>noticeRows(h.storage).some(([,v])=>v.requests[NOTICE]?.phase==='submitted'&&!v.requests[NOTICE].events.length),'notice durable ACK');
- const record=noticeRows(h.storage).find(([,v])=>v.requests[NOTICE])?.[1].requests[NOTICE];assert.equal(record.attempted,true);
- assert.deepEqual(h.submissions,[{text:replyNoticeText(PUBLIC),asUser:false}]);
+ await h.tick();await h.tick();await h.waitForEvent('dropped');
+ await h.drive(()=>noticeRows(h.storage).some(([,v])=>v.requests[NOTICE]?.phase==='dropped'&&!v.requests[NOTICE].events.length),'retired notice ACK');
+ const record=noticeRows(h.storage).find(([,v])=>v.requests[NOTICE])?.[1].requests[NOTICE];assert.notEqual(record.attempted,true);
+ assert.equal(h.submissions.length,0);
  assert(!runtimeRows(h.storage).some(([,v])=>v.requests?.[NOTICE]));
- await h.call('turn.start',{turnId:'notice-main',text:wrappedPrompt(replyNoticeText(PUBLIC))});
- await h.call('turn.complete',{turnId:'notice-main',answer:'No return marker expected',reason:'answer',isAborted:false});
  h.setNow(112000);await h.tick();await h.tick();
- assert.equal(h.submissions.length,1);assert.deepEqual(h.events().map(e=>e.kind),['submitted']);
+ assert.equal(h.submissions.length,0);assert.deepEqual(h.events().map(e=>e.kind),['dropped']);
  assert.equal(JSON.parse((await h.command('watch-status')).text).pending,null);
 });
 
@@ -1050,35 +1048,19 @@ test('protocol0 or manual connections never admit a typed notice even if server 
  }
 });
 
-test('busy notice keeps original durable pending attempt through recovery heartbeat then ACKs once',async()=>{
- let settle,offered=false;const storage=new Map([[GLOBAL_KEY,CONFIG]]);
- const h=await harness({storage,claimed:false,submit:()=>new Promise(resolve=>{settle=resolve}),fetch:(url,body)=>{
-  if(url.endsWith('/poll')){const claim=!offered&&body.accept?noticeClaim():null;if(claim)offered=true;return responseJSON({version:1,native_id:NATIVE,generation:GENERATION,reply_notice_protocol:1,claim,requests:[]})}
-  return supportedFetch(url,body);
- }});
- await h.tick();await h.tick();await h.waitSubmission();h.setNow(112000);await h.tick();
- const record=noticeRows(storage).find(([,v])=>v.requests[NOTICE])?.[1].requests[NOTICE];
- assert.equal(record.phase,'pending');assert.equal(record.attempted,true);assert.equal(h.events().length,0);
- assert(h.calls.filter(c=>c.url.endsWith('/poll')).some(c=>c.body.accept===false));
- settle({});await h.waitForEvent('submitted');await h.tick();assert.equal(h.submissions.length,1);assert.deepEqual(h.events().map(e=>e.kind),['submitted']);
-});
-
-
-test('dropped or uncertain notice admissions retain terminal ACKs across reload without native resubmission',async()=>{
- for(const [kind,submit] of [['dropped',()=>({drop:'host unavailable'})],['unknown',()=>{throw Error('ambiguous admission')}]] ){
-  const storage=new Map([[GLOBAL_KEY,CONFIG]]);
-  const options=()=>{let offered=false;return {storage,claimed:false,submit,fetch:(url,body)=>{
-   if(url.endsWith('/poll')){const claim=!offered?noticeClaim():null;offered=true;return responseJSON({version:1,native_id:NATIVE,generation:GENERATION,claim,requests:[]})}
-   return supportedFetch(url,body);
-  }}};
-  const h=await harness(options());await h.tick();await h.tick();await h.waitSubmission();await h.waitForEvent(kind);
-  await h.drive(()=>noticeRows(storage).some(([,v])=>v.requests[NOTICE]?.phase===kind&&!v.requests[NOTICE].events.length),'terminal notice ACK persisted');
-  const h2=await harness(options());await h2.tick();await h2.tick();h2.setNow(112000);await h2.tick();
-  assert.equal(h.submissions.length,1);assert.equal(h2.submissions.length,0);
-  assert(h.events().every(e=>e.kind===kind));assert(h2.events().every(e=>e.kind===kind));
+test('retained unacknowledged notice recovers as unknown without native submission',async()=>{
+ const key='watch-reply-notice-runtime-v1:'+NATIVE+':88888888-8888-4888-8888-888888888888';
+ for(const phase of ['claimed','pending','submitted','dropped','unknown']) {
+  const receipt={kind:'peer_reply_notice',request_id:NOTICE,public_request_id:PUBLIC,attempt_id:ATTEMPT,envelope_digest:'a'.repeat(64),phase,events:[]};
+  const shard={kind:'peer_reply_notice',native_id:NATIVE,project:'/fictional/project',grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,acknowledged:{},requests:{[NOTICE]:receipt}};
+  const storage=new Map([[GLOBAL_KEY,CONFIG],[key,shard]]);
+  const h=await harness({storage,claimed:false,fetch:supportedFetch});await h.tick();await h.tick();
+  if(['claimed','pending'].includes(phase))await h.waitForEvent('unknown');
+  const h2=await harness({storage,claimed:false,fetch:supportedFetch});await h2.tick();await h2.tick();
+  assert.equal(h.submissions.length,0);assert.equal(h2.submissions.length,0);
+  assert(h.events().every(e=>e.kind==='unknown'));
  }
 });
-
 
 test('one failed notice claim write leaves no flight and reconnect accepts ordinary work',async()=>{
  let offered=false,failed=0;
@@ -1115,6 +1097,39 @@ async function lifecycleHarness(options={}) {
     if(url.endsWith('/register'))return responseJSON(registered(body,{peer_protocol:1,supported_lifecycle_protocol:2,lifecycle_protocol:body.lifecycle_protocol===2?2:0}));
   }});
 }
+
+test('native queued peer removal records one durable drop without resubmitting',async()=>{
+  let release;
+  const h=await lifecycleHarness({submit:()=>new Promise(resolve=>{release=resolve})});
+  await h.tick();await h.waitSubmission();
+  try{
+    release({drop:'the prompt was removed from the queue before it ran'});
+    await h.waitAck('dropped');await h.waitSettlement();
+    const request=h.ownData().requests[REQUEST];
+    assert.equal(request.phase,'dropped');assert.equal(request.execution_completed,true);
+    assert.equal(h.events().filter(e=>e.kind==='dropped').length,1);
+    await h.tick();assert.equal(h.submissions.length,1);
+    assert(!h.events().some(e=>e.kind==='completed'||e.kind==='answered'));
+  }finally{release?.({drop:'the prompt was removed from the queue before it ran'});}
+});
+
+test('late submit drop after a peer turn starts cannot release its execution or lose completion',async()=>{
+  let release;
+  const h=await lifecycleHarness({submit:()=>new Promise(resolve=>{release=resolve})});
+  await h.tick();await h.waitSubmission();
+  try{
+    await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'fictional-started-turn'});await h.waitAck('started');
+    release({drop:'the turn was interrupted while the prompt was checked'});
+    await h.waitAck('unknown');await h.waitSettlement();
+    assert(!h.ownData().requests[REQUEST].execution_completed);
+    assert(!h.events().some(e=>e.kind==='dropped'));
+    const cursor=h.calls.length;
+    await h.drive(()=>h.calls.slice(cursor).some(c=>c.url.endsWith('/poll')),'bound peer remains in flight');
+    assert.equal(h.calls.filter(c=>c.url.endsWith('/poll')).at(-1).body.accept,false);
+    await h.call('turn.complete',{turnId:'fictional-started-turn',answer:ANSWER,isAborted:false,reason:'answer'});
+    await h.waitAck('completed');assert.equal(h.submissions.length,1);
+  }finally{release?.({drop:'the turn was interrupted while the prompt was checked'});}
+});
 
 test('v2 completion before submit settlement permits the next request',async()=>{
   for(const mixed of [false,true]){

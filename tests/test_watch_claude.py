@@ -36,7 +36,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_removed_peer_refuses_before_runtime_checks_or_state_writes(self):
         with patch.object(m, 'executable') as executable, patch.object(m, 'ensure_private') as private, patch.object(m.os, 'execv') as execv:
-            with self.assertRaisesRegex(ValueError, 'shared WATCH MCP separately'):
+            with self.assertRaisesRegex(ValueError, 'shared Motet MCP separately'):
                 m.main(['--peer', 'Example'])
             executable.assert_not_called()
             private.assert_not_called()

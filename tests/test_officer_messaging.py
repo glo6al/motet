@@ -81,7 +81,7 @@ class MessagingTests(unittest.TestCase):
         self.submit()
         launch = self.tick()
         sent = launch.call_args.args[0][-1]
-        self.assertIn(self.question, sent)
+        self.assertIn('The owner asks through Motet:\n' + self.question, sent)
         self.assertIn('an explicit work instruction authorizes that work under your existing permissions', sent)
         self.assertIn('a status question asks only for information', sent)
         self.assertNotIn('not permission to change files', sent)

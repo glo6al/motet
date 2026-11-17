@@ -532,9 +532,11 @@ class AntigravityTests(unittest.TestCase):
         self.assertEqual(reply.got[0], 404)
         self.assertIn('Antigravity', reply.got[1].decode())
 
+    @unittest.skipUnless(os.name == 'posix', 'Messaging store requires POSIX file locking.')
     def test_native_actions_remain_unavailable(self):
         self.append(self.record(0)); server.AntigravityTail(str(self.path)).poll()
-        store = officer_messaging.MessagingStore.__new__(officer_messaging.MessagingStore)
+        store = officer_messaging.MessagingStore(str(self.home / 'messages'), str(self.home / 'sessions'))
+        self.addCleanup(store.close)
         out = store.owner_capabilities(self.aid, server.AGENTS)['actions']
         self.assertFalse(out['queue']['available'])
         self.assertFalse(out['steer']['supported'])

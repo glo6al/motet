@@ -1,6 +1,6 @@
 {
   "name": "watch-local",
-  "description": "Local WATCH messaging integration",
-  "owner": {"name": "WATCH maintainers"},
-  "plugins": [{"name": "watch-owner", "source": "./", "description": "Existing-chat WATCH messaging"}]
+  "description": "Local Motet messaging integration",
+  "owner": {"name": "Motet maintainers"},
+  "plugins": [{"name": "watch-owner", "source": "./", "description": "Existing-chat Motet messaging"}]
 }

@@ -15,7 +15,7 @@ import uuid
 
 LEASE, PAIR_TTL, TTL, RETENTION = 12, 300, 900, 86400
 TRANSPORT = 'claude_mod'
-PEER_UNAVAILABLE = 'Agent receiving requires explicit WATCH setup and a compatible live official plugin in this exact Claude chat.'
+PEER_UNAVAILABLE = 'Agent receiving requires explicit Motet setup and a compatible live official plugin in this exact Claude chat.'
 MAX_ENROLLMENTS = 256
 
 
@@ -65,6 +65,7 @@ class ClaudeMod:
     def __init__(self, store):
         self.store, self.db = store, store.db
         self.room_snapshot = None
+        self.attachment_mount = None
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_pairs (
             code_hash TEXT PRIMARY KEY, agent TEXT NOT NULL, project TEXT NOT NULL, expires REAL NOT NULL)''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_enrollments (
@@ -92,7 +93,7 @@ class ClaudeMod:
         self.db.execute('UPDATE claude_mod_enrollments SET generation=NULL,last_seen=0')
         for row in self.rows():
             if row.get('launched') and not row.get('settled') and row['state'] not in ('answered', 'failed'):
-                row.update(state='unknown', error='WATCH restarted after a Claude mod claim. It will not resubmit.')
+                row.update(state='unknown', error='Motet restarted after a Claude mod claim. It will not resubmit.')
                 self.put(row)
         self.db.commit()
 
@@ -134,7 +135,7 @@ class ClaudeMod:
                 row.update(state='failed', error='This message expired before a Claude mod claimed it. Nothing was submitted.')
                 self.put(row)
             elif row.get('launched') and row['state'] in ('queued', 'awaiting_reply') and now >= row['created'] + TTL:
-                row.update(state='expired', error='No matching reply yet. Native input may still run; WATCH will not resubmit.')
+                row.update(state='expired', error='No matching reply yet. Native input may still run; Motet will not resubmit.')
                 self.put(row)
 
     def pair(self, agent, agents, port):
@@ -151,6 +152,8 @@ class ClaudeMod:
         return dict(agent=agent, port=port, pair_code=code, expires_at=expiry, command=f'/watch-connect {port}:{code}')
 
     def session(self, entry):
+        # Notice negotiation is historical ACK cleanup only; polls never create
+        # or claim notice prompts. Retained old clients can drain their receipts.
         result = dict(version=1, native_id=entry['agent'][2:], generation=entry['generation'], heartbeat_interval_ms=2000, lease_seconds=LEASE, peer_protocol=entry['peer_protocol'],
                       reply_notice_protocol=entry['reply_notice_protocol'], supported_reply_notice_protocol=1,
                       lifecycle_protocol=entry['lifecycle_protocol'], supported_lifecycle_protocol=2,
@@ -257,7 +260,7 @@ class ClaudeMod:
             if not local_parent(aid, item):
                 raise ModError(409, 'This is not an eligible local parent Claude chat and project.', 'identity_rejected')
             if not item.get('cwd'):
-                raise ModError(409, 'Waiting for WATCH to observe this local Claude project.', 'not_observed')
+                raise ModError(409, 'Waiting for Motet to observe this local Claude project.', 'not_observed')
             if not eligible(aid, item) or item['cwd'] != data['project']:
                 raise ModError(409, 'This is not an eligible local parent Claude chat and project.', 'identity_rejected')
         elif (not proof or proof['agent'] != aid or proof['project'] != data['project']
@@ -266,9 +269,9 @@ class ClaudeMod:
         active = self.db.execute('SELECT id FROM claude_mod_enrollments WHERE agent=? AND active=1', (aid,)).fetchone()
         entry = self.get(active[0]) if active else None
         if entry and not entry['grant_id']:
-            raise ModError(409, 'This chat retains its manual WATCH connection.', 'manual_conflict')
+            raise ModError(409, 'This chat retains its manual Motet connection.', 'manual_conflict')
         if entry and (entry['grant_id'] != gid or entry['project'] != data['project']):
-            raise ModError(409, 'This chat retains a different WATCH enrollment.', 'identity_rejected')
+            raise ModError(409, 'This chat retains a different Motet enrollment.', 'identity_rejected')
         payload = json.dumps(['watch-claude-session-v1', data['native_id'], data['project']], separators=(',', ':'), ensure_ascii=True)
         service_token = hmac.new(token.encode('ascii'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
         if entry:
@@ -331,7 +334,7 @@ class ClaudeMod:
                 ready = False
             if item is not None and entry and (not eligible(agent, item) or item.get('cwd') != entry['project']):
                 ready = False
-            return ready, entry, ('' if ready else 'Connect the WATCH official mod in this exact existing Claude chat.')
+            return ready, entry, ('' if ready else 'Connect the official Motet plugin in this exact existing Claude chat.')
 
     def peer_ready(self, entry, item=None):
         """Transaction-owned facts only: no lock, filesystem, maintenance or commit."""
@@ -350,7 +353,7 @@ class ClaudeMod:
             row = self.db.execute('SELECT id FROM claude_mod_enrollments WHERE agent=? AND active=1', (agent,)).fetchone()
             entry = self.get(row[0]) if row else None
             ready = self.peer_ready(entry, item)
-            return ready, entry, ('' if ready else 'Agent receiving requires explicit WATCH setup and a compatible live official plugin in this exact Claude chat.')
+            return ready, entry, ('' if ready else 'Agent receiving requires explicit Motet setup and a compatible live official plugin in this exact Claude chat.')
 
     def any_ready(self):
         with self.store.lock, self.db:
@@ -386,6 +389,67 @@ class ClaudeMod:
         if data['project'] != entry['project'] or type(data['accept']) is not bool:
             raise ModError(409, 'The enrolled Claude project does not match.')
 
+    def attachment_entry(self, agent, item):
+        """Current derived owner enrollment, without maintenance or discovery."""
+        if not eligible(agent, item) or self.store.worker_failed:
+            return None
+        row = self.db.execute('SELECT id FROM main.claude_mod_enrollments WHERE agent=? AND active=1', (agent,)).fetchone()
+        entry = self.get(row[0]) if row else None
+        if (not entry or entry['project'] != item['cwd'] or not ident(entry['grant_id'])
+                or not ident(entry['client_id']) or not ident(entry['generation'])
+                or entry['lifecycle_protocol'] != 2 or entry['last_seen'] <= time.time() - LEASE
+                or self.room_veto(agent, entry['project'])):
+            return None
+        grant = self.db.execute('SELECT 1 FROM main.claude_mod_grants WHERE id=? AND active=1',
+                                (entry['grant_id'],)).fetchone()
+        return entry if grant else None
+
+    def attachment_claim_entry(self, mount, token, data, agents):
+        """Called by the protected writer after file and namespace checks."""
+        if self.attachment_mount is not mount:
+            return None
+        entry = self.authenticate(token)
+        self.validate_poll(entry, data)
+        snapshot = agents() if callable(agents) else agents
+        item = snapshot.get(entry['agent']) if isinstance(snapshot, dict) else None
+        if not data['accept'] or self.attachment_entry(entry['agent'], item) != entry:
+            return None
+        if peer_lifecycle.blockers(self.db, entry['agent']):
+            return None
+        for row in self.rows():
+            if row['agent'] != entry['agent'] or peer_lifecycle.is_terminal(self.db, row['request_id']):
+                continue
+            if (row.get('launched') and not row.get('settled') and row['state'] not in ('answered', 'failed')
+                    or row.get('mod_enrollment') == entry['id'] and not row.get('launched')
+                    and row['state'] == 'sending' and row['created'] + TTL > time.time()):
+                return None
+        return entry
+
+    def attachment_event(self, mount, token, data):
+        adapter, activity = mount
+
+        def recheck(*, native=True):
+            if self.attachment_mount is not mount:
+                raise ModError(409, 'Claude request does not match its original claim.')
+            entry = self.authenticate(token)
+            if native:
+                self.native(entry, data)
+                if entry['last_seen'] <= time.time() - LEASE:
+                    raise ModError(409, 'Reconnect the Claude mod before reporting the original receipt.')
+            return entry
+
+        from attachments_owner_transport import LedgerError
+        from attachments_types import AttachmentError
+        try:
+            with activity():
+                with self.store.lock:
+                    entry = recheck(native=False)
+                    if not adapter.handles(data.get('request_id')):
+                        return None
+                return adapter.event(entry, data, recheck=recheck)
+        except (LedgerError, AttachmentError) as error:
+            raise ModError(getattr(error, 'status', 409), 'The Claude attachment receipt could not be verified.', error.code) from None
+
     def poll_call(self, data, token, agents):
         # Preparation can read files/directory, so it cannot run under our SQLite
         # lock or transaction. It conveys evidence, never permission to dispatch.
@@ -396,10 +460,9 @@ class ClaudeMod:
             new_rows = [r for r in self.rows() if data['accept'] and r.get('mod_enrollment') == entry['id']
                         and not r.get('launched') and r['state'] == 'sending']
             candidates = [r for r in new_rows if self.peer_row(r)]
-            notices = self.store.reply_delivery.candidates(entry['agent']) if hasattr(self.store, 'reply_delivery') and entry['reply_notice_protocol'] == 1 and data['accept'] else []
         snapshot = agents() if callable(agents) else agents
         proof = None
-        if (new_rows or notices) and (not isinstance(snapshot, dict) or entry['agent'] not in snapshot):
+        if new_rows and (not isinstance(snapshot, dict) or entry['agent'] not in snapshot):
             try:
                 proof = self.store.shared.metadata_target(entry['agent'], entry['project'])
             except Exception:
@@ -410,12 +473,6 @@ class ClaudeMod:
                 prepared[row['request_id']] = self.store.shared.prepare_mod_claim(row)
             except Exception:
                 prepared[row['request_id']] = None
-        notice_proofs = {}
-        for row in notices:
-            try:
-                notice_proofs[row['request_id']] = self.store.reply_delivery.prepare(row['source']['agent_id'], row['source'])
-            except Exception:
-                pass
         with self.store.lock, self.db:
             snapshot = agents() if callable(agents) else agents  # pure current room vetoes
             snapshot = dict(snapshot) if isinstance(snapshot, dict) else {}
@@ -425,21 +482,49 @@ class ClaudeMod:
             # Connection or grant replacement during preparation invalidates this
             # poll; retained original attempts can still recover after reconnect.
             entry = self.authenticate(token)
-            return self.poll(entry, data, snapshot, prepared, notice_proofs)
+            result = self.poll(entry, data, snapshot, prepared)
+            mount = self.attachment_mount
+        if mount is None or not data['accept'] or result['claim'] is not None or entry['lifecycle_protocol'] != 2:
+            return result
+        from attachments_owner_transport import LedgerError
+        from attachments_types import AttachmentError
+        try:
+            adapter, activity = mount
+            with activity():
+                if self.attachment_mount is mount:
+                    result['claim'] = adapter.poll(entry, recheck=lambda: self.attachment_claim_entry(mount, token, data, agents))
+        except (LedgerError, AttachmentError):
+            # An uncertain local or owner commit must never return a claim.
+            pass
+        return result
+
+    def attachment_busy(self, agent):
+        mount = self.attachment_mount
+        if mount is None and self.store._attachment_guard is None:
+            return False  # Never-installed state has no protected reader.
+        from attachments_owner_transport import LedgerError
+        from attachments_types import AttachmentError
+        try:
+            if mount is not None:
+                return mount[0].busy(agent)
+            from claude_attachment_adapter import protected_busy
+            return protected_busy(self.db, agent)
+        except (LedgerError, AttachmentError):
+            return True
 
     def poll(self, entry, data, agents, prepared, notice_proofs=None):
         self.validate_poll(entry, data)
         self.db.execute('UPDATE claude_mod_enrollments SET last_seen=? WHERE id=?', (time.time(), entry['id']))
         rows = self.rows()
-        busy = any(not peer_lifecycle.is_retired(self.db, r['request_id']) and r.get('mod_enrollment') == entry['id'] and r.get('launched') and not r.get('settled') and r['state'] in ('queued', 'awaiting_reply') for r in rows)
+        busy = any(not peer_lifecycle.is_terminal(self.db, r['request_id']) and r.get('mod_enrollment') == entry['id'] and r.get('launched') and not r.get('settled') and r['state'] in ('queued', 'awaiting_reply') for r in rows)
         busy = busy or any(state != 'reserved' for _, state, _ in peer_lifecycle.blockers(self.db, entry['agent']))
-        busy = busy or self.store.reply_delivery.busy(entry['id'])
+        busy = busy or self.attachment_busy(entry['agent'])
         claim = None
         item = agents.get(entry['agent']) if isinstance(agents, dict) else None
         can_claim = local_parent(entry['agent'], item) and item.get('cwd') == entry['project']
         if data['accept'] and can_claim and not busy and not self.store.worker_failed:
             for row in sorted(rows, key=lambda r: r['created']):
-                if (peer_lifecycle.is_retired(self.db, row['request_id']) or row.get('mod_enrollment') != entry['id']
+                if (peer_lifecycle.is_terminal(self.db, row['request_id']) or row.get('mod_enrollment') != entry['id']
                         or row.get('launched') or row['state'] != 'sending'):
                     continue
                 # Deadline checked inside the same serialized reservation transaction.
@@ -467,8 +552,6 @@ class ClaudeMod:
                 if row.get('origin') == 'peer':
                     claim['origin'] = 'peer'
                 break
-        if claim is None and data['accept'] and can_claim and not busy:
-            claim = self.store.reply_delivery.claim_in_transaction(entry, notice_proofs or {})
         return dict(version=1, native_id=entry['agent'][2:], generation=entry['generation'], peer_protocol=entry['peer_protocol'], reply_notice_protocol=entry['reply_notice_protocol'], lifecycle_protocol=entry['lifecycle_protocol'], supported_lifecycle_protocol=2, peer_envelope_limit=entry['peer_envelope_limit'], supported_peer_envelope_limit=100000, claim=claim, requests=self.statuses(entry))
 
     def event(self, entry, data):
@@ -487,10 +570,12 @@ class ClaudeMod:
             raise ModError(400, 'Invalid Claude request event.')
         schema(data, self.fields(entry, ('generation', 'native_id', 'request_id', 'attempt_id', 'kind') + extras[kind]))
         self.native(entry, data)
+        if self.store._attachment_reserved(data['request_id']):
+            raise ModError(409, 'Claude request does not match its original claim.')
         lifecycle = peer_lifecycle.get(self.db, data['request_id'])
         row = next((r for r in self.rows() if r['request_id'] == data['request_id']), None)
         payload_expired = row is None
-        if lifecycle and (payload_expired or lifecycle['execution'] == 'retired'):
+        if lifecycle and (payload_expired or lifecycle['execution'] in ('retired', 'dropped')):
             evidence = lifecycle['evidence']
             if evidence.get('project_digest') != digest(entry['project']):
                 raise ModError(409, 'Original Claude project evidence is unavailable.')
@@ -528,6 +613,23 @@ class ClaudeMod:
                                         'retired', 'retired')
             return dict(request_id=row['request_id'], state='unknown', turn_id=row.get('mod_turn', ''),
                         retired=True, message=peer_lifecycle.RETIRE_MESSAGE)
+        if lifecycle and lifecycle['execution'] == 'dropped':
+            if kind in ('started', 'answered', 'completed'):
+                raise ModError(409, 'Claude execution contradicts a verified dropped submission.')
+            # The row above is an authentication view of immutable receipts,
+            # not a replacement payload. Late ACKs must neither erase a retained
+            # envelope nor recreate one after pruning.
+            peer_lifecycle.record_event(self.db, row['request_id'], 'dropped_late_event', kind,
+                                        'dropped', 'dropped')
+            return dict(request_id=row['request_id'], state='failed', turn_id='',
+                        message=peer_lifecycle.DROP_MESSAGE)
+        if self.peer_row(row):
+            evidence = lifecycle['evidence'] if lifecycle else {}
+            if kind == 'dropped' and (row.get('mod_turn') or row.get('bound_turn')
+                    or row.get('execution_outcome') == 'completed' or row.get('state') in ('awaiting_reply', 'answered')
+                    or evidence.get('mod_turn') or evidence.get('bound_turn')
+                    or lifecycle and lifecycle['execution'] in ('running', 'completed')):
+                raise ModError(409, 'Claude input already has execution evidence; a pre-start drop is contradictory.')
         answered = kind == 'answered' or kind == 'completed' and data['outcome'] == 'answered'
         reply = None
         if answered:
@@ -581,11 +683,12 @@ class ClaudeMod:
         elif not terminal and row['state'] != 'answered':
             if kind == 'started' and row['state'] != 'failed':
                 row.update(state='awaiting_reply', mod_turn=turn, error='')
-            elif kind == 'dropped' and row['state'] not in ('awaiting_reply', 'expired'):
+            elif kind == 'dropped' and (self.peer_row(row) or row['state'] not in ('awaiting_reply', 'expired')):
                 row.update(state='failed', execution_outcome='dropped', settled=True,
                            error='Native Claude input was dropped before it started. It was not resubmitted.')
             elif kind == 'unknown' and row['state'] != 'failed':
                 row.update(state='unknown', error='Claude submission could not be confirmed. Nothing was resubmitted.')
+        peer_lifecycle.project_terminal(self.db, row['request_id'], row)
         if row['state'] == 'answered':
             self.store.peers.owner_warning(row)
         if payload_expired:
@@ -621,6 +724,11 @@ class ClaudeMod:
                 self.maintain()
                 current = agents() if callable(agents) else agents  # pure room snapshot only
                 return self.register(data, token, current, proof)
+        mount = self.attachment_mount
+        if method == 'event' and mount is not None:
+            result = self.attachment_event(mount, token, data)
+            if result is not None:
+                return result
         agents = agents() if callable(agents) else agents
         with self.store.lock, self.db:
             self.maintain()

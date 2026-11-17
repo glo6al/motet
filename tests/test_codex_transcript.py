@@ -209,6 +209,35 @@ class TranscriptTests(unittest.TestCase):
     def oversized(self, path, size=4500):
         self.append(path, 'compacted', {'opaque': 'x' * size})
 
+    def admit(self, version=2):
+        self.client_id, self.sender_id = str(uuid.uuid4()), str(uuid.uuid4())
+        if version == 2:
+            self.row['bridge_version'] = 2
+            self.store.db.execute('INSERT INTO shared_bridge_requests VALUES (?,?,?,?,?,?,?,?,?)',
+                (self.client_id, self.row['agent'], '{}', 'a'*64, self.rid, str(uuid.uuid4()),
+                 self.row['created'], self.row['created'], 'Fictional'))
+        else:
+            principal = str(uuid.uuid4())
+            self.store.db.execute('INSERT INTO peer_principals VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (principal, 'Fictional recipient', 'codex', self.ident, '/fictional/project',
+                 'exact', '{}', 'fictional-secret', 1, 1, self.row['created']))
+            self.store.db.execute('INSERT INTO peer_requests VALUES (?,?,?,?,?,?,?)',
+                (self.sender_id, self.client_id, principal, 'a'*64, self.rid,
+                 self.row['created'], self.row['created']))
+        self.store._save(self.row)
+
+    def public_result(self, version):
+        return (self.store.shared.result(self.client_id) if version == 2
+                else self.store.peers.result(self.sender_id, self.client_id))
+
+    def assert_withheld_completion(self):
+        self.assertTrue(self.row.get('settled'))
+        self.assertTrue(self.row.get('tracking_stopped'))
+        self.assertEqual(self.row['state'], 'unknown')
+        self.assertEqual(self.row['capture_disposition'], 'withheld')
+        for key in ('reply', 'candidate_reply', 'final', 'final_turn'):
+            self.assertEqual(self.row.get(key, ''), '')
+
     def test_oversized_before_explicit_envelope_drains_across_restart_and_withholds(self):
         self.oversized(self.old)
         self.append(self.old, 'response_item', dict(type='message', role='user', content=[dict(text=self.row['envelope'])],
@@ -232,16 +261,206 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(self.row['capture_disposition'], 'withheld')
         self.assertNotIn('codex_discard_record', self.row)
 
-    def test_oversized_inside_bound_turn_requires_new_envelope_proof(self):
+    def test_oversized_inside_bound_turn_exact_end_releases_only_its_capacity(self):
+        self.admit()
         self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
         self.message(self.old, 'bound', self.row['envelope'])
+        self.store._poll(self.row); self.store._save(self.row)
+        self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+        other = dict(self.row, request_id=str(uuid.uuid4()), agent='x:'+str(uuid.uuid4()),
+                     bound_turn='', state='unknown')
+        self.store.db.execute('INSERT INTO shared_bridge_requests VALUES (?,?,?,?,?,?,?,?,?)',
+            (str(uuid.uuid4()), other['agent'], '{}', 'b'*64, other['request_id'], str(uuid.uuid4()),
+             other['created'], other['created'], 'Fictional other'))
+        self.store._save(other)
         self.oversized(self.old)
         self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
                     last_agent_message='WATCH_REPLY ' + self.rid + '\nNot enough provenance.'))
+        terminal_offset = self.old.stat().st_size
+        self.message(self.old, 'later', self.row['envelope'])
+        self.row.update(reply='Old reply', candidate_reply='Old candidate', final='Old final', final_turn='bound')
+        with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 600):
+            with patch.object(m.subprocess, 'Popen', side_effect=AssertionError('no dispatch')):
+                self.poll(30); self.store._save(self.row); self.store.tick()
+        self.assert_withheld_completion()
+        self.assertTrue(self.row.get('codex_gap_needs_envelope'))
+        self.assertEqual(c.segment(self.row)['cursor'], terminal_offset)
+        self.assertEqual(self.row['bound_turn'], 'bound')
+        record = peer_lifecycle.get(self.store.db, self.rid)
+        self.assertEqual((record['execution'], record['capture']), ('completed', 'withheld'))
+        self.assertIsNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+        self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, other['agent'], time.time(), 900))
+        self.assertEqual(self.public_result(2)['reply'], '')
+
+    def test_exact_bound_gap_end_survives_restart_without_answer_or_marker(self):
+        self.admit()
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.store._poll(self.row); self.store._save(self.row)
+        self.oversized(self.old)
+        with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 600):
+            self.store._poll(self.row)
+            self.assertTrue(self.row.get('codex_discard_record'))
+            self.store._save(self.row); self.store.close()
+            self.store = m.MessagingStore(str(self.root / 'watch'), str(self.sessions))
+            self.row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+            self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound'))
+            with patch.object(m.subprocess, 'Popen', side_effect=AssertionError('no dispatch')):
+                self.poll(30); self.store._save(self.row)
+        self.assert_withheld_completion()
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'completed')
+
+    def test_exact_bound_gap_aborts_do_not_read_answer(self):
+        class Terminal(dict):
+            def get(self, key, *args):
+                if key == 'last_agent_message':
+                    raise AssertionError('terminal answer must not be inspected')
+                return super().get(key, *args)
+        for kind in ('task_complete', 'turn_aborted', 'task_aborted'):
+            with self.subTest(kind=kind):
+                self.row.update(bound_turn='bound', settled=False, tracking_stopped=False,
+                                reply='Old reply', candidate_reply='Old candidate', final='Old final', final_turn='bound')
+                self.store._codex_gap(self.row)
+                self.store._consume(self.row, dict(type='event_msg', payload=Terminal(type=kind, turn_id='bound')))
+                self.assert_withheld_completion()
+
+    def native_bound_gap_abort(self, kind):
+        self.admit()
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.oversized(self.old, 900)
+        self.append(self.old, 'event_msg', dict(type=kind, turn_id='bound'))
+        with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 1600):
+            with patch.object(m.subprocess, 'Popen', side_effect=AssertionError('no dispatch')):
+                self.poll(); self.store._save(self.row); self.store.tick()
+        self.assert_withheld_completion()
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'completed')
+        self.assertIsNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+
+    def test_native_bound_gap_turn_abort_releases_capacity(self):
+        self.native_bound_gap_abort('turn_aborted')
+
+    def test_native_bound_gap_task_abort_releases_capacity(self):
+        self.native_bound_gap_abort('task_aborted')
+
+    def test_gap_end_requires_exact_nonempty_binding(self):
+        baseline = dict(self.row)
+        for binding, terminal in [('bound', {}), ('bound', {'turn_id':''}), ('bound', {'turn_id':'wrong'}),
+                                  ('bound', {'turn_id':[]}), ('', {'turn_id':'unbound'})]:
+            with self.subTest(binding=binding, terminal=terminal):
+                self.row = dict(baseline, bound_turn=binding)
+                self.store._codex_gap(self.row)
+                for kind in ('task_complete', 'turn_aborted', 'task_aborted'):
+                    self.store._consume(self.row, dict(type='event_msg', payload=dict(type=kind, **terminal)))
+                self.assertFalse(self.row.get('settled'))
+                self.assertFalse(self.row.get('tracking_stopped'))
+                self.assertEqual(self.row['reply'], '')
+
+    def test_incomplete_oversized_end_record_cannot_settle_bound_gap(self):
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        with open(self.old, 'ab') as source:
+            source.write(json.dumps(dict(type='event_msg', payload=dict(type='task_complete', turn_id='bound',
+                              last_agent_message='x'*4500))).encode())
         with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 600): self.poll(30)
         self.assertFalse(self.row.get('settled'))
-        self.assertTrue(self.row.get('codex_gap_needs_envelope'))
+        self.assertTrue(self.row.get('codex_discard_record'))
         self.assertEqual(self.row['reply'], '')
+        with open(self.old, 'ab') as source: source.write(b'\n')
+        self.poll()
+        self.assertFalse(self.row.get('settled'))  # Draining an unreadable end is not completion proof.
+
+    def bind_and_gap(self):
+        self.admit()
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.oversized(self.old, 900)
+        with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 1600): self.poll()
+        self.store._save(self.row)
+        self.assertEqual(self.row['bound_turn'], 'bound')
+        self.assertTrue(self.row.get('codex_gap_needs_envelope'))
+
+    def test_replaced_bound_gap_transcript_cannot_prove_completion(self):
+        self.bind_and_gap()
+        replacement = self.root / 'replacement'
+        replacement.write_bytes(self.old.read_bytes())
+        self.append(replacement, 'event_msg', dict(type='task_complete', turn_id='bound'))
+        os.replace(replacement, self.old)
+        self.poll(); self.store._save(self.row)
+        self.assertFalse(self.row.get('settled'))
+        self.assertEqual(self.row['reply'], '')
+        self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+
+    def test_invalid_bound_gap_continuation_cannot_prove_completion(self):
+        self.bind_and_gap()
+        self.successor(end_ordinal_exclusive=999)
+        self.append(self.new, 'event_msg', dict(type='task_complete', turn_id='bound'))
+        self.poll(); self.store._save(self.row)
+        self.assertFalse(self.row.get('settled'))
+        self.assertEqual(self.row['reply'], '')
+        self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+
+    def stale_answer_save_stays_withheld(self, version):
+        self.admit(version)
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.store._poll(self.row); self.store._save(self.row)
+        stale = dict(self.row, state='answered', settled=True, capture_disposition='captured',
+                     tracking_stopped=False, reply='Fictional late answer', candidate_reply='Late candidate',
+                     final='Late final', final_turn='bound')
+        self.oversized(self.old, 900)
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound'))
+        with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 1600): self.poll()
+        self.store._save(self.row)
+        self.store._save(dict(stale))  # Exercise the real save ordering, not a hand-written UPDATE.
+        with self.assertRaisesRegex(ValueError, 'original attempt'):
+            self.store._save(dict(stale, bound_turn='conflicting-turn'))
+        self.row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assert_withheld_completion()
+        result = self.public_result(version)
+        self.assertEqual((result['state'], result['reply']), ('unknown', ''))
+        self.store.close()
+        self.store = m.MessagingStore(str(self.root / 'watch'), str(self.sessions))
+        self.row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assert_withheld_completion()
+        self.assertEqual(self.public_result(version)['state'], 'unknown')
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['capture'], 'withheld')
+        self.store.db.execute('DELETE FROM requests WHERE id=?', (self.rid,)); self.store.db.commit()
+        self.store._save(dict(stale))
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM requests WHERE id=?', (self.rid,)).fetchone())
+        result = self.public_result(version)
+        self.assertEqual((result['state'], result['reply']), ('unknown', ''))
+        self.store.close()
+        self.store = m.MessagingStore(str(self.root / 'watch'), str(self.sessions))
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM requests WHERE id=?', (self.rid,)).fetchone())
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'completed')
+        self.assertEqual(self.public_result(version)['reply'], '')
+
+    def test_shared_stale_answer_save_and_pruning_preserve_withheld_result(self):
+        self.stale_answer_save_stays_withheld(2)
+
+    def test_legacy_stale_answer_save_and_pruning_preserve_withheld_result(self):
+        self.stale_answer_save_stays_withheld(1)
+
+    def pruned_terminal_payload_stays_absent(self, execution):
+        self.admit()
+        stale = dict(self.row, state='answered', bound_turn='late', settled=True,
+                     reply='Fictional late answer', candidate_reply='Late candidate', final='Late final', final_turn='late')
+        if execution == 'retired':
+            peer_lifecycle.retire(self.store.db, self.rid, peer_lifecycle.RETIRE_REASON)
+        else:
+            self.store._save(dict(self.row, state='failed', execution_outcome='dropped', settled=True))
+        self.store.db.execute('DELETE FROM requests WHERE id=?', (self.rid,)); self.store.db.commit()
+        self.store._save(dict(stale))
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM requests WHERE id=?', (self.rid,)).fetchone())
+        self.assertEqual(self.public_result(2)['reply'], '')
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], execution)
+
+    def test_save_does_not_recreate_pruned_retired_payload(self):
+        self.pruned_terminal_payload_stays_absent('retired')
+
+    def test_save_does_not_recreate_pruned_dropped_payload(self):
+        self.pruned_terminal_payload_stays_absent('dropped')
 
     def test_oversized_gap_fresh_started_envelope_proves_completion_not_capture(self):
         self.oversized(self.old, 900)
@@ -263,7 +482,7 @@ class TranscriptTests(unittest.TestCase):
         with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 1600): self.poll(8)
         self.assertFalse(self.row.get('settled')); self.assertEqual(self.row['reply'], '')
 
-    def test_malformed_or_nondict_after_binding_invalidates_completion_proof(self):
+    def test_malformed_or_nondict_after_binding_withholds_but_exact_end_settles(self):
         original = json.loads(json.dumps(self.row))
         header = self.old.read_bytes()
         for malformed in (b'{broken native record}\n', b'[]\n', b'null\n', b'{"type":"event_msg","payload":[]}\n'):
@@ -275,7 +494,7 @@ class TranscriptTests(unittest.TestCase):
                 self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
                             last_agent_message='WATCH_REPLY ' + self.rid + '\nNo provenance.'))
                 self.poll()
-                self.assertFalse(self.row.get('settled'))
+                self.assert_withheld_completion()
                 self.assertTrue(self.row.get('codex_gap_needs_envelope'))
                 self.assertEqual(self.row['reply'], '')
 
@@ -354,7 +573,7 @@ class TranscriptTests(unittest.TestCase):
         self.assertTrue(self.row.get('settled')); self.assertEqual(self.row['bound_turn'], 'same')
         self.assertEqual(self.row['state'], 'unknown'); self.assertEqual(self.row['reply'], '')
 
-    def test_unverifiable_foreign_message_metadata_invalidates_binding(self):
+    def test_unverifiable_foreign_message_metadata_withholds_but_exact_end_settles(self):
         original = json.loads(json.dumps(self.row)); header = self.old.read_bytes()
         variants = [dict(internal_chat_message_metadata_passthrough=[]), dict(turn_id=[]),
                     dict(turn_id='bound', internal_chat_message_metadata_passthrough=dict(turn_id='different'))]
@@ -368,7 +587,7 @@ class TranscriptTests(unittest.TestCase):
                 self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
                             last_agent_message='WATCH_REPLY ' + self.rid + '\nMust not escape.'))
                 self.poll(); self.store.peers.reconcile([self.row])
-                self.assertFalse(self.row.get('settled')); self.assertTrue(self.row.get('codex_gap_needs_envelope'))
+                self.assert_withheld_completion(); self.assertTrue(self.row.get('codex_gap_needs_envelope'))
                 self.assertEqual(self.row['reply'], ''); self.assertEqual(self.row['capture_disposition'], 'withheld')
 
     def test_pure_native_user_text_content_shapes_remain_correlatable(self):

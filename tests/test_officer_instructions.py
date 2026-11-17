@@ -44,10 +44,14 @@ class InstructionFixture(unittest.TestCase):
 
 class CoreInstructionsTests(InstructionFixture):
     def test_builtin_fallback_pins_original_prompt(self):
-        # Pins the pre-extraction UTF-8 prompt, including its original whitespace.
+        # The historical prompt is still pinned apart from the assistant name.
         bundle = instructions.load_instructions()
         self.assertTrue(bundle.packaged)
-        self.assertEqual(hashlib.sha256(instructions.BUILTIN_OFFICER_SYSTEM.encode()).hexdigest(),
+        prompt = instructions.BUILTIN_OFFICER_SYSTEM
+        self.assertIn('You are Motet:', prompt)
+        self.assertIn('You are Motet:', bundle.system)
+        previous_brand = prompt.replace('You are Motet:', 'You are the Officer of the Watch:', 1)
+        self.assertEqual(hashlib.sha256(previous_brand.encode()).hexdigest(),
                          'c28133c5f9da7870356be72f67061fca40fc5fd0c1cceafcfa9c8019bf46fe05')
 
     def test_windows_line_endings_normalize_without_changing_prompt(self):

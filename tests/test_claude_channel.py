@@ -161,7 +161,7 @@ class ClaudeChannelTests(unittest.TestCase):
         with self.assertRaises(peer_bridge.PeerError) as rejected:
             self.store.shared.send(auth, self.agent, 'a'*64, 'peer payload', str(uuid.uuid4()))
         self.assertEqual(rejected.exception.status, 409)
-        self.assertIn('official plugin', str(rejected.exception))
+        self.assertIn('official Motet plugin', str(rejected.exception))
         self.assertIn('native conversation identity', str(rejected.exception))
         self.assertEqual(self.calls, [])
 

@@ -90,7 +90,7 @@ def pinned(root, expected):
     d = discover(root, expected['session_id'])
     # Pre-v2 owner rows pinned the same v1 fields without an explicit version.
     if identity(d) != {'version': 1, **expected}:
-        raise ChannelError('The Claude channel instance changed. WATCH will not redirect or resend this request.')
+        raise ChannelError('The Claude channel instance changed. Motet will not redirect or resend this request.')
     return d
 
 
@@ -155,7 +155,7 @@ def exchange(descriptor, request_id, content=None, timeout=3, origin='owner'):
             raise ChannelError('Claude returned a mismatched or invalid request record.')
         return d
     except (OSError, http.client.HTTPException, ValueError, TypeError):
-        raise ChannelError('Claude channel delivery could not be confirmed; WATCH will not resend.') from None
+        raise ChannelError('Claude channel delivery could not be confirmed; Motet will not resend.') from None
     finally:
         timer.cancel()
         connection.close()

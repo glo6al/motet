@@ -23,11 +23,11 @@ function trimHistory(state, data) {
 // Keep every official API call in a top-level $ function: the native compiler scans them.
 async function save($, state, change) {
   const data = state.data, key = state.key;
-  if (!data || !key) throw Error('Missing WATCH receipt context.');
+  if (!data || !key) throw Error('Missing Motet receipt context.');
   const operation = state.writes.then(async () => {
     if (change) change(data);
     trimHistory(state, data);
-    if (JSON.stringify(data).length > MAX_DATA) throw Error('WATCH recovery data limit.');
+    if (JSON.stringify(data).length > MAX_DATA) throw Error('Motet recovery data limit.');
     await $.store.set(key, copy(data));
   });
   state.writes = operation.catch(() => {});
@@ -46,10 +46,10 @@ async function post($, state, path, body, options = {}) {
     try {
       const response = await $.http.fetch('http://127.0.0.1:' + port + '/claude-mod/' + path,
         {method:'POST',headers,body:JSON.stringify(body)});
-      if (typeof response.text !== 'string' || response.text.length > 650000) throw Error('Invalid WATCH response.');
+      if (typeof response.text !== 'string' || response.text.length > 650000) throw Error('Invalid Motet response.');
       const value = JSON.parse(response.text);
       if (!response.ok) {
-        const error = Error('WATCH service unavailable.');
+        const error = Error('Motet service unavailable.');
         error.code = typeof value?.error_code === 'string' ? value.error_code : '';
         error.status = response.status;
         throw error;
@@ -95,7 +95,7 @@ async function fingerprint(value) {
 
 async function event($, state, request, kind, extras = {}, reason = '') {
   const data = state.data, at = await $.clock.now();
-  if (state.data !== data || data.requests[request.request_id] !== request) throw Error('WATCH receipt identity changed.');
+  if (state.data !== data || data.requests[request.request_id] !== request) throw Error('Motet receipt identity changed.');
   await save($, state, () => {
     if (request.execution_completed || (request.completed && kind !== 'answered')) return;
     if (kind === 'submitted' && ['started','answered','unknown','dropped'].includes(request.phase)) return;
@@ -110,7 +110,7 @@ async function event($, state, request, kind, extras = {}, reason = '') {
     const value = {request_id:request.request_id,attempt_id:request.attempt_id,kind,...extras};
     if (!request.events.some(item => JSON.stringify(item) === JSON.stringify(value))) request.events.push(value);
   });
-  if (state.data === data) flush($, state).catch(() => {state.error = 'WATCH event delivery interrupted; retained receipts will be retried without resubmitting.';});
+  if (state.data === data) flush($, state).catch(() => {state.error = 'Motet event delivery interrupted; retained receipts will be retried without resubmitting.';});
 }
 
 async function flush($, state) {
@@ -121,7 +121,7 @@ async function flush($, state) {
     for (const request of Object.values(data.requests)) {
       while (request.events.length && state.connected && state.data === data && state.epoch === epoch) {
         const value = request.events[0];
-        if (value.kind === 'completed' && state.lifecycleProtocol !== 2) throw Error('WATCH lifecycle recovery requires a compatible bridge.');
+        if (value.kind === 'completed' && state.lifecycleProtocol !== 2) throw Error('Motet lifecycle recovery requires a compatible bridge.');
         await post($, state, 'event', {...value,...identityBody(state)});
         if (state.data !== data || state.epoch !== epoch) return;
         const hash = data.mode === 'derived' ? await fingerprint(value) : null;
@@ -138,31 +138,31 @@ async function recover($, state) {
   const data = state.data;
   if (data.mode !== 'derived') return;
   const keys = await $.store.keys();
-  if (!Array.isArray(keys) || keys.length > 4096) throw Error('WATCH recovery data limit.');
+  if (!Array.isArray(keys) || keys.length > 4096) throw Error('Motet recovery data limit.');
   let total = JSON.stringify(data).length;
   const shards = [];
   for (const key of keys) {
     if (typeof key !== 'string' || key === state.key) continue;
     const prefix = [shardPrefix(data.native_id),legacyShardPrefix(data.native_id)].find(prefix=>key.startsWith(prefix));
     if (!prefix) continue;
-    if (!UUID.test(key.slice(prefix.length))) throw Error('Invalid WATCH receipt namespace.');
+    if (!UUID.test(key.slice(prefix.length))) throw Error('Invalid Motet receipt namespace.');
     const shard = await $.store.get(key);
     total += JSON.stringify(shard ?? null).length;
-    if (total > MAX_DATA) throw Error('WATCH recovery data limit.');
+    if (total > MAX_DATA) throw Error('Motet recovery data limit.');
     if (!shard || shard.mode !== 'derived' || shard.native_id !== data.native_id ||
         shard.project !== data.project || shard.grant_id !== data.grant_id || shard.enrollment_id !== data.enrollment_id) continue;
-    if (!shard.requests || typeof shard.requests !== 'object' || Array.isArray(shard.requests)) throw Error('Invalid WATCH receipt data.');
+    if (!shard.requests || typeof shard.requests !== 'object' || Array.isArray(shard.requests)) throw Error('Invalid Motet receipt data.');
     shards.push({...shard, legacy:prefix===legacyShardPrefix(data.native_id)});
   }
   // Validate before writing; foreign runtime keys are read-only, even after lease takeover.
   for (const shard of shards) for (const [id,record] of Object.entries(shard.requests)) {
-    if (!(shard.legacy?receiptRecord(record,id):lifecycleReceipt(record,id))) throw Error('Invalid WATCH receipt data.');
+    if (!(shard.legacy?receiptRecord(record,id):lifecycleReceipt(record,id))) throw Error('Invalid Motet receipt data.');
     const current = data.requests[id];
-    if (current && (current.attempt_id !== record.attempt_id || current.envelope_digest !== record.envelope_digest)) throw Error('Conflicting WATCH receipt identity.');
+    if (current && (current.attempt_id !== record.attempt_id || current.envelope_digest !== record.envelope_digest)) throw Error('Conflicting Motet receipt identity.');
     if (current?.completed && record.completed) {
       const own = current.events.find(value => value.kind === 'answered');
       const incoming = record.events.find(value => value.kind === 'answered');
-      if (own && incoming && JSON.stringify(own) !== JSON.stringify(incoming)) throw Error('Conflicting WATCH answer.');
+      if (own && incoming && JSON.stringify(own) !== JSON.stringify(incoming)) throw Error('Conflicting Motet answer.');
     }
   }
   for (const shard of shards) for (const [id,record] of Object.entries(shard.requests)) {
@@ -190,11 +190,11 @@ async function recover($, state) {
 
 async function saveNotices($,state,change) {
   const data=state.noticeData,key=state.noticeKey;
-  if (!data || !key) throw Error('Missing WATCH notice context.');
+  if (!data || !key) throw Error('Missing Motet notice context.');
   const operation=state.writes.then(async()=>{
     if(change)change(data);
     for(const [id,r] of Object.entries(data.requests))if(Object.keys(data.requests).length>32 && !r.events.length && r!==state.flight && ['submitted','dropped','unknown'].includes(r.phase))delete data.requests[id];
-    if(JSON.stringify(data).length>MAX_DATA)throw Error('WATCH recovery data limit.');
+    if(JSON.stringify(data).length>MAX_DATA)throw Error('Motet recovery data limit.');
     await $.store.set(key,copy(data));
   });
   state.writes=operation.catch(()=>{});return operation;
@@ -223,19 +223,19 @@ async function recoverNotices($,state) {
   if(state.noticeProtocol!==1)return;
   if(state.noticeData && (state.submitting || state.flight?.kind==='peer_reply_notice' || state.noticeFlushing))return;
   const ordinary=state.data,prefix=noticePrefix(ordinary.native_id),key=prefix+state.clientId;
-  const keys=await $.store.keys();if(!Array.isArray(keys)||keys.length>4096)throw Error('WATCH recovery data limit.');
+  const keys=await $.store.keys();if(!Array.isArray(keys)||keys.length>4096)throw Error('Motet recovery data limit.');
   let total=0;const records={},acknowledged={};
   for(const k of keys){
     if(typeof k!=='string'||!k.startsWith(prefix))continue;
-    if(!UUID.test(k.slice(prefix.length)))throw Error('Invalid WATCH notice namespace.');
+    if(!UUID.test(k.slice(prefix.length)))throw Error('Invalid Motet notice namespace.');
     const shard=await $.store.get(k);total+=JSON.stringify(shard??null).length;
-    if(total>MAX_DATA)throw Error('WATCH recovery data limit.');
+    if(total>MAX_DATA)throw Error('Motet recovery data limit.');
     if(shard?.kind!=='peer_reply_notice'||shard.native_id!==ordinary.native_id||shard.project!==ordinary.project||shard.grant_id!==ordinary.grant_id||shard.enrollment_id!==ordinary.enrollment_id)continue;
-    if(!shard.requests||!shard.acknowledged||typeof shard.requests!=='object'||Array.isArray(shard.requests)||typeof shard.acknowledged!=='object'||Array.isArray(shard.acknowledged))throw Error('Invalid WATCH notice receipts.');
-    for(const [hash,v] of Object.entries(shard.acknowledged)){if(!/^[a-f0-9]{64}$/.test(hash)||v!==true)throw Error('Invalid WATCH notice ACK.');acknowledged[hash]=true;}
+    if(!shard.requests||!shard.acknowledged||typeof shard.requests!=='object'||Array.isArray(shard.requests)||typeof shard.acknowledged!=='object'||Array.isArray(shard.acknowledged))throw Error('Invalid Motet notice receipts.');
+    for(const [hash,v] of Object.entries(shard.acknowledged)){if(!/^[a-f0-9]{64}$/.test(hash)||v!==true)throw Error('Invalid Motet notice ACK.');acknowledged[hash]=true;}
     for(const [id,r] of Object.entries(shard.requests)){
-      if(!noticeReceipt(r,id))throw Error('Invalid WATCH notice receipt.');
-      if(records[id] && (records[id].attempt_id!==r.attempt_id||records[id].envelope_digest!==r.envelope_digest||records[id].public_request_id!==r.public_request_id))throw Error('Conflicting WATCH notice receipt.');
+      if(!noticeReceipt(r,id))throw Error('Invalid Motet notice receipt.');
+      if(records[id] && (records[id].attempt_id!==r.attempt_id||records[id].envelope_digest!==r.envelope_digest||records[id].public_request_id!==r.public_request_id))throw Error('Conflicting Motet notice receipt.');
       if(!records[id])records[id]=copy(r);
       else for(const e of r.events)if(!records[id].events.some(v=>JSON.stringify(v)===JSON.stringify(e)))records[id].events.push(copy(e));
     }
@@ -252,13 +252,10 @@ async function recoverNotices($,state) {
   await saveNotices($,state);await flushNotices($,state);
 }
 async function submitNotice($,state,request,envelope,epoch) {
+  // Compatibility is ACK-only: an old server may still offer an admitted notice.
+  // Never call prompt.submit, including after recovery or a protocol downgrade.
   try {
-    if(!state.connected||state.noticeProtocol!==1||state.epoch!==epoch||await $.session.id()!==state.data.native_id||await $.session.cwd()!==state.data.project) {await noticeEvent($,state,request,'unknown');return;}
-    if((await $.clock.now())/1000>=request.expires_at){await noticeEvent($,state,request,'dropped');return;}
-    await saveNotices($,state,()=>{request.attempted=true;request.phase='pending';});
-    if(!state.connected||state.noticeProtocol!==1||state.epoch!==epoch||await $.session.id()!==state.data.native_id||await $.session.cwd()!==state.data.project){await noticeEvent($,state,request,'unknown');return;}
-    const result=await $.prompt.submit({text:envelope,asUser:false});
-    await noticeEvent($,state,request,typeof result?.drop==='string'?'dropped':'submitted');
+    await noticeEvent($,state,request,'dropped');
   }catch{try{await noticeEvent($,state,request,'unknown');}catch{}}
   finally{state.submitting=false;if(state.flight===request){state.flight=null;state.envelope=null;}}
 }
@@ -276,19 +273,24 @@ async function submit($, state, request, envelope, epoch) {
     if (!state.connected || state.epoch !== epoch || await $.session.id() !== state.data.native_id || await $.session.cwd() !== state.data.project) {await failRequest($,state,request); return;}
     state.envelope = envelope;
     const result = await $.prompt.submit({text:envelope,asUser:false});
-    if (typeof result?.drop === 'string') await event($,state,request,'dropped');
+    if (typeof result?.drop === 'string') {
+      // A turn receipt outranks a late submit result. Never release a peer's
+      // execution slot using a pre-start claim after native execution started.
+      await event($,state,request,request.origin === 'peer' && request.turn_id ? 'unknown' : 'dropped');
+    }
     else await event($,state,request,'submitted');
   } catch {await failRequest($,state,request);}
   finally {
     state.submitting = false;
-    if (state.flight === request && (request.execution_completed || ['answered','dropped','unknown'].includes(request.phase))) {state.flight = null; state.envelope = null;}
+    if (state.flight === request && (request.execution_completed || ['answered','dropped'].includes(request.phase) ||
+        request.phase === 'unknown' && !(request.origin === 'peer' && request.turn_id))) {state.flight = null; state.envelope = null;}
   }
 }
 
 async function poll($, state) {
   const epoch = state.epoch;
   const response = await post($,state,'poll',{...identityBody(state),project:state.data.project,accept:!state.flight && !state.submitting});
-  if (!sessionResponse({...response,heartbeat_interval_ms:2000,lease_seconds:12},state.data.native_id) || response.generation !== state.generation) throw Error('Invalid WATCH poll identity.');
+  if (!sessionResponse({...response,heartbeat_interval_ms:2000,lease_seconds:12},state.data.native_id) || response.generation !== state.generation) throw Error('Invalid Motet poll identity.');
   if (!state.connected || state.epoch !== epoch || !response.claim) return;
   const claim = response.claim;
   if(claim.kind!==undefined){
@@ -319,7 +321,7 @@ async function poll($, state) {
 
 async function activate($, state, response, eligibilityEpoch) {
   checkEligibility(state,eligibilityEpoch);
-  if (!sessionResponse(response,state.data.native_id)) throw Error('Invalid WATCH connection identity.');
+  if (!sessionResponse(response,state.data.native_id)) throw Error('Invalid Motet connection identity.');
   if (await $.session.id() !== state.data.native_id || await $.session.cwd() !== state.data.project) throw Error('Native conversation changed.');
   checkEligibility(state,eligibilityEpoch);
   state.generation = response.generation;
@@ -348,16 +350,16 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
   state.config = config;
   async function registration(notices=false,lifecycle=false,largePeer=false){
     // Reserve before I/O, including while not connected: lost commits never reuse a tuple's episode.
-    if(!Number.isSafeInteger(state.sequence+1))throw Error('WATCH connection sequence exhausted.');
+    if(!Number.isSafeInteger(state.sequence+1))throw Error('Motet connection sequence exhausted.');
     const sequence=++state.sequence;
     const body={native_id:id,project,client_id:state.clientId,connection_seq:sequence,peer_protocol:1,...notices?{reply_notice_protocol:1}:{},...lifecycle?{lifecycle_protocol:2}:{},...largePeer?{peer_envelope_limit:100000}:{}};
     const response=await post($,state,'register',body,{port:config.port,token:config.grant});
     checkEligibility(state,eligibilityEpoch);
     if(!sessionResponse(response,id)||response.grant_id!==config.grant_id||!UUID.test(response.enrollment_id)||
-       !/^[a-f0-9]{64}$/.test(response.token)||response.client_id!==state.clientId||response.connection_seq!==sequence)throw Error('Invalid WATCH registration.');
-    if(notices && response.reply_notice_protocol!==1)throw Error('Invalid WATCH notice negotiation.');
-    if(lifecycle && response.lifecycle_protocol!==2)throw Error('Invalid WATCH lifecycle negotiation.');
-    if(largePeer && response.peer_envelope_limit!==100000)throw Error('Invalid WATCH peer capacity negotiation.');
+       !/^[a-f0-9]{64}$/.test(response.token)||response.client_id!==state.clientId||response.connection_seq!==sequence)throw Error('Invalid Motet registration.');
+    if(notices && response.reply_notice_protocol!==1)throw Error('Invalid Motet notice negotiation.');
+    if(lifecycle && response.lifecycle_protocol!==2)throw Error('Invalid Motet lifecycle negotiation.');
+    if(largePeer && response.peer_envelope_limit!==100000)throw Error('Invalid Motet peer capacity negotiation.');
     return response;
   }
   let response=await registration();
@@ -378,7 +380,7 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
       if (JSON.stringify(stored).length > MAX_DATA || !stored.requests || typeof stored.requests !== 'object' || Array.isArray(stored.requests) ||
           !stored.acknowledged || typeof stored.acknowledged !== 'object' || Array.isArray(stored.acknowledged) ||
           !Object.entries(stored.requests).every(([requestId,record])=>lifecycleReceipt(record,requestId)) ||
-          !Object.entries(stored.acknowledged).every(([hash,value])=>/^[a-f0-9]{64}$/.test(hash) && value === true)) throw Error('Invalid WATCH receipt data.');
+          !Object.entries(stored.acknowledged).every(([hash,value])=>/^[a-f0-9]{64}$/.test(hash) && value === true)) throw Error('Invalid Motet receipt data.');
       requests = copy(stored.requests); acknowledged = copy(stored.acknowledged);
     }
     state.key = key;
@@ -399,7 +401,7 @@ function invalidateEligibility(state) {
 }
 
 function checkEligibility(state, expected) {
-  if (expected !== undefined && state.eligibilityEpoch !== expected) throw Error('WATCH eligibility changed.');
+  if (expected !== undefined && state.eligibilityEpoch !== expected) throw Error('Motet eligibility changed.');
 }
 
 async function readSurfaces($, state, eligibilityEpoch) {
@@ -490,8 +492,8 @@ async function supervisor($, state) {
       if (state.eligibilityEpoch !== eligibilityEpoch) return;
       state.rejectedIdentity = JSON.stringify([id,project,configurationId(state.config)]);
     }
-    state.error = error.message === 'WATCH recovery data limit.' ? 'WATCH recovery data limit reached; automatic claims stopped.' :
-      'WATCH connection interrupted; existing attempts are never resubmitted.';
+    state.error = error.message === 'Motet recovery data limit.' ? 'Motet recovery data limit reached; automatic claims stopped.' :
+      'Motet connection interrupted; existing attempts are never resubmitted.';
     backoff(state,now);
   } finally {state.supervising = false;}
 }
@@ -538,46 +540,46 @@ export function register(on) {
     try {
       state.timer?.cancel();
       state.timer = null;
-      await $.command.register({name:'watch-setup',description:'Authorize automatic WATCH connections once for your local Claude chats.',argumentHint:'<port:setup-code>',immediate:true});
-      await $.command.register({name:'watch-connect',description:'Reconnect this chat, or use a legacy WATCH pairing code.',argumentHint:'[port:pair-code]',immediate:true});
-      await $.command.register({name:'watch-status',description:'Show WATCH connection status without secrets.',immediate:true});
+      await $.command.register({name:'watch-setup',description:'Authorize automatic Motet connections once for your local Claude chats.',argumentHint:'<port:setup-code>',immediate:true});
+      await $.command.register({name:'watch-connect',description:'Reconnect this chat, or use a legacy Motet pairing code.',argumentHint:'[port:pair-code]',immediate:true});
+      await $.command.register({name:'watch-status',description:'Show Motet connection status without secrets.',immediate:true});
       await $.command.register({name:'watch-disconnect',description:'Keep this chat disconnected until explicit reconnect.',immediate:true});
       state.timer = $.clock.every(2000,()=>{
         // Count actual dispatch before any supervisor gate, never imply installation is dispatch.
         state.timerTicks = Math.min(Number.MAX_SAFE_INTEGER,state.timerTicks + 1);
         return supervisor($,state);
       });
-    } catch {state.error = 'WATCH command registration failed.';}
+    } catch {state.error = 'Motet command registration failed.';}
     return next(e);
   });
   on('command.run',async($,e,next)=>{
     if (TRANSITIONS.has(e.command)) {invalidateEligibility(state); suspend($,state); return next(e);}
     if (e.command === 'watch-status') {await readSurfaces($,state); return {text:JSON.stringify(publicStatus(state))};}
     if (!['watch-connect','watch-disconnect','watch-setup'].includes(e.command)) return next(e);
-    if (!['composer','bridge'].includes(e.origin?.kind)) return {text:'WATCH connection commands require direct owner input.'};
+    if (!['composer','bridge'].includes(e.origin?.kind)) return {text:'Motet connection commands require direct owner input.'};
     if (e.command === 'watch-disconnect') {
-      try {await explicitDisconnect($,state); return {text:'WATCH disconnected. ' + LIMITATION};}
-      catch {return {text:'WATCH disconnect could not be saved; readiness expires when its heartbeat stops.'};}
+      try {await explicitDisconnect($,state); return {text:'Motet disconnected. ' + LIMITATION};}
+      catch {return {text:'Motet disconnect could not be saved; readiness expires when its heartbeat stops.'};}
     }
-    if (state.connecting || state.submitting || (state.connected && state.flight && ['pending','claimed','submitted','started'].includes(state.flight.phase))) return {text:'An existing WATCH attempt is unresolved; nothing was resubmitted.'};
+    if (state.connecting || state.submitting || (state.connected && state.flight && ['pending','claimed','submitted','started'].includes(state.flight.phase))) return {text:'An existing Motet attempt is unresolved; nothing was resubmitted.'};
     state.connecting = true;
     invalidateEligibility(state);
     try {
       const id = await $.session.id(), project = await $.session.cwd();
       if (!UUID.test(id)) throw Error('Native identity unavailable.');
       const pair = e.args.trim() ? pairing(e.args) : null;
-      if (e.args.trim() && !pair) return {text:'Use the exact port:code command from WATCH.'};
+      if (e.args.trim() && !pair) return {text:'Use the exact port:code command from Motet.'};
       if (e.command === 'watch-setup') {
-        if (!pair) return {text:'Use the exact /watch-setup command from WATCH.'};
+        if (!pair) return {text:'Use the exact /watch-setup command from Motet.'};
         const config = await post($,state,'setup',{code:pair.code},{port:pair.port,anonymous:true});
-        if (!globalConfiguration(config) || config.port !== pair.port) throw Error('Invalid WATCH setup response.');
+        if (!globalConfiguration(config) || config.port !== pair.port) throw Error('Invalid Motet setup response.');
         await $.store.set(GLOBAL_KEY,config);
         state.rejectedGrant = ''; state.rejectedIdentity = '';
         await $.store.set(preferenceKey(id),{version:1,disconnected:false});
         suspend($,state);
         state.data = null; state.key = null; state.config = config;
         state.retryAt = 0; state.failures = 0;
-        return {text:'WATCH automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
+        return {text:'Motet automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
       }
       await $.store.set(preferenceKey(id),{version:1,disconnected:false});
       state.rejectedIdentity = ''; state.retryAt = 0; state.failures = 0;
@@ -589,21 +591,21 @@ export function register(on) {
         if (typeof response.token !== 'string' || response.token.length < 16 || !UUID.test(response.enrollment_id)) throw Error('Invalid enrollment.');
         state.data.token = response.token; state.data.enrollment_id = response.enrollment_id;
         await activate($,state,response);
-        return {text:'WATCH connected to this existing chat. ' + LIMITATION};
+        return {text:'Motet connected to this existing chat. ' + LIMITATION};
       }
       if (state.data?.mode !== 'derived') {
         state.data = await $.store.get(legacyKey(id)); state.key = state.data ? legacyKey(id) : null;
         if (state.data?.native_id === id && state.data.project === project) {
           state.data.active = true;
           await activate($,state,await post($,state,'connect',{native_id:id,project}));
-          return {text:'WATCH connected to this existing chat. ' + LIMITATION};
+          return {text:'Motet connected to this existing chat. ' + LIMITATION};
         }
         state.data = null; state.key = null;
       }
-      return {text:'WATCH reconnect scheduled for this existing chat. ' + LIMITATION};
-    } catch {stop(state); return {text:'WATCH connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.'};}
+      return {text:'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
+    } catch {stop(state); return {text:'Motet connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.'};}
     finally {state.connecting = false;}
-  }).catch(($,e,next)=>{stop(state); return ['watch-connect','watch-disconnect','watch-status','watch-setup'].includes(e.command)?{text:'WATCH command failed; no automatic request retry.'}:next(e);});
+  }).catch(($,e,next)=>{stop(state); return ['watch-connect','watch-disconnect','watch-status','watch-setup'].includes(e.command)?{text:'Motet command failed; no automatic request retry.'}:next(e);});
   on('prompt.submit',async($,e,next)=>{
     try {await observeInput($,state,e);} catch { /* Native input is never blocked. */ }
     return next(e);
@@ -620,7 +622,7 @@ export function register(on) {
         state.bound.set(e.turnId,{request,native_id:state.data.native_id,project:state.data.project,enrollment_id:state.data.enrollment_id});
         await event($,state,request,'started',{turn_id:e.turnId});
       }
-    } catch { /* WATCH cannot block native admission. */ }
+    } catch { /* Motet cannot block native admission. */ }
     return next(e);
   });
   on('turn.complete',async($,e,next)=>{

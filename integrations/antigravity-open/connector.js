@@ -85,7 +85,7 @@ function boot() {
   if (window.parent === window || !/^https:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(parentOrigin || '') ||
       observedParent !== parentOrigin || actualOrigin !== uiOrigin ||
       window.location.protocol !== 'plugin:' || tokens.length !== 1 || !tokens[0]) {
-    status.textContent = 'Open WATCH Navigation inside Antigravity to connect.';
+    status.textContent = 'Open Motet Navigation inside Antigravity to connect.';
     return;
   }
   const token = tokens[0];
@@ -121,6 +121,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   try { boot(); }
   catch (_) {
     const status = document.getElementById('status');
-    if (status) status.textContent = 'Connection unavailable. Reopen WATCH Navigation to try again.';
+    if (status) status.textContent = 'Connection unavailable. Reopen Motet Navigation to try again.';
   }
 }
