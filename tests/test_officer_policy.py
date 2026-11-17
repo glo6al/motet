@@ -35,7 +35,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.load_policy(), policy.ModelPolicy('claude-haiku-5-5', 'claude-sonnet-5-5'))
         self.path.write_bytes(POLICY.replace('\n', '\r\n').encode())
         self.assertEqual(policy.load_policy().summary, 'claude-sonnet-5-5')
-        with patch.object(policy, 'POLICY_PATH', Path(policy.__file__).resolve().parents[1] / 'officer/MODEL_POLICY.md'):
+        with patch.object(policy, 'POLICY_PATH', Path(policy.__file__).resolve().parents[1] / 'motet/MODEL_POLICY.md'):
             self.assertEqual(policy.load_policy().qa, 'claude-haiku-5-5')
 
     def test_invalid_missing_or_unreadable_policy_fails_fixed_without_echo(self):

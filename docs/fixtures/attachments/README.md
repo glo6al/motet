@@ -51,7 +51,7 @@ Storage retains unfinished rows together, followed by finished rows oldest autho
 then request ID. These sample dates do not establish actual runtime completion times.
 
 These samples cover retention, expiry, cleanup and follow-up states in memory. For live Motet storage
-and follow-ups, see [Motet file reading](../../OFFICER_FILE_READING.md). For copies sent to agents, see
+and follow-ups, see [Motet file reading](../../MOTET_FILE_READING.md). For copies sent to agents, see
 the [trust boundary](../../../README.md#trust-boundary).
 
 ## Scenarios
