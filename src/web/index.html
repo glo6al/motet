@@ -5190,7 +5190,10 @@ const OFUI={tab:'officer',recipient:'watch',target:null,targetName:'',scope:'roo
 function cuEventKey(it){return Number.isInteger(it.seq)&&it.seq>=0?'seq:'+it.seq:it.key?'key:'+it.key:it.n!=null?'story:'+it.n:null}
 function cuSourceRows(a){const rows=[],seen=new Set();for(const it of a.story){if(!['you','say'].includes(it.t))continue;const key=cuEventKey(it);if(key&&seen.has(key))continue;if(key)seen.add(key);rows.push({...it,key:key||'story-index:'+rows.length,...(typeof WORKSPACE!=='undefined'&&WORKSPACE?{workspaceStoryN:it.n}:{})})}for(const [i,m] of a.msgs.entries()){const key=cuEventKey(m);if(key&&seen.has(key))continue;if(key)seen.add(key);rows.push({...m,t:'you',key:key||'message-index:'+i})}return rows}
 function cuEnvelopeMatch(it,agent,records){
-  const text=String(it.text||''),match=text.match(/^WATCH_(REQUEST|REPLY) ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\n/i);if(!match)return false;
+  let text=String(it.text||'');
+  const hostPrefix='The watch-owner plugin sent a message:\n',hostSuffix="\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
+  if(it.t==='you'&&text.startsWith(hostPrefix)&&text.endsWith(hostSuffix))text=text.slice(hostPrefix.length,-hostSuffix.length);
+  const match=text.match(/^WATCH_(REQUEST|REPLY) ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\n/i);if(!match)return false;
   const r=records.get(match[2]);if(!r||r.agent!==agent)return false;
   if(it.t==='say')return match[1]==='REPLY'&&r.state==='answered'&&text==='WATCH_REPLY '+r.request_id+'\n'+r.reply;
   if(it.t!=='you'||match[1]!=='REQUEST')return false;
@@ -5312,7 +5315,7 @@ function cuSources(a){
   if(!rows.length){const emptyId='source:'+a.id+':empty';add(emptyId,{t:'info',text:a.observed?'Conversation history stays in ChatGPT; this computer records commands only.':'No conversation entries have been read from this agent’s log yet.'});if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&focus&&OFUI.docked&&a.observed&&typeof workspaceSeenOnlyPaint==='function')workspaceSeenOnlyPaint(CU.nodes.get(emptyId),a)}
   if(a.assign)add('source:'+a.id+':assignment',{...a.assign,t:'info',assignment:true,text:'Recorded assignment: '+a.assign.text});
   for(const it of rows)if(!cuEnvelopeMatch(it,a.id,OFM.records))add('source:'+a.id+':'+it.key,it);
-  const queueKeys=new Set();for(const [i,it] of a.q.entries()){const key='queue:'+a.id+':'+(cuEventKey(it)||'index:'+i),collision=typeof WORKSPACE!=='undefined'&&WORKSPACE&&focus&&OFUI.docked&&queueKeys.has(key)&&typeof workspaceNewToken==='function';queueKeys.add(key);add(collision?key+':duplicate:'+workspaceNewToken(it):key,it,true)}
+  const queueKeys=new Set();for(const [i,it] of a.q.entries()){if(cuEnvelopeMatch({...it,t:'you'},a.id,OFM.records))continue;const key='queue:'+a.id+':'+(cuEventKey(it)||'index:'+i),collision=typeof WORKSPACE!=='undefined'&&WORKSPACE&&focus&&OFUI.docked&&queueKeys.has(key)&&typeof workspaceNewToken==='function';queueKeys.add(key);add(collision?key+':duplicate:'+workspaceNewToken(it):key,it,true)}
   for(const [id,r] of CU.nodes){if(r.kind==='source'&&r.context.agent===a.id&&!active.has(id)){r.el.remove();CU.nodes.delete(id)}}
 }
 function cuNotice(html){const id='notice:'+ ++CU.serial,d=ofAdd('k',html,{id});CU.nodes.get(id).global=true;cuPaint();return d}

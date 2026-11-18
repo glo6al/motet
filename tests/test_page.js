@@ -409,15 +409,26 @@ function unifiedChecks(code=unifiedCode){
     assert.equal(api.cuEnvelopeMatch({t:'you',text:text.slice(0,-1)},record.agent,records),false);
     assert.equal(api.cuEnvelopeMatch({t:'you',text:text.replace('Hello','Different')},record.agent,records),false);
   }
+  const hostPrefix='The watch-owner plugin sent a message:\n',hostSuffix="\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.",wrap=text=>hostPrefix+text+hostSuffix;
+  const current=requestText.replace('the Officer of the Watch','Motet').replace('This is a question, not permission to change files or send messages.',"This message relays the owner's request. Preserve its scope and authorization: an explicit work instruction authorizes that work under your existing permissions; a status question asks only for information. Do not infer additional tasks or permissions.");
+  const channel='WATCH_REQUEST '+id+'\nThe owner asks through the Officer of the Watch:\nHello\nUse this channel\'s reply tool with request_id '+id+" and your answer in text. Preserve the owner's scope and authorization: an explicit work instruction authorizes that work under your existing permissions; a status question asks only for information. Do not infer additional tasks or permissions. For a progress question, inspect your own current state.";
+  for(const envelope of [requestText,requestText.replace('the Officer of the Watch','Motet'),current,channel]){
+    const text=wrap(envelope);
+    assert.equal(api.cuEnvelopeMatch({t:'you',text},record.agent,records),true,'the whole official host-wrapped request is a duplicate');
+    assert.equal(api.cuEnvelopeMatch({t:'you',text},record.agent,new Map()),false,'unproven messages remain visible');
+    assert.equal(api.cuEnvelopeMatch({t:'you',text},'x:other',records),false);
+    assert.equal(api.cuEnvelopeMatch({t:'say',text},record.agent,records),false,'host wrapping never broadens assistant suppression');
+    for(const literal of [text.slice(0,-1),text+'\nExtra owner text','Discuss this:\n'+text,'```\n'+text+'\n```',wrap(text),text.replace('watch-owner plugin','another plugin'),text.replace('Hello','Different'),text.replace('WATCH_REQUEST','watch_request'),text.replace(id,id.toUpperCase())])assert.equal(api.cuEnvelopeMatch({t:'you',text:literal},record.agent,records),false,'partial, quoted or altered messages remain visible');
+  }
   assert.equal(api.cuVisible({scope:'room'},'A'),false);assert.equal(api.cuVisible({scope:'station',agent:'A'},'A'),true);assert.equal(api.cuVisible({scope:'station',agent:'A'},'B'),false);assert.equal(api.cuVisible(null,'A'),false);assert.equal(api.cuVisible(null,null),true);
   assert.equal(api.cuMeta(null),null);assert.equal(api.cuMeta({id:'turn:old'}),null);assert.equal(api.cuMeta({id:'turn:x',ts:NaN}),null);assert.equal(api.cuMeta({id:'turn:x',ts:4}).ts,4);
   const keys=[api.cuDraftKey('A','agent','station'),api.cuDraftKey('A','watch','station'),api.cuDraftKey('A','watch','room'),api.cuDraftKey('B','agent','station')];assert.equal(new Set(keys).size,4);
 }
 unifiedChecks();
-for(const [label,from,to] of [['cross-agent envelope','r.agent!==agent','false'],['event dedup','if(key&&seen.has(key))continue','if(false)continue'],['legacy timestamp invention',"return value&&typeof value.id", "return !value?{id:'turn:invented',ts:1}:value&&typeof value.id"]]){
+for(const [label,from,to] of [['cross-agent envelope','r.agent!==agent','false'],['wrapped owner echo',"if(it.t==='you'&&text.startsWith(hostPrefix)","if(false&&text.startsWith(hostPrefix)"],['event dedup','if(key&&seen.has(key))continue','if(false)continue'],['legacy timestamp invention',"return value&&typeof value.id", "return !value?{id:'turn:invented',ts:1}:value&&typeof value.id"]]){
   let failed=false;try{unifiedChecks(unifiedCode.replaceAll(from,to))}catch(e){failed=true}assert.ok(failed,label+' must be caught');
 }
-console.log('ok unified identities, exact envelope correlation, legacy dates, context and draft partitions; three mutations detected');
+console.log('ok unified identities, exact raw/wrapped envelope correlation, legacy dates, context and draft partitions; four mutations detected');
 
 /* Composer pending evidence distinguishes message queues, observations and explicit steering. */
 function pendingChecks(code=unifiedCode){
@@ -637,6 +648,42 @@ function sourceChecks(mutate=false){
   a.story.push({t:'say',n:3,seq:3,ts:3,text:'Later'});sources(a);assert.equal(card.detail.open,false);assert.equal(ctx.CU.nodes.get('source:A:seq:3').el.detail.open,true);assert.equal(row.el,card);
 }
 sourceChecks();let reconciliationCaught=false;try{sourceChecks(true)}catch(e){reconciliationCaught=true}assert.ok(reconciliationCaught);console.log('ok stable source DOM/details, immutable name, no duplicate current request and independent native queue; recreation mutation detected');
+
+/* Hide complete transport echoes, including stale queue rows, without changing the recorded messages. */
+function transportEchoChecks(page=html){
+  const helpers=page.slice(page.indexOf('function cuEventKey('),page.indexOf('/* end unified conversation helpers */'));
+  const source=page.slice(page.indexOf('function cuSources('),page.indexOf('function cuNotice('));
+  const envelope='WATCH_REQUEST '+request.request_id+'\nThe owner asks through Motet:\n'+request.question+'\nReply in your final answer with WATCH_REPLY '+request.request_id+" on its own line, followed by your answer. This message relays the owner's request. Preserve its scope and authorization: an explicit work instruction authorizes that work under your existing permissions; a status question asks only for information. Do not infer additional tasks or permissions. For a progress question, inspect your own current state.";
+  const wrapped='The watch-owner plugin sent a message:\n'+envelope+"\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
+  for(const mode of ['classic','workspace','officer-desk']){
+    const h=messaging(),ctx=h.ctx,tokens=new WeakMap();let serial=0;
+    const add=ctx.ofAdd;ctx.ofAdd=(cls,body,meta)=>{const el=add(cls,body,meta);if(meta?.id)Object.assign(ctx.CU.nodes.get(meta.id),{kind:meta.kind,context:meta.context});return el};
+    class SourceNode{constructor(){this.dataset={}}set innerHTML(v){this.html=v;this.detail=v.includes('<details')?{open:true}:null}querySelector(s){return s==='details'?this.detail:null}contains(){return false}remove(){this.removed=true}}
+    Object.assign(ctx,{WORKSPACE:mode!=='classic',STEADY:false,focus:mode==='officer-desk'?null:request.agent,OFUI:{docked:true,recipient:'agent'},document:{activeElement:null,createElement:()=>new SourceNode()},plain:String,one:String,need:()=>null,workspaceOfficerDeskActive:()=>mode==='officer-desk',workspaceOfficerSayMarkup:(r,text)=>'<p>'+safeEsc(text)+'</p>',workspaceNewToken:value=>{if(!tokens.has(value))tokens.set(value,++serial);return tokens.get(value)},workspaceNewSourceKey:(a,it)=>it.key});
+    const api=vm.runInContext(helpers+'\n'+page.split('\n').find(l=>l.startsWith('function cuCard('))+'\n'+page.split('\n').find(l=>l.startsWith('function workspaceStationUserMarkup('))+'\n'+page.split('\n').find(l=>l.startsWith('function workspaceNewProjection('))+'\n'+source+';({cuSources,cuPendingRows,workspaceNewProjection})',ctx);
+    const a={id:request.agent,name:'Aster',story:[{t:'you',seq:1,text:wrapped},{t:'say',seq:2,text:'WATCH_REPLY '+request.request_id+'\nFictional update.'},{t:'you',seq:3,text:'Discuss this example:\n'+wrapped}],msgs:[],q:[{seq:4,text:wrapped},{seq:5,text:'Ordinary queued instruction'}]};
+    const before=JSON.stringify(a);api.cuSources(a);
+    const oldSource=ctx.CU.nodes.get('source:'+a.id+':seq:1').el,oldQueue=ctx.CU.nodes.get('queue:'+a.id+':seq:4').el;
+    assert.equal(oldSource.removed,undefined,'unknown transport remains until a correlated record exists');
+    h.ofMessageMerge([{...request,state:'answered',reply:'Fictional update.',created:1}]);api.cuSources(a);
+    assert.equal(oldSource.removed,true,mode+' removes the previously rendered whole host message');
+    assert.equal(oldQueue.removed,true,mode+' removes the previously rendered queue echo');
+    assert.equal(ctx.CU.nodes.has('source:'+a.id+':seq:2'),false,mode+' removes the correlated raw reply');
+    assert.equal(ctx.CU.nodes.has('source:'+a.id+':seq:3'),true,'ordinary discussion stays visible');
+    assert.equal(ctx.CU.nodes.has('queue:'+a.id+':seq:5'),true,'ordinary queued input stays visible');
+    const cards=[...ctx.CU.nodes.values()].filter(r=>r.kind==='message');assert.equal(cards.length,1);
+    const card=cards[0].el.html;assert.match(card,/How far along are your subagents\?/);assert.match(card,/Fictional update\./);assert.doesNotMatch(card,/WATCH_REQUEST|WATCH_REPLY|watch-owner plugin/);
+    assert.equal(api.cuPendingRows(a.id,a,h.OFM.records,new Map()).length,1,'only the ordinary queued observation remains pending');
+    const projection=api.workspaceNewProjection(a);assert.equal(projection.has('seq:1'),false);assert.equal(projection.has('seq:2'),false);assert.equal(projection.has('seq:3'),true,'new-entry projection agrees with visible history');
+    assert.equal(JSON.stringify(a),before,'presentation does not mutate source/queue arrays');assert.equal(h.OFM.records.get(request.request_id).state,'answered');
+    const sourceNodes=[...ctx.CU.nodes.values()].filter(r=>r.kind==='source').map(r=>r.el);api.cuSources(a);assert.equal(sourceNodes.every(el=>[...ctx.CU.nodes.values()].some(r=>r.el===el)),true,'ordinary source nodes remain stable on refresh');
+  }
+}
+transportEchoChecks();{
+  const guard="if(cuEnvelopeMatch({...it,t:'you'},a.id,OFM.records))continue;";assert.ok(html.includes(guard));
+  assert.throws(()=>transportEchoChecks(html.replace(guard,'')),assert.AssertionError,'removing the queue-source filter must fail');
+}
+console.log('ok complete host-message and queue-echo cleanup in Classic, Workspace and Motet desk; source data and clean message/reply preserved; queue mutation detected');
 
 /* Unsupported stations explain their limitation before a send is attempted. */
 {
