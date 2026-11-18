@@ -17,6 +17,10 @@
   <a href="#try-it">Try it</a> &middot; <a href="#what-you-can-see">What you can see</a> &middot; <a href="#what-you-cannot-see">What you cannot</a> &middot; <a href="#trust-boundary">Trust boundary</a> &middot; <a href="#status">Status</a> &middot; <a href="docs/ROADMAP.md">Roadmap</a> &middot; <a href="#license">License</a>
 </p>
 
+<p align="center">
+  <img src="docs/media/workspace-room.png" width="1000" alt="The Motet room in the Workspace interface. A sidebar lists fictional agents under three projects, each with the app it runs in and a time or the word ended; one has an orange dot because it needs you. In the room, the agents' screens stand side by side on a light floor. Motet's question box sits at the bottom with three suggested questions.">
+</p>
+
 > **Early.** macOS; on Windows only the automated tests have run, in CI. Python 3 standard library, no dependencies, one HTML page. Watching is safe to try today; read the [trust boundary](#trust-boundary) before switching on anything that answers prompts.
 
 The demos use fictional agents and projects. For public recordings, use `?demo` for Workspace or `?demo&ui=classic` for Classic. Live conversations and command output can contain personal information and absolute file paths.
@@ -64,7 +68,13 @@ The [plain address](http://127.0.0.1:8793/) opens Workspace on desktop and phone
 
 Workspace brings the room sidebar, notification bell, monitor contents, conversation desks and Settings into one light interface. Room movement and interactions stay the same. The bottom caption strip is omitted; each agent’s sidebar tooltip carries its caption and recorded or inferred qualifications. Opening the notification bell shows existing requests and recorded alerts. The **Notify me** control remains separate in Settings.
 
+<p align="center"><img src="docs/media/workspace-desk.png" width="1000" alt="Ada's desk in Workspace. The conversation is on the left: your request, a folded run of steps, Ada's update and a command still running. The Changes panel on the right shows two recorded edits to one file as short red and green excerpts, each noting that only the recorded change text is shown."></p>
+<p align="center"><sub><b>An agent's desk in Workspace.</b> The conversation on the left, recorded changes on the right. Fictional demo data.</sub></p>
+
 Choose **Motet** in the sidebar for its desk. **Recorded days · UTC** opens retained Motet questions and answers when memory recording has captured them. Saved days are read-only: browsing them makes no model call and cannot retry, apply or send anything. Coverage can be partial, not recorded, expired or unavailable. Return to the current window to continue your conversation; its draft stays in place.
+
+<p align="center"><img src="docs/media/workspace-motet.png" width="1000" alt="Motet's desk in Workspace. Asked Who is waiting on me?, Motet answers with a short list: Cleo wants permission to run a command, and Esme probably asked a question. Under the answer are a link to two pieces of recorded evidence and the note Scripted demo answer, no live agents contacted. A panel on the right lists Watch, Actions, Evidence and Memory."></p>
+<p align="center"><sub><b>Motet's desk.</b> Ask about the room and read the answer with the recorded evidence behind it. In the demo the answers are scripted and say so.</sub></p>
 
 See [brand assets](brand/README.md) for the Motet wordmark and icon. Workspace follows the same provider and permission limits described below.
 
@@ -174,19 +184,25 @@ The board and the tail ring the terminal bell when an agent starts waiting on yo
 
 ## The room, and the desk
 
-Explore these examples in the [Classic demo](http://127.0.0.1:8793/?demo&ui=classic).
+These pictures are from the [Classic demo](http://127.0.0.1:8793/?demo&ui=classic), which uses fictional agents and projects. Open it to explore the same examples.
 
-- **The room.** One monitor per agent, seated by project. The ledge along the bottom says where each idle agent stopped and shows a sweeping rail for each one that is working.
+<p align="center"><img src="docs/media/demo-room.png" width="1000" alt="The Classic room, dark. Monitors stand in a curved row over project names drawn on the floor: Lighthouse, Orchard and Tidewater. Each monitor shows what its agent is saying. Along the bottom, a ledge of captions: Cleo wants permission, Ada is in a turn, Bram reported a review, Codex cloud is running a command, Esme probably asked a question, Fen finished. A Motet plate at the bottom right says Cleo is waiting on you."></p>
+<p align="center"><sub><b>The room.</b> One monitor per agent, seated by project. The ledge along the bottom says where each idle agent stopped and shows a sweeping rail for each one that is working.</sub></p>
 
-- **In hand.** Hover and the monitor comes to you and stays put while you turn the camera, showing what the agent is saying under your last message to it. The banner across its top is the permission request it is waiting on; click its tag to open it at the desk.
+<p align="center"><img src="docs/media/demo-held.png" width="1000" alt="One monitor brought forward to the centre of the window, facing the camera: an agent named Cleo, waiting on you. An Approve banner across its top shows the command she wants to run, with a Review button. Under your last message to Cleo is what Cleo has been saying."></p>
+<p align="center"><sub><b>In hand.</b> Hover and the monitor comes to you and stays put while you turn the camera, showing what the agent is saying under your last message to it. The banner across its top is the permission request it is waiting on; click its tag to open it at the desk.</sub></p>
 
-- **The desk.** Read the conversation and inspect recorded work alongside it. Work offers Preview, Changes and Activity; its divider adjusts the space. The agent tree preserves parent–child relationships, while session details stay in the right rail.
+<p align="center"><img src="docs/media/demo-desk.png" width="1000" alt="Ada's desk in the Classic interface, Original theme. The agent list is on the left, the conversation in the centre, and the Recorded work panel open beside it on its Activity tab, showing the pricing tests passing. Session details such as model, context, project and branch are on the right."></p>
+<p align="center"><sub><b>The desk.</b> Read the conversation and inspect recorded work alongside it. Work offers Preview, Changes and Activity; its divider adjusts the space. The agent tree preserves parent–child relationships, while session details stay in the right rail.</sub></p>
 
-- **Watch.** Type a command or a sentence and the panel draws the banner the room would give it. If that is wrong, click what it should be and the room learns those words. Your rules are listed below; the built-in ones are folded under them, each with a switch.
+<p align="center"><img src="docs/media/demo-watch.png" width="1000" alt="The Watch panel open at the top of the room. Its field holds git push origin main. Under it a preview reads Alert, push: would be flagged, looks like a push. Below are the kinds it could be shown as, with Push lit, then Your rules, empty, and the folded built-in rules."></p>
+<p align="center"><sub><b>Watch.</b> Type a command or a sentence and the panel draws the banner the room would give it. If that is wrong, click what it should be and the room learns those words. Your rules are listed below; the built-in ones are folded under them, each with a switch.</sub></p>
 
-- **Motet.** A plate on the bottom band with the room's own count of who is waiting on you; press it, or `/`, and ask about the room in plain English. The answer comes from the logs the room keeps, laid out like a README when that reads better, with the entries it consulted as chips that jump to them. In the live room the server asks the model; in the demo the answers are scripted from the synthetic agents and say so.
+<p align="center"><img src="docs/media/demo-motet.png" width="1000" alt="Motet open as a panel at the right of the room, its header reading demo, scripted answers. Under the question What did I miss? is a shift report: a table of agents with their project, what each last recorded and when."></p>
+<p align="center"><sub><b>Motet.</b> The plate on the bottom band carries the room's own count of who is waiting on you; press it, or <code>/</code>, and it opens as this panel. Ask about the room in plain English. The answer comes from the logs the room keeps, laid out like a README when that reads better, with the entries it consulted as chips that jump to them. In the live room the server asks the model; in the demo the answers are scripted from the synthetic agents and say so.</sub></p>
 
-- **A rule it drafted.** Ask Motet to flag something and it drafts the words and the kind into the Watch panel, with the room's preview and one plain button. Nothing is saved until you press Keep this rule; Motet cannot press it, and no answer can write a rule on its own.
+<p align="center"><img src="docs/media/demo-motet-rule.png" width="1000" alt="The Watch panel open with a banner at its top: Motet suggests a rule: flag alembic upgrade as a deploy. Nothing is saved until you press Keep. Under it are a Keep this rule button and a Not now button, then the field holding the words, the room's preview, and the kinds with Deploy marked as suggested."></p>
+<p align="center"><sub><b>A rule it drafted.</b> Ask Motet to flag something and it drafts the words and the kind into the Watch panel, with the room's preview and two plain buttons, Keep this rule and Not now. Nothing is saved until you press Keep this rule; Motet cannot press it, and no answer can write a rule on its own.</sub></p>
 
 ## How it works
 
@@ -397,7 +413,7 @@ Early, and in daily use by its author. Every change that touches the key, the ho
     scripts/check_secrets.py refuses to publish a key: names, link text and contents, any size, in the working tree and in what git has staged (the staged copy is what a commit publishes); anything it cannot examine fails it. Run before any commit (the tests run it too)
     docs/ROADMAP.md          what is planned and what is unproven
     docs/WINDOWS.md          installing and trying it on Windows, and what to report
-    docs/media/              the README wordmark
+    docs/media/              the README wordmark and screenshots
 
 ## Contributing and reporting
 
