@@ -14,6 +14,7 @@ from attachments_native_namespace import OWNER_DB, NamespaceError, NativeNamespa
 from attachments_native_reads import NativeAgentReadService
 from attachments_native_receipts import NativeReadReceipts
 from attachments_owner_runtime import bind_owner_runtime
+from attachments_owner_marker import sqlite_marker_available
 from attachments_requests import RequestLedger, _native_mirror_layout
 from attachments_resources import ResourceLocks
 from attachments_types import AttachmentError, fail
@@ -415,6 +416,18 @@ def bind_native_composition(messaging, base_service, *, _qualification=None, cla
         composition = None
         try:
             _same_root(messaging, base_service.store)
+            with messaging.lock:
+                if not sqlite_marker_available(messaging.db):
+                    # Retained protection is never reclassified as fresh storage.
+                    if messaging._attachment_guard is not None:
+                        messaging._attachment_guard.require_schema()
+                    namespace = NativeNamespaceFence(base_service.store.files.parent)
+                    if namespace.detected(owner_db=messaging.db):
+                        namespace.validate_mount(messaging.db)
+                    messaging._native_composition_error = 'sqlite_unavailable'
+                    messaging._native_owner_error = 'sqlite_unavailable'
+                    base_service.native_sqlite_available = False
+                    return None
             claude_index = None
             if claude_room is not None:
                 if not callable(claude_room) or _qualification is not None:

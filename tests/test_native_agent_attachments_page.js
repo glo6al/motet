@@ -138,6 +138,35 @@ test('opening the picker from saved drafts does not create an empty draft', asyn
   assert.deepEqual(h.calls,[['picker']]);
 });
 
+test('SQLite notice leaves ordinary words and Send usable only without retained work', async () => {
+  const {createNativeAgentAttachmentsClient} = require('../src/web/native-agent-attachments-client.js');
+  const expected = 'Sending files to agents is unavailable because this Python uses an older database library. Install a newer Python and use it to restart Motet.';
+  const calls=[];
+  const client=createNativeAgentAttachmentsClient({enabled:true,demo:false,auth:()=> 'fictional-owner',
+    crypto:require('node:crypto').webcrypto,AbortController,fetch:async (path,init)=>{
+      calls.push([path,init.method]);
+      return new Response(JSON.stringify({schemaVersion:1,fixture:false,serverTime:'2030-01-01T00:00:00Z',
+        error:{code:'sqlite_unavailable',message:'Untrusted wire text.',retryable:false}}),{status:503});
+    }});
+  const passive=await client.connect({destinationId:destination});
+  const h=await harness(passive);
+  assert(h.root.textContent.includes(expected));
+  assert.equal(h.input.value,'Independent ordinary text');
+  assert.equal(h.input.readOnly,undefined);
+  assert.equal(h.send.disabled,false);
+  assert.equal(h.p.ownsInput(),false);
+  assert.equal(h.p.blocksSend(),false);
+  assert.deepEqual(calls,[[`/api/attachments/native/selection?destinationId=${destination}`,'GET']]);
+  for (const change of [s=>s.uncertain=true,s=>s.uploads=stage(1,{uploads:[{}]}).uploads,
+    s=>s.attempts=[{id:'fictional',draftId:null,requestId:null,phase:'creating',submitted:null}],
+    s=>s.busy=true]) {
+    const held=JSON.parse(JSON.stringify(passive));change(held);
+    const locked=await harness(held);
+    assert.equal(locked.p.blocksSend(),true,'retained or unreadable work cannot become passive');
+  }
+  client.dispose();
+});
+
 test('discard needs an explicit confirmation for the displayed draft version', async () => {
   const h=await harness();
   h.button('Discard draft');

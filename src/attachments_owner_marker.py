@@ -154,6 +154,10 @@ def sqlite_payload_state(column):
             f'ELSE {UNCERTAIN} END)')
 
 
+SQLITE_UNAVAILABLE_MESSAGE = ('Sending files to agents is unavailable because this Python uses an older database library. '
+                              'Install a newer Python and use it to restart Motet.')
+
+
 def sqlite_marker_available(db):
     statement = f'SELECT {sqlite_payload_state("sample.body")} FROM (SELECT CAST(? AS TEXT) AS body) AS sample'
     fixtures = (

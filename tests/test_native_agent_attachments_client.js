@@ -96,6 +96,22 @@ test('retained summary and unavailable qualification are separate', async () => 
   assert.equal(client.snapshot().savedDrafts[0].id, ID);
 });
 
+test('unsupported SQLite is a typed read refusal without any file write', async () => {
+  const expected = 'Sending files to agents is unavailable because this Python uses an older database library. Install a newer Python and use it to restart Motet.';
+  const {client, requests} = setup({route: () => positive({error: {
+    code:'sqlite_unavailable', message:'Untrusted wire prose.', retryable:false}}, 503)});
+  const s = await client.connect({destinationId:DEST});
+  assert.equal(s.error.code, 'sqlite_unavailable');
+  assert.equal(s.error.message, expected);
+  assert.equal(s.context, null);
+  assert(Object.values(s.features).every(value => value === false));
+  assert.equal(s.busy, false);
+  assert.equal(s.uncertain, false);
+  assert.equal(s.uploads.length + s.attempts.length + s.requests.length, 0);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].method, 'GET');
+});
+
 test('malformed draft page leaves listing incomplete and cannot resume a guessed draft', async () => {
   const {client, requests} = setup({route(path) {
     if (path.includes('/drafts?')) return positive({items: [{id: ID, destination: {...destination, scopeId: 'fictional-wrong'},

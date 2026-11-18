@@ -12,7 +12,7 @@ import stat
 import time
 
 from attachments_owner_guards import LINKS, OUTCOMES, OwnerAttachmentGuard, OwnerGuardError, _table
-from attachments_owner_marker import CLEAR, UNCERTAIN
+from attachments_owner_marker import CLEAR, UNCERTAIN, sqlite_marker_available
 
 OWNER_DB = 'officer-messages.sqlite3'
 ANCHOR = 'native-attachment-namespace.expected'
@@ -380,6 +380,7 @@ class NativeNamespaceFence:
     def initialize_owner(self, owner_db, owner_lock):
         """Install the witness only with proved owner identity and no managed history."""
         with owner_lock, _qualified():
+            _require(sqlite_marker_available(owner_db))
             self._never_created()
             if not _present(self.host):
                 try:

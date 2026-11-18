@@ -3,6 +3,7 @@ import sqlite3
 import threading
 
 from attachments_owner_guards import OwnerAttachmentGuard, OwnerGuardError
+from attachments_owner_marker import sqlite_marker_available
 from attachments_owner_transport import LedgerError, OwnerAttachmentLedger
 
 
@@ -86,6 +87,9 @@ def bind_owner_runtime(store, *, allow_install, scheduler=_schedule, _native_per
             guard = store._attachment_guard
             if guard is None:
                 if not allow_install:
+                    return None
+                if not sqlite_marker_available(store.db):
+                    store._native_owner_error = 'sqlite_unavailable'
                     return None
                 if store.db.in_transaction:
                     raise OwnerGuardError('Owner attachment setup requires its own writer.')

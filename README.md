@@ -149,6 +149,8 @@ The stage shows what those records contain and nothing else. That rules some thi
 
 Two minutes, no install.
 
+Sending files to agents requires SQLite 3.45 or newer linked into the Python running Motet; Python 3.9 remains supported for core features.
+
 ```bash
 git clone https://github.com/glo6al/motet.git && cd motet
 python3 src/server.py

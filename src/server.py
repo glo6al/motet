@@ -48,6 +48,7 @@ if __name__ == '__main__' and sys.argv[1:] == ['--version']:
 
 import glob, gzip, hashlib, hmac, http.client, json, math, mimetypes, os, secrets, select, socket, sqlite3, ssl, subprocess, threading, time, urllib.parse
 import uuid
+from socketserver import TCPServer
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from officer_policy import AUTOMATIC, RoutingSnapshot, load_policy
@@ -5708,7 +5709,8 @@ class Server(ThreadingHTTPServer):
     def server_bind(self):
         if WIN:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)     # and this keeps them off it
-        super().server_bind()
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def process_request(self, request, client_address):
         with LOCK:
