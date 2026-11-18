@@ -39,17 +39,26 @@ async function setup(t, {deletion = false} = {}) {
     finally { clearTimeout(timeout); }
   });
   const lines = createInterface({input: child.stdout});
-  async function nextLine() {
-    const result = await Promise.race([
-      once(lines, 'line', {signal: AbortSignal.timeout(15000)}),
-      exited.then(([code]) => { throw Error(`Fixture exited ${code}. ${errors}`); }),
-    ]);
-    return result[0];
+  async function nextLine(phase, timeoutMs = 15000) {
+    try {
+      const result = await Promise.race([
+        once(lines, 'line', {signal: AbortSignal.timeout(timeoutMs)}),
+        exited.then(([code]) => { throw Error(`Fixture exited ${code}. ${errors}`); }),
+      ]);
+      return result[0];
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`Fixture ${phase} timed out after ${timeoutMs}ms.`, {cause: error});
+      }
+      throw error;
+    }
   }
-  const origin = await nextLine();
+  const origin = await nextLine('startup');
   assert.match(origin, /^http:\/\/127\.0\.0\.1:\d+$/);
   async function rpc(action, fields = {}) {
-    const promised = nextLine();
+    // Bulk seeds run real durable file lifecycles, outside client HTTP budgets.
+    const phase = `RPC action=${action}` + (action === 'seed' ? ` count=${fields.count}` : '');
+    const promised = nextLine(phase, action === 'seed' ? 60000 : 15000);
     child.stdin.write(JSON.stringify({action, ...fields}) + '\n');
     return JSON.parse(await promised);
   }
