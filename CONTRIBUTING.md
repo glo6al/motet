@@ -11,16 +11,13 @@ change, and how you tested it. Run the relevant checks from the
 [workflow](.github/workflows/tests.yml), and keep recorded facts distinct
 from inferences in any change that presents session data.
 
-## Contributor agreement
+## Contributions and the license
 
-Contributions require a signed [Motet Contributor Licence Agreement](CLA.md)
-before they can be accepted. To sign, post the following sentence as a comment
-on your pull request from your own GitHub account.
-
-> I have read the Motet Contributor Licence Agreement and I hereby sign the CLA.
-
-Your signature covers this contribution and later contributions until a new
-version of the agreement is published.
+Motet is licensed under the [Apache License 2.0](LICENSE). Unless you
+explicitly state otherwise, anything you submit for inclusion is provided
+under that same license, as its section 5 describes. There is no separate
+contributor agreement to sign. Please submit only work you have the right to
+contribute.
 
 ## Motet name and logo
 
