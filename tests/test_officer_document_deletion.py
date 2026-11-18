@@ -285,37 +285,47 @@ class DeletionTests(unittest.TestCase):
             worker.close(3)
         self.assertEqual(self.status(p)['state'], 'deleted')
 
-    def test_packed_files_leaf_at_actual_full_consumes_reserved_fence_space(self):
-        sources = []
-        for length in (178, 170, 170, 170, 170, 170):
-            draft = self.f.draft()
-            upload = self.store.reserve_upload(draft['id'], draft['capability'], fence(draft),
-                dict(metadata(PDF), name='n' * length, mediaType='application/pdf'), self.f.key(),
-                preparation_kind='officer_direct', officer_profile=self.f.direct_profile())
-            draft['revision'] = upload['draftRevision']
-            completed = self.store.receive_upload(draft['id'], draft['capability'], fence(draft), upload['id'], upload['fingerprint'], io.BytesIO(PDF))
-            draft['revision'] = completed['draftRevision']; self.f.admit(draft); sources.append(upload['fileId'])
-        self.store.db.execute('VACUUM')
-        unused = self.store.db.execute("SELECT SUM(unused) FROM dbstat WHERE name='files' AND pagetype='leaf'").fetchone()[0]
-        self.assertEqual(unused, 0, 'fixture must pack the source leaf before filling SQLite')
-        self.store.db.execute('CREATE TABLE fictional_packed_filler(id INTEGER PRIMARY KEY,payload BLOB)')
-        maximum = self.store.db.execute('PRAGMA page_count').fetchone()[0] + 12
-        self.store.db.execute('PRAGMA max_page_count=%d' % maximum)
-        for _ in range(1000):
-            try:
-                with self.store._transaction(reclaim=True):
-                    self.store.db.execute('INSERT INTO fictional_packed_filler(payload) VALUES(zeroblob(3000))')
-            except sqlite3.DatabaseError as error:
-                self.assertEqual(getattr(error, 'sqlite_errorcode', 13), 13); break
-        else: self.fail('fixture did not reach actual SQLite FULL')
-        self.assertEqual(self.store.db.execute('PRAGMA page_count').fetchone()[0], maximum)
-        source = sources[0]; prepare_key = self.f.key(); p = self.prepare(source, command=prepare_key)
-        self.assertEqual(p, self.prepare(source, command=prepare_key))
-        confirm_key = self.f.key(); self.confirm(p, confirm_key); self.l.execute(p['id'])
-        self.assertEqual(self.status(p)['state'], 'deleted')
-        self.assertEqual(self.confirm(p, confirm_key)['releasedBytes'], len(PDF))
-        self.assertLessEqual(len(self.store.db.execute('SELECT cleanup_reserve FROM files WHERE id=?', (source,)).fetchone()[0]), 128)
-        self.assertEqual(self.store.db.execute('PRAGMA max_page_count').fetchone()[0], maximum)
+    def test_deletion_uses_reserved_fence_space_at_actual_sqlite_full(self):
+        source = self.add()
+        db = self.store.db
+        reserve_query = 'SELECT cleanup_reserve FROM files WHERE id=?'
+        original_reserve = db.execute(reserve_query, (source,)).fetchone()[0]
+        self.assertGreater(len(original_reserve), 128)
+        maximum = db.execute('PRAGMA page_count').fetchone()[0]
+        self.assertEqual(db.execute('PRAGMA max_page_count=%d' % maximum).fetchone()[0], maximum)
+
+        # Demand more overflow pages than the free list can supply. Probe the
+        # source row itself so the assertion holds regardless of its leaf layout.
+        page_size = db.execute('PRAGMA page_size').fetchone()[0]
+        free_pages = db.execute('PRAGMA freelist_count').fetchone()[0]
+        oversized_reserve = 'x' * (page_size * (free_pages + 2))
+        with self.assertRaises(sqlite3.DatabaseError) as full:
+            db.execute('UPDATE files SET cleanup_reserve=? WHERE id=?', (oversized_reserve, source))
+        if hasattr(full.exception, 'sqlite_errorcode'):
+            self.assertEqual(full.exception.sqlite_errorcode, sqlite3.SQLITE_FULL)
+        else:  # Python 3.9 does not expose SQLite's result code.
+            self.assertEqual(str(full.exception), 'database or disk is full')
+        self.assertEqual(db.execute(reserve_query, (source,)).fetchone()[0], original_reserve)
+
+        used = self.store.storage()['usedBytes']
+        prepare_key = self.f.key()
+        prepared = self.prepare(source, command=prepare_key)
+        self.assertEqual(prepared, self.prepare(source, command=prepare_key))
+        confirm_key = self.f.key()
+        confirmed = self.confirm(prepared, confirm_key)
+        self.assertEqual(confirmed['state'], 'deleting')
+        self.assertTrue(confirmed['sourceUnavailable'])
+        self.assertEqual(db.execute(reserve_query, (source,)).fetchone()[0], original_reserve[:128])
+        self.assertEqual(self.store.storage()['usedBytes'], used)
+
+        self.l.execute(prepared['id'])
+        deleted = self.status(prepared)
+        self.assertEqual((deleted['state'], deleted['releasedBytes']), ('deleted', len(PDF)))
+        self.assertEqual(self.confirm(prepared, confirm_key), deleted)
+        self.assertFalse((self.store.files.root / 'objects' / source).exists())
+        self.assertEqual(self.store.storage()['usedBytes'], used - len(PDF))
+        self.assertEqual(db.execute('PRAGMA page_count').fetchone()[0], maximum)
+        self.assertEqual(db.execute('PRAGMA max_page_count').fetchone()[0], maximum)
 
     def test_uncertain_descriptor_prevents_absent_success_and_quota_release(self):
         source = self.add(); p = self.prepare(source); self.confirm(p)

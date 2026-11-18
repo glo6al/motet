@@ -651,9 +651,16 @@ class HostGateTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 root=Path(os.path.realpath(tmp));(root/'.live-room').mkdir(mode=0o700)
                 with mock.patch.object(server,'ATTACHMENTS_ENABLED',True),mock.patch.object(server,'OFFICER_DOCUMENTS_ENABLED',documents_enabled),mock.patch.object(server,'HOME',str(root)),mock.patch.object(server,'KEY',KEY),mock.patch.dict(os.environ,{'WATCH_DEMO':'0'}),mock.patch('officer_document_transport.DirectDocumentTransport',side_effect=AssertionError('network constructed')):
-                    service=server.start_attachments()
-                    try:self.assertFalse(service.capabilities('officer','room',documents.MODEL)['available'])
-                    finally:service.close()
+                    service = server.start_attachments()
+                    try:
+                        if os.name == 'posix':
+                            self.assertIsNotNone(service)
+                            self.assertFalse(service.capabilities('officer', 'room', documents.MODEL)['available'])
+                        else:
+                            self.assertIsNone(service)
+                    finally:
+                        if service is not None:
+                            service.close()
                 self.assertFalse((root/'.live-room'/policy.POLICY_FILENAME).exists())
 
     def test_ordinary_ask_rejects_document_fields_before_action_routing(self):
