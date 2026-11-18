@@ -520,31 +520,65 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(factory.calls,[])
 
     def test_four_timed_out_workers_keep_capacity_until_actual_exit(self):
+        class HeldResponse(FakeResponse):
+            def read(self, size):
+                self.entered.set()
+                self.gate.wait()  # Only test cleanup may release this worker.
+                return super().read(size)
+
         tickets=[];connections=[];gates=[]
         for _ in range(4):
             tickets.append(self.ticket())
             gate=threading.Event();gates.append(gate);self.release_events.append(gate)
-            connections.append(FakeConnection(FakeResponse(b'late',gate=gate)))
+            connections.append(FakeConnection(HeldResponse(b'late',gate=gate)))
         pending=list(connections);calls=[]
         def connect(*args,**kwargs):
             calls.append((args,kwargs));return pending.pop(0)
-        item=transport.DirectDocumentTransport(enabled=True,connect=connect,_test_qualification=lambda *a:None)
+        stamp=[time.monotonic()]
+        item=transport.DirectDocumentTransport(enabled=True,connect=connect,clock=lambda:stamp[0],
+            _test_qualification=lambda *a:None)
         self.transports.append(item)
-        for ticket in tickets:
-            self.assertEqual(self.call(item,ticket,seconds=.05).state,'unknown')
-        self.assertEqual(len(calls),4)
-        self.busy()
-        # A different store has a free buffer bundle, isolating worker capacity
-        # from the independent per-store four-bundle buffer limit.
-        other=execution_fixtures.ExecutionTests();other.setUp()
+        callers=[]
         try:
-            other.add();lease=other.store.files.buffer_lease(tuple(other.sources))
-            request=other.prepare();state,permit,prepared=other.claim(request)
-            self.rejected('worker_capacity',lambda:item.call(prepared,other.l,permit,lease,lambda:KEY,time.monotonic()+1))
-            lease.close()
-        finally:other.tearDown()
-        for gate in gates:gate.set()
-        item.close(timeout=2)
+            for ticket,connection in zip(tickets,connections):
+                results=[];errors=[];deadline=stamp[0]+.1
+                def call(ticket=ticket,deadline=deadline,results=results,errors=errors):
+                    try:
+                        results.append(item.call(ticket[3],self.f.l,ticket[2],ticket[4],lambda:KEY,deadline))
+                    except BaseException as error:
+                        errors.append(error)
+                caller=threading.Thread(target=call,daemon=True);callers.append(caller)
+                caller.start()
+                self.assertTrue(connection.response.entered.wait(10),'Worker did not reach the held response read.')
+                stamp[0]=deadline+1
+                caller.join(10)
+                self.assertFalse(caller.is_alive(),'Caller did not return after its controlled deadline.')
+                self.assertEqual(errors,[])
+                self.assertEqual(len(results),1)
+                result=results[0]
+                self.assertEqual(result.state,'unknown')
+                self.assertTrue(result.consumed);self.assertTrue(result.dispatch_started)
+                self.assertFalse(connection.response.closed)
+                self.assertFalse(connection.response.gate.is_set())
+            self.assertEqual(len(calls),4)
+            with item._condition:
+                self.assertEqual(len(item._jobs),4)
+                self.assertTrue(all(job.thread.is_alive() and not job.exited.is_set() for job in item._jobs))
+            self.busy()
+            # A different store has a free buffer bundle, isolating worker capacity
+            # from the independent per-store four-bundle buffer limit.
+            other=execution_fixtures.ExecutionTests();other.setUp()
+            try:
+                other.add();lease=other.store.files.buffer_lease(tuple(other.sources))
+                request=other.prepare();state,permit,prepared=other.claim(request)
+                self.rejected('worker_capacity',lambda:item.call(prepared,other.l,permit,lease,lambda:KEY,stamp[0]+1))
+                lease.close()
+            finally:other.tearDown()
+        finally:
+            for gate in gates:gate.set()
+            for caller in callers:caller.join(10)
+            item.clock=time.monotonic
+            item.close(timeout=2)
         self.assertFalse(self.store.files.io_active())
 
     def test_buffer_bundle_cap_and_tls_key_logging_are_independently_bounded(self):

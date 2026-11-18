@@ -581,7 +581,9 @@ class TransportTests(unittest.TestCase):
         marker = Path(self.temp.name) / 'fictional-child.pid'
         script = ('import os,time,sys,signal\npid=os.fork()\nif pid==0:\n'
                   ' signal.signal(signal.SIGTERM,signal.SIG_IGN)\n'
-                  ' open(sys.argv[1],"w").write(str(os.getpid()))\n time.sleep(30)\n')
+                  ' with open(sys.argv[1]+".part","w") as marker:\n'
+                  '  marker.write(str(os.getpid()))\n'
+                  ' os.replace(sys.argv[1]+".part",sys.argv[1])\n time.sleep(30)\n')
         def spawn(argv, **kwargs):
             return self.real_popen([sys.executable, '-c', script, str(marker)], **kwargs)
         with patch.object(native.subprocess, 'Popen', side_effect=spawn):
