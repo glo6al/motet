@@ -277,6 +277,12 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_attachments_owner_startup.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_delivery_admission.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+      - run: python tests/test_delivery_admission_e2e.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_attachments_proof_generator.py
         if: ${{ !cancelled() }}
       - run: python tests/test_attachments_proof_harness.py

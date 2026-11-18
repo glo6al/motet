@@ -14,6 +14,7 @@ import uuid
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from attachments_owner_runtime import OwnerAttachmentRuntime, bind_owner_runtime
+from attachments_owner_transport import LedgerError
 import officer_messaging as messaging
 import server
 
@@ -98,9 +99,12 @@ class OwnerActionsTests(unittest.TestCase):
         with patch.object(OwnerAttachmentRuntime, 'start'):
             runtime = bind_owner_runtime(self.store, allow_install=True)
         payload = self.payload()
-        status, body, _ = self.request('POST', '/agent-message', payload)
+        with patch.object(runtime.ledger.directory, 'rebuild_step', side_effect=LedgerError('Fictional unreadable directory.')) as rebuild:
+            status, body, _ = self.request('POST', '/agent-message', payload)
+        rebuild.assert_called_once()
         self.assertEqual(status, 503)
         self.assertEqual(body['delivery'], 'not_submitted')
+        self.assertEqual(body['error'], 'Motet could not check the message queue. Nothing was sent.')
         self.assertEqual(self.store._rows(), [])
 
         runtime.checkpoint()
@@ -251,6 +255,49 @@ finally:
             self.store.owner_action('promote_queued',self.aid,'',str(uuid.uuid4()),server.AGENTS)
         self.assertEqual(self.store._rows(),[])
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM controls').fetchone()[0],0)
+
+
+@unittest.skipIf(os.name == 'nt', 'Messaging storage requires POSIX')
+class GuardedRelayTests(unittest.TestCase):
+    # Share the real HTTP fixture, without duplicating the unrelated test methods.
+    setUp = OwnerActionsTests.setUp
+    tearDown = OwnerActionsTests.tearDown
+    request = OwnerActionsTests.request
+    payload = OwnerActionsTests.payload
+    freeze = OwnerActionsTests.freeze
+
+    def bind(self):
+        with patch.object(OwnerAttachmentRuntime, 'start'):
+            return bind_owner_runtime(self.store, allow_install=True)
+
+    def test_relay_known_refusal_keeps_recipient_and_no_submission(self):
+        runtime = self.bind()
+        body = self.freeze({'kind': 'relay', 'agent': self.aid, 'question': 'Report progress'})
+        with patch.object(runtime.ledger.directory, 'rebuild_step', side_effect=LedgerError('Fictional unreadable directory.')) as rebuild:
+            status, result, _ = self.request('POST', '/ask', body)
+        rebuild.assert_called_once()
+        self.assertEqual(status, 200)
+        self.assertEqual(result['delivery'], 'not_submitted')
+        self.assertEqual(result['agent'], self.aid)
+        self.assertEqual(result['request_id'], body['request_id'])
+        self.assertEqual(result['error'], 'Motet could not send your message to Atlas. Nothing was sent. It could not check the message queue.')
+        self.assertEqual(self.store._rows(), [])
+        self.assertEqual(self.store.claim_ask(body['request_id'], body['turns'][0]['content'])['kind'], 'relay')
+
+    def test_relay_lost_post_insert_response_does_not_claim_nothing_sent(self):
+        self.bind()
+        body = self.freeze({'kind': 'relay', 'agent': self.aid, 'question': 'Report progress'})
+        with patch.object(self.store, '_history_outcome', side_effect=OSError('Fictional lost commit response.')):
+            status, result, _ = self.request('POST', '/ask', body)
+        self.assertEqual(status, 200)
+        self.assertNotIn('delivery', result)
+        self.assertNotIn('Nothing was sent', result['error'])
+        self.assertIn('could not be confirmed', result['error'])
+        self.assertEqual(len(self.store._rows()), 1)
+        status, replay, _ = self.request('POST', '/ask', body)
+        self.assertEqual(status, 200)
+        self.assertEqual(replay['messages'][0]['request_id'], body['request_id'])
+        self.assertEqual(len(self.store._rows()), 1)
 
 
 if __name__ == '__main__': unittest.main()

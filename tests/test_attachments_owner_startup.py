@@ -254,9 +254,6 @@ class StartupTests(unittest.TestCase):
         self.assertIsNotNone(instance)
         self.assertEqual(self.catalog(), before)
         self.assertEqual(instance.ledger.status(protected)['state'], 'owner_recorded')
-        with self.assertRaises(messaging.MessagingError) as denied:
-            self.submit()
-        self.assertEqual(denied.exception.status, 503)
         directory = instance.ledger.directory
         tick = self.workers[0].checkpoint
         with patch.object(owner.OwnerAttachmentLedger, 'decode_pair', wraps=owner.OwnerAttachmentLedger.decode_pair) as decode:

@@ -3812,6 +3812,7 @@ def officer_dispatch(user_text, request_id, call, model_snapshot=None, route_out
     """
     if not valid_uuid(request_id):
         return {'error': 'The request identifier is invalid. Nothing was sent.'}
+    decision = None
     try:
         model_snapshot = model_snapshot or officer_model_snapshot()
         decision = MESSAGING.claim_ask(request_id, user_text) if MESSAGING else None
@@ -3888,6 +3889,16 @@ def officer_dispatch(user_text, request_id, call, model_snapshot=None, route_out
         result = MESSAGING.owner_action('queue', decision['agent'], decision['question'], request_id, dict(AGENTS))
         return {'text': 'The message and its delivery status are shown here.',
                 'messages': [result], 'actions': [], 'cites': []}
+    except MessageNotSubmitted as e:
+        # This exact subclass guarantees the ordinary queue insert was not attempted.
+        out = {'error': str(e), 'delivery': 'not_submitted', 'request_id': request_id}
+        if isinstance(decision, dict) and decision.get('kind') == 'relay':
+            agent = decision['agent']
+            with LOCK:
+                name = str(AGENTS.get(agent, {}).get('name') or agent)[:120]
+            out.update(agent=agent, error='Motet could not send your message to ' + name +
+                       '. Nothing was sent. It could not check the message queue.')
+        return out
     except MessagingError as e:
         return {'error': str(e)}
     except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):

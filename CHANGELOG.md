@@ -9,3 +9,8 @@ Published commit: [295f8de](https://github.com/glo6al/motet/commit/295f8dec9e817
 - Ask Motet about recorded work with your own Anthropic API key. Auto mode picks a model for the question. Optional local memory lets you revisit saved evidence and Motet conversations.
 - The app runs locally with Python 3.9 or later and the standard library. macOS is the tested desktop platform. Windows coverage is limited to automated tests in CI.
 - Check SQLite before starting file delivery to agents, explain when a newer Python is needed, and preserve ordinary messaging across restarts. Bind the local server without a hostname lookup.
+
+### Follow-up fixes
+
+- Refresh message-queue checks before admitting a message, so Motet's own request bookkeeping does not cause a false refusal. Keep definite refusals distinct from uncertain delivery, and identify the recipient when a relayed message was not sent.
+- Hide complete, correlated Claude plugin request echoes from the conversation and queue history while keeping the original message and reply visible.

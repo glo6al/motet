@@ -582,16 +582,42 @@ class OwnerAttachmentLedger:
     @contextmanager
     def ordinary_slots(self, now_ms):
         """Use the same exact combined counts and writer as native admission."""
-        checking_capacity = False
+        checking_capacity = True
         try:
-            with self.ordinary_writer() as proof:
-                checking_capacity = True
-                _, history, pending, recent = self._counts(now_ms, include_full_history=True)
-                checking_capacity = False
-                yield (history, pending, recent), proof
-        except LedgerError:
-            error = OwnerCapacityUnavailable if checking_capacity else OwnerGuardError
-            raise error('Owner attachment capacity is unavailable.') from None
+            with self.lock:
+                # Never adopt or roll back a caller's pending SQL transaction.
+                if self.db.in_transaction:
+                    fail('nested_transaction')
+                directory = self.directory
+                try:
+                    if not directory.matches(directory.epoch()):
+                        from attachments_owner_directory import BATCH_SIZE
+                        # A full final batch needs one empty step to publish.
+                        # Start one coherent pass even if a scheduler left a
+                        # partial candidate; never retry or rebase its epoch.
+                        max_batches = MAX_LINKS // BATCH_SIZE + 1
+                        directory.begin_rebuild()
+                        for _ in range(max_batches):
+                            if directory.rebuild_step():
+                                break
+                        else:
+                            fail('directory_rebuild_bound')
+                except BaseException:
+                    directory.abandon()
+                    raise
+                # Keep the shared owner lock through counting and insertion.
+                # counts() rechecks the epoch after BEGIN IMMEDIATE, so a
+                # different connection cannot be silently blessed by preflight.
+                with self.ordinary_writer() as proof:
+                    _, history, pending, recent = self._counts(now_ms, include_full_history=True)
+                    checking_capacity = False
+                    yield (history, pending, recent), proof
+        except (LedgerError, OwnerGuardError, sqlite3.Error) as error:
+            if not checking_capacity:
+                if isinstance(error, LedgerError):
+                    raise OwnerGuardError('Owner attachment capacity is unavailable.') from None
+                raise
+            raise OwnerCapacityUnavailable('Owner attachment capacity is unavailable.') from None
 
     def admit(self, admission, *, now_ms):
         if self._native_permission is None:

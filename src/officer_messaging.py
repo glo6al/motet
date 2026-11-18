@@ -621,7 +621,7 @@ class MessagingStore:
                         self._check_owner_slots(*counts)
                         self._save(row, commit=False, ordinary_proof=proof)
                 except OwnerCapacityUnavailable:
-                    raise MessageNotSubmitted(503, 'Motet could not verify capacity in the message queue.') from None
+                    raise MessageNotSubmitted(503, 'Motet could not check the message queue. Nothing was sent.') from None
                 except OwnerGuardError:
                     raise MessagingError(503, 'Owner attachment capacity is unavailable.') from None
                 self._history_outcome(row)
