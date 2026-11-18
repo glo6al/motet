@@ -16,6 +16,35 @@ def test_import_is_quiet():
     check('import does not load a key', server.KEY == '')
 
 
+def test_release_version():
+    import re
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    page, _ = server.page_with_nonce()
+    versions = re.findall(rb'<meta name="motet-version" content="([0-9]+\.[0-9]+\.[0-9]+)">', page)
+    check('page carries one release version', len(versions) == 1)
+    version = versions[0].decode('ascii')
+    check('Settings reads the page version',
+          b'versionNote.textContent=\'Motet \'+document.querySelector(\'meta[name="motet-version"]\').content' in page)
+    with tempfile.TemporaryDirectory() as directory:
+        result = subprocess.run(
+            [sys.executable, str(root / 'src/server.py'), '--version'],
+            cwd=directory, env={**os.environ, 'PORT': 'invalid'},
+            capture_output=True, text=True, timeout=10,
+        )
+    check('--version prints the page version and exits before startup',
+          result.returncode == 0 and result.stdout == 'Motet ' + version + '\n' and not result.stderr)
+    changelog = (root / 'CHANGELOG.md').read_text(encoding='utf-8')
+    newest = next((line for line in changelog.splitlines() if line.startswith('## ')), '')
+    check('newest changelog entry agrees with the page',
+          re.fullmatch(r'## ' + re.escape(version) + r' — [0-9]{4}-[0-9]{2}-[0-9]{2}', newest))
+    readme = (root / 'README.md').read_text(encoding='utf-8')
+    check('README links to the current changelog version',
+          f'Current version is [v{version}](CHANGELOG.md).' in readme.splitlines())
+
+
 def test_static_brand_assets():
     """Exercise the real GET handler without a key, including its exact allowlist."""
     import gzip
@@ -1552,6 +1581,7 @@ if __name__ == '__main__':
     test_idle_stream_fence()
     test_idle_tail_catchup()
     test_import_is_quiet()
+    test_release_version()
     test_static_brand_assets()
     test_pair_keeps_only_supported_view_flags()
     test_session_facts()

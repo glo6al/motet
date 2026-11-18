@@ -23,6 +23,8 @@
 
 > **Early.** macOS; on Windows only the automated tests have run, in CI. Python 3 standard library, no dependencies, one HTML page. Watching is safe to try today; read the [trust boundary](#trust-boundary) before switching on anything that answers prompts.
 
+Current version is [v0.1.0](CHANGELOG.md).
+
 The demos use fictional agents and projects. For public recordings, use `?demo` for Workspace or `?demo&ui=classic` for Classic. Live conversations and command output can contain personal information and absolute file paths.
 
 ## Why this exists

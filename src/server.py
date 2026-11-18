@@ -33,7 +33,20 @@ Trust boundary
 Run:  python3 src/server.py      (Windows: py src/server.py) then open http://127.0.0.1:8793/ and press Unlock
 Env:  PORT (8793), WINDOW_MIN (20: how recently a session must have been active to appear)
 """
-import glob, gzip, hashlib, hmac, http.client, json, math, mimetypes, os, re, secrets, select, socket, sqlite3, ssl, subprocess, sys, threading, time, urllib.parse
+import re
+import sys
+from pathlib import Path
+
+if __name__ == '__main__' and sys.argv[1:] == ['--version']:
+    page = Path(__file__).with_name('web') / 'index.html'
+    version = re.search(r'^<meta name="motet-version" content="([0-9]+\.[0-9]+\.[0-9]+)">$',
+                        page.read_text(encoding='utf-8'), re.MULTILINE)
+    if version is None:
+        raise SystemExit('Motet version is missing from the page.')
+    print('Motet ' + version[1])
+    raise SystemExit(0)
+
+import glob, gzip, hashlib, hmac, http.client, json, math, mimetypes, os, secrets, select, socket, sqlite3, ssl, subprocess, threading, time, urllib.parse
 import uuid
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone

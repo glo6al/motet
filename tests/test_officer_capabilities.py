@@ -190,11 +190,14 @@ class OfficerCapabilityTests(unittest.TestCase):
 
     def seed(self, dense=False):
         if dense:
+            # A single UTC day keeps this fixture in one daily evidence bucket per chat.
+            start = int(self.now // 86400) * 86400 - 3600
             for index in range(1200):
-                self.add('Middle milestone: the rounding decision was reversed.' if index == 600 else 'Busy pricing detail ' + str(index))
+                self.add('Middle milestone: the rounding decision was reversed.' if index == 600 else 'Busy pricing detail ' + str(index),
+                         stamp=start + index + 1)
             for index in range(3):
                 self.add('Quiet critical decision: preserve old session rows.' if index == 1 else 'Quiet migration detail ' + str(index),
-                         chat='x:demo-bram', name='Bram', stamp=self.now - 3000 + index)
+                         chat='x:demo-bram', name='Bram', stamp=start + 600 + index)
         else:
             self.add('Fictional saved progress: pricing review needs a rounding correction.')
         self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))

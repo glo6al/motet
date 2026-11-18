@@ -1,6 +1,6 @@
 # Motet artwork
 
-The wordmark uses outlined Avenir Next Bold lettering. The two t crossbars rise toward the right. The o uses an adaptation of the Bravura whole note, with its slanted opening. The note also serves as the standalone icon. The Avenir and Bravura font files are unnecessary to rebuild and are not distributed here. [Bravura source](https://github.com/steinbergmedia/bravura)
+The wordmark uses outlined Avenir Next Bold lettering. The two t crossbars rise toward the right. The o uses an adaptation of the Bravura whole note, with a level outer oval and an opening angled about 19° from vertical. The note also serves as the standalone icon. The Avenir and Bravura font files are unnecessary to rebuild and are not distributed here. [Bravura source](https://github.com/steinbergmedia/bravura)
 
 - `svg/watch-*.svg` and `png/watch-*.png` contain the wordmark in charcoal, white and black.
 - `svg/mark-*.svg` and `png/mark-*.png` contain the single note in the same colors.

@@ -10,7 +10,15 @@ const pair=()=>({version:1,peer_receive:true,port:8793,pair_code:'fictional_setu
 function page(code=source,refresh=refreshSource){
  const nodes=new Map(),calls=[];
  const context={DEMO:false,KEY:'fictional-owner-key',claiming:false,locked:false,connected:true,OFUI:{recipient:'agent',epoch:1},CU:{capability:null},A:{[agent]:{name:'Atlas',runtime:'Claude'}},target:agent,Date,encodeURIComponent,cuDirectReason:()=>'',ofContextPaint(){},AbortSignal:{timeout:()=>null},
-  $(id){if(!nodes.has(id))nodes.set(id,{hidden:false,disabled:false,textContent:''});return nodes.get(id)},cuTarget(){return context.target},fetch:async(url,opts)=>{calls.push({url,opts});return {ok:true,json:async()=>url==='/claude-mod-revoke'?{version:1,revoked:true}:pair()}}};
+  $(id){
+   if(!nodes.has(id)){
+    const attributes=new Set();
+    nodes.set(id,{hidden:false,disabled:false,textContent:'',
+     toggleAttribute(name,force=!attributes.has(name)){if(force)attributes.add(name);else attributes.delete(name);return force;},
+     hasAttribute(name){return attributes.has(name);}});
+   }
+   return nodes.get(id);
+  },cuTarget(){return context.target},fetch:async(url,opts)=>{calls.push({url,opts});return {ok:true,json:async()=>url==='/claude-mod-revoke'?{version:1,revoked:true}:pair()}}};
  function capability(state='setup_needed',authorized=false,peer_receive=authorized){context.CU.capability={agent:context.target,key:context.KEY,epoch:context.OFUI.epoch,status:'ready',expires:Date.now()+15000,queue:{available:state==='connected',claude_setup:{authorized,state,peer_receive}}};}
  capability();vm.createContext(context);const api=vm.runInContext(code+refresh+';({CCM,cuCapabilityRefresh,cuClaudeConnect,cuClaudeRevoke,cuClaudeSetupPaint,cuClaudePair,cuClaudeEligible})',context);
  return {context,nodes,calls,capability,...api};
@@ -31,8 +39,17 @@ async function checks(code=source,refresh=refreshSource){
  assert.equal(pending.CCM.pair,null);assert.equal(pending.nodes.get('#claudeConnectCommand').textContent,'');
  const connected=page(code);await connected.cuClaudeConnect();connected.capability('waiting',true);connected.cuClaudeSetupPaint();
  assert.equal(connected.CCM.pair,null,'successful global authorization clears the one-use command');assert.equal(connected.nodes.get('#claudeConnect').hidden,true);assert.equal(connected.nodes.get('#claudeRevoke').hidden,false);assert.match(connected.nodes.get('#claudeConnectNote').textContent,/no separate installation or pairing/);
- connected.capability('connected',true);connected.cuClaudeSetupPaint();assert.equal(connected.nodes.get('#claudeSetup').hidden,false,'connected status and revocation stay visible');assert.match(connected.nodes.get('#claudeConnectNote').textContent,/this exact Claude chat/);
- connected.capability('disconnected',true);connected.cuClaudeSetupPaint();assert.match(connected.nodes.get('#claudeConnectNote').textContent,/watch-connect/);
+ const setup=connected.nodes.get('#claudeSetup'),note=connected.nodes.get('#claudeConnectNote');
+ assert.equal(setup.hasAttribute('data-quiet'),false);
+ connected.capability('connected',true);connected.cuClaudeSetupPaint();
+ assert.equal(setup.hasAttribute('data-quiet'),true,'an already connected chat keeps the composer quiet');
+ assert.equal(note.hidden,true);
+ assert.equal(note.textContent,'');
+ assert.equal(connected.nodes.get('#claudeRevoke').hidden,false,'the revoke control stays available outside the composer');
+ connected.capability('disconnected',true);connected.cuClaudeSetupPaint();
+ assert.equal(setup.hasAttribute('data-quiet'),false);
+ assert.equal(note.hidden,false);
+ assert.match(note.textContent,/watch-connect/);
  await connected.cuClaudeRevoke();assert.equal(connected.calls.at(-1).url,'/claude-mod-revoke');assert.equal(connected.context.CU.capability,null,'revoke discards previous readiness proof');assert.match(connected.nodes.get('#claudeConnectNote').textContent,/Already queued native input may still run/);
  const upgrade=page(code);upgrade.capability('connected',true,false);upgrade.cuClaudeSetupPaint();
  assert.equal(upgrade.nodes.get('#claudeConnect').hidden,false);assert.equal(upgrade.nodes.get('#claudeConnect').textContent,'Enable agent messaging');assert.equal(upgrade.nodes.get('#claudeRevoke').hidden,false);assert.match(upgrade.nodes.get('#claudeConnectNote').textContent,/all connected clients/);
