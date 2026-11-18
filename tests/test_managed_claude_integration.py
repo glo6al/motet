@@ -51,7 +51,7 @@ class ManagedIntegrationTests(unittest.TestCase):
 
     @contextmanager
     def http(self):
-        httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+        httpd = server.Server(('127.0.0.1', 0), server.H)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         with patch.object(server, 'PORT', httpd.server_port), patch.object(server, 'KEY', 'fictional-owner'):
             thread.start()

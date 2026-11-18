@@ -42,7 +42,7 @@ class OwnerActionsTests(unittest.TestCase):
         server.MESSAGING, server.KEY = self.store, 'fixture-owner-key'
         server.AGENTS.clear(); server.AGENTS.update({self.aid:{'runtime':'Codex','name':'Atlas'}, self.cid:{'runtime':'Claude','name':'Mira'}})
         server.OFFICER_ASKS.clear()
-        self.httpd = server.ThreadingHTTPServer(('127.0.0.1',0),server.H)
+        self.httpd = server.Server(('127.0.0.1',0),server.H)
         server.PORT = self.httpd.server_port
         self.thread = threading.Thread(target=self.httpd.serve_forever,daemon=True); self.thread.start()
 

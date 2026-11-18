@@ -40,7 +40,7 @@ class ClaudeModTests(unittest.TestCase):
         self.previous = server.MESSAGING, server.KEY, server.PORT, dict(server.AGENTS)
         server.MESSAGING, server.KEY = self.store, 'fictional-owner-key'
         server.AGENTS.clear(); server.AGENTS.update(self.agents)
-        self.httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+        self.httpd = server.Server(('127.0.0.1', 0), server.H)
         server.PORT = self.httpd.server_port
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()

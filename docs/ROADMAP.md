@@ -6,6 +6,10 @@ Motet brings supported sessions, their context, and their available capabilities
 
 This is a working study. The sections below distinguish shipped behavior, investigated gaps, proposed priorities, and longer-term ideas. Priorities are a direction for planning, not release dates or promises of access to a provider's private interfaces. The [README capability table](../README.md#current-provider-capabilities) is the reference for what users can do today.
 
+## Next after v0.1.0
+
+- **Enable file delivery for Claude setups first created with an older Python.** Design an explicit, owner-approved adoption or migration of their existing managed-chat storage before enabling files. Do not migrate automatically. Preserve ordinary messaging, retained identities and every existing file-protection check throughout.
+
 ## Available today
 
 - **Supported local sessions:** observation of Claude Code and Codex session logs and Cursor and Antigravity transcripts. Recently active sessions appear by default; this is not an import of every chat or full account history. Codex cloud work on this computer has command observation only.

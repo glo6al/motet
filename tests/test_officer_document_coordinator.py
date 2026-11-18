@@ -3,6 +3,7 @@ from dataclasses import replace
 import copy
 import http.client
 import http.server
+from loopback_http_fixture import LoopbackHTTPServer
 import io
 import json
 import os
@@ -460,7 +461,7 @@ class CoordinatorTests(unittest.TestCase):
                 self.end_headers();self.wfile.write(body)
             def do_GET(self):handle_http(self,service,KEY,self.server.server_port)
             def do_POST(self):handle_http(self,service,KEY,self.server.server_port)
-        httpd=http.server.ThreadingHTTPServer(('127.0.0.1',0),HTTP)
+        httpd=LoopbackHTTPServer(('127.0.0.1',0),HTTP)
         thread=threading.Thread(target=httpd.serve_forever);thread.start()
         def call(method,path,data=None,headers=None):
             conn=http.client.HTTPConnection('127.0.0.1',httpd.server_port,timeout=5)

@@ -1,6 +1,7 @@
 """Owner CLI tests use fictional private keys and disposable loopback servers only."""
 import contextlib
 import http.server
+from loopback_http_fixture import LoopbackHTTPServer
 import importlib.util
 import io
 import json
@@ -57,7 +58,7 @@ class ClearTests(unittest.TestCase):
                 self.send_response(200); self.send_header('Content-Length', str(len(raw))); self.end_headers()
                 self.wfile.write(raw)
 
-        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
         self.port = self.server.server_address[1]
 
@@ -93,7 +94,7 @@ class ClearTests(unittest.TestCase):
         class OwnerHandler(server.H):
             def log_message(self, *args):
                 pass
-        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), OwnerHandler)
+        self.server = LoopbackHTTPServer(('127.0.0.1', 0), OwnerHandler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
         store = MessagingStore(str(self.state), str(self.root / 'sessions'))

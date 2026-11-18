@@ -1,0 +1,8 @@
+# Source extraction and causal mutations use LF on every checkout.
+# Binary assets retain Git's ordinary binary handling.
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.py text eol=lf

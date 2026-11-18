@@ -125,14 +125,14 @@ function createNativeAgentAttachmentsPage(o) {
   const current = b => !!b && binding === b && sameSelection(b, o.selection());
   const sameSelection = (b, selected) => !!selected && b.key === selected.key && b.target === selected.target && b.identity === selected.identity;
   const safeUUID = () => typeof o.crypto?.randomUUID === 'function' && !!o.crypto?.subtle;
-  const sqliteUnavailable = s => !!s && s.error?.code === 'sqlite_unavailable' &&
+  const passiveFileRefusal = s => !!s && ['sqlite_unavailable','legacy_managed_storage'].includes(s.error?.code) &&
     Object.values(s.features).every(value => value === false) && !s.context && !s.draft && !s.unsavedEdit &&
     !s.uploads.length && !s.attempts.length && !s.requests.length && !s.uncertain && !s.busy;
   const stateOwns = b => {
     if (!b) return false;
     const s = b.state;
     if (!s) return true;
-    if (sqliteUnavailable(s)) return false;
+    if (passiveFileRefusal(s)) return false;
     if (!s.features.drafts) return s.busy || s.draftRead === 'idle' || !!s.error;
     return s.draftRead !== 'complete' || s.uncertain || !!s.attempts.length || !!s.uploads.length ||
       !!s.draft || !!s.unsavedEdit || ['addFiles','createDraft','resume','editText','removeFile','removeSelection','discardDraft','send'].includes(b.op);
@@ -160,7 +160,8 @@ function createNativeAgentAttachmentsPage(o) {
   function restoreOrdinary(keep) {
     if (!composer) return;
     input.readOnly = composer.readOnly;
-    input.maxLength = composer.maxLength;
+    if (composer.maxLength < 0) input.removeAttribute('maxlength');
+    else input.maxLength = composer.maxLength;
     input.value = keep ? composer.text : '';
     if (keep && Number.isInteger(composer.start) && Number.isInteger(composer.end)) {
       input.setSelectionRange?.(composer.start, composer.end, composer.direction);
@@ -484,7 +485,7 @@ function createNativeAgentAttachmentsPage(o) {
 
   function message(b, s, label) {
     const look = ['Look again', () => invoke(b, 'refresh')];
-    if (!b.invalid && sqliteUnavailable(s)) return [s.error.message, []];
+    if (!b.invalid && passiveFileRefusal(s)) return [s.error.message, []];
     const hold = !b.invalid && sendHold(s);
     if (hold && !s.busy && !b.op) {
       const detail = s.draft || holdCopy(s, hold) ? 'so nothing more is being changed.' : 'and the saved draft could not be read here.';

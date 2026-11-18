@@ -32,6 +32,7 @@ const PRE_EFFECT = {
 };
 const MESSAGES = {
   sqlite_unavailable: 'Sending files to agents is unavailable because this Python uses an older database library. Install a newer Python and use it to restart Motet.',
+  legacy_managed_storage: "Sending files to agents is unavailable because Motet's Claude chats were first set up with an older Python. Ordinary messages still work.",
   invalid_response: 'The attachment response could not be verified.', invalid_request: 'Choose an exact attachment item.',
   unavailable: 'This attachment operation is unavailable.', unauthorized: 'Owner access changed.',
   forbidden: 'The attachment could not be authorized.', destination_unavailable: 'Attachments are unavailable for this agent.',

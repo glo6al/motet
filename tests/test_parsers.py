@@ -69,7 +69,7 @@ def test_static_brand_assets():
     }
     check('static exact names', set(server.STATIC) == set(assets))
     previous_port = server.PORT
-    httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+    httpd = server.Server(('127.0.0.1', 0), server.H)
     server.PORT = httpd.server_port
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -154,7 +154,7 @@ def test_pair_keeps_only_supported_view_flags():
             document = Path(path).read_text(encoding='utf-8')
             redirects.append(json.loads(re.search(r'location\.replace\((.+)\)</script>', document)[1]))
 
-        with server.ThreadingHTTPServer(('127.0.0.1', 0), server.H) as httpd:
+        with server.Server(('127.0.0.1', 0), server.H) as httpd:
             with patch.multiple(server, PORT=httpd.server_port, HOME=home, KEY='fictional-pairing-key',
                                 CODES={}, LAST_PAIR=0.0, launch=launch), patch.object(threading, 'Timer'):
                 thread = threading.Thread(target=httpd.serve_forever, daemon=True)

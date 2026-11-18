@@ -414,8 +414,23 @@ def bind_native_composition(messaging, base_service, *, _qualification=None, cla
                     _unavailable()
                 return existing.owner_runtime
         composition = None
+        legacy_managed_storage = None
         try:
             _same_root(messaging, base_service.store)
+            if claude_room is not None:
+                namespace = NativeNamespaceFence(base_service.store.files.parent)
+
+                def legacy_managed_storage():
+                    with messaging.lock:
+                        return namespace.legacy_managed_storage(messaging.db)
+
+                # Managed chats may first be created after this startup declined
+                # files. Re-read their state before offering upgrade advice.
+                base_service._native_legacy_managed_storage = legacy_managed_storage
+                if legacy_managed_storage():
+                    messaging._native_composition_error = 'legacy_managed_storage'
+                    messaging._native_owner_error = 'legacy_managed_storage'
+                    return None
             with messaging.lock:
                 if not sqlite_marker_available(messaging.db):
                     # Retained protection is never reclassified as fresh storage.
@@ -454,6 +469,17 @@ def bind_native_composition(messaging, base_service, *, _qualification=None, cla
                                                       claude_room=claude_room, claude_index=claude_index, codex_room=codex_room)
         except (AttachmentError, NamespaceError):
             messaging._native_composition_error = 'setup_unavailable'
+            # A legacy chat may have won the race with fresh initialization.
+            # Do not install a files-only SQL guard into that ordinary registry.
+            # Failed or partial native installations retain the old path below.
+            if legacy_managed_storage is not None:
+                try:
+                    if legacy_managed_storage():
+                        messaging._native_composition_error = 'legacy_managed_storage'
+                        messaging._native_owner_error = 'legacy_managed_storage'
+                        return None
+                except NamespaceError:
+                    pass
         permission = composition._permission if composition is not None else None
         runtime = bind_owner_runtime(messaging, allow_install=True, _native_permission=permission, **settings)
         if composition is not None and runtime is not None:

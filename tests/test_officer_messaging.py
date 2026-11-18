@@ -516,7 +516,7 @@ class MessagingTests(unittest.TestCase):
         old_agents = server.AGENTS.copy()
         server.KEY, server.MESSAGING = 'test-key', self.store
         server.AGENTS.clear(); server.AGENTS.update(self.agents)
-        httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+        httpd = server.Server(('127.0.0.1', 0), server.H)
         server.PORT = httpd.server_port
         thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
         def request(method, path, headers=None, body=None):

@@ -181,7 +181,7 @@ class AdmissionTests(unittest.TestCase):
                 pass
         adapter = Adapter()
         store = NewChatService(self.home / 'private-state', adapter, lambda: [self.identity], enabled=True)
-        httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+        httpd = server.Server(('127.0.0.1', 0), server.H)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         def request(method, route, data=None):
             conn = http.client.HTTPConnection('127.0.0.1', httpd.server_port, timeout=3)
@@ -254,7 +254,7 @@ class DisabledHTTPTests(unittest.TestCase):
     def setUp(self):
         self.patches = [patch.object(server, 'NEW_CHAT', None), patch.object(server, 'KEY', 'fictional-owner-key')]
         for p in self.patches: p.start()
-        self.httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+        self.httpd = server.Server(('127.0.0.1', 0), server.H)
         self.portpatch = patch.object(server, 'PORT', self.httpd.server_port)
         self.portpatch.start()
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)

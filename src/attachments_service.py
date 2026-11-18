@@ -1,7 +1,7 @@
 """Owner-only attachment orchestration; no native or provider transport."""
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from attachments_owner_marker import SQLITE_UNAVAILABLE_MESSAGE
+from attachments_owner_marker import SQLITE_UNAVAILABLE_MESSAGE, LEGACY_MANAGED_UNAVAILABLE_MESSAGE
 import threading
 import time
 
@@ -38,6 +38,7 @@ class AttachmentService:
     def __init__(self, store, *, resolver, clock=time.time, officer_deletions=True):
         self.store, self.resolver, self.clock = store, resolver, clock
         self.native_sqlite_available = True
+        self._native_legacy_managed_storage = None
         self.catalogue = Catalogue(store)
         self.condition = threading.Condition()
         self.accepting, self.active = True, 0
@@ -146,6 +147,8 @@ class AttachmentService:
         return self.store.create_draft(self.binding(data), command_key)
 
     def native_selection(self, destination_id):
+        if self._native_legacy_managed_storage is not None and self._native_legacy_managed_storage():
+            fail('legacy_managed_storage', LEGACY_MANAGED_UNAVAILABLE_MESSAGE, 503)
         if not self.native_sqlite_available:
             fail('sqlite_unavailable', SQLITE_UNAVAILABLE_MESSAGE, 503)
         fail('attachments_disabled', 'Native agent attachments are unavailable.', 503)

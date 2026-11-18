@@ -88,7 +88,7 @@ File cards distinguish Motet's kept copy, files supplied for a particular answer
 
 The Files view can remove Motet's retained original, with explicit confirmation and status recovery. This does not remove the original you selected, a provider's copy, or your messages. Dependent answers stop being shown; uncertain cleanup is not reported as success. Local file management can remain available while file reading is off. See [Set up Motet file reading](docs/MOTET_FILE_READING.md) for the local policy, supported formats and usage limits.
 
-**Files to agents** ships enabled for eligible local Codex and plugin-connected Claude chats. Attach a PDF, PNG or JPEG in the agent's workspace composer. The draft is kept locally. Send saves copies to the verified project folder and queues the message with references to those files. Motet reports unconfirmed delivery as uncertain. The destination must be an eligible local parent chat in a regular Git checkout. Codex also requires macOS desktop version `26.1029.61003`, build `24614`, and a chat with GPT-6 Astra and compatible settings. A Claude chat needs a live attachment-capable Motet plugin connection. Claude sessions run by Motet do not qualify for this relay. The demo uses fictional files and never sends them.
+**Files to agents** ships enabled for eligible local Codex and plugin-connected Claude chats. Sending files to agents needs SQLite 3.45 or newer in the Python that runs Motet. If that Python has an older database library, Motet explains that file sending is unavailable while ordinary messaging remains available. Attach a PDF, PNG or JPEG in the agent's workspace composer. The draft is kept locally. Send saves copies to the verified project folder and queues the message with references to those files. Motet reports unconfirmed delivery as uncertain. The destination must be an eligible local parent chat in a regular Git checkout. Codex also requires macOS desktop version `26.1029.61003`, build `24614`, and a chat with GPT-6 Astra and compatible settings. A Claude chat needs a live attachment-capable Motet plugin connection. Claude sessions run by Motet do not qualify for this relay. The demo uses fictional files and never sends them.
 
 **New chat** ships enabled in the workspace on macOS. Choose a verified folder from the workspace's project list. On Codex Desktop version `26.1029.61003`, build `24614`, open a blank chat or use **Start working** with an instruction when that mode qualifies. **Claude run by Motet** launches local Claude Code with an instruction. Motet checks Claude Code `2.1.323` against a pinned executable hash and requires a verified readiness record for that Mac and user at `~/.live-room/managed-claude-readiness.json`. This release has no self-serve setup for that record. Blank managed Claude chats are unavailable. Motet shows the session on the stage only after it verifies it belongs to the selected folder. If a provider, app build, host or folder cannot be verified, the corresponding action stays unavailable.
 
@@ -148,8 +148,6 @@ The stage shows what those records contain and nothing else. That rules some thi
 ## Try it
 
 Two minutes, no install.
-
-Sending files to agents requires SQLite 3.45 or newer linked into the Python running Motet; Python 3.9 remains supported for core features.
 
 ```bash
 git clone https://github.com/glo6al/motet.git && cd motet

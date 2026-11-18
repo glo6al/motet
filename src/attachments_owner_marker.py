@@ -156,6 +156,8 @@ def sqlite_payload_state(column):
 
 SQLITE_UNAVAILABLE_MESSAGE = ('Sending files to agents is unavailable because this Python uses an older database library. '
                               'Install a newer Python and use it to restart Motet.')
+LEGACY_MANAGED_UNAVAILABLE_MESSAGE = ("Sending files to agents is unavailable because Motet's Claude chats "
+                                      "were first set up with an older Python. Ordinary messages still work.")
 
 
 def sqlite_marker_available(db):

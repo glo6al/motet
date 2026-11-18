@@ -35,7 +35,7 @@ class GlobalModIntegration(unittest.TestCase):
             server.AGENTS.clear()
             for native, name in zip(NATIVE, ['Atlas', 'Birch']):
                 server.AGENTS['c:'+native] = dict(runtime='Claude', name=name, cwd=os.path.realpath(temp))
-            httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+            httpd = server.Server(('127.0.0.1', 0), server.H)
             server.PORT = httpd.server_port
             thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
             try:

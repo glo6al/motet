@@ -185,7 +185,7 @@ class HistoryTests(unittest.TestCase):
             again = server.officer_ask([{'role':'user','content':'What did Cedar report?'}], call=live, request_id=ident)
             self.assertTrue(again['duplicate']); self.assertEqual(live.call_count, 1)
         self.store.close(); self.store = DeckLog(self.root, clock=lambda:self.now)
-        httpd = server.ThreadingHTTPServer(('127.0.0.1',0), server.H)
+        httpd = server.Server(('127.0.0.1',0), server.H)
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever,daemon=True); thread.start()
         try:

@@ -16,12 +16,22 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from attachments_owner_marker import (CLEAR, MARKER, UNCERTAIN, SQLITE_UNAVAILABLE_MESSAGE,
+                                      LEGACY_MANAGED_UNAVAILABLE_MESSAGE,
                                       lexical_payload_state, sqlite_marker_available)
 import attachments_owner_guards as guards
 import server
 
 
 class SemanticChecks(unittest.TestCase):
+    def test_python_and_client_notice_are_identical(self):
+        import re
+        source = (Path(__file__).resolve().parents[1] / 'src/web/native-agent-attachments-client.js').read_text(encoding='utf-8')
+        for code, expected in (('sqlite_unavailable', SQLITE_UNAVAILABLE_MESSAGE),
+                               ('legacy_managed_storage', LEGACY_MANAGED_UNAVAILABLE_MESSAGE)):
+            notice = re.search(code + r""": (['"])(.*?)\1""", source)
+            self.assertIsNotNone(notice)
+            self.assertEqual(notice.group(2), expected)
+
     def test_real_engine_capability_and_atomic_guard_refusal(self):
         from test_attachments_owner_transport import owner_schema
         with closing(sqlite3.connect(':memory:')) as db:

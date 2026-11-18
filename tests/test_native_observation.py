@@ -401,7 +401,7 @@ class HTTPTests(unittest.TestCase):
         self.svc = obs.NativeObservationService(lambda aid: {'runtime': 'Codex'} if aid == AID else None,
                     model_reader=lambda aid: (self.calls.append(aid), model())[1], input_reader=lambda *a, **k: None)
         self.svc.start()
-        self.http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+        self.http = server.Server(('127.0.0.1', 0), server.H)
         self.http.daemon_threads = True
         self.port = self.http.server_address[1]
         self.patches = [patch.object(server, 'KEY', 'fiction-owner-key'), patch.object(server, 'PORT', self.port),

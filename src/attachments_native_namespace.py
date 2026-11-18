@@ -190,6 +190,18 @@ class NativeNamespaceFence:
                             return True
             return False
 
+    def legacy_managed_storage(self, owner_db):
+        """Decline optional files for an unfenced managed registry; write nothing.
+
+        Any surviving native witness or owner protection keeps its existing
+        maintenance path. A legacy managed directory is not adopted or repaired.
+        The caller holds the owner database lock.
+        """
+        with _qualified():
+            if self.detected(owner_db=owner_db) or OwnerAttachmentGuard.probe(owner_db) is not None:
+                return False
+            return _present(self.root / MANAGED) or _present(self.root / MANAGED_EXPECTED)
+
     @contextmanager
     def host_fence(self):
         with _qualified(), _open(self.host) as (fd, _):

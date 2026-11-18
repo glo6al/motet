@@ -145,7 +145,7 @@ class HTTPTests(unittest.TestCase):
         AdminTests.setUp(self)
         self.old = server.MESSAGING, server.KEY, server.PORT
         server.MESSAGING, server.KEY = self.store, 'fictional-owner-key'
-        self.httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.H)
+        self.httpd = server.Server(('127.0.0.1', 0), server.H)
         server.PORT = self.port = self.httpd.server_port
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True); self.thread.start()
         self.addCleanup(self.cleanup_http)

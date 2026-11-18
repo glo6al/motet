@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Private temporary discovery and fake local HTTP; never runs a model."""
 import http.server
+from loopback_http_fixture import LoopbackHTTPServer
 import json
 import os
 import sys
@@ -52,7 +53,7 @@ class ClaudeChannelTests(unittest.TestCase):
                 if owner.body_delay: time.sleep(owner.body_delay)
                 try: self.wfile.write(raw)
                 except (BrokenPipeError, ConnectionResetError): pass
-        self.httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.httpd = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True); self.thread.start()
         self.descriptor = dict(version=1, session_id=self.sid, instance_id=self.instance, port=self.httpd.server_port, token='a' * 64)
         self.write_manifest()

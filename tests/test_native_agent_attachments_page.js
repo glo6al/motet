@@ -29,6 +29,12 @@ class Element {
   contains(node) { return node === this || this.children.some(n => n.contains(node)); }
   setAttribute(name, value) { this.attrs[name] = value; }
   getAttribute(name) { return this.attrs[name]; }
+  removeAttribute(name) { delete this.attrs[name]; }
+  get maxLength() { return this.attrs.maxlength === undefined ? -1 : Number(this.attrs.maxlength); }
+  set maxLength(value) {
+    if (value < 0) throw new RangeError('A textarea cannot be assigned a negative limit.');
+    this.attrs.maxlength = String(value);
+  }
   addEventListener(name, fn) { this.events[name] = fn; }
   get isConnected() { return !!this.parentNode; }
   get textContent() { return this.words + this.children.map(n => n.textContent).join(''); }
@@ -37,10 +43,11 @@ class Element {
   querySelector(selector) { return this.all().find(node => node.className === selector.slice(1)); }
 }
 async function tick() { for (let i=0;i<8;i++) await Promise.resolve(); }
-async function harness(initial = stage(1), target = destination, stage2Fixture = false) {
+async function harness(initial = stage(1), target = destination, stage2Fixture = false, inputLimit = 2000) {
   const top = new Element(), row = new Element(), input = new Element(), compose = new Element(), send = new Element();
   const log = new Element();
   top.append(log, compose, row); compose.append(input); row.append(send); input.value = 'Independent ordinary text';
+  if (inputLimit >= 0) input.maxLength = inputLimit;
   const classes = new Set(), tasks = new Map(), calls = [], paints = [];
   let changed, snapshot = initial, serial = 0, nearEnd = true, selected = {target, identity:{}, key:'fictional-owner'};
   function publish(value) { snapshot = value; changed(value); return value; }
@@ -138,15 +145,17 @@ test('opening the picker from saved drafts does not create an empty draft', asyn
   assert.deepEqual(h.calls,[['picker']]);
 });
 
-test('SQLite notice leaves ordinary words and Send usable only without retained work', async () => {
+for (const [code, expected] of [
+  ['sqlite_unavailable', 'Sending files to agents is unavailable because this Python uses an older database library. Install a newer Python and use it to restart Motet.'],
+  ['legacy_managed_storage', "Sending files to agents is unavailable because Motet's Claude chats were first set up with an older Python. Ordinary messages still work."],
+]) test(code+' notice leaves ordinary words and Send usable only without retained work', async () => {
   const {createNativeAgentAttachmentsClient} = require('../src/web/native-agent-attachments-client.js');
-  const expected = 'Sending files to agents is unavailable because this Python uses an older database library. Install a newer Python and use it to restart Motet.';
   const calls=[];
   const client=createNativeAgentAttachmentsClient({enabled:true,demo:false,auth:()=> 'fictional-owner',
     crypto:require('node:crypto').webcrypto,AbortController,fetch:async (path,init)=>{
       calls.push([path,init.method]);
       return new Response(JSON.stringify({schemaVersion:1,fixture:false,serverTime:'2030-01-01T00:00:00Z',
-        error:{code:'sqlite_unavailable',message:'Untrusted wire text.',retryable:false}}),{status:503});
+        error:{code,message:'Untrusted wire text.',retryable:false}}),{status:503});
     }});
   const passive=await client.connect({destinationId:destination});
   const h=await harness(passive);
@@ -157,6 +166,11 @@ test('SQLite notice leaves ordinary words and Send usable only without retained 
   assert.equal(h.p.ownsInput(),false);
   assert.equal(h.p.blocksSend(),false);
   assert.deepEqual(calls,[[`/api/attachments/native/selection?destinationId=${destination}`,'GET']]);
+  const contextual = JSON.parse(JSON.stringify(passive));
+  contextual.context = stage(1).context;
+  assert.equal(stageOneSnapshot(contextual, destination), true, 'a retained context is a valid client state');
+  const withContext = await harness(contextual);
+  assert.equal(withContext.p.blocksSend(), true, 'a qualified context with this error stays held');
   for (const change of [s=>s.uncertain=true,s=>s.uploads=stage(1,{uploads:[{}]}).uploads,
     s=>s.attempts=[{id:'fictional',draftId:null,requestId:null,phase:'creating',submitted:null}],
     s=>s.busy=true]) {
@@ -165,6 +179,15 @@ test('SQLite notice leaves ordinary words and Send usable only without retained 
     assert.equal(locked.p.blocksSend(),true,'retained or unreadable work cannot become passive');
   }
   client.dispose();
+});
+
+test('returning to ordinary input restores an unlimited textarea', async () => {
+  const h = await harness(stage(1), destination, false, -1);
+  h.publish(stage(2, {draft:null}));
+  assert.equal(h.input.value, 'Independent ordinary text');
+  assert.equal(h.input.maxLength, -1);
+  assert.equal(h.input.getAttribute('maxlength'), undefined);
+  assert.equal(h.send.disabled, false);
 });
 
 test('discard needs an explicit confirmation for the displayed draft version', async () => {
