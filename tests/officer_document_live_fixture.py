@@ -14,13 +14,16 @@ Add --fictional-station --seed-answer-scope station to prepare them at the synth
 """
 import argparse
 from contextlib import ExitStack
+import faulthandler
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import socket
+import socketserver
 import ssl
 import sys
 import tempfile
@@ -93,6 +96,7 @@ def main():
     parser.add_argument('--browser-fault', choices=BROWSER_FAULTS, default='none')
     parser.add_argument('--management-fault', choices=('none', 'unreadable-once'), default='none')
     parser.add_argument('--upload-fault', choices=('none', 'interrupted-once'), default='none')
+    parser.add_argument('--trace-startup', action='store_true', help='Print a traceback if startup stalls')
     args = parser.parse_args()
     if args.seed_count != 1 and not (args.seed_file or args.reading_off):
         parser.error('--seed-count requires --seed-file or --reading-off')
@@ -117,6 +121,8 @@ def main():
                           'browserFault': args.browser_fault, 'managementFault': args.management_fault,
                           'uploadFault': args.upload_fault, 'clock': 'advancing-fictional', **extra_metadata}))
         return
+    if args.trace_startup:
+        faulthandler.dump_traceback_later(10)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
     import server
     import officer_documents as documents
@@ -342,6 +348,12 @@ def main():
             self.active, self.active_lock, self.closing = set(), threading.Lock(), False
             super().__init__(*a, **kw)
 
+        def server_bind(self):
+            # The fixture binds a numeric loopback address. HTTPServer's reverse
+            # lookup serves no purpose here and can stall startup on hosted runners.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
         def process_request(self, request, address):
             with self.active_lock:
                 if self.closing:
@@ -381,6 +393,7 @@ def main():
         for name in ('connect', 'connect_ex'):
             stack.enter_context(patch.object(socket.socket, name, no_network))
         stack.enter_context(patch.object(socket, 'create_connection', no_network))
+        stack.enter_context(patch.object(socket, 'getfqdn', no_network))
         stack.enter_context(patch.object(transport, '_tls_context',
                                        lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)))
         root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='watch-offline-browser-'))).resolve()
@@ -516,6 +529,8 @@ def main():
         httpd = FixtureServer(('127.0.0.1', 0), Handler)
         stack.callback(httpd.server_close)
         server.PORT = httpd.server_port
+        if args.trace_startup:
+            faulthandler.cancel_dump_traceback_later()
         print('OFFLINE fixture URL: http://127.0.0.1:%d/#k=%s' % (httpd.server_port, KEY), flush=True)
         print('Fictional owner key: ' + KEY + '\nStop with Ctrl-C; temporary state is removed.', flush=True)
         if args.browser_fault != 'none':
@@ -531,4 +546,5 @@ def main():
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     main()

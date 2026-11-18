@@ -173,8 +173,9 @@ class PrivacyCheckRepositoryTests(unittest.TestCase):
         if host is not None:   # the machine name the operating system reports, injected
             command = [sys.executable, '-c', 'import runpy, socket, sys; host = sys.argv.pop(1); socket.gethostname = lambda: host; '
                        "sys.argv[0] = 'scripts/check_privacy.py'; runpy.run_path(sys.argv[0], run_name='__main__')", host, *args]
-        run = subprocess.run(command, cwd=self.repo, env=env or self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-        return run.returncode, run.stdout.decode('utf-8', 'replace') + run.stderr.decode('utf-8', 'replace')
+        run = subprocess.run(command, cwd=self.repo, env=env or self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             encoding='utf-8', errors='replace', timeout=10)
+        return run.returncode, run.stdout + run.stderr
 
     def test_report_names_the_kind_and_place_but_not_the_finding(self):
         self.write('notes.txt', 'first line\nsee %s and %s\n' % (self.LEAK, self.SENTINEL))
@@ -308,22 +309,22 @@ class PrivacyCheckRepositoryTests(unittest.TestCase):
         base = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=self.repo, env=self.env, stdout=subprocess.PIPE, check=True).stdout.decode().strip()
         self.write('.gitattributes', '*.dat binary\n')
         self.write('marked.dat', 'see %s\n' % self.LEAK)
-        with open(os.path.join(self.repo, 'nul.txt'), 'wb') as f:
+        with open(os.path.join(self.repo, 'embedded-nul.txt'), 'wb') as f:
             f.write(b'header\0\nsee ' + self.LEAK.encode() + b'\n')
-        self.git('add', '.gitattributes', 'marked.dat', 'nul.txt')
+        self.git('add', '.gitattributes', 'marked.dat', 'embedded-nul.txt')
         code, out = self.check('--staged')
         self.assertEqual(code, 1, out)
         self.assertIn('[personal macOS user path] marked.dat:1', out)
-        self.assertIn('[personal macOS user path] nul.txt:2', out)
+        self.assertIn('[personal macOS user path] embedded-nul.txt:2', out)
         self.git('commit', '-q', '-m', 'Add data')
-        self.git('rm', '-q', 'marked.dat', 'nul.txt')
+        self.git('rm', '-q', 'marked.dat', 'embedded-nul.txt')
         self.git('commit', '-q', '-m', 'Remove data')
         code, out = self.check('--all')
         self.assertEqual(code, 0, out)
         code, out = self.check('--range', base + '..HEAD')
         self.assertEqual(code, 1, out)
         self.assertIn('marked.dat:1', out)
-        self.assertIn('nul.txt:2', out)
+        self.assertIn('embedded-nul.txt:2', out)
 
     @unittest.skipIf(os.name == 'nt', 'Windows file names cannot hold a newline')
     def test_each_finding_is_one_log_line_whatever_the_file_name(self):
@@ -362,8 +363,9 @@ class PrivacyCheckRepositoryTests(unittest.TestCase):
             self.assertEqual(code, 1, case + ': ' + out)
             self.assertIn('origin/main could not be read', out, case)
         os.remove(loose)
-        with open(os.path.join(self.repo, '.git', 'packed-refs'), 'a') as f:
-            f.write('%s refs/remotes/origin/main\n' % head)
+        self.git('update-ref', 'refs/remotes/origin/main', head)
+        self.git('pack-refs', '--all')
+        self.assertFalse(os.path.exists(loose), 'Git must pack the comparison ref')
         code, out = self.check()
         self.assertEqual(code, 1, out)
         self.assertIn('notes.txt:1', out, 'a packed origin/main is compared too')

@@ -35,14 +35,17 @@ class FixtureProcess(unittest.TestCase):
     def start(self, outcome='normal', *, arguments=None):
         flags = ['--reading-off', '--deletion-outcome', outcome] if arguments is None else arguments
         self.child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('officer_document_live_fixture.py')),
-            *flags], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            '--trace-startup', *flags], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.stopped = False
         self.addCleanup(self.stop)
-        ready, _, _ = select.select([self.child.stdout], [], [], 10)
-        self.assertTrue(ready, 'Fixture startup timed out')
-        line = self.child.stdout.readline()
+        ready, _, _ = select.select([self.child.stdout], [], [], 15)
+        line = self.child.stdout.readline() if ready else ''
         match = re.search(r'http://127\.0\.0\.1:\d+', line)
-        self.assertIsNotNone(match, 'Fixture did not start')
+        if match is None:
+            self.stopped = True
+            self.child.kill()
+            _, err = self.child.communicate(timeout=5)
+            self.fail('Fixture did not print its ready URL: ' + err[-4000:])
         self.origin = match[0]
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         if arguments is not None:

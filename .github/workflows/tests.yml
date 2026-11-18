@@ -4,7 +4,7 @@ permissions:
   contents: read
 jobs:
   tests:
-    timeout-minutes: 20
+    timeout-minutes: 40
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -57,6 +57,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_document_live_fixture.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_officer_document_page_embed.py
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_document_page_routes.py
@@ -89,8 +90,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_attachments_http.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_attachments_integration.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_attachments_native_composition.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_attachments_native_deletion.py
@@ -113,6 +116,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_attachments_proof_harness.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python -m unittest discover -s tests -p test_attachments_workspace_lifetime.py   # its __main__ is a child-process helper
         if: ${{ !cancelled() }}
       - run: python tests/test_codex_attachment_adapter.py
@@ -123,10 +127,12 @@ jobs:
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_codex_attachment_integration.py
         if: ${{ !cancelled() && runner.os == 'macOS' }}
+        timeout-minutes: 5
       - run: python tests/test_claude_attachment_adapter.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_claude_attachment_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python tests/test_native_managed_namespace.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_attachments_expiry_time.py
@@ -139,18 +145,23 @@ jobs:
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_managed_claude_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python tests/test_managed_claude_http.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: node docs/fixtures/new-chat/managed-fixture.test.mjs
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_new_chat_http.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_new_chat_inventory.py
         if: ${{ !cancelled() }}
       - run: python tests/test_codex_new_chat.py
         if: ${{ !cancelled() }}
       - run: python tests/test_new_chat_integration.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: node --test docs/fixtures/new-chat/fixture.test.mjs
         if: ${{ !cancelled() }}
       - run: python tests/test_owner_actions.py
@@ -165,6 +176,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_deck_log_integration.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_antigravity.py
         if: ${{ !cancelled() }}
       - run: python tests/test_check_privacy.py
@@ -189,6 +201,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_anthropic_reporting_integration.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_officer_request.py
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_evidence.py
@@ -241,8 +254,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_claude_global_integration.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_claude_channel.py
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_watch_claude.py
         if: ${{ !cancelled() }}
       - run: npm --prefix integrations/claude ci --ignore-scripts --no-audit --no-fund
@@ -251,12 +266,16 @@ jobs:
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_claude_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python tests/test_peer_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python tests/test_claude_peer_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python tests/test_peer_reply_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: npm --prefix integrations/claude-mod test
         if: ${{ !cancelled() }}
       - run: node tests/test_claude_mod_page.js
@@ -265,6 +284,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: node tests/test_page.js      # the page's path helpers, outside a browser
         if: ${{ !cancelled() }}
+        timeout-minutes: 7
       - run: node tests/test_app_marks.js
         if: ${{ !cancelled() }}
       - run: node tests/test_officer_evidence_ui.js
@@ -275,21 +295,26 @@ jobs:
         if: ${{ !cancelled() }}
       - run: node tests/test_claude_attachment_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: node tests/test_native_agent_attachments_client.js
         if: ${{ !cancelled() }}
       - run: node tests/test_native_agent_attachments_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: node tests/test_native_agent_attachments_journal.js
         if: ${{ !cancelled() }}
       - run: node tests/test_native_agent_attachments_page.js
         if: ${{ !cancelled() }}
       - run: node tests/test_native_agent_attachments_stage23_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: node tests/test_officer_document_browser_faults.js
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: node tests/test_officer_document_pending.js
         if: ${{ !cancelled() }}
       - run: node tests/test_officer_documents_client.js
         if: ${{ !cancelled() }}
       - run: node tests/test_officer_documents_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
