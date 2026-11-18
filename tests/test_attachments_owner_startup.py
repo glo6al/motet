@@ -21,6 +21,7 @@ import attachments_owner_runtime as runtime
 import attachments_owner_transport as owner
 import officer_messaging as messaging
 import peer_bridge
+import peer_lifecycle
 import server
 from test_attachments_owner_guards import admission, insert, install
 
@@ -141,6 +142,25 @@ class StartupTests(unittest.TestCase):
     def save(self, row):
         with self.store.lock:
             self.store._save(row)
+
+    def retained_peer(self, execution, *, age=120):
+        launched = execution != 'dropped'
+        row = self.ordinary_row(age=age, origin='peer', bridge_version=2, launched=launched,
+                                state='unknown' if launched else 'failed', error='Fictional peer outcome.')
+        if execution == 'completed':
+            row.update(settled=True, bound_turn='fictional-turn', capture_disposition='withheld')
+        identity = row['request_id']
+        with self.store.db:
+            insert(self.store.db, 'shared_bridge_requests', (uid(), self.agent, '{}', 'hash', identity,
+                   'fictional', row['created'], row['created'] + 1 if launched else None, 'preview'))
+            insert(self.store.db, 'requests', (identity, json.dumps(row)))
+            if execution == 'retired':
+                peer_lifecycle.retire(self.store.db, identity, peer_lifecycle.RETIRE_REASON)
+            else:
+                peer_lifecycle.reconcile(self.store.db, row)
+        self.save(row)
+        self.assertEqual(peer_lifecycle.get(self.store.db, identity)['execution'], execution)
+        return identity
 
     def installed_fixture(self, tombstones=0, *, pending=False):
         # The L1 offline API produces real validated fixed records in a disposable DB.
@@ -457,6 +477,45 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(db.execute('SELECT 1 FROM expired_controls WHERE id=?', (side_effect,)).fetchone(), (1,))
         with self.assertRaisesRegex(owner.LedgerError, 'attachment_index_unavailable'):
             self.counts(instance)
+
+    def test_unchanged_peer_history_keeps_owner_queue_available(self):
+        instance = self.bind()
+        db, checkpoint = self.store.db, self.workers[0].checkpoint
+        peer_ids = {self.retained_peer(state) for state in ('dropped', 'retired', 'completed')}
+        checkpoint()
+        before = db.total_changes
+        self.store.tick()
+        self.assertEqual(db.total_changes, before)
+        self.assertEqual(self.counts(instance), (0, 0, 0, 0))
+
+        rid, question = uid(), 'Check the fictional orchard.'
+        first = self.store.submit(self.agent, question, rid, self.agents)
+        self.assertEqual(first['state'], 'sending')
+        self.assertEqual(self.store.submit(self.agent, question, rid, self.agents), first)
+        self.assertEqual({row['request_id'] for row in self.store._rows()}, peer_ids | {rid})
+        with self.assertRaises(messaging.MessagingError) as conflict:
+            self.store.submit(self.agent, 'Different text.', rid, self.agents)
+        self.assertEqual(conflict.exception.status, 409)
+
+    def test_guarded_send_prunes_owner_rows_and_leaves_peer_expiry_to_worker(self):
+        instance = self.bind()
+        expired = messaging.RETENTION + 10
+        peer = self.retained_peer('dropped', age=expired)
+        ordinary = self.ordinary_row(age=expired)
+        self.save(ordinary)
+        self.workers[0].checkpoint()
+
+        accepted = self.submit('Check the fictional orchard.')
+        self.assertEqual(accepted['state'], 'sending')
+        self.assertEqual({row['request_id'] for row in self.store._rows()}, {peer, accepted['request_id']})
+        # Run the worker's cleanup without dispatching the accepted owner request.
+        with self.store.lock:
+            self.store._prune(self.store._rows(), time.time())
+        self.assertEqual([row['request_id'] for row in self.store._rows()], [accepted['request_id']])
+        with self.assertRaisesRegex(owner.LedgerError, 'attachment_index_unavailable'):
+            self.counts(instance)
+        self.workers[0].checkpoint()
+        self.assertEqual(self.counts(instance), (0, 0, 0, 0))
 
     def test_invalidated_build_discards_candidate_and_retries_only_at_next_tick(self):
         self.installed_fixture(65)

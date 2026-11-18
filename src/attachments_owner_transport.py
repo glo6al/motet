@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import uuid
 
-from attachments_owner_guards import OwnerGuardError
+from attachments_owner_guards import OwnerCapacityUnavailable, OwnerGuardError
 from attachments_owner_marker import CLEAR, sqlite_payload_state
 
 LINK_BYTES = OUTCOME_BYTES = 4096
@@ -582,12 +582,16 @@ class OwnerAttachmentLedger:
     @contextmanager
     def ordinary_slots(self, now_ms):
         """Use the same exact combined counts and writer as native admission."""
+        checking_capacity = False
         try:
             with self.ordinary_writer() as proof:
+                checking_capacity = True
                 _, history, pending, recent = self._counts(now_ms, include_full_history=True)
+                checking_capacity = False
                 yield (history, pending, recent), proof
         except LedgerError:
-            raise OwnerGuardError('Owner attachment capacity is unavailable.') from None
+            error = OwnerCapacityUnavailable if checking_capacity else OwnerGuardError
+            raise error('Owner attachment capacity is unavailable.') from None
 
     def admit(self, admission, *, now_ms):
         if self._native_permission is None:

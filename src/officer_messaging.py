@@ -17,8 +17,8 @@ import sys
 import threading
 import time
 import uuid
-from attachments_owner_guards import (OwnerAttachmentGuard, OwnerGuardError, alias_state,
-                                      bind_uninstalled_payload_state, check_uninstalled_peer_orphans)
+from attachments_owner_guards import (OwnerAttachmentGuard, OwnerCapacityUnavailable, OwnerGuardError,
+                                      alias_state, bind_uninstalled_payload_state, check_uninstalled_peer_orphans)
 from attachments_owner_marker import CLEAR, UNCERTAIN
 import claude_channel
 import claude_mod
@@ -38,6 +38,10 @@ class MessagingError(Exception):
     def __init__(self, status, message):
         super().__init__(message)
         self.status = status
+
+
+class MessageNotSubmitted(MessagingError):
+    """The server rejected the message before writing a queue entry."""
 
 
 def valid_uuid(value):
@@ -395,8 +399,13 @@ class MessagingStore:
         peer_lifecycle.reconcile(self.db, row)
         peer_lifecycle.project_terminal(self.db, row['request_id'], row)
         if not terminal or retained:
-            write = self.db.execute('INSERT OR REPLACE INTO requests VALUES (?,?)', (row['request_id'], json.dumps(row)))
-            if proof is not None:
+            identity, payload = row['request_id'], json.dumps(row)
+            if proof is None:
+                self.db.execute('INSERT OR REPLACE INTO requests VALUES (?,?)', (identity, payload))
+            else:
+                write = self.db.execute('''INSERT OR REPLACE INTO requests SELECT ?,?
+                    WHERE NOT EXISTS (SELECT 1 FROM requests WHERE id=? AND data=?)''',
+                                        (identity, payload, identity, payload))
                 proof.record(write)
 
     def probe(self):
@@ -591,13 +600,13 @@ class MessagingStore:
             if not queue['available']:
                 raise MessagingError(503, queue['reason'])
             now = time.time()
-            rows = [r for r in self._prune(rows, now) if r.get('origin') != 'peer']
+            guard = self._attachment_guard
+            rows = [r for r in self._prune(rows, now, ordinary_only=guard is not None) if r.get('origin') != 'peer']
             active = [r for r in rows if r['state'] in ACTIVE]
             # An unresolved request is not a lock on the whole conversation.
             # A distinct explicit instruction gets its own delivery/reply identity.
             if any(r['agent'] == agent and r['question'] == question for r in active):
                 raise MessagingError(409, 'This same message is still unresolved for that agent and may still run. Motet will not send it twice; no new message was sent.')
-            guard = self._attachment_guard
             if guard is None:
                 self._check_owner_slots(len(rows), len(active), sum(r['created'] > now - 60 for r in rows))
                 row = self._queue_row(agent, agents, request_id, question, name, now, active)
@@ -611,6 +620,8 @@ class MessagingStore:
                             raise MessagingError(409, 'That identifier is reserved for a different operation.')
                         self._check_owner_slots(*counts)
                         self._save(row, commit=False, ordinary_proof=proof)
+                except OwnerCapacityUnavailable:
+                    raise MessageNotSubmitted(503, 'Motet could not verify capacity in the message queue.') from None
                 except OwnerGuardError:
                     raise MessagingError(503, 'Owner attachment capacity is unavailable.') from None
                 self._history_outcome(row)
@@ -986,27 +997,32 @@ class MessagingStore:
                 self.db.execute('INSERT OR IGNORE INTO request_fulfillments VALUES (?,?,?)', (rid, cid, ended))
                 break
 
-    def _prune(self, rows, now):
+    def _prune(self, rows, now, *, ordinary_only=False):
         runtime = self._native_owner_runtime
         if runtime is not None and not self.db.in_transaction:
             with runtime.ledger.ordinary_writer() as proof:
-                return self._prune_rows(rows, now, proof)
+                return self._prune_rows(rows, now, proof, ordinary_only=ordinary_only)
         try:
             if self._attachment_guard is not None and not self.db.in_transaction:
                 self.db.execute('BEGIN IMMEDIATE')
-            retained = self._prune_rows(rows, now, None)
+            retained = self._prune_rows(rows, now, None, ordinary_only=ordinary_only)
             self.db.commit()
             return retained
         except BaseException:
             self.db.rollback()
             raise
 
-    def _prune_rows(self, rows, now, proof):
+    def _prune_rows(self, rows, now, proof, *, ordinary_only=False):
         rows = [row for row in rows if not self._attachment_reserved(row['request_id'])]
+        if ordinary_only:
+            # Peer reconciliation can invalidate the directory that gates new
+            # sends. Leave peer maintenance to the messaging worker.
+            rows = [row for row in rows if self._ordinary_row(row)]
         for row in rows:
-            if proof is not None and not self._ordinary_row(row):
-                proof.eligible = False
-            peer_lifecycle.reconcile(self.db, row)
+            if not ordinary_only:
+                if proof is not None and not self._ordinary_row(row):
+                    proof.eligible = False
+                peer_lifecycle.reconcile(self.db, row)
         for row in rows:
             if now - row['created'] > RETENTION:
                 fulfillment = self._unreserved('request_fulfillments.request_id')
@@ -1018,6 +1034,8 @@ class MessagingStore:
                 if proof is not None:
                     proof.record(deleted)
                     proof.record(removed)
+        if ordinary_only:
+            return [row for row in rows if now - row['created'] <= RETENTION]
         shared = self._unreserved('shared_bridge_requests.transport_id')
         shared_removed = self.db.execute(f'''DELETE FROM requests WHERE id IN
             (SELECT transport_id FROM shared_bridge_requests WHERE created < ? AND {shared})''', (now - RETENTION,))

@@ -39,7 +39,8 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from officer_policy import AUTOMATIC, RoutingSnapshot, load_policy
 from officer_instructions import BUILTIN_PLAIN_ENGLISH, BUILTIN_OFFICER_SYSTEM, load_instructions, load_skill, skill_menu
-from officer_messaging import MessagingStore, MessagingError, validate_question, validate_target, valid_uuid
+from officer_messaging import (MessageNotSubmitted, MessagingError, MessagingStore,
+                               validate_question, validate_target, valid_uuid)
 from officer_capabilities import (ANSWER_CHARS, ANSWER_SCHEMA, EVIDENCE_SYSTEM, EVIDENCE_TOOLS, READ_NAMES, EvidenceAliases, parse_answer,
                                   live_view as officer_live_projection, sign_receipt, verify_receipt, authenticate_receipt, receipt_refs, record_fingerprint)
 from officer_evidence import EvidenceService
@@ -5362,6 +5363,8 @@ class H(BaseHTTPRequestHandler):
                 if set(d) != {'agent', 'question', 'request_id'}:
                     raise MessagingError(400, 'Expected agent, question, and request_id only.')
                 out = owner_target_call('owner_action', d.get('agent'), d.get('question'), d.get('request_id'))
+            except MessageNotSubmitted as e:
+                return self.send(e.status, json.dumps({'error': str(e), 'delivery': 'not_submitted'}).encode(), 'application/json')
             except MessagingError as e:
                 return self.send(e.status, json.dumps({'error': str(e)}).encode(), 'application/json')
             except (OSError, ValueError, sqlite3.Error):

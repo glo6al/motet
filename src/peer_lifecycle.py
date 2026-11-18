@@ -155,6 +155,11 @@ def retire(db, transport_id, owner_reason, *, expected_agent=None, source='offli
     return get(db, transport_id)
 
 
+def _update_payload(db, request_id, row):
+    data = json.dumps(row)
+    db.execute('UPDATE requests SET data=? WHERE id=? AND data IS NOT ?', (data, request_id, data))
+
+
 def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
     """Called inside the caller's request-write transaction. No payload retained."""
     payload = row
@@ -181,7 +186,7 @@ def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
         project_terminal(db, tid, row)
         # Some callers persist JSON before reconciliation; overwrite that retained
         # copy too. Never recreate an expired payload merely to project retirement.
-        db.execute('UPDATE requests SET data=? WHERE id=?', (json.dumps(row), tid))
+        _update_payload(db, tid, row)
         if old['execution'] == 'dropped' and old['capture'] != 'withheld':
             db.execute("UPDATE peer_execution SET capture='withheld' WHERE request_id=?", (tid,))
         return
@@ -237,13 +242,16 @@ def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
             capture = 'captured'
         elif capture != 'captured' and row.get('capture_disposition') == 'unusable':
             capture = 'unusable'
-    db.execute('INSERT OR REPLACE INTO peer_execution VALUES (?,?,?,?,?,?)',
-               (tid, target, created, execution, capture, json.dumps(evidence, sort_keys=True)))
+    values = (tid, target, created, execution, capture, json.dumps(evidence, sort_keys=True))
+    db.execute('''INSERT OR REPLACE INTO peer_execution SELECT ?,?,?,?,?,?
+        WHERE NOT EXISTS (SELECT 1 FROM peer_execution
+            WHERE request_id=? AND agent=? AND created=? AND execution=? AND capture=? AND evidence=?)''',
+               values + values)
     if write_payload and execution == 'completed' and capture == 'withheld':
         # Merge and validate later protocol receipts above before suppressing the
         # public payload. Unlike retirement, completion can gain native receipts.
         project_terminal(db, tid, payload)
-        db.execute('UPDATE requests SET data=? WHERE id=?', (json.dumps(payload), tid))
+        _update_payload(db, tid, payload)
 
 
 def valid_payload(tid, row, meta):

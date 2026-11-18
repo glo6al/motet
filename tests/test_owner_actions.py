@@ -13,6 +13,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from attachments_owner_runtime import OwnerAttachmentRuntime, bind_owner_runtime
 import officer_messaging as messaging
 import server
 
@@ -92,6 +93,26 @@ class OwnerActionsTests(unittest.TestCase):
         self.assertEqual(self.request('POST','/agent-message',dict(p,capabilities={'queue':True}))[0],400)
         self.assertEqual(self.request('POST','/agent-message',dict(p,agent='x:'+str(uuid.uuid4())))[0],404)
         self.assertEqual(self.store._rows(),[])
+
+    def test_direct_capacity_refusal_is_distinct_from_a_lost_commit_response(self):
+        with patch.object(OwnerAttachmentRuntime, 'start'):
+            runtime = bind_owner_runtime(self.store, allow_install=True)
+        payload = self.payload()
+        status, body, _ = self.request('POST', '/agent-message', payload)
+        self.assertEqual(status, 503)
+        self.assertEqual(body['delivery'], 'not_submitted')
+        self.assertEqual(self.store._rows(), [])
+
+        runtime.checkpoint()
+        with patch.object(self.store, '_history_outcome', side_effect=OSError('Fictional lost commit response.')):
+            status, body, _ = self.request('POST', '/agent-message', payload)
+        self.assertEqual(status, 503)
+        self.assertNotIn('not_submitted', body)
+        self.assertEqual([row['request_id'] for row in self.store._rows()], [payload['request_id']])
+        status, body, _ = self.request('POST', '/agent-message', payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(body['request_id'], payload['request_id'])
+        self.assertEqual(len(self.store._rows()), 1)
 
     def test_direct_and_officer_claude_fail_before_discover_or_request_write(self):
         body = self.freeze({'kind':'relay','agent':self.cid,'question':'Report progress'})

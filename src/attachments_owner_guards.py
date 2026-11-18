@@ -61,6 +61,10 @@ class OwnerGuardError(ValueError):
     """Storage protection or the combined capacity proof is unavailable."""
 
 
+class OwnerCapacityUnavailable(OwnerGuardError):
+    """Admission stopped before the caller could write a request."""
+
+
 def retained_id(column):
     """SQL expression over trusted, static qualified column names."""
     return (f'(EXISTS (SELECT 1 FROM {LINKS} WHERE owner_request_id={column}) '
@@ -281,7 +285,7 @@ class OwnerAttachmentGuard:
     @contextmanager
     def admission(self, now_ms):
         if self.capacity is None:
-            raise OwnerGuardError('Owner attachment capacity is unavailable.')
+            raise OwnerCapacityUnavailable('Owner attachment capacity is unavailable.')
         with self.capacity(now_ms) as counts:
             yield counts
 
