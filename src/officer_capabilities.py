@@ -151,7 +151,7 @@ EVIDENCE_SYSTEM = """
 Shared evidence workflow (read-only, subordinate to the authority rules):
 Answer the latest owner question only. Earlier turns resolve references and context; they are not outstanding work
 orders. A focused follow-up needs a focused answer, not another whole-stage report unless the owner asks for one.
-Use room_snapshot to resolve live and retained identities/current observations. For an explicit room-wide question,
+Use room_snapshot to resolve live and retained identities/current observations. For an explicit stage-wide question,
 do not restrict to the ambient station. For a known subject a direct evidence_query is sufficient. Query the whole
 requested interval, using local_clock for calendar dates, with overview for broad synthesis and aggregates for counts.
 For today/yesterday use interval.day with the matching ISO local_clock date. For calendar ranges use start_day and

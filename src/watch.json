@@ -1,5 +1,5 @@
 {
-  "_comment": "Shipped patterns. Add and remove from the Watch button in the room; that writes ~/.live-room/watch.json as plain words, not patterns. A pattern here that does not compile is skipped. Launch detection is not here, because a loose pattern would invent who started whom.",
+  "_comment": "Shipped patterns. Add and remove from the Watch button on the stage; that writes ~/.live-room/watch.json as plain words, not patterns. A pattern here that does not compile is skipped. Launch detection is not here, because a loose pattern would invent who started whom.",
   "risks": [
     {
       "label": "deploy",

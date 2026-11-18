@@ -42,6 +42,7 @@ async function checks(code=source,refresh=refreshSource){
  const setup=connected.nodes.get('#claudeSetup'),note=connected.nodes.get('#claudeConnectNote');
  assert.equal(setup.hasAttribute('data-quiet'),false);
  connected.capability('connected',true);connected.cuClaudeSetupPaint();
+ assert.equal(setup.hidden,false,'the connected setup stays mounted for Settings');
  assert.equal(setup.hasAttribute('data-quiet'),true,'an already connected chat keeps the composer quiet');
  assert.equal(note.hidden,true);
  assert.equal(note.textContent,'');
