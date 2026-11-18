@@ -32,6 +32,7 @@ class Element {
   addEventListener(name, fn) { this.events[name] = fn; }
   get isConnected() { return !!this.parentNode; }
   get textContent() { return this.words + this.children.map(n => n.textContent).join(''); }
+  set textContent(value) { this.words = value; this.children = []; }
   all() { return [this, ...this.children.flatMap(n => n.all())]; }
   querySelector(selector) { return this.all().find(node => node.className === selector.slice(1)); }
 }
@@ -238,16 +239,42 @@ test('verified completion and reply remain with their exact message and retire o
   assert.match(h.log.textContent,/Finished · no reply was returned to Motet/);
   assert.doesNotMatch(h.log.textContent,/Answered/);
   const row = h.log.children[0];
-  h.button('Check status'); await tick();
+  h.button('Check status');
+  assert.match(row.textContent,/Checking…/);
+  await tick();
   assert.deepEqual(h.calls,[['checkRequest','check-exact']]);
   assert.equal(h.log.children[0],row,'inconclusive readback keeps the original row and action');
+  assert.match(row.textContent,/Status checked\./);
   h.publish(stage2(2,{requests:[observed({reply:{state:'available',text:'A verified fictional reply.'}})]}));
-  assert.match(h.log.textContent,/AnsweredReply from Fictional AdaA verified fictional reply\./);
+  assert.match(h.log.textContent,/AnsweredStatus checked\.Reply from Fictional AdaA verified fictional reply\./);
   h.publish(stage2(3,{requests:[observed({reply:{state:'withheld',text:null}})]}));
   assert.match(h.log.textContent,/Finished · the reply was withheld/);
   assert.doesNotMatch(h.log.textContent,/A verified fictional reply/);
   h.leave();
   assert.equal(h.log.children.length,0);
+});
+
+test('a failed Check status reports the read failure on the same row', async () => {
+  const error = {code:'network_error',message:'Fictional HTTP failure'};
+  const h = await harness(stage2(1,{requests:[observed()],error}),claude);
+  const row = h.log.children[0];
+  h.button('Check status'); await tick();
+  assert.deepEqual(h.calls,[['checkRequest','check-exact']]);
+  assert.equal(h.log.children[0],row);
+  assert.match(row.textContent,/Could not check status\./);
+  assert.doesNotMatch(row.textContent,/Status checked\./);
+});
+
+test('a sealed refusal keeps the draft and only reports that nothing was sent', async () => {
+  const request = observed({revision:1, delivery:'not_started', accepted:false, execution:'unobserved',
+    preparation:'intent', reason:'earlier_delivery_unresolved',
+    files:[{...submittedFile,savedCopyState:'not_saved'}]});
+  const draft = {...fileDraft,text:'Fictional draft'};
+  const error = {code:'earlier_delivery_unresolved',message:'Fictional refusal'};
+  const h = await harness(stage2(1,{draft,requests:[request],error}),claude);
+  assert.equal(h.input.value,'Fictional draft');
+  assert.equal(h.log.children.length,0);
+  assert.match(h.root.textContent,/An earlier unresolved delivery to Fictional Ada blocked this send\. Nothing was sent\./);
 });
 
 test('an exact partial-copy fixture shows no Finish or Remove and cannot enable it on the live binding', async () => {

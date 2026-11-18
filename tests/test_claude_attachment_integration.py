@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 import server
+import peer_lifecycle
 from attachments_native_namespace import NativeNamespaceFence
 from attachments_owner_transport import CLAUDE_CLAIMS
 from attachments_types import AttachmentError
@@ -317,6 +318,88 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         self.assertIsNone(self.selection(managed_target)['context'])
         self.assertEqual(managed.calls, [])
 
+    def seed_uncertain_peer(self, session):
+        request_id, created = uid(), time.time() - 1800
+        row = dict(request_id=request_id, agent=self.destination, created=created, launched=True,
+                   state='unknown', origin='peer', runtime='claude', transport='claude_mod', bridge_version=2,
+                   mod_enrollment=session['enrollment_id'], mod_attempt_id=uid(), mod_generation=session['generation'],
+                   mod_turn='fictional-turn', lifecycle_protocol=2, mod_project=str(self.project),
+                   target_project=str(self.project))
+        db = self.messaging.db
+        with self.messaging.lock, db:
+            db.execute('INSERT INTO shared_bridge_requests VALUES (?,?,?,?,?,?,?,?,?)',
+                       (uid(), self.destination, '{}', 'fictional-digest', request_id, 'fictional-credential',
+                        created, created, 'Fictional earlier request'))
+            db.execute('INSERT INTO requests VALUES (?,?)', (request_id, json.dumps(row)))
+            peer_lifecycle.reconcile(db, row)
+            self.assertEqual(peer_lifecycle.get(db, request_id)['execution'], 'uncertain')
+        return request_id
+
+    def retire_fixture_peer(self, request_id):
+        with self.messaging.lock, self.messaging.db:
+            peer_lifecycle.retire(self.messaging.db, request_id, peer_lifecycle.RETIRE_REASON,
+                                  expected_agent=self.destination)
+
+    def test_uncertain_peer_refuses_before_copy_and_cannot_replay_after_recovery(self):
+        self.start()
+        session = self.register()
+        selection = self.selection()
+        draft, fence, caps = self.build(selection)
+        prepare_path = '/native/drafts/' + draft['id'] + '/send-intent'
+
+        def prepare():
+            return self.attach('POST', prepare_path, fence, status=201,
+                               headers={**caps, 'Idempotency-Key': uid()})
+
+        first = prepare()
+        earlier = self.seed_uncertain_peer(session)
+        self.send({**first, 'requestCapability': '0' * 64}, status=403)
+        self.assertIsNone(self.status(selection, first)['observation']['request']['reason'])
+        refusal = self.send(first)['observation']
+        self.assertEqual(refusal['draftAdmission'], 'unadmitted')
+        self.assertEqual(refusal['request']['delivery'], 'not_started')
+        self.assertEqual(refusal['request']['reason'], 'earlier_delivery_unresolved')
+        self.assertEqual([f['savedCopyState'] for f in refusal['request']['files']], ['not_saved'])
+        self.assertEqual(self.status(selection, first)['observation'], refusal)
+        self.assertFalse((self.project / '.watch-attachments').exists())
+        self.assertIsNone(self.poll(session))
+        self.assertIsNone(self.attachments.store.db.execute(
+            'SELECT authorized_at FROM attachment_requests').fetchone()[0])
+        self.assertEqual(self.messaging.db.execute('SELECT COUNT(*) FROM owner_attachment_links').fetchone()[0], 0)
+        saved = self.attach('GET', '/drafts/' + draft['id'], headers=caps)
+        self.assertEqual((saved['text'], saved['files'][0]['state']), (QUESTION, 'ready'))
+
+        self.retire_fixture_peer(earlier)
+        self.send(first, status=403)
+        self.assertEqual(self.status(selection, first)['observation'], refusal)
+        self.assertFalse((self.project / '.watch-attachments').exists())
+
+        second = prepare()
+        self.assertEqual(self.send(second)['observation']['draftAdmission'], 'matched')
+        self.assertIsNotNone(self.poll(session))
+        self.assertIsNone(self.poll(session))
+        self.assertEqual(len(list(self.project.glob('.watch-attachments/*/*.pdf'))), 1)
+
+    def test_pruned_peer_becoming_uncertain_after_admission_still_blocks_the_claim(self):
+        runtime = self.start()
+        session = self.register()
+        selection = self.selection()
+        intent = self.prepare(selection)
+        result = self.send(intent)['observation']
+        self.assertEqual(result['draftAdmission'], 'matched')
+
+        earlier = self.seed_uncertain_peer(session)
+        # Retention can remove a message body while its execution still occupies the recipient.
+        with self.messaging.lock, self.messaging.db:
+            self.messaging.db.execute('DELETE FROM requests WHERE id=?', (earlier,))
+            self.assertEqual(peer_lifecycle.get(self.messaging.db, earlier)['execution'], 'uncertain')
+        runtime.refresh_directory()
+        self.assertIsNone(self.poll(session))
+        status = self.status(selection, intent)['observation']['request']
+        self.assertFalse(status['accepted'])
+        self.assertEqual(status['delivery'], 'unknown')
+        self.assertEqual(len(list(self.project.glob('.watch-attachments/*/*.pdf'))), 1)
+
     def test_ordinary_pending_and_unknown_claims_take_precedence(self):
         runtime = self.start()
         session = self.register()
@@ -497,10 +580,17 @@ def browser_client_fixture():
         session = fixture.register()
         print(json.dumps({'origin': f'http://127.0.0.1:{fixture.httpd.server_port}',
                           'destinationId': fixture.destination}), flush=True)
-        claim, first = None, None
+        claim, first, blocked = None, None, None
         for line in sys.stdin:
             mode = json.loads(line)
-            if mode == 'claim':
+            if mode == 'block' and blocked is None:
+                blocked = fixture.seed_uncertain_peer(session)
+                value = {'blocked': True}
+            elif mode == 'retire' and blocked is not None:
+                fixture.retire_fixture_peer(blocked)
+                blocked = None
+                value = {'retired': True}
+            elif mode == 'claim':
                 if claim is not None:
                     raise ValueError('This fictional fixture already granted its attempt.')
                 claim = fixture.poll(session)

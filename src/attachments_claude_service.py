@@ -7,6 +7,7 @@ import os
 import stat
 
 import claude_mod
+import peer_lifecycle
 from attachments_materialize import (DirectoryIdentity, FileIdentity, Materializer, WorkspaceContext,
                                      WorkspaceDirectories, copy_identity)
 from attachments_native_namespace import NamespaceError
@@ -20,6 +21,7 @@ from attachments_service import closed
 from attachments_types import AttachmentError, canonical, digest, fail, ident, integer, key
 
 PROFILE = 'claude-completion-only'
+EARLIER_DELIVERY_UNRESOLVED = 'earlier_delivery_unresolved'
 FORMATS = tuple(sorted(RELAY_FORMATS))
 RECEIPTS = '''CREATE TABLE claude_native_prepare_receipts (
     command_digest TEXT PRIMARY KEY NOT NULL CHECK(length(command_digest)=64),
@@ -337,6 +339,24 @@ class ClaudeAttachmentService:
                 return {'match': None}
             return {'match': {'draftId': draft_id, 'requestId': rid}}
 
+    def _refuse_blocked_send(self, request_id, capability, body, destination_id):
+        if not destination_id.startswith('c:'):
+            return False
+        with self.messaging.lock:
+            blocked = any(state == 'uncertain' for _, state, _ in
+                          peer_lifecycle.blockers(self.messaging.db, destination_id))
+        if not blocked:
+            return False
+        with self.store._gate(), self.store._transaction(reclaim=True):
+            row = self.requests._authorize(request_id, capability, body['revision'], body['fingerprint'])
+            if row['stage'] != 'intent' or row['authorized_at'] is not None:
+                conflict()
+            # Exact readback proves refusal even if the HTTP response is lost.
+            # Revoke the capability so an older server would also reject replay.
+            self.store.db.execute("UPDATE attachment_requests SET cap_hash='',error=? WHERE id=?",
+                                  (EARLIER_DELIVERY_UNRESOLVED.ljust(64), request_id))
+        return True
+
     def send(self, request_id, capability, body, command):
         closed(body, {'revision', 'fingerprint'})
         token(capability); token(body['fingerprint']); key(command)
@@ -355,6 +375,8 @@ class ClaudeAttachmentService:
                 row = self._row(request_id, destination_id, scope_id)
                 if row['stage'] != 'intent' or row['authorized_at'] is not None:
                     conflict()
+            if self._refuse_blocked_send(request_id, capability, body, destination_id):
+                return {'observation': self._observation(request_id, destination_id, scope_id)}
             status = self.mirror.authorize_send(request_id, capability, body['revision'], body['fingerprint'],
                 resolved_binding=json.loads(binding.destination_record), transport_profile=binding.profile,
                 resource_lease=lease)
@@ -415,7 +437,13 @@ class ClaudeAttachmentService:
         reply = {'state': 'unknown', 'text': None}
         delivery, reason = ('pending' if admitted else 'not_started'), None
         accepted = False
-        if claimed:
+        if row['error'].strip() == EARLIER_DELIVERY_UNRESOLVED:
+            if (not destination_id.startswith('c:') or admitted or row['cap_hash'] or row['stage'] != 'intent'
+                    or row['revision'] != 1 or claimed or facts is not None
+                    or any(file['savedCopyState'] != 'not_saved' for file in files)):
+                conflict()
+            reason = EARLIER_DELIVERY_UNRESOLVED
+        elif claimed:
             # Read the exact live owner pair. Missing or lagged observations never supply prose.
             try:
                 live = self._adapter(destination_id).observe(request_id)

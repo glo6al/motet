@@ -12,6 +12,7 @@ const INACTIVE_FILES = {state: 'unavailable', associationCount: null, unclassifi
 const PHASE = {draft_create: 'creating', upload_reserve: 'reserving', upload_put: 'uploading',
   draft_edit: 'editing', draft_remove: 'removing', draft_discard: 'discarding', send_prepare: 'preparing', send_execute: 'sending',
   deletion_prepare: 'preparing_deletion', deletion_confirm: 'confirming_deletion', deletion_execute: 'executing_deletion'};
+const EARLIER_DELIVERY_UNRESOLVED = 'earlier_delivery_unresolved';
 const COPY_STATES = ['not_saved', 'saving', 'available', 'unavailable', 'removed', 'unknown'];
 const DELETION_REASONS = [null, 'source_in_use', 'identity_changed', 'removal_unconfirmed', 'workspace_unavailable', 'workspace_unverified'];
 const DELETION_PIECES = ['watch_original', 'workspace'];
@@ -34,6 +35,7 @@ const MESSAGES = {
   unavailable: 'This attachment operation is unavailable.', unauthorized: 'Owner access changed.',
   forbidden: 'The attachment could not be authorized.', destination_unavailable: 'Attachments are unavailable for this agent.',
   capability_changed: 'The attachment qualification changed. Refresh the exact destination.',
+  [EARLIER_DELIVERY_UNRESOLVED]: 'An earlier unresolved delivery blocked this send. Nothing was sent.',
   journal_unavailable: 'Attachment recovery storage could not be verified.', journal_conflict: 'An attachment operation is unresolved.',
   draft_conflict: 'This draft changed in another window.', incomplete: 'The exact draft state could not be confirmed.',
   network_error: 'The attachment operation could not be confirmed.', draft_capacity: 'Discard a saved draft before creating another.',
@@ -110,12 +112,14 @@ function wireObservation(value, context, completion) {
     (completion ? ['not_started', 'pending', 'completed', 'unknown'] :
       ['not_started', 'pending', 'queued', 'not_submitted', 'unknown']).includes(r.delivery) && typeof r.accepted === 'boolean' &&
     ['unobserved', 'started', 'ended'].includes(r.execution) &&
-    [null, 'destination_unavailable', 'source_changed', 'copy_failed', 'dispatch_unconfirmed', 'proven_not_submitted'].includes(r.reason) &&
+    [null, 'destination_unavailable', 'source_changed', 'copy_failed', 'dispatch_unconfirmed', 'proven_not_submitted',
+      EARLIER_DELIVERY_UNRESOLVED].includes(r.reason) &&
     Array.isArray(r.files) && r.files.length >= 1 && r.files.length <= 5 && r.files.every(f =>
       closed(f, ['fileId', 'name', 'mediaType', 'bytes', 'savedCopyState']) && inputRow(f) && COPY_STATES.includes(f.savedCopyState)) &&
     unique(r.files.map(f => f.fileId)) && closed(r.reply, ['state', 'text']) &&
     ['available', 'withheld', 'unknown'].includes(r.reply.state));
-  const admitted = value.draftAdmission === 'matched';
+  const admitted = value.draftAdmission === 'matched', refused = r.reason === EARLIER_DELIVERY_UNRESOLVED;
+  check(!refused || completion && !admitted && context.destinationId.startsWith('c:'));
   check(admitted ? r.revision > 1 && r.preparation !== 'intent' && r.delivery !== 'not_started' :
     r.preparation === 'intent' && r.revision === 1 && r.delivery === 'not_started' && r.files.every(f => f.savedCopyState === 'not_saved'));
   check((completion ? (r.delivery === 'completed' ? admitted && r.accepted && r.execution === 'ended' :
@@ -125,7 +129,7 @@ function wireObservation(value, context, completion) {
     (r.delivery === 'not_submitted' ? !r.accepted && r.reason === 'proven_not_submitted' : r.reason !== 'proven_not_submitted') &&
     (r.reply.state === 'available' ? r.accepted && r.execution === 'ended' && text(r.reply.text, 16000) &&
       r.reply.text.length > 0 && new TextEncoder().encode(r.reply.text).length <= 64000 : r.reply.text === null) &&
-    (admitted || !r.accepted && r.execution === 'unobserved' && r.reply.state === 'unknown' && r.reason === null));
+    (admitted || !r.accepted && r.execution === 'unobserved' && r.reply.state === 'unknown' && (r.reason === null || refused)));
   return value;
 }
 
@@ -487,6 +491,7 @@ function createNativeAgentAttachmentsClient(options = {}) {
   async function run(t, action, affectsDraft = true) {
     if (!current(t) || operation) return snapshot();
     const job = {};
+    let result;
     operation = job;
     state.busy = true;
     state.error = null;
@@ -504,10 +509,15 @@ function createNativeAgentAttachmentsClient(options = {}) {
         operation = null;
         state.busy = false;
         emit();
-        if (journalDirty && current(t) && !operation) { journalDirty = false; void run(t, refreshScope); }
+        if (journalDirty && current(t) && !operation) {
+          // Starting a refresh clears state.error before its first await.
+          result = snapshot();
+          journalDirty = false;
+          void run(t, refreshScope);
+        }
       }
     }
-    return snapshot();
+    return result ?? snapshot();
   }
 
   function contextData() { return {destinationId: state.context.destinationId, scopeId: state.context.scopeId}; }
@@ -672,6 +682,7 @@ function createNativeAgentAttachmentsClient(options = {}) {
     check(old.draftId === r.draftId && old.createdAt === r.createdAt && sameInput(old, r) &&
       recordEqual(prior.draftFence, value.draftFence) && r.revision >= old.revision && (!old.accepted || r.accepted) &&
       (old.delivery !== 'not_submitted' || r.delivery === 'not_submitted') &&
+      (old.reason !== EARLIER_DELIVERY_UNRESOLVED || r.reason === EARLIER_DELIVERY_UNRESOLVED) &&
       (old.execution === 'unobserved' || r.execution === old.execution || old.execution === 'started' && r.execution === 'ended') &&
       (prior.draftAdmission !== 'matched' || value.draftAdmission === 'matched'));
   }
@@ -754,7 +765,14 @@ function createNativeAgentAttachmentsClient(options = {}) {
     matchesAttempt(value, hold);
     rememberRequest(value);
     attemptRequests.set(hold.attemptId, value.request.id);
-    if (value.draftAdmission !== 'matched') return;
+    if (value.draftAdmission !== 'matched') {
+      if (hold.kind === 'send_execute' && value.request.reason === EARLIER_DELIVERY_UNRESOLVED) {
+        await settle(t, hold);
+        guard(t);
+        state.error = notice(EARLIER_DELIVERY_UNRESOLVED);
+      }
+      return;
+    }
     const proven = new Set(value.request.files.map(f => f.fileId));
     if (draft?.id === hold.draftId) {
       check(draft.revision === hold.revision && draft.writerGeneration === hold.writerGeneration &&
@@ -830,7 +848,7 @@ function createNativeAgentAttachmentsClient(options = {}) {
     check(closed(raw, ['observation', 'requestCapability', 'fingerprint']) && secret(raw.requestCapability) && secret(raw.fingerprint));
     const prepared = wireObservation(raw.observation, state.context, !staged);
     matchesAttempt(prepared, hold);
-    check(prepared.draftAdmission === 'unadmitted' && prepared.request.preparation === 'intent');
+    check(prepared.draftAdmission === 'unadmitted' && prepared.request.preparation === 'intent' && prepared.request.reason === null);
     rememberRequest(prepared);
     attemptRequests.set(hold.attemptId, prepared.request.id);
     const executing = {...hold, kind: 'send_execute', requestId: prepared.request.id, requestRevision: prepared.request.revision};
@@ -852,8 +870,10 @@ function createNativeAgentAttachmentsClient(options = {}) {
     if (!requestId) throw fault('invalid_request');
     const observation = await getRequest(t, requestId);
     guard(t);
-    rememberRequest(observation);
-    await recoverStageReads(t);
+    const hold = allHolds().find(record => record.kind === 'send_execute' && record.requestId === requestId ||
+      record.kind === 'send_prepare' && attemptRequests.get(record.attemptId) === requestId);
+    if (hold && !journalUnreadable) await observeAttempt(t, hold, observation);
+    else rememberRequest(observation);
   }
 
   function clearFilePage(enabled = state.features.files) {

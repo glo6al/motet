@@ -44,12 +44,15 @@ function completionRequest(r, fixture) {
       r.accepted === (r.delivery === 'completed') && r.execution === (r.accepted ? 'ended' : 'unobserved')) &&
     ['intent','preparing_delivery','materialized','cleanup','cleaned'].includes(r.preparation) &&
     (r.delivery === 'not_started') === (r.preparation === 'intent') &&
-    [null,'destination_unavailable','source_changed','copy_failed','dispatch_unconfirmed','proven_not_submitted'].includes(r.reason) &&
+    [null,'destination_unavailable','source_changed','copy_failed','dispatch_unconfirmed','proven_not_submitted',
+      'earlier_delivery_unresolved'].includes(r.reason) &&
     closed(r.reply, ['state','text']) && ['unknown','withheld','available'].includes(r.reply.state) &&
     (r.reply.state === 'available' ? r.accepted && r.execution === 'ended' && str(r.reply.text, 32000) && !!r.reply.text : r.reply.text === null) &&
     array(r.files, 5, f => closed(f, ['fileId','name','mediaType','bytes','savedCopyState']) && id(f.fileId) &&
       str(f.name, 510) && !!f.name && !/[\\/\p{C}]/u.test(f.name) && supported.includes(f.mediaType) &&
       integer(f.bytes) && copyStates.includes(f.savedCopyState)) && r.files.length > 0 &&
+    (r.reason !== 'earlier_delivery_unresolved' || !fixture && r.delivery === 'not_started' && !r.accepted &&
+      r.execution === 'unobserved' && r.files.every(f => f.savedCopyState === 'not_saved')) &&
     new Set(r.files.map(f => f.fileId)).size === r.files.length;
 }
 
@@ -218,7 +221,7 @@ function createNativeAgentAttachmentsPage(o) {
     paint(b);
     flushEditor(b);
   }
-  async function invoke(b, method, args = []) {
+  async function invoke(b, method, args = [], checkedRequest = null) {
     if (!current(b) || b.op || b.state?.busy) return;
     if (b.editor && !['editText', 'openFileDetails', 'closeFileDetails'].includes(method)) {
       if (method !== 'refresh' && !(method === 'resume' && b.state.draft?.readOnly && args[0] === b.editor.id)) return;
@@ -230,17 +233,19 @@ function createNativeAgentAttachmentsPage(o) {
     if (method === 'refresh') b.readNotice = b.state ? message(b, b.state, o.recipientName())?.[0] : null;
     b.op = method;
     b.problem = null;
+    if (checkedRequest) b.checkFeedback = {id: checkedRequest, text: 'Checking…'};
     if (method === 'addFiles') {
       b.received.clear();
       b.selectionCount = args[0].length;
     }
     paint(b);
-    let relinquishEmptyDraft = false;
+    let relinquishEmptyDraft = false, checked = false;
     try {
       const result = method === 'refresh' && !b.state?.context ?
         await b.client.connect({destinationId: b.target}) : await b.client[method](...args);
       if (!current(b)) return;
       adopt(b, result);
+      checked = !b.invalid && !result.error;
       const s = b.state;
       relinquishEmptyDraft = !b.invalid && s && !s.busy && !s.error && s.draftRead === 'complete' &&
         ['removeFile','removeSelection'].includes(method) && !s.uncertain && !s.attempts.length &&
@@ -254,6 +259,8 @@ function createNativeAgentAttachmentsPage(o) {
     } finally {
       if (current(b)) {
         b.op = null; b.readNotice = null;
+        if (checkedRequest) b.checkFeedback = {id: checkedRequest,
+          text: checked ? 'Status checked.' : 'Could not check status.'};
         if (relinquishEmptyDraft) {
           // The file removal is confirmed. Release the private writer and read
           // the retained draft as a saved draft before ordinary Send can return.
@@ -406,11 +413,14 @@ function createNativeAgentAttachmentsPage(o) {
     if (r.delivery === 'unknown' || r.execution === 'ended' && r.reply.state !== 'available' ||
       r.delivery === 'pending' || r.delivery === 'queued' || r.execution === 'started') {
       const check = btn('Check status', 'workspace-attachments-check-status', () => {
-        if (check.getAttribute('aria-disabled') !== 'true') void invoke(b, 'checkRequest', [r.actions.check]);
+        if (check.getAttribute('aria-disabled') !== 'true') void invoke(b, 'checkRequest', [r.actions.check], r.id);
       }, b);
       check.setAttribute('aria-disabled', String(disabled));
       status.append(check);
     }
+    const feedback = addNode('span', '');
+    feedback.hidden = true;
+    status.append(feedback);
     message.append(status);
     const notice = partialNotice(r, label);
     if (notice) {
@@ -426,13 +436,14 @@ function createNativeAgentAttachmentsPage(o) {
       for (const paragraph of r.reply.text.split(/\n\s*\n/)) reply.append(addNode('p', '', paragraph));
       el.append(reply);
     }
-    return {el, kind:'message', context:{scope:'station', agent:b.target, name:label}, ts:r.createdAt};
+    return {el, feedback, kind:'message', context:{scope:'station', agent:b.target, name:label}, ts:r.createdAt};
   }
   function paintRequests(b, s, label, scrollSnapshot) {
     const disabled = !!b.op || !!s?.busy || !!b.editor;
     const previous = b.requestView;
-    if (previous && previous.snapshot === s && previous.label === label && previous.disabled === disabled && previous.invalid === b.invalid) return;
-    b.requestView = {snapshot:s, label, disabled, invalid:b.invalid};
+    if (previous && previous.snapshot === s && previous.label === label && previous.disabled === disabled &&
+      previous.invalid === b.invalid && previous.feedback === b.checkFeedback) return;
+    b.requestView = {snapshot:s, label, disabled, invalid:b.invalid, feedback:b.checkFeedback};
     const requests = !b.invalid && s?.features.send ? s.requests.filter(r => r.delivery !== 'not_started') : [];
     const ids = new Set(requests.map(r => r.id));
     let changed = false, focusedRequest = null;
@@ -447,14 +458,18 @@ function createNativeAgentAttachmentsPage(o) {
     }
     for (const r of requests) {
       const signature = JSON.stringify([r, label]);
-      const item = b.messages.get(r.id);
+      let item = b.messages.get(r.id);
       if (item?.signature === signature) {
         item.el.querySelector('.workspace-attachments-check-status')?.setAttribute('aria-disabled', String(disabled));
-        continue;
+      } else {
+        if (item) remove(r.id, item);
+        item = {...requestRow(b, r, label, disabled), signature};
+        b.messages.set(r.id, item);
+        changed = true;
       }
-      if (item) remove(r.id, item);
-      b.messages.set(r.id, {...requestRow(b, r, label, disabled), signature});
-      changed = true;
+      const feedback = b.checkFeedback?.id === r.id ? b.checkFeedback.text : '';
+      if (item.feedback.textContent !== feedback) item.feedback.textContent = feedback;
+      item.feedback.hidden = !feedback;
     }
     if (changed) o.repaintConversation?.(scrollSnapshot);
     if (focusedRequest) {
@@ -496,6 +511,9 @@ function createNativeAgentAttachmentsPage(o) {
     }
     if (!s.error || s.busy) return null;
     const {code} = s.error;
+    if (code === 'earlier_delivery_unresolved') {
+      return ['An earlier unresolved delivery to ' + label + ' blocked this send. Nothing was sent.', []];
+    }
     const limits = s.qualification.limits;
     const refused = b.selectionCount === 1 ? 'That file was not added. ' : 'None of those files were added. ';
     if (limits && code === 'file_too_large') return [refused + 'The limit for one file is ' + o.bytes(limits.fileBytes) + '.', []];
