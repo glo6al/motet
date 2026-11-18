@@ -1,6 +1,6 @@
 # Shared Motet chat bridge
 
-The optional Motet MCP connection exposes a directory of existing named Codex and Claude chats. Configure the connection once in each client. The installed MCP name is still `watch-peer`. Chats do not need separate bridge credentials or enrollment. The bridge is the provider-to-provider messaging service; the Motet room and desks are its separate user interface. Bridge delivery and reply tracking do not require that interface to be open.
+The optional Motet MCP connection exposes a directory of existing named Codex and Claude chats. Configure the connection once in each client. The installed MCP name is still `watch-peer`. Chats do not need separate bridge credentials or enrollment. The bridge is the provider-to-provider messaging service; the Motet stage and desks are its separate user interface. Bridge delivery and reply tracking do not require that interface to be open.
 
 Agent-to-agent routing uses native tools within a provider and Motet only between providers:
 

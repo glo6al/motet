@@ -14,7 +14,7 @@ class OfficerScopeResolver(UnqualifiedResolver):
     def resolve_scope(self, scope_id):
         opaque(scope_id)
         if scope_id not in self.known_scopes():
-            fail('destination_unavailable','Choose a registered Motet room or station.',503)
+            fail('destination_unavailable','Choose a registered Motet stage or station.',503)
         return {'id':scope_id}
 
 

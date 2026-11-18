@@ -287,7 +287,7 @@ class AssertionTests(unittest.TestCase):
         item = request.AssertionRegistry(); item.register({'quantities': [first, second]}); item.mark_supplied()
         a, b = item.render_assertion(first), item.render_assertion(second)
         self.assertNotEqual(a, b)
-        for expected in ('live room', 'c:demo-ada', 'source time', request.datetime.fromtimestamp(100, request.timezone.utc).astimezone().isoformat(sep=' ', timespec='seconds')):
+        for expected in ('live stage', 'c:demo-ada', 'source time', request.datetime.fromtimestamp(100, request.timezone.utc).astimezone().isoformat(sep=' ', timespec='seconds')):
             self.assertIn(expected, a)
         for expected in ('retained records', 'x:demo-bram', 'c' * 64, 'observation time', 'outcome: failure', 'operation: run'):
             self.assertIn(expected, b)

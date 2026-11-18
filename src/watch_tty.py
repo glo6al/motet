@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The room in a terminal, from the running server's /events stream. Run the server first, then:
+"""The stage in a terminal, from the running server's /events stream. Run the server first, then:
     python3 src/watch_tty.py              a board: one row per agent, redrawn in place
     python3 src/watch_tty.py --tail       one line per event as it arrives, greppable
     python3 src/watch_tty.py --once       one line, e.g. "2 waiting · 3 working", for a status bar

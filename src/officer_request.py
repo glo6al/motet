@@ -439,7 +439,7 @@ class AssertionRegistry:
         # scope labels. Stable IDs distinguish subjects when no trusted name map
         # is available; source time and observation time remain separate.
         scope, interval = value['scope'], value['interval']
-        sources = ' and '.join({'live': 'live room', 'retained': 'retained records'}[source] for source in scope['sources'])
+        sources = ' and '.join({'live': 'live stage', 'retained': 'retained records'}[source] for source in scope['sources'])
         chats = 'chats ' + ', '.join(scope['chat_ids']) if scope['chat_ids'] else 'all recorded chats'
         projects = 'projects ' + ', '.join(scope['project_ids']) if scope['project_ids'] else 'all recorded projects'
         def when(stamp):

@@ -1,6 +1,6 @@
 # Installing and trying Motet on Windows
 
-Motet shows your coding agents (Claude Code, Codex, Cursor) as a room of monitors in your browser, one per agent, as they work. This guide takes you from a Windows PC with nothing installed to that room. It also lists what we would like you to check, because **nobody has run it on a real Windows desktop yet**. So far the tests have passed on Windows in automated CI, but only in CI. Your report is the first real one.
+Motet shows your coding agents (Claude Code, Codex, Cursor) on a browser stage with one monitor per agent, updated as they work. This guide takes you from a Windows PC with nothing installed to that stage. It also lists what we would like you to check, because **nobody has run it on a real Windows desktop yet**. So far the tests have passed on Windows in automated CI, but only in CI. Your report is the first real one.
 
 Allow about fifteen minutes. You need no administrator rights unless your installer asks for them, and you install nothing besides Python and Git.
 
@@ -13,9 +13,9 @@ Allow about fifteen minutes. You need no administrator rights unless your instal
 | Windows 10 or 11 | | 64-bit |
 | **Python** | runs the server; nothing else is installed into it | 3.12 or later recommended. 3.9 to 3.11 run it too, but show no rendered previews (see the README's Windows section) |
 | **Git** | to download the project (optional: a ZIP download works too) | any recent version |
-| A browser | the room is a web page | Chrome or Edge recommended |
+| A browser | the stage is a web page | Chrome or Edge recommended |
 | **Windows Terminal** | only for the optional terminal view | included in Windows 11; free in the Microsoft Store for Windows 10 |
-| At least one agent that has been used on this PC | the room shows their sessions | Claude Code, Codex CLI or Cursor |
+| At least one agent that has been used on this PC | the stage shows their sessions | Claude Code, Codex CLI or Cursor |
 
 No agent sessions yet? You can still try it: the demo (step 5) needs none.
 
@@ -140,7 +140,7 @@ It listens on `127.0.0.1` only, so only this PC can reach it. Windows Firewall s
 
 Now open <http://127.0.0.1:8793/> in your browser:
 
-- **To see your own agents:** press **Unlock**. The server asks Windows to open a small unlock page in your default browser, and that tab becomes the unlocked room. It shows every Claude Code, Codex or Cursor session that has written to its log in the last 20 minutes.
+- **To see your own agents:** press **Unlock**. The server asks Windows to open a small unlock page in your default browser, and that tab becomes the unlocked stage. It shows every Claude Code, Codex or Cursor session that has written to its log in the last 20 minutes.
   - If **Unlock opens an editor instead of a browser** (Notepad, VS Code, …), your default app for `.html` files is not a browser. Please tell us. To fix it: **Settings → Apps → Default apps**, find `.html`, and choose your browser. Then press Unlock again; it allows one try a minute.
 - **To try it without any agents:** open <http://127.0.0.1:8793/?demo>. It plays a made-up fleet of agents, and it needs no unlock.
 
@@ -160,7 +160,7 @@ py src\server.py
 
 These last only for that PowerShell window.
 
-To give a project folder a friendlier name in the room, create `%USERPROFILE%\.live-room\projects.json` containing, for example:
+To give a project folder a friendlier name on the stage, create `%USERPROFILE%\.live-room\projects.json` containing, for example:
 
 ```json
 {"my-long-folder-name": "Website"}
@@ -170,7 +170,7 @@ To give a project folder a friendlier name in the room, create `%USERPROFILE%\.l
 
 ## Step 7 (optional): The terminal view
 
-The room also runs in a terminal. With the server running, open a **second** window in **Windows Terminal** (the older blue PowerShell console may show odd characters instead of redrawing), go to the project folder, and run:
+The stage also runs in a terminal. With the server running, open a **second** window in **Windows Terminal** (the older blue PowerShell console may show odd characters instead of redrawing), go to the project folder, and run:
 
 ```powershell
 py src\watch_tty.py            # a board, one row per agent
@@ -207,7 +207,7 @@ dir "$env:USERPROFILE\.cursor\projects"
 
 ## What does not work on Windows yet
 
-- **Answering permission prompts from the room (Allow / Deny), and the hooks behind it.** The hooks are shell scripts, and how Claude Code runs hook commands on Windows has not been checked. `py scripts\install_hooks.py` says so and changes nothing. The room still watches, and Claude asks in its own app as usual.
+- **Answering permission prompts from the stage (Allow / Deny), and the hooks behind it.** The hooks are shell scripts, and how Claude Code runs hook commands on Windows has not been checked. `py scripts\install_hooks.py` says so and changes nothing. Motet still watches, and Claude asks in its own app as usual.
 - **Rendered previews show the page alone.** The styles, scripts and images it links to from files beside it are not served on Windows yet (inline ones still apply), so a previewed page can look unstyled; previews need Python 3.12 or later. A page reached through a link or junction, with more than one name (such as files pnpm hard-links into `node_modules`), or in `AppData` is refused. OneDrive-synced, network and ReFS/Dev Drive folders have not been tried: they may be refused by those checks, or may work. Please tell us which happen to you.
 - **Desktop app details** (session titles, permission mode, when you last looked at a session) come from the Claude desktop app's own records. We assumed they are in `%APPDATA%\Claude`, but have not checked.
 
@@ -219,7 +219,7 @@ dir "$env:USERPROFILE\.cursor\projects"
 |---|---|
 | `py` is not recognised | Install Python (step 1), then open a **new** PowerShell window. |
 | `Port 8793 is busy …` | Another copy is running (look for its window), or one just stopped and Windows is still holding the port. Wait a minute, or use `$env:PORT = "8794"`. |
-| The room is empty | Use an agent, then reload the page within 20 minutes, or set `$env:WINDOW_MIN = "120"`. Check the agent's log folder exists (see "Where things are"). |
+| The stage is empty | Use an agent, then reload the page within 20 minutes, or set `$env:WINDOW_MIN = "120"`. Check the agent's log folder exists (see "Where things are"). |
 | "Motet is locked" | Press **Unlock**, and use the **new** tab it opens. |
 | Unlock opens an editor | See step 5: set your browser as the default for `.html`. |
 | A preview says not found, or a page looks unstyled | See "What does not work on Windows yet": the page alone is served, without the files beside it, and only from Python 3.12. Tell us which folder kind it was in. |
@@ -244,7 +244,7 @@ Please tell us what happened, even if it was "everything worked". [Open an issue
 **Things only a real Windows PC can answer.** Each one is a yes/no or a short paste:
 
 - [ ] Did Windows Firewall ask about `python.exe` when the server started?
-- [ ] Did **Unlock** open your browser, and did the room fill with your agents?
+- [ ] Did **Unlock** open your browser, and did the stage fill with your agents?
 - [ ] Did each agent show the right project folder name? Cursor agents especially: we have not seen how Cursor names folders on Windows. Please paste the output of `dir "$env:USERPROFILE\.cursor\projects"`.
 - [ ] Is there a Claude desktop app sessions folder? Paste the output of:
   ```powershell

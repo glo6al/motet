@@ -373,7 +373,7 @@ function makeScenario(key) {
       s.draft.noticeCode = 'saved_recipient'; s.draft.notice = 'Your Ada draft is saved. It is not shared with Motet.'; break;
     case 'a05-scope':
       setDestination(s, destination('officer', null, 'room'), 'room');
-      s.draft.noticeCode = 'saved_scope'; s.draft.notice = 'Your draft about Ada is saved. This one is for the whole room.'; break;
+      s.draft.noticeCode = 'saved_scope'; s.draft.notice = 'Your draft about Ada is saved. This one is for the whole stage.'; break;
     case 'a05-resume':
       setDraft(s, ['plan', 'req']);
       s.files.forEach(f => {f.actions = []; f.previewable = false;});

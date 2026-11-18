@@ -2,7 +2,7 @@
 
 ## Lucide Settings and Folder Open icons
 
-The workspace Room controls button uses the Lucide Settings icon, and project marks use the Lucide Folder Open icon.
+The workspace Stage controls button uses the Lucide Settings icon, and project marks use the Lucide Folder Open icon.
 Source: https://github.com/lucide-icons/lucide
 
 ISC License

@@ -33,7 +33,7 @@ old_runner = _module('officer_demo_eval_helpers', ROOT / 'scripts/eval_officer.p
 
 CASES = {
     'broad_summary': {
-        'question': "Summarise today's recorded work across the whole retained room. Include important changes from quiet chats as well as the busy chat, and explain any meaningful gaps.",
+        'question': "Summarise today's recorded work across the whole stage in retained records. Include important changes from quiet chats as well as the busy chat, and explain any meaningful gaps.",
         'required': ['Use the fixture local day; exclude the yesterday-only deployment statement.',
                      'Retained inventory contains thirty-nine distinct chats; selected detail is not complete real capture.',
                      'Attribute Ada\'s middle-period reversal and need for renewed review to the saved statement.',
@@ -45,7 +45,7 @@ CASES = {
                       'Treating saved agent statements as independently verified work or all real activity.'],
     },
     'count_today': {
-        'question': "How many saved events and recorded chats are there today across the whole retained room? Keep the requested local day and source counts clear.",
+        'question': "How many saved events and recorded chats are there today across the whole stage in retained records? Keep the requested local day and source counts clear.",
         'required': ['Exactly 1314 retained events and 39 retained chats for the fixture local day.',
                      'Typed assertions retain their exact source/unit/scope/interval/completeness.',
                      'The yesterday-only event does not enter today\'s count; all-time retained events would be 1315.',

@@ -80,7 +80,7 @@ function rebindCitationOwner(s,message){
  }groups++;
  function officerMetadata(A=api()){
   const s=snapshot('a08-doc'),view=A.workspaceAttachmentsCreateMessages(doc,s,()=> '4:02 PM',{scopeLabel:'Ada'}),row=view.messages[0];assert.equal(cls(view.root,'workspace-attachments-message-meta')[0].textContent,'You to Motet · about Ada · 4:02 PM');assert.equal(cls(view.root,'workspace-attachments-message-status').length,0,'Motet Answered has no hidden placeholder');assert.equal(row.scrollAnchor,cls(view.root,'workspace-attachments-message-meta')[0]);
-  for(const d of [s.destination,s.draft.destination,s.messages[0].destination]){d.scope={kind:'room',agentId:null}}s.officerAnswer=null;const room=A.workspaceAttachmentsCreateMessages(doc,s,()=> '4:02 PM');assert.equal(cls(room.root,'workspace-attachments-message-meta')[0].textContent,'You to Motet · whole room · 4:02 PM');assert.equal(cls(room.root,'workspace-attachments-message-status').length,0);
+  for(const d of [s.destination,s.draft.destination,s.messages[0].destination]){d.scope={kind:'room',agentId:null}}s.officerAnswer=null;const room=A.workspaceAttachmentsCreateMessages(doc,s,()=> '4:02 PM');assert.equal(cls(room.root,'workspace-attachments-message-meta')[0].textContent,'You to Motet · whole stage · 4:02 PM');assert.equal(cls(room.root,'workspace-attachments-message-status').length,0);
   for(const scenario of ['a07-answered','a06-queued','a06-unknown']){const v=A.workspaceAttachmentsCreateMessages(doc,snapshot(scenario));assert.equal(cls(v.root,'workspace-attachments-message-status').length,1);assert.equal(v.messages[0].scrollAnchor,cls(v.root,'workspace-attachments-message-status')[0])}
  }officerMetadata();groups++;
  function noticeParts(A=api()){

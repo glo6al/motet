@@ -237,7 +237,7 @@ The opt-in `scripts/eval_officer_capabilities.py` runner creates a temporary fic
 
 | Real-model acceptance case | Evidence and observed result | Model calls |
 | --- | --- | --- |
-| Whole-room retrospective | 1,314 same-day events across 39 fictional chats plus one excluded prior-day event; evidence supplied from all 39 chats, with the busy-chat reversal and quiet-chat concerns retained | 4 |
+| Whole-stage retrospective | 1,314 same-day events across 39 fictional chats plus one excluded prior-day event; evidence supplied from all 39 chats, with the busy-chat reversal and quiet-chat concerns retained | 4 |
 | Focused follow-up | Used the actual prior checked answer and reread the relevant chat's three statements; kept its reported need for an owner decision separate from migration execution, which was not established | 2 |
 | Same-day totals | Correctly returned 1,314 retained observations and 39 chats, kept source/unit/day qualifications, and excluded the older event | 2 |
 

@@ -96,7 +96,7 @@ Six authored PDF pages
 are bounded to 1–6; text uses 21 literal lines and inclusive cited range 10–17; image starts at fit with
 adjacent fit/100/150/200 steps. The checkout drawing is a fixed DOM/CSS sample, not SVG or a live Pay now
 control. No URLs, fetched images, scripts, frames, active HTML or file decoding. Rendering/focus remain
-page responsibilities. The room tray includes one-file and five-file samples scoped to the whole room.
+page responsibilities. The stage tray includes one-file and five-file samples scoped to the whole stage.
 
 ## Replies and source navigation
 
@@ -174,8 +174,8 @@ that returned text rather than reconstructing or clearing it locally.
 an open Files history with the same request and manifest. Motet requests queue only, without synthesizing an
 answer to arbitrary text. The seeded `a08-forward` refusal blocks Send and preserves the draft. Editing its
 text clears that old refusal; this fixture has no natural-language forwarding classifier and proves no semantic
-screening capability. Room samples accept the same bound sample selection and Send actions. They remain
-analysis-only Motet requests for the whole room: no agent delivery, room action or live call is performed.
+screening capability. Stage samples accept the same bound sample selection and Send actions. They remain
+analysis-only Motet requests for the whole stage: no agent delivery, stage action or live call is performed.
 
 `filesCount` supplies the closed Files-entry count. Draft files and picker choices do not count. The count can
 include gone files represented in history; its presence is not a claim that their bytes remain available.

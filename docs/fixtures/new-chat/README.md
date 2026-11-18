@@ -1,6 +1,6 @@
 # New chat page fixture
 
-This pure ES module provides seven fictional page states without launching an app, contacting a host, registering an agent, or changing a Room. It is documentation/demo code only. Nothing imports it into the server or production bridge. All folders, host identifiers, sessions, and agents are invented.
+This pure ES module provides seven fictional page states without launching an app, contacting a host, registering an agent, or changing a live stage. It is documentation/demo code only. Nothing imports it into the server or production bridge. All folders, host identifiers, sessions, and agents are invented.
 
 ```js
 import { createNewChatFixture } from './fixture.mjs';
@@ -31,7 +31,7 @@ const result = await adapter.status(attempt.attemptId);
 | --- | --- |
 | `waiting` | Accepted launch; waiting until the 120-second observation deadline. |
 | `confirm` | Claude Code only: after one second, an explicitly observed native folder-confirmation prompt; session stays null. Expires at the deadline. |
-| `added` | After one second, a verified matching fictional session and Room agent are attached. |
+| `added` | After one second, a verified matching fictional session and agent on the stage are attached. |
 | `timeout` | Accepted launch; expires after 120 seconds without a matching observation. |
 | `mismatch` | After one second, an observed chat has a different folder; separate mismatch evidence identifies its actual folder and an already independently observed monitor. No session or agent is attached by this attempt. |
 | `failed` | Immediate fictional launch rejection; observation complete. |
@@ -47,9 +47,9 @@ Replaying the same request ID and payload returns the same attempt at its curren
 
 The live service retains ordinary attempt details for 24 hours and an expired-attempt marker for another 24 hours. Unknown or expired IDs cannot authorize a new launch. Managed Claude ownership has separate retention. This fixture keeps its state in memory.
 
-Every response has the versioned attempt contract: `schemaVersion`, `attemptId`, `requestId`, `provider`, the selected `folder`, `state`, `launch`, `observation`, ISO `createdAt`/`deadlineAt`, nullable `session`, `mismatch`, and `reason`, `draft`, `capabilities`, and `fixture: true`. Only `added` attaches a matching session and Room agent. Response objects cannot mutate fixture state.
+Every response has the versioned attempt contract: `schemaVersion`, `attemptId`, `requestId`, `provider`, the selected `folder`, `state`, `launch`, `observation`, ISO `createdAt`/`deadlineAt`, nullable `session`, `mismatch`, and `reason`, `draft`, `capabilities`, and `fixture: true`. Only `added` attaches a matching session and agent on the stage. Response objects cannot mutate fixture state.
 
-`mismatch` is null except in the mismatch result, where it contains `{sessionId, displayPath, existingRoomAgentId}`. Its actual display path differs from the selected folder. `session` remains null: mismatch evidence is not a success binding. The fictional `existingRoomAgentId` represents a monitor already observed independently by the Room, never a monitor added by this attempt. The page can offer “Show it on its own” by navigating that existing desk when the ID is nonnull; hide that action if no existing monitor is known. This needs no new endpoint or action.
+`mismatch` is null except in the mismatch result, where it contains `{sessionId, displayPath, existingRoomAgentId}`. Its actual display path differs from the selected folder. `session` remains null: mismatch evidence is not a success binding. The fictional `existingRoomAgentId` represents a monitor already observed independently by Motet, never a monitor added by this attempt. The page can offer “Show it on its own” by navigating that existing desk when the ID is nonnull; hide that action if no existing monitor is known. This needs no new endpoint or action.
 
 At the deadline the observation stops with `state: 'timeout'`; status and replay never launch again. `keepWaiting(attemptId)` is available only after timeout and resets the observation deadline to the current time plus 120 seconds on the same attempt. It preserves the original creation time and launch count. An explicitly stopped attempt cannot resume or add a session later. `stopWaiting(attemptId)` is idempotent and leaves completed results stable. Added, mismatch, failed, and unavailable results are stable; timeout changes only through explicit continuation or stop. A wall-clock correction cannot undo observed progress.
 
@@ -77,9 +77,9 @@ node --test docs/fixtures/new-chat/fixture.test.mjs
 
 ### Creation versus opening
 
-Attempt snapshots also expose `creation: {outcome}`, `uiOpen: {attempts, outcome}` and nullable `existingSession: {id, folderId}`. A verified existing native session is separate from `session`, which still requires room admission. `uiOpen.outcome: accepted` records a handoff request, not visual confirmation. `capabilities.openExisting` is false in this fixture.
+Attempt snapshots also expose `creation: {outcome}`, `uiOpen: {attempts, outcome}` and nullable `existingSession: {id, folderId}`. A verified existing native session is separate from `session`, which still requires stage admission. `uiOpen.outcome: accepted` records a handoff request, not visual confirmation. `capabilities.openExisting` is false in this fixture.
 
-Use `createNewChatFixture({scenario: 'failed', failurePhase: 'ui'})` to render a created chat whose window could not be opened. It returns `failed`, `creation.outcome: verified`, `uiOpen.outcome: rejected`, a verified `existingSession`, and no room binding. It must not display “nothing was created” or offer automatic recreation. The default failure phase is `creation`, which demonstrates a rejected request before creation. These are two variants of the same failed state, not a new eighth state.
+Use `createNewChatFixture({scenario: 'failed', failurePhase: 'ui'})` to render a created chat whose window could not be opened. It returns `failed`, `creation.outcome: verified`, `uiOpen.outcome: rejected`, a verified `existingSession`, and no stage binding. It must not display “nothing was created” or offer automatic recreation. The default failure phase is `creation`, which demonstrates a rejected request before creation. These are two variants of the same failed state, not a new eighth state.
 
 The live release enables New chat for verified local providers on macOS. Codex requires desktop version `26.1029.61003`, build `24614`. Starting Claude Code from Motet requires the verified Claude Code `2.1.323` executable and a validated `~/.live-room/managed-claude-readiness.json` for the host and user. This release has no self-serve setup for that record. Live New chat routes require the owner key. A server started with `WATCH_DEMO=1` refuses launches. The browser’s `?demo` flag selects the fictional UI, which has no live-adapter fallback and needs no owner credential. See the [workspace guide](../../../README.md#workspace-interface-preview).
 

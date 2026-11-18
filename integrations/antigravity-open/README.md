@@ -30,7 +30,7 @@ is retained to recognize a later reinstall.
 
 Owner authorization and ephemeral connection data live under
 `~/.live-room/antigravity-open/` in owner-only directories and files. The owner
-capability is distinct from both the Motet room key and the native UI capability.
+capability is distinct from both the Motet stage key and the native UI capability.
 It never appears in URLs, the extension page, public status, logs or model
 context. The native UI uses Antigravity's own token bootstrap. Its proxy can
 forward a canonical `localhost:<port>` Host and omit Origin; UI requests always

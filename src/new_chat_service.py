@@ -51,7 +51,7 @@ MESSAGES = {
     'ui_open_outcome_unknown': 'The chat exists; opening Codex could not be confirmed.',
     'identity_unavailable': 'The exact native session could not be verified.',
     'clock_uncertain': 'The observation deadline could not be verified after a clock change.',
-    'admission_unavailable': 'The session exists, but its room monitor has not been confirmed.',
+    'admission_unavailable': 'The session exists, but its monitor on the stage has not been confirmed.',
     'native_dispatch_rejected': 'The native application rejected this request.',
 }
 

@@ -43,16 +43,14 @@ class InstructionFixture(unittest.TestCase):
 
 
 class CoreInstructionsTests(InstructionFixture):
-    def test_builtin_fallback_pins_original_prompt(self):
-        # The historical prompt is still pinned apart from the assistant name.
+    def test_builtin_fallback_pins_motet_stage_prompt(self):
         bundle = instructions.load_instructions()
         self.assertTrue(bundle.packaged)
         prompt = instructions.BUILTIN_OFFICER_SYSTEM
-        self.assertIn('You are Motet:', prompt)
-        self.assertIn('You are Motet:', bundle.system)
-        previous_brand = prompt.replace('You are Motet:', 'You are the Officer of the Watch:', 1)
-        self.assertEqual(hashlib.sha256(previous_brand.encode()).hexdigest(),
-                         'c28133c5f9da7870356be72f67061fca40fc5fd0c1cceafcfa9c8019bf46fe05')
+        self.assertIn('Call this overview the stage.', prompt)
+        self.assertIn('Call this overview the stage.', bundle.system)
+        self.assertEqual(hashlib.sha256(prompt.encode()).hexdigest(),
+                         '1feb0bdb8ac78fc2098fddd582bd348c00ab66fd3bbbe4c29dab961003224da7')
 
     def test_windows_line_endings_normalize_without_changing_prompt(self):
         self.write_core('\r\n')
@@ -147,7 +145,7 @@ class SkillInstructionsTests(InstructionFixture):
         for card in bundle.skills:
             self.assertLessEqual(len(json.dumps(instructions.load_skill(bundle, {'skill': card.skill}))), server.OFFICER_TOOL_CHARS)
         self.assertNotIn('For "what did I miss"', bundle.system)
-        self.assertNotIn('When the owner wants the room to flag something', bundle.system)
+        self.assertNotIn('When the owner wants the stage to flag something', bundle.system)
 
     def test_menu_is_metadata_only_and_selected_card_is_complete(self):
         bundle = instructions.load_instructions()

@@ -1168,12 +1168,12 @@ def test_officer():
         del server.AGENTS['e:eeeeeeee-5']
         es3 = server.officer_tool('events_since', {'minutes': 5, 'limit': 60}, acts)
         gone = [st for st in es3['steps'] if st['id'] == 'e:eeeeeeee-5']
-        check('an observed agent that has left keeps its name and its process-list provenance', len(gone) == 2 and all(st['agent'] == 'Codex cloud (no longer in the room)' and st.get('source') for st in gone))
+        check('an observed agent that has left keeps its name and its process-list provenance', len(gone) == 2 and all(st['agent'] == 'Codex cloud (no longer on the stage)' and st.get('source') for st in gone))
         server.AGENTS['e:ffffffff-6'] = {'name': 'Brief', 'runtime': 'Codex cloud', 'cwd': '/tmp/b', 'observed': 'the process list'}
         server.emit('e:ffffffff-6', 'run', False, now - 3, id='b1', cmd='ls', seen=True)
         del server.AGENTS['e:ffffffff-6']                   # gone before the Officer was ever asked
         brief = [st for st in server.officer_tool('events_since', {'minutes': 5, 'limit': 60}, acts)['steps'] if st['id'] == 'e:ffffffff-6']
-        check('an agent that left before the Officer was first asked is still named', brief and brief[0]['agent'] == 'Brief (no longer in the room)' and brief[0].get('source'))
+        check('an agent that left before the Officer was first asked is still named', brief and brief[0]['agent'] == 'Brief (no longer on the stage)' and brief[0].get('source'))
         check('events_since with an unknown agent is an error, not a crash', 'error' in server.officer_tool('events_since', {'minutes': 5, 'agent': 'nobody'}, acts))
         acts2 = []
         dr = server.officer_tool('draft_watch_rule', {'words': '  npm   run migrate ', 'show_as': 'deploy'}, acts2)
@@ -1311,7 +1311,7 @@ def test_officer():
             snap = [st for st in server.officer_tool('events_since', {'minutes': 5, 'limit': 60}, acts)['steps'] if st['id'] == 'e:88888888-8']
         finally:
             server.officer_step = real_step
-        check('a trim between the snapshot and the formatting cannot strip a name from a step already copied', fired[0] and snap and snap[0]['agent'] == 'Snap (no longer in the room)' and 'e:88888888-8' not in server.KNOWN_NAMES)
+        check('a trim between the snapshot and the formatting cannot strip a name from a step already copied', fired[0] and snap and snap[0]['agent'] == 'Snap (no longer on the stage)' and 'e:88888888-8' not in server.KNOWN_NAMES)
     finally:
         server.AGENTS.clear(); server.AGENTS.update(saved[0]); server.LOG[:] = saved[1]; server.BASE = saved[2]
 

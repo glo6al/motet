@@ -285,7 +285,7 @@ class ContextTests(unittest.TestCase):
             for aid in ['c:87654321', 'x:12345678']:
                 out = server.officer_ask(self.turns, call=self.model, request_id='request', context={'scope': 'station', 'agent': aid})
                 self.assertTrue(out['context_unavailable'])
-                self.assertIn('Whole room', out['error'])
+                self.assertIn('Whole stage', out['error'])
         self.assertEqual(self.calls, [])
 
     def test_history_is_untrusted_data_and_raw_content_stays_immutable(self):
@@ -301,7 +301,7 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(body['system'].count('</context_data>'), 1)
         self.assertEqual(body['messages'], [{'role': t['role'], 'content': t['content']} for t in turns if t['role'] == 'user'])
         self.assertEqual(turns, before)
-        for rule in ('Explicit named agents or explicit room-wide questions override', 'Current context does not reinterpret earlier turns',
+        for rule in ('Explicit named agents or explicit stage-wide questions override', 'Current context does not reinterpret earlier turns',
                      'does not restrict', 'untrusted context data', "'ask it' still needs an explicit named recipient"):
             self.assertIn(rule, body['system'])
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Add (or with --remove, take out) Motet's Claude Code hooks in ~/.claude/settings.json.
 
-  Notification       tells the room a session wants attention. Observes only.
-  Stop, SubagentStop tell the room Claude, or a sub-agent, is about to stop. That is provisional, not a finished
+  Notification       tells Motet a session wants attention. Observes only.
+  Stop, SubagentStop tell Motet that Claude, or a sub-agent, is about to stop. That is provisional, not a finished
                      turn: another Stop hook can tell Claude to continue, and the log's own records of the turn's
-                     end may arrive later; the room labels it so. Observe only: they print nothing, so they cannot
+                     end may arrive later; Motet labels it so. Observe only: they print nothing, so they cannot
                      keep Claude going or change what it does.
-  PermissionRequest  asks the room for your Allow / Deny and passes the answer back to Claude.
-                     This one DOES decide prompts on your behalf when you press a button in the room.
-                     With the room closed, or no answer, it prints nothing. Claude is then expected to ask in the app
+  PermissionRequest  asks Motet for your Allow / Deny and passes the answer back to Claude.
+                     This one DOES decide prompts on your behalf when you press a button on the stage.
+                     With the stage closed, or no answer, it prints nothing. Claude is then expected to ask in the app
                      as usual; that has not yet been confirmed against a real prompt (see README).
 
 All send the key from ~/.live-room/header, which the server writes when it starts. Only entries carrying this script's

@@ -130,7 +130,7 @@ class OfficerEvidenceEvals(unittest.TestCase):
         self.assertEqual(after['steps'], [])
         self.assertIn('silence, not idleness', after['note'])
         agents, _ = self.tool('list_agents')
-        self.assertTrue(all(a['last_recorded'] == 'nothing in what the room keeps' for a in agents['agents']))
+        self.assertTrue(all(a['last_recorded'] == 'nothing in what the stage keeps' for a in agents['agents']))
 
     def test_synthetic_overlap_preserves_read_vs_edit_and_citations(self):
         path = next(e['path'] for e in server.LOG if e.get('id') == 'a-seed' and e['kind'] == 'edit')

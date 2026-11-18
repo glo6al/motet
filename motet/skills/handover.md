@@ -2,7 +2,7 @@ Name: Handover
 Use when: The owner asks for a session summary or a handover for themselves or the next agent.
 Tools: room_snapshot, evidence_query, evidence_expand, draft_to_clipboard
 
-1. Identify the intended session and time span. Use live evidence for the recent room and retained memory for earlier sessions or days. Resolve ambiguous archived names before summarising.
+1. Identify the intended session and time span. Use live evidence for recent activity on the stage and retained memory for earlier sessions or days. Resolve ambiguous archived names before summarising.
 2. Use evidence_query overview across the full requested scope, then scoped records and evidence_expand for relevant discussion and operation results. Collect the recorded goal, useful changes, reported validation, actual operation outcomes, open questions, held permission requests, and next steps the agent explicitly stated. Inspect omissions rather than substituting the latest few entries for a handover. Do not invent a next step or infer private reasoning.
 3. Separate recorded actions from agent claims. A statement that checks pass is a reported result unless a corresponding tool result establishes it. An ended turn, returned step, or written summary does not establish that the overall task is complete, approved, shipped, or sent.
 4. Preserve probably, inferred, unknown outcomes, and parent-relation qualifications. State partial coverage and bounded evidence plainly. Do not explain a historical gap with a current pause unless an overlapping interval supports it.

@@ -65,7 +65,7 @@ def validate_target(agent, agents):
         raise MessagingError(400, 'Select an exact local chat identifier. New named-chat delivery currently supports Codex only.')
     a = agents.get(agent)
     if not a:
-        raise MessagingError(404, 'That agent is no longer in the room.')
+        raise MessagingError(404, 'That agent is no longer on the stage.')
     expected = 'Claude' if agent.startswith('c:') else 'Codex'
     if a.get('runtime') != expected or a.get('observed') or (expected == 'Claude' and a.get('sub')):
         raise MessagingError(400, 'That target is not an eligible local parent chat. New named-chat delivery currently supports Codex only.')

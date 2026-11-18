@@ -7,7 +7,7 @@ Open the [workspace](http://127.0.0.1:8793/) on the computer running Motet. File
 3. Send a question to provide only the originals shown in its tray to Anthropic under your API key. Anthropic bills your API account for usage. Send a new attachment with an empty message to keep it in this conversation without a model call.
 4. To add a kept file to a question, open **Files** and choose **Use in next question**. **Take out** removes it from the tray and leaves the kept copy in the conversation. **Ask a follow-up from your files** adds the files used by that answer that are still kept. Ordinary questions continue to use Motet’s regular conversation.
 
-A question using only kept files can include up to eight earlier answers from the same conversation as text. Each earlier answer qualifies only if all the files it used are in the current tray. File questions have no access to the room’s recorded activity. Motet stores drafts and kept originals under `~/.live-room/attachments/`.
+A question using only kept files can include up to eight earlier answers from the same conversation as text. Each earlier answer qualifies only if all the files it used are in the current tray. File questions have no access to the stage’s recorded activity. Motet stores drafts and kept originals under `~/.live-room/attachments/`.
 
 This example gives file questions a one-time **USD 6.00 total** allowance. Choose your own limit before the policy is registered.
 
