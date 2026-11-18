@@ -724,7 +724,8 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.manager.owner_capabilities('c:' + native)['actions']['steer']['supported'])
 
     def test_real_ipc_client_accepts_bounded_large_response_and_hides_credentials(self):
-        with tempfile.TemporaryDirectory(prefix='cm-', dir='/private/tmp') as short:
+        # Unix-domain sockets need a short path even when TMPDIR is long.
+        with tempfile.TemporaryDirectory(prefix='cm-', dir=Path('/tmp').resolve()) as short:
             manager = managed.ManagedClaude(Path(short), enabled=True, configuration_ready=True,
                                              _test_dependencies=self.dependencies)
             run_id = manager.reserve(self.folder, uid())

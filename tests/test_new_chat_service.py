@@ -565,6 +565,7 @@ class WorkAdapter(FakeAdapter):
         return ExecutionResult('completed', turn_id) if self.completed else None
 
 
+@unittest.skipIf(os.name == 'nt', 'New chat uses private POSIX storage; Windows native launch is unavailable.')
 class WorkingServiceTests(unittest.TestCase):
     setUp = ServiceTests.setUp
     cleanup_services = ServiceTests.cleanup_services
