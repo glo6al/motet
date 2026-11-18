@@ -113,8 +113,11 @@ class OfficerCapabilityTests(unittest.TestCase):
         with self.history.wake:
             out = self.history.offer_record(record, [row], capture_epoch=self.epoch)
         self.assertEqual(out['status'], 'queued')
-        if self.number % 100 == 0:
-            self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))
+        batch = 20 if os.name == 'nt' else 100
+        if self.number % batch == 0:
+            self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10),
+                            f'Fictional archive at {self.number}: {self.history.reason!r}, '
+                            f'queued={len(self.history.queue)}, inflight={self.history.inflight}')
 
     def test_fixture_admission_cannot_race_the_writers_nonblocking_gate(self):
         attempted, release = threading.Event(), threading.Event()
@@ -192,15 +195,25 @@ class OfficerCapabilityTests(unittest.TestCase):
         if dense:
             # A single UTC day keeps this fixture in one daily evidence bucket per chat.
             start = int(self.now // 86400) * 86400 - 3600
-            for index in range(1200):
-                self.add('Middle milestone: the rounding decision was reversed.' if index == 600 else 'Busy pricing detail ' + str(index),
-                         stamp=start + index + 1)
-            for index in range(3):
-                self.add('Quiet critical decision: preserve old session rows.' if index == 1 else 'Quiet migration detail ' + str(index),
-                         chat='x:demo-bram', name='Bram', stamp=start + 600 + index)
+            # This disposable corpus tests evidence selection, not durability.
+            # Keep the real writer without an OS disk sync for every fixture record.
+            with self.history.lock:
+                synchronous = self.history.db.execute('PRAGMA synchronous').fetchone()[0]
+                self.history.db.execute('PRAGMA synchronous=OFF')
+            try:
+                for index in range(1200):
+                    self.add('Middle milestone: the rounding decision was reversed.' if index == 600 else 'Busy pricing detail ' + str(index),
+                             stamp=start + index + 1)
+                for index in range(3):
+                    self.add('Quiet critical decision: preserve old session rows.' if index == 1 else 'Quiet migration detail ' + str(index),
+                             chat='x:demo-bram', name='Bram', stamp=start + 600 + index)
+                self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))
+            finally:
+                with self.history.lock:
+                    self.history.db.execute(f'PRAGMA synchronous={synchronous}')
         else:
             self.add('Fictional saved progress: pricing review needs a rounding correction.')
-        self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))
+            self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))
 
     def query(self, **changes):
         value = {'scope': copy.deepcopy(SCOPE), 'view': 'overview', 'limit': 20}

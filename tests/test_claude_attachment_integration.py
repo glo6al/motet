@@ -25,6 +25,7 @@ import peer_lifecycle
 from attachments_native_namespace import NativeNamespaceFence
 from attachments_owner_transport import CLAUDE_CLAIMS
 from attachments_types import AttachmentError
+from loopback_http_fixture import LoopbackHTTPServer
 from officer_messaging import MessagingStore
 
 OWNER_KEY = 'fictional-owner-key'
@@ -70,7 +71,7 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         self.attachments = self.stack.enter_context(closing(server.start_attachments()))
         self.stack.enter_context(patch.object(server, 'ATTACHMENTS', self.attachments))
         self.stack.callback(self.messaging.stop_native_attachment_runtime)
-        self.httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), QuietHandler)
+        self.httpd = LoopbackHTTPServer(('127.0.0.1', 0), QuietHandler)
         self.httpd.daemon_threads = False
         port = self.httpd.server_port
         self.stack.enter_context(patch.object(server, 'PORT', port))

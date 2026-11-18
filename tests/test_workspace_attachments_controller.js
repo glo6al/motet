@@ -1,6 +1,6 @@
 'use strict';
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
-const html=fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8');
+const html=fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8').replace(/\r\n?/g,'\n');
 const start=html.indexOf('/* Workspace attachments controller:'),end=html.indexOf('/* end Workspace attachments controller */',start);
 const controller=html.slice(start,end);
 const presentation=html.split('/* Workspace attachments presentation */')[1].split('/* end Workspace attachments presentation */')[0];

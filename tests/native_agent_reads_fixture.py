@@ -1,6 +1,6 @@
 """Disposable loopback HTTP fixture for the native attachment read stage."""
 from contextlib import ExitStack, contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 import json
 import re
@@ -9,6 +9,7 @@ import socket
 import threading
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
+from loopback_http_fixture import LoopbackHTTPServer
 
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
@@ -48,7 +49,7 @@ class ResponseFault:
             return True
 
 
-class _LocalServer(ThreadingHTTPServer):
+class _LocalServer(LoopbackHTTPServer):
     daemon_threads = False
     block_on_close = True
 

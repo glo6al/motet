@@ -3,7 +3,7 @@
 /* The real workspace permission presentation against the inert managed fixture. */
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 const {pathToFileURL}=require('node:url');
-const html=fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8');
+const html=fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8').replace(/\r\n?/g,'\n');
 const source=html.slice(html.indexOf('function workspaceRequestCard('),html.indexOf('/* end request-card presentation */'));
 const fn=name=>{const start=html.indexOf('function '+name+'('),end=html.indexOf('\nfunction ',start+10);assert.ok(start>0&&end>start,name);return html.slice(start,end)};
 class Node{

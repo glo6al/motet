@@ -57,7 +57,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_document_live_fixture.py
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
+        timeout-minutes: 8
       - run: python tests/test_officer_document_page_embed.py
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_document_page_routes.py

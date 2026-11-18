@@ -4,14 +4,14 @@
  * it does not claim native picker, DOM, layout, or real provider coverage. */
 'use strict';
 const assert = require('node:assert/strict');
-const {spawn} = require('node:child_process');
+const {spawn, spawnSync} = require('node:child_process');
 const {webcrypto} = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {createOfficerDocumentsClient} = require('../src/web/officer-documents-client.js');
 
-const pageSource = fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8');
+const pageSource = fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8').replace(/\r\n?/g,'\n');
 const liveMarker = '/* Workspace live Officer documents: separate asynchronous owner-resource consumer. */';
 const liveEnd = '/* end Workspace live Officer documents */';
 assert.equal(pageSource.split(liveMarker).length,2,'one actual live consumer region');
@@ -21,7 +21,7 @@ assert(validatorEnd>0,'actual closed validator extraction boundary');
 // Both real validation functions, with their actual dependency closure. No DOM
 // substitutes or relaxed public DTO schema are introduced by this harness.
 const validate = vm.runInNewContext(liveSource.slice(0,validatorEnd)+';workspaceLiveDocumentsSnapshot');
-const clientSource = fs.readFileSync(path.join(__dirname,'../src/web/officer-documents-client.js'),'utf8');
+const clientSource = fs.readFileSync(path.join(__dirname,'../src/web/officer-documents-client.js'),'utf8').replace(/\r\n?/g,'\n');
 const key = 'fictional-officer-browser-fixture-key';
 const context = {scopeId:'room',modelId:'claude-haiku-5-5'};
 
@@ -764,7 +764,27 @@ async function run() {
     "!str(value.text,20000)||!value.text.trim()||value.sourceValidation!=='current'"),markerOnlyPresentation,/actual marker-only display projection is accepted/);
   console.log('Motet page/client actual HTTP: 21 flows + 12 unmodified VM scenario controls / 14 causal mutants passed; every callback and final DTO validated, only explicit fictional calls, 0 external calls.');
 }
-// The aggregate requires CPU-heavy suites whose synchronous/microtask work can
-// delay stdout delivery. Start the disposable listener after that import turn,
-// so its real startup deadline measures startup rather than blocked parent IO.
-setImmediate(()=>{run().catch(e=>{console.error(e);process.exitCode=1;});});
+if (process.platform === 'win32') {
+  // Positive HTTP cases require POSIX storage. Exercise the actual native
+  // Windows refusal and verify that it leaves no private store behind.
+  const result = spawnSync('python', ['-c', `
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from attachments_files import PrivateFiles
+from attachments_types import AttachmentError
+with TemporaryDirectory() as folder:
+    try:
+        PrivateFiles(folder)
+    except AttachmentError as error:
+        assert error.code == 'host_unavailable', error
+        assert not any(Path(folder).iterdir())
+    else:
+        raise AssertionError('Native Windows accepted POSIX attachment storage.')
+`], {cwd: path.join(__dirname, '../src'), encoding: 'utf8', timeout: 15000});
+  if (result.error) throw result.error;
+  assert.equal(result.status, 0, result.stderr);
+  console.log('ok native Windows refuses private attachment storage before creating files');
+} else {
+  // Let the aggregate's synchronous work finish before timing real startup.
+  setImmediate(() => run().catch(error => { console.error(error); process.exitCode = 1; }));
+}

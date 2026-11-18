@@ -35,7 +35,8 @@ class FixtureProcess(unittest.TestCase):
     def start(self, outcome='normal', *, arguments=None):
         flags = ['--reading-off', '--deletion-outcome', outcome] if arguments is None else arguments
         self.child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('officer_document_live_fixture.py')),
-            '--trace-startup', *flags], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            '--trace-startup', *flags], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
         self.stopped = False
         self.addCleanup(self.stop)
         ready, _, _ = select.select([self.child.stdout], [], [], 15)
@@ -372,9 +373,9 @@ class OrdinaryFixtureTests(FixtureProcess):
         return dict(turns=[{'role': 'user', 'content': text, 'context': {'scope': 'room'}}],
                     context={'scope': 'room'}, request_id='00000000-0000-4000-8000-000000000001')
 
-    def assert_http_error(self, want, route, data, headers=None):
+    def assert_http_error(self, want, route, data=None, headers=None, method=None):
         with self.assertRaises(urllib.error.HTTPError) as raised:
-            self.request(route, data, headers)
+            self.request(route, data, headers, method)
         with raised.exception as response:
             self.assertEqual(response.code, want)
             return response.read()
@@ -402,7 +403,9 @@ class OrdinaryFixtureTests(FixtureProcess):
         self.assert_http_error(400, '/ask?unexpected=1', self.ordinary())
         self.assert_http_error(400, '/ask', dict(self.ordinary(), attachment={'content': 'fictional injected bytes'}))
         self.assert_http_error(400, '/ask', {'turns': [{'role': 'assistant', 'content': 'Last role is not owner.'}]})
-        self.assert_http_error(400, '/ask', b'x' * 200001, {'Content-Type': 'application/json'})
+        # The server rejects the declared length before reading the body.
+        self.assert_http_error(400, '/ask', headers={'Content-Type': 'application/json',
+                                                    'Content-Length': '200001'}, method='POST')
         self.assert_http_error(503, '/fictional-other-route', self.ordinary())
         self.assert_fixed_answer(self.request('/ask', self.ordinary()))
         with_marker = self.ordinary('Distinct fictional follow-up.')

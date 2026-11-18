@@ -23,7 +23,6 @@ from pathlib import Path
 import re
 import signal
 import socket
-import socketserver
 import ssl
 import sys
 import tempfile
@@ -31,6 +30,7 @@ import threading
 import time
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
+from loopback_http_fixture import LoopbackHTTPServer
 
 KEY = 'fictional-officer-browser-fixture-key'
 CLAIM = 'fictional-officer-browser-fixture-claim'
@@ -340,19 +340,13 @@ def main():
 
         do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_PUT
 
-    class FixtureServer(server.ThreadingHTTPServer):
+    class FixtureServer(LoopbackHTTPServer):
         daemon_threads = False
         block_on_close = True
 
         def __init__(self, *a, **kw):
             self.active, self.active_lock, self.closing = set(), threading.Lock(), False
             super().__init__(*a, **kw)
-
-        def server_bind(self):
-            # The fixture binds a numeric loopback address. HTTPServer's reverse
-            # lookup serves no purpose here and can stall startup on hosted runners.
-            socketserver.TCPServer.server_bind(self)
-            self.server_name, self.server_port = self.server_address[:2]
 
         def process_request(self, request, address):
             with self.active_lock:
