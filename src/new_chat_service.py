@@ -25,6 +25,9 @@ from new_chat_types import (Capability, FrozenFolder, NewChatError, OpenResult, 
 
 PROVIDERS = ('codex', 'claude_code', 'antigravity', 'chatgpt_work')
 WINDOW, INTENT_LIFE, RETENTION = 120, 300, 86400
+_SAVED_FOLDER_ROWS = ("SELECT CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB))=64 "
+                      "THEN CAST(id AS BLOB) END,CASE WHEN typeof(data)='text' "
+                      'THEN substr(CAST(data AS BLOB),1,65537) END FROM registered_folders')
 MESSAGES = {
     'execution_unknown': 'The first instruction outcome is uncertain. It will not be sent again.',
     'owner_unavailable': 'Codex did not take ownership of this chat. The instruction was not submitted.',
@@ -202,7 +205,7 @@ class NewChatService:
         except Exception:
             return Capability(False, 'adapter_unavailable', MESSAGES['adapter_unavailable'])
 
-    def _registered_folders(self):
+    def _decode_registered_folder(self, ident_bytes, raw_bytes):
         def unique(items):
             result = {}
             for key, value in items:
@@ -211,25 +214,70 @@ class NewChatService:
                 result[key] = value
             return result
 
-        folders = []
+        if type(ident_bytes) is not bytes or type(raw_bytes) is not bytes or len(raw_bytes) > 65536:
+            raise ValueError('Invalid saved folder data.')
+        ident = ident_bytes.decode('utf-8')
+        value = json.loads(raw_bytes.decode('utf-8'), object_pairs_hook=unique)
+        return self.inventory.restore_registered(ident, value)
+
+    def _read_registered_folders(self):
+        folders, unreadable = [], 0
         with self.lock:
             # API writes already cap the row count. Bound individual transfers
             # too, so a damaged row cannot force an unbounded JSON allocation.
-            rows = self.db.execute("SELECT CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB))=64 "
-                                   "THEN CAST(id AS BLOB) END,CASE WHEN typeof(data)='text' "
-                                   'THEN substr(CAST(data AS BLOB),1,65537) END '
-                                   'FROM registered_folders ORDER BY id')
+            rows = self.db.execute(_SAVED_FOLDER_ROWS + ' ORDER BY id')
             for ident_bytes, raw_bytes in rows:
                 try:
-                    if type(ident_bytes) is not bytes or type(raw_bytes) is not bytes or len(raw_bytes) > 65536:
-                        continue
-                    ident = ident_bytes.decode('utf-8')
-                    raw = raw_bytes.decode('utf-8')
-                    value = json.loads(raw, object_pairs_hook=unique)
-                    folders.append(self.inventory.restore_registered(ident, value))
+                    folders.append(self._decode_registered_folder(ident_bytes, raw_bytes))
                 except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
-                    continue
-        return folders
+                    unreadable += 1
+        return folders, unreadable
+
+    def _registered_folders(self):
+        return self._read_registered_folders()[0]
+
+    def saved_folders(self):
+        with self.lock:
+            self._guard()
+            try:
+                folders, unreadable = self._read_registered_folders()
+            except sqlite3.Error:
+                _error('saved_folders_unavailable',
+                       'Saved project folders are unavailable. Refresh saved folders to check.', 503)
+            return {'schemaVersion': 1, 'savedFolders': [public_folder(folder) for folder in folders],
+                    'complete': unreadable == 0, 'unreadableCount': unreadable}
+
+    def remove_saved_folder(self, ident, data):
+        self._guard()
+        def identity(value):
+            return type(value) is str and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+        if (not identity(ident) or type(data) is not dict or set(data) != {'revision'}
+                or not identity(data['revision'])):
+            _error('invalid_request', 'Invalid New chat request.', 400)
+        try:
+            with self.lock:
+                self._guard()
+                with self.db:
+                    row = self.db.execute(_SAVED_FOLDER_ROWS + ' WHERE id=?', (ident,)).fetchone()
+                    if row is None:
+                        _error('unknown_saved_folder', 'This folder is no longer saved in Motet.', 404)
+                    try:
+                        folder = self._decode_registered_folder(*row)
+                    except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+                        _error('unreadable_saved_folder',
+                               'This saved project folder could not be verified. Nothing was removed.', 409)
+                    if not hmac.compare_digest(folder.revision, data['revision']):
+                        _error('saved_folder_changed',
+                               'This saved project folder changed. Refresh saved folders before removing it.', 409)
+                    deleted = self.db.execute("DELETE FROM registered_folders WHERE id=? AND typeof(id)='text' "
+                                              "AND typeof(data)='text' AND CAST(data AS BLOB)=?", (ident, row[1]))
+                    if deleted.rowcount != 1:
+                        _error('saved_folder_changed',
+                               'This saved project folder changed. Refresh saved folders before removing it.', 409)
+        except sqlite3.Error:
+            _error('saved_folders_unavailable',
+                   'Saved project folders are unavailable. Refresh saved folders to check.', 503)
+        return {'schemaVersion': 1, 'removed': {'id': folder.id, 'revision': folder.revision}}
 
     def register_folder(self, data):
         self._guard()

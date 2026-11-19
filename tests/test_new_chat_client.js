@@ -20,6 +20,7 @@ function harness(options={}){
     const route=url.replace('/api/new-chat/',''),body=opts.body&&JSON.parse(opts.body);requests.push({route,body,opts});
     if(route==='attempts')assert.equal(store.get('watch-new-chat:digest-'+key),requestId,'durable opaque request ID precedes dispatch');
     const value=await run(route,body,requests);
+    if(value?.httpResponse)return {ok:false,status:value.status,json:async()=>value.value};
     if(value?.jsonHang)return {ok:true,status:200,json:()=>new Promise(()=>{})};
     if(value?.httpError)return {ok:false,status:value.httpError,json:async()=>({schemaVersion:1,error:{message:value.message,code:value.code}})};
     return {ok:true,status:200,json:async()=>value};
@@ -113,10 +114,122 @@ async function chooserChecks(factory=create){
     const b=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch}:{schemaVersion:1,...bad}});await b.boot();await assert.rejects(b.client.beginFolderChoice(data),'a mismatched or malformed chooser receipt is not authority');await assert.rejects(b.client.folderChoiceStatus(requestId));
   }
   let response;const l=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch}:new Promise(resolve=>response=resolve)});await l.boot();const pending=l.client.beginFolderChoice(data);await tick();l.setKey('changed-owner');l.client.sync();response({schemaVersion:1,requestId,state:'selected',selectionToken:token});await assert.rejects(pending,/authentication/);
-  let recoveredReads=0;const recovered=harness({create:factory,route:route=>route==='context'?(recoveredReads++,{...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch,folders:recoveredReads===1?[]:[saved]}):{schemaVersion:1,requestId,state:'saved',folder:saved}});await recovered.boot();const recoveredReceipt=await recovered.client.folderChoiceStatus(requestId);assert.equal(recoveredReceipt.folder.availabilityChecked,true,'a saved GET receipt refreshes availability just as the accept reply does');assert.equal(recovered.client.isRegistered(folder.displayPath),true);assert.equal(recovered.requests.filter(r=>r.body).length,0);
+  let recoveredReads=0;const recovered=harness({create:factory,route:route=>route==='context'?(recoveredReads++,{...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch,folders:recoveredReads===1?[]:[saved]}):{schemaVersion:1,requestId,state:'saved',folder:saved}});await recovered.boot();const recoveredReceipt=await recovered.client.folderChoiceStatus(requestId);assert.equal(recoveredReceipt.folder.availabilityChecked,false,'an arbitrary historical saved GET is not a new Add episode');assert.equal(recovered.client.isRegistered(folder.displayPath),true);assert.equal(recovered.requests.filter(r=>r.body).length,0);
   let posts=0;const u=harness({create:factory,route:(route,body)=>{if(route==='context')return {...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch};if(body){posts++;throw Error('lost response')}return {schemaVersion:1,requestId,state:'pending'}}});await u.boot();await assert.rejects(u.client.beginFolderChoice(data));await u.client.folderChoiceStatus(requestId);assert.equal(posts,1,'unknown begin is never automatically repeated');
 }
-(async()=>{
+const savedA={id:'a'.repeat(64),revision:'1'.repeat(64),label:'Orchard',displayPath:'/fictional/projects/orchard'},savedB={id:'b'.repeat(64),revision:'2'.repeat(64),label:'Orchard',displayPath:'/fictional/other/orchard'};
+const listing=(folders=[savedA],unreadableCount=0)=>({schemaVersion:1,savedFolders:folders,complete:unreadableCount===0,unreadableCount});
+const removed=f=>({schemaVersion:1,removed:{id:f.id,revision:f.revision}});
+const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject}};
+async function savedFolderChecks(factory=create){
+  let list=listing([savedA,savedB]),post=removed(savedA),catalog=[{...savedA,registered:true}];
+  const h=harness({create:factory,route:(route,body)=>route==='context'?{...context(),folders:catalog}:route==='folders'?list:post});await h.boot();
+  assert.equal(await h.client.refreshSavedFolders(),true);assert.equal(h.client.savedFoldersState().folders.length,2);
+  list=listing([{...savedA,revision:'3'.repeat(64)}],1);await h.client.refreshSavedFolders();let state=h.client.savedFoldersState();
+  assert.equal(state.complete,false);assert.equal(state.unreadableCount,1);assert.equal(state.folders.find(f=>f.id===savedA.id).revision,'3'.repeat(64),'positive replacement supersedes the old revision even in partial data');assert.equal(state.folders.find(f=>f.id===savedA.id).verified,true);assert.equal(state.folders.find(f=>f.id===savedB.id).verified,false,'partial omission never proves absence');
+  await assert.rejects(h.client.removeSavedFolder(savedB.id,savedB.revision),/Refresh/);assert.equal(h.requests.filter(r=>r.body).length,0);
+  const launchFresh=h.client.inventoryFresh;list={httpError:503};assert.equal(await h.client.refreshSavedFolders(),false);assert.equal(h.client.inventoryFresh,launchFresh,'management read failure does not disable independent launch inventory');assert.equal(h.client.savedFoldersState().folders.length,2);assert(h.client.savedFoldersState().folders.every(f=>!f.verified));
+  for(const bad of [listing([{...savedA,id:'not-an-id'}]),{...listing(),complete:false},{...listing(),unexpected:true},listing([savedA,savedA]),{...listing(),unreadableCount:-1}]){list=bad;assert.equal(await h.client.refreshSavedFolders(),false);assert.equal(h.client.savedFoldersState().folders.length,2,'malformed response preserves display');}
+  list=listing();await h.client.refreshSavedFolders();catalog=[];
+  const before=h.requests.filter(r=>r.body).length;const result=await h.client.removeSavedFolder(savedA.id,savedA.revision);assert.equal(result.state,'removed');assert.equal(h.client.savedFoldersState().folders.length,0);assert.match(h.client.savedFoldersState().status,/Removed Orchard/);assert(h.client.knownUnregistered(savedA.displayPath,savedA.revision));assert.equal(h.requests.filter(r=>r.body).length,before+1);assert.deepEqual(h.requests.find(r=>r.route.endsWith('/remove')).body,{revision:savedA.revision});
+  assert.equal(h.store.size,0,'saved metadata and operation latches never enter browser persistence');
+  // Unknown outcomes remain read-only until a fresh list; current presence permits a NEW explicit confirmation.
+  catalog=[{...savedA,registered:true}];list=listing();await h.client.refreshSavedFolders();post={httpError:503,code:'saved_folders_unavailable'};assert.equal((await h.client.removeSavedFolder(savedA.id,savedA.revision)).state,'unknown');const count=h.requests.filter(r=>r.body).length;
+  assert.match(h.client.savedFoldersState().status,/Nothing will be removed again automatically/);await assert.rejects(h.client.removeSavedFolder(savedA.id,savedA.revision));assert.equal(h.requests.filter(r=>r.body).length,count);
+  list=listing([],1);await h.client.refreshSavedFolders();assert.equal(h.client.savedFoldersState().folders.length,1,'partial absence cannot resolve unknown');
+  list=listing();await h.client.refreshSavedFolders();assert(h.client.savedFoldersState().folders[0].verified);assert.match(h.client.savedFoldersState().status,/could not confirm/,'positive presence does not prove the prior POST failed');
+  post={schemaVersion:1,removed:{id:savedA.id,revision:savedB.revision}};assert.equal((await h.client.removeSavedFolder(savedA.id,savedA.revision)).state,'unknown','mismatched receipt is unknown');
+  list=listing([]);await h.client.refreshSavedFolders();assert.equal(h.client.savedFoldersState().folders.length,0);assert.equal(h.client.savedFoldersState().status,'This folder is no longer saved in Motet.');
+  list=listing();await h.client.refreshSavedFolders();post={httpError:409,code:'saved_folder_changed',message:'untrusted raw detail'};assert.equal((await h.client.removeSavedFolder(savedA.id,savedA.revision)).state,'refused');assert.equal(h.client.savedFoldersState().status,'This saved project folder changed. Refresh saved folders before removing it.');
+  h.setKey('');h.client.sync();assert.equal(h.client.savedFoldersState().folders.length,0);assert.equal(h.client.savedFoldersState().status,'');assert(!h.client.knownUnregistered(savedA.displayPath,savedA.revision));
+}
+async function catalogRaceChecks(factory=create){
+  let reads=0,ctxReads=0,listValue=listing(),ctxValue={...context(),folders:[{...savedA,registered:true}],canChooseFolders:true,folderChoiceEpoch:choiceEpoch},removeWait=deferred(),listWait=null,contextWait=null;
+  const h=harness({create:factory,route:(route,body)=>{
+    if(route==='context'){ctxReads++;return contextWait?contextWait.promise:ctxValue}
+    if(route==='folders'){reads++;return listWait?listWait.promise:listValue}
+    if(route.endsWith('/remove'))return removeWait.promise;
+    if(route==='folders/choose')return {schemaVersion:1,requestId:body.requestId,state:'pending'};
+    if(route.endsWith('/accept'))return {schemaVersion:1,requestId:route.split('/')[2],state:'saved',folder:{...savedA,registered:true}};
+    if(route.startsWith('folders/choose/'))return {schemaVersion:1,requestId:route.split('/')[2],state:'saved',folder:{...savedA,registered:true}};
+    throw Error(route);
+  }});await h.boot();await h.client.refreshSavedFolders();
+  listWait=deferred();const old=h.client.refreshSavedFolders();await tick(); // Before mutation.
+  // The stale read made its rows unverified; finish a current read before Remove while retaining its older callback for the ticket test below.
+  listWait.resolve(listing());await old;listWait=null;
+  contextWait=deferred();const oldContext=h.client.retryContext();await tick();
+  const removal=h.client.removeSavedFolder(savedA.id,savedA.revision);await tick();assert.equal(h.client.inventoryFresh,false);
+  listWait=deferred();const during=h.client.refreshSavedFolders();await tick();listWait.resolve(listing());await during;assert.equal(h.client.savedFoldersState().folders[0].verified,false,'read during active mutation cannot authorize a row');
+  contextWait.resolve(ctxValue);assert.equal(await oldContext,false,'pre-mutation context cannot restore authority');contextWait=null;
+  listWait=deferred();const spanning=h.client.refreshSavedFolders();await tick();removeWait.resolve(removed(savedA));await removal;
+  const newest=h.client.refreshSavedFolders();await tick();assert.notEqual(spanning,newest,'settlement detaches reads started during mutation');listWait.resolve(listing());assert.equal(await spanning,false);await newest;listWait=null;
+  assert.equal(h.client.inventoryFresh,true,'only current quiet context restores launch authority');
+  // Separate deterministic context ticket race below uses an acceptance response, without a real chooser.
+  let pendingContext=deferred(),nextContext=deferred(),cr=0,acceptWait=deferred();const r=harness({create:factory,route:route=>route==='context'?(++cr===1?ctxValue:cr===2?pendingContext.promise:nextContext.promise):route==='folders/choose'?{schemaVersion:1,requestId,state:'pending'}:route.endsWith('/accept')?acceptWait.promise:listing()});await r.boot();await r.client.beginFolderChoice({requestId,epoch:choiceEpoch,gesture:{trusted:true}});
+  const a=r.client.retryContext();await tick();const accept=r.client.acceptFolderChoice(requestId,attemptId);await tick();const b=r.client.retryContext();await tick();pendingContext.resolve(ctxValue);await a;assert.equal(r.client.retryContext(),b,'stale finally cannot release a newer read ticket');nextContext.resolve(ctxValue);assert.equal(await b,false,'read begun during active Add cannot be authoritative');acceptWait.reject(Error('lost'));await assert.rejects(accept);
+  // A read started before Add cannot replace a later read or release its busy slot.
+  const firstList=deferred(),secondList=deferred(),acceptResult=deferred();let lr=0;
+  const q=harness({create:factory,route:route=>route==='context'?ctxValue:route==='folders'?(++lr===1?firstList.promise:secondList.promise):route==='folders/choose'?{schemaVersion:1,requestId,state:'pending'}:acceptResult.promise});await q.boot();
+  const oldList=q.client.refreshSavedFolders();await tick();await q.client.beginFolderChoice({requestId,epoch:choiceEpoch,gesture:{trusted:true}});const aq=q.client.acceptFolderChoice(requestId,attemptId);await tick();const liveList=q.client.refreshSavedFolders();await tick();firstList.resolve(listing());assert.equal(await oldList,false);assert.equal(q.client.refreshSavedFolders(),liveList,'stale saved read finally cannot clear the newer ticket');secondList.resolve(listing());await liveList;acceptResult.reject(Error('lost'));await assert.rejects(aq);
+  // A positive replacement in an active partial read cannot be erased by the old removal receipt.
+  listValue=listing();await h.client.refreshSavedFolders();removeWait=deferred();const replaceRemoval=h.client.removeSavedFolder(savedA.id,savedA.revision);await tick();listValue=listing([{...savedA,revision:savedB.revision}],1);await h.client.refreshSavedFolders();removeWait.resolve(removed(savedA));await replaceRemoval;assert.equal(h.client.savedFoldersState().folders[0].revision,savedB.revision,'old receipt cannot delete a positively observed replacement');
+  listValue=listing();await h.client.refreshSavedFolders();
+  // Historical saved GET is never a new Add episode, even if the GET itself starts after Remove.
+  const id='55555555-5555-4555-8555-555555555555';await h.client.beginFolderChoice({requestId:id,epoch:choiceEpoch,gesture:{trusted:true}});await h.client.acceptFolderChoice(id,attemptId);assert(h.client.folderChoiceCurrent(id,savedA));
+  // Native-only current proof cannot validate a saved receipt even within its original Add episode.
+  ctxValue={...ctxValue,folders:[{...savedA}]};const nativeOnly=await h.client.folderChoiceStatus(id);assert.equal(nativeOnly.folder.availabilityChecked,false);ctxValue={...ctxValue,folders:[{...savedA,registered:true}]};
+  await h.client.refreshSavedFolders();removeWait=deferred();const rem=h.client.removeSavedFolder(savedA.id,savedA.revision);removeWait.resolve(removed(savedA));await rem;
+  ctxValue={...ctxValue,folders:[{...savedA}]};const historical=await h.client.folderChoiceStatus(id);assert.equal(historical.folder.availabilityChecked,false);assert.equal(h.client.isRegistered(savedA.displayPath),false,'native discovery is not registration');assert.equal(h.client.folderChoiceCurrent(id,savedA),false);
+  ctxValue={...ctxValue,folders:[{...savedA,registered:true}]};await h.client.retryContext();assert.equal(h.client.folderChoiceCurrent(id,savedA),false,'even a later same-revision registration does not revive the old Add episode');assert.equal(h.client.knownUnregistered(savedA.displayPath,savedA.revision),false,'fresh exact registered proof clears obsolete removal reason');
+}
+async function unregistrationChecks(factory=create){
+  let folders=[{...savedA,registered:true}],list=listing(),post={httpError:404,code:'unknown_saved_folder',message:'This folder is no longer saved in Motet.'};
+  const h=harness({create:factory,route:route=>route==='context'?{...context(),folders}:route==='folders'?list:post});await h.boot();await h.client.refreshSavedFolders();folders=[];
+  assert.equal((await h.client.removeSavedFolder(savedA.id,savedA.revision)).state,'refused');await tick();assert(h.client.knownUnregistered(savedA.displayPath,savedA.revision),'known404 explains registration absence, not filesystem loss');assert.equal(h.client.hasFolder(savedA.displayPath),false);
+  list=listing([]);await h.client.refreshSavedFolders();assert(h.client.knownUnregistered(savedA.displayPath,savedA.revision));
+  folders=[{...savedA,registered:true}];await h.client.retryContext();assert.equal(h.client.knownUnregistered(savedA.displayPath,savedA.revision),false);list=listing();await h.client.refreshSavedFolders();list=listing([]);await h.client.refreshSavedFolders();assert(h.client.knownUnregistered(savedA.displayPath,savedA.revision),'complete metadata absence is known even without an uncertain operation');
+  list=listing();await h.client.refreshSavedFolders();folders=[{...savedA}];await h.client.retryContext();list=listing([]);await h.client.refreshSavedFolders();assert(h.client.hasFolder(savedA.displayPath),'complete saved absence preserves independently discovered native folder authority');assert.equal(h.client.inventoryFresh,true);
+  list=listing();await h.client.refreshSavedFolders();post=removed(savedA);await h.client.removeSavedFolder(savedA.id,savedA.revision);await tick();assert(h.client.hasFolder(savedA.displayPath));assert.match(h.client.savedFoldersState().status,/still available through a connected app/,'continuing native discovery is explained only after fresh context proof');
+  // Overlapping Add and Remove cannot establish ordering from their request starts.
+  let removeReply=deferred(),acceptReply=deferred();list=listing();const ctx=()=>({...context(),folders:[{...savedA,registered:true}],canChooseFolders:true,folderChoiceEpoch:choiceEpoch});
+  const r=harness({create:factory,route:route=>route==='context'?ctx():route==='folders'?list:route==='folders/choose'?{schemaVersion:1,requestId,state:'pending'}:route.endsWith('/accept')?acceptReply.promise:removeReply.promise});await r.boot();await r.client.refreshSavedFolders();const removal=r.client.removeSavedFolder(savedA.id,savedA.revision);await r.client.beginFolderChoice({requestId,epoch:choiceEpoch,gesture:{trusted:true}});const accept=r.client.acceptFolderChoice(requestId,attemptId);removeReply.resolve({httpError:404,code:'unknown_saved_folder',message:'This folder is no longer saved in Motet.'});await removal;assert(!r.client.knownUnregistered(savedA.displayPath,savedA.revision),'overlap404 does not override another Add');acceptReply.resolve({schemaVersion:1,requestId,state:'saved',folder:{...savedA,registered:true}});const add=await accept;assert.equal(add.folder.availabilityChecked,false,'conflicting Add receipt remains historical until new explicit Add episode');assert.equal(r.client.savedFoldersState().folders.length,1);
+}
+async function negativeReadChecks(factory=create){
+  let folders=[{...savedA,registered:true}],list=listing(),contextWait=null;
+  const h=harness({create:factory,route:route=>route==='context'?(contextWait?contextWait.promise:{...context(),folders,canChooseFolders:true,folderChoiceEpoch:choiceEpoch}):route==='folders'?list:route==='folders/choose'?{schemaVersion:1,requestId,state:'pending'}:{schemaVersion:1,requestId,state:'saved',folder:{...savedA,registered:true}}});await h.boot();await h.client.beginFolderChoice({requestId,epoch:choiceEpoch,gesture:{trusted:true}});await h.client.acceptFolderChoice(requestId,attemptId);assert(h.client.folderChoiceCurrent(requestId,savedA));await h.client.refreshSavedFolders();
+  contextWait=deferred();const old=h.client.retryContext();await tick();list=listing([]);assert.equal(await h.client.refreshSavedFolders(),true);assert(h.client.knownUnregistered(savedA.displayPath,savedA.revision));assert.equal(h.client.hasFolder(savedA.displayPath),false);contextWait.resolve({...context(),folders:[{...savedA,registered:true}]});assert.equal(await old,false,'older context cannot undo quiet complete negative metadata proof');assert.equal(h.client.hasFolder(savedA.displayPath),false);
+  contextWait=null;folders=[{...savedA,revision:savedB.revision,registered:true}];await h.client.retryContext();assert(h.client.knownUnregistered(savedA.displayPath,savedA.revision),'replacement B does not erase removed exact A evidence');list=listing([{...savedA,revision:savedB.revision}]);await h.client.refreshSavedFolders();assert(h.client.knownUnregistered(savedA.displayPath,savedA.revision));
+  list=listing([]);await h.client.refreshSavedFolders();assert(h.client.knownUnregistered(savedA.displayPath,savedA.revision));assert(h.client.knownUnregistered(savedA.displayPath,savedB.revision),'two removed physical identities at the same path retain separate evidence');
+  folders=[{...savedA,registered:true}];await h.client.retryContext();assert.equal(h.client.knownUnregistered(savedA.displayPath,savedA.revision),false);assert(h.client.knownUnregistered(savedA.displayPath,savedB.revision),'positive A clears A only');assert.equal(h.client.folderChoiceCurrent(requestId,savedA),false,'new same-identity registration cannot make historical Add current after negative proof');
+}
+async function malformedRemovalChecks(factory=create){
+  const error={code:'unknown_saved_folder',message:'This folder is no longer saved in Motet.'};
+  for(const value of [{schemaVersion:2,error},{error},{schemaVersion:1,error,fixture:true},{schemaVersion:1,error,extra:true},{schemaVersion:1,error:[]},{schemaVersion:1,error:{...error,message:7}},{schemaVersion:1,error:{...error,code:7}},{schemaVersion:1,error:{...error,extra:true}}]){
+    const h=harness({create:factory,route:route=>route==='context'?{...context(),folders:[{...savedA,registered:true}]}:route==='folders'?listing():{httpResponse:true,status:404,value}});await h.boot();await h.client.refreshSavedFolders();assert.equal((await h.client.removeSavedFolder(savedA.id,savedA.revision)).state,'unknown','malformed refusal wrapper is not authority');assert.equal(h.client.knownUnregistered(savedA.displayPath,savedA.revision),false);assert.match(h.client.savedFoldersState().status,/could not confirm/);
+  }
+}
+let savedProofDeadline;(async()=>{
+  savedProofDeadline=setTimeout(()=>{console.error('Saved-folder client proof did not finish.');process.exitCode=1},5000);
+  await savedFolderChecks();await catalogRaceChecks();await unregistrationChecks();await negativeReadChecks();await malformedRemovalChecks();
+  for(const [from,to,check] of [
+    ["receipt.removed.revision!==revision","false",savedFolderChecks],
+    ["if(verified&&value.complete)","if(verified)",savedFolderChecks],
+    ["const verified=ticket.quiet&&mutations.size===0","const verified=true",catalogRaceChecks],
+    ["||!ticket.quiet||mutations.size", "",catalogRaceChecks],
+    ["if(valid(e,k)&&loading===ticket)loading=null", "if(valid(e,k))loading=null",catalogRaceChecks],
+    ["if(valid(e,k)&&savedLoading===ticket){savedLoading=null", "if(valid(e,k)){savedLoading=null",catalogRaceChecks],
+    ["choice.fence===catalog", "true",catalogRaceChecks],
+    ["current?.registered===true", "!!current",catalogRaceChecks],
+    ["||!f?.verified", "||!f",savedFolderChecks],
+    ["if(known&&alone&&failure.status===404", "if(false&&failure.status===404",unregistrationChecks],
+    ["forgetCurrent(old);saved.delete(id)", "saved.delete(id)",unregistrationChecks],
+    ["function forgetCurrent(f){catalog++;loading=null;", "function forgetCurrent(f){",negativeReadChecks],
+    ["for(const f of c.folders)if(f.registered===true&&unregistered.has(JSON.stringify([f.displayPath,f.revision])))unregistered.delete(JSON.stringify([f.displayPath,f.revision]));", "for(const f of c.folders)if(f.registered===true)unregistered.clear();",negativeReadChecks],
+    ["failure.checkedError&&", "",malformedRemovalChecks],
+    ["folder(savedNotice.displayPath).registered!==true", "folder(savedNotice.displayPath).registered===false",unregistrationChecks]
+  ]){assert(source.includes(from),'Remove causal target exists: '+from);await assert.rejects(check(vm.runInNewContext(source.replace(from,to)+';createNewChatClient')),'Remove mutant survived: '+from)}
+  {const mutant=source.replace('unregistered.add(JSON.stringify([f.displayPath,f.revision]));','unregistered.clear();unregistered.add(JSON.stringify([f.displayPath,f.revision]));');await assert.rejects(negativeReadChecks(vm.runInNewContext(mutant+';createNewChatClient')),'single remembered revision mutant survived')}
+  clearTimeout(savedProofDeadline);console.log('ok saved folders: strict metadata/receipts/errors, partial replacement, unknown/read-only reconciliation, Add/Remove catalog/read ownership, historical Add/quiet-negative evidence,404/native preservation, owner reset and sixteen causal mutants');
   await checkProductionTimerWiring();
   await chooserChecks();
   assert.equal(typeof harness().client.registerFolder,'undefined','typed registration has no client surface');
@@ -180,4 +293,4 @@ async function chooserChecks(factory=create){
   assert.equal(h.requests.filter(r=>r.route==='attempts').length,1,'status and permission actions do not relaunch');
   h.setKey('');h.client.sync();assert.equal(h.client.managedPermissionTimeoutSeconds,null);await assert.rejects(h.client.managedStatus(runId),/authentication/);
   console.log('ok New chat HTTP client: authoritative inventory, explicit work/blank contracts, authenticated requests, receipt separation, durable request-ID recovery, no mutation replay, key/lock stale guards, observation errors and bounded polling');
-})().catch(error=>{console.error(error);process.exitCode=1});
+})().catch(error=>{clearTimeout(savedProofDeadline);console.error(error);process.exitCode=1});

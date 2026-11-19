@@ -1,5 +1,6 @@
 """Durable New chat behavior using injected fictional native identities only."""
 from dataclasses import replace
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -87,6 +88,31 @@ class FakeAdapter:
     def close(self):
         self.closed = True
         self.create_release.set()
+
+
+class DatabaseProbe:
+    def __init__(self, db, execute=None, committed=None):
+        self.db, self.before_execute, self.committed = db, execute, committed
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    def execute(self, sql, *args):
+        if self.before_execute:
+            override = self.before_execute(sql, *args)
+            if override is not None:
+                return override
+        return self.db.execute(sql, *args)
+
+    def __enter__(self):
+        self.db.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        result = self.db.__exit__(*args)
+        if args[0] is None and self.committed:
+            self.committed()
+        return result
 
 
 @unittest.skipIf(os.name == 'nt', 'New chat uses private POSIX storage; Windows native launch is unavailable.')
@@ -278,6 +304,9 @@ class ServiceTests(unittest.TestCase):
                     s.db.execute('UPDATE registered_folders SET data=? WHERE id=?', (raw, damaged['id']))
                 before = s.db.execute('SELECT id,data FROM registered_folders ORDER BY id').fetchall()
                 self.assertEqual(s.context()['folders'], [healthy])
+                self.assertEqual(s.saved_folders(), {'schemaVersion': 1,
+                    'savedFolders': [{key: healthy[key] for key in ('id', 'revision', 'label', 'displayPath')}],
+                    'complete': False, 'unreadableCount': 1})
                 self.assertEqual(s.db.execute('SELECT id,data FROM registered_folders ORDER BY id').fetchall(), before)
         with s.db:
             s.db.execute('UPDATE registered_folders SET id=?,data=? WHERE id=?',
@@ -322,9 +351,272 @@ class ServiceTests(unittest.TestCase):
                         s.db.execute('UPDATE registered_folders SET id=CAST(? AS TEXT) WHERE id=?', (invalid, damaged['id']))
                 before = s.db.execute('SELECT CAST(id AS BLOB),CAST(data AS BLOB) FROM registered_folders ORDER BY id').fetchall()
                 self.assertEqual(s.context()['folders'], [healthy])
+                listing = s.saved_folders()
+                self.assertEqual((listing['complete'], listing['unreadableCount']), (False, 1))
+                self.assertEqual([row['id'] for row in listing['savedFolders']], [healthy['id']])
                 choice = dict(provider='codex', folderId=healthy['id'], folderRevision=healthy['revision'])
                 self.assertIn('requestId', s.prepare(choice))
                 self.assertEqual(s.db.execute('SELECT CAST(id AS BLOB),CAST(data AS BLOB) FROM registered_folders ORDER BY id').fetchall(), before)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
+
+    def test_saved_management_uses_only_stored_metadata_for_unavailable_targets(self):
+        s = self.service()
+        saved = [s.register_folder({'path': str(self.folder)})['folder']]
+        missing, replaced = self.root / 'missing-project', self.root / 'replaced-project'
+        for path in (missing, replaced):
+            path.mkdir()
+            saved.append(s.register_folder({'path': str(path)})['folder'])
+        missing.rmdir()
+        replaced.rename(self.root / 'previous-project')
+        replaced.mkdir()
+        private = self.root / '.claude'
+        private.mkdir()
+        frozen = s.inventory._folder(str(private), private.stat())
+        with s.db:
+            s.db.execute('INSERT INTO registered_folders VALUES (?,?)', (frozen.id, json.dumps(vars(frozen))))
+        saved.append(dict(id=frozen.id, revision=frozen.revision, label=frozen.label, displayPath=frozen.path))
+        protected = self.folder / 'kept.txt'
+        protected.write_text('Fictional owner file stays in place.')
+        self.adapter.available = False
+        with ExitStack() as stack:
+            for obj, name in ((s, 'context'), (s, '_capability'), (s, '_chooser'),
+                              (s, 'prepare'), (s, 'open'), (s.inventory, 'source'),
+                              (s.inventory, 'require_allowed'), (self.adapter, 'preflight'),
+                              (self.adapter, 'create_once'), (self.adapter, 'open_existing'),
+                              (self.adapter, 'verify_existing')):
+                stack.enter_context(patch.object(obj, name, side_effect=AssertionError('Management reached a launch effect.')))
+            stack.enter_context(patch('new_chat_inventory.os.stat', side_effect=AssertionError('Management probed a target.')))
+            stack.enter_context(patch('new_chat_inventory._physical_path', side_effect=AssertionError('Management resolved a target.')))
+            stack.enter_context(patch('new_chat_service.validate_folder', side_effect=AssertionError('Management validated a target.')))
+            listing = s.saved_folders()
+            self.assertEqual((listing['schemaVersion'], listing['complete'], listing['unreadableCount']), (1, True, 0))
+            self.assertEqual({row['id'] for row in listing['savedFolders']}, {row['id'] for row in saved})
+            self.assertTrue(all(set(row) == {'id', 'revision', 'label', 'displayPath'} for row in listing['savedFolders']))
+            for row in saved:
+                self.assertEqual(s.remove_saved_folder(row['id'], {'revision': row['revision']}),
+                                 {'schemaVersion': 1, 'removed': {'id': row['id'], 'revision': row['revision']}})
+            self.assertEqual(s.saved_folders(), {'schemaVersion': 1, 'savedFolders': [], 'complete': True, 'unreadableCount': 0})
+        self.assertEqual(protected.read_text(), 'Fictional owner file stays in place.')
+        self.assertFalse(missing.exists())
+        self.assertTrue(replaced.is_dir())
+        self.assertTrue(private.is_dir())
+        self.assertEqual(s.db.execute('SELECT count(*) FROM intents').fetchone()[0], 0)
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+        self.assertEqual(s.jobs, {})
+
+    def test_saved_remove_refuses_unknown_discovered_stale_corrupt_and_invalid_requests(self):
+        s = self.service()
+        discovered = s.context()['folders'][0]
+        with self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(discovered['id'], {'revision': discovered['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message),
+                         (404, 'unknown_saved_folder', 'This folder is no longer saved in Motet.'))
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        before = s.db.execute('SELECT id,data FROM registered_folders').fetchall()
+        invalid = [(value, {'revision': saved['revision']}) for value in (None, True, 'a' * 63, 'A' * 64, 'z' * 64)]
+        invalid += [(saved['id'], value) for value in (None, [], {}, {'revision': True}, {'revision': 'A' * 64},
+                     {'revision': 'a' * 63}, {'revision': saved['revision'], 'path': str(self.folder)})]
+        for ident, data in invalid:
+            with self.subTest(ident=ident, data=data):
+                with self.assertRaises(NewChatError) as failed:
+                    s.remove_saved_folder(ident, data)
+                self.assertEqual((failed.exception.status, failed.exception.code), (400, 'invalid_request'))
+        with self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': '0' * 64})
+        self.assertEqual((failed.exception.status, failed.exception.code), (409, 'saved_folder_changed'))
+        self.assertEqual(s.db.execute('SELECT id,data FROM registered_folders').fetchall(), before)
+        with s.db:
+            s.db.execute('UPDATE registered_folders SET data=?', ('{',))
+        with self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message),
+                         (409, 'unreadable_saved_folder', 'This saved project folder could not be verified. Nothing was removed.'))
+        self.assertEqual(s.db.execute('SELECT data FROM registered_folders').fetchone()[0], '{')
+
+    def test_saved_remove_old_revision_cannot_remove_replacement_registration(self):
+        s = self.service()
+        old = s.register_folder({'path': str(self.folder)})['folder']
+        self.folder.rename(self.root / 'previous-project')
+        self.folder.mkdir()
+        current = s.register_folder({'path': str(self.folder)})['folder']
+        self.assertEqual(current['id'], old['id'])
+        self.assertNotEqual(current['revision'], old['revision'])
+        with self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(old['id'], {'revision': old['revision']})
+        self.assertEqual(failed.exception.code, 'saved_folder_changed')
+        self.assertEqual(s.saved_folders()['savedFolders'][0]['revision'], current['revision'])
+
+    def test_saved_remove_raw_compare_and_one_row_check_protect_concurrent_changes(self):
+        s = self.service()
+        for action in ('replace', 'blob', 'delete'):
+            saved = s.register_folder({'path': str(self.folder)})['folder']
+            original = s.db.execute('SELECT data FROM registered_folders').fetchone()[0]
+            changed = json.dumps(dict(json.loads(original), label='Fictional concurrent label'))
+            def interfere(sql, *args):
+                if sql.startswith('DELETE FROM registered_folders'):
+                    with sqlite3.connect(s.root / 'journal.sqlite') as other:
+                        if action == 'replace':
+                            other.execute('UPDATE registered_folders SET data=? WHERE id=?', (changed, saved['id']))
+                        elif action == 'blob':
+                            other.execute('UPDATE registered_folders SET data=? WHERE id=?',
+                                          (sqlite3.Binary(original.encode()), saved['id']))
+                        else:
+                            other.execute('DELETE FROM registered_folders WHERE id=?', (saved['id'],))
+            with self.subTest(action=action), patch.object(s, 'db', DatabaseProbe(s.db, execute=interfere)):
+                with self.assertRaises(NewChatError) as failed:
+                    s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+                self.assertEqual((failed.exception.status, failed.exception.code), (409, 'saved_folder_changed'))
+            remaining = s.db.execute('SELECT data FROM registered_folders').fetchone()
+            self.assertEqual(remaining, (changed,) if action == 'replace' else (original.encode(),) if action == 'blob' else None)
+
+    def test_saved_database_failures_are_unavailable_and_committed_response_can_be_uncertain(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        unavailable = (503, 'saved_folders_unavailable',
+                       'Saved project folders are unavailable. Refresh saved folders to check.')
+        def broken(sql, *args):
+            raise sqlite3.OperationalError('/fictional/private database failure')
+        for operation in (lambda: s.saved_folders(), lambda: s.remove_saved_folder(saved['id'], {'revision': saved['revision']})):
+            with patch.object(s, 'db', DatabaseProbe(s.db, execute=broken)), self.assertRaises(NewChatError) as failed:
+                operation()
+            self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message), unavailable)
+        class InterruptedRead:
+            def __iter__(self):
+                yield tuple(value.encode() for value in s.db.db.execute('SELECT id,data FROM registered_folders').fetchone())
+                raise sqlite3.DatabaseError('/fictional/interrupted read')
+        with patch.object(s, 'db', DatabaseProbe(s.db, execute=lambda *args: InterruptedRead())), self.assertRaises(NewChatError) as failed:
+            s.saved_folders()
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message), unavailable)
+        def delete_failed(sql, *args):
+            if sql.startswith('DELETE FROM registered_folders'):
+                raise sqlite3.OperationalError('/fictional/delete failed')
+        with patch.object(s, 'db', DatabaseProbe(s.db, execute=delete_failed)), self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message), unavailable)
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
+        def lost_commit_response():
+            raise sqlite3.OperationalError('/fictional/lost commit response')
+        with patch.object(s, 'db', DatabaseProbe(s.db, committed=lost_commit_response)), self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message), unavailable)
+        self.assertEqual(s.saved_folders()['savedFolders'], [])
+
+    def test_saved_management_preserves_guards_and_shutdown_race(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        for flag, code in (('enabled', 'disabled'), ('demo', 'demo_unavailable')):
+            value = False if flag == 'enabled' else True
+            with patch.object(s, flag, value):
+                for operation in (s.saved_folders, lambda: s.remove_saved_folder(saved['id'], {'revision': saved['revision']})):
+                    with self.assertRaises(NewChatError) as failed:
+                        operation()
+                    self.assertEqual((failed.exception.status, failed.exception.code), (503, code))
+        guard = s._guard
+        def close_after_initial_guard():
+            guard()
+            s.close()
+        with patch.object(s, '_guard', side_effect=close_after_initial_guard), self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code), (503, 'service_closed'))
+
+    def test_saved_removal_keeps_discovery_and_claimed_work_but_blocks_manual_preclaim(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        discovered = s.context()['folders'][0]
+        self.assertEqual(discovered['id'], saved['id'])
+        self.assertNotIn('registered', discovered)
+        manual = self.root / 'manual-project'
+        manual.mkdir()
+        saved = s.register_folder({'path': str(manual)})['folder']
+        choice = dict(provider='codex', folderId=saved['id'], folderRevision=saved['revision'])
+        intent = s.prepare(choice)
+        s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        with self.assertRaises(NewChatError) as failed:
+            s.open(dict(choice, requestId=intent['requestId']))
+        self.assertEqual(failed.exception.code, 'folder_changed')
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+        s.register_folder({'path': str(manual)})
+        request = dict(choice, requestId=s.prepare(choice)['requestId'])
+        entered, release = threading.Event(), threading.Event()
+        create = self.adapter.create_once
+        def held(folder, callback):
+            entered.set()
+            release.wait()
+            return create(folder, callback)
+        with patch.object(self.adapter, 'create_once', side_effect=held):
+            try:
+                _, attempt = s.open(request)
+                self.assertTrue(entered.wait(3))
+                tables = ('intents', 'attempts', 'native_receipts', 'intent_issues', 'folders', 'meta')
+                before = {table: s.db.execute('SELECT * FROM ' + table).fetchall() for table in tables}
+                s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+                self.assertEqual({table: s.db.execute('SELECT * FROM ' + table).fetchall() for table in tables}, before)
+            finally:
+                release.set()
+                self.settle(s)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (1, 1))
+        s.process_admissions(lambda identity, folder, permit: 'x:' + identity.native_id if permit() else None)
+        self.assertEqual(s.status(attempt['attemptId'])['state'], 'added')
+        self.assertEqual(s.open(request)[0], 200)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (1, 1))
+
+    def test_remove_and_preclaim_open_share_the_same_service_lock(self):
+        s = self.service()
+        manual = self.root / 'manual-project'
+        manual.mkdir()
+        saved = s.register_folder({'path': str(manual)})['folder']
+        choice = dict(provider='codex', folderId=saved['id'], folderRevision=saved['revision'])
+        request = dict(choice, requestId=s.prepare(choice)['requestId'])
+        entered, release, open_at_lock = threading.Event(), threading.Event(), threading.Event()
+        outputs, failures = {}, {}
+        class TrackedLock:
+            def __init__(self, lock):
+                self.lock, self.owners = lock, []
+            def __enter__(self):
+                if threading.current_thread().name == 'fictional-open':
+                    open_at_lock.set()
+                self.lock.acquire()
+                self.owners.append(threading.current_thread())
+                return self
+            def __exit__(self, *args):
+                self.owners.pop()
+                self.lock.release()
+        tracked = TrackedLock(s.lock)
+        decode = s._decode_registered_folder
+        def held_decode(*args):
+            if threading.current_thread().name == 'fictional-remove':
+                entered.set()
+                self.assertIs(tracked.owners[-1] if tracked.owners else None, threading.current_thread())
+                release.wait()
+            return decode(*args)
+        def invoke(name, operation):
+            try:
+                outputs[name] = operation()
+            except BaseException as error:
+                failures[name] = error
+        remove = threading.Thread(name='fictional-remove', target=invoke,
+            args=('remove', lambda: s.remove_saved_folder(saved['id'], {'revision': saved['revision']})))
+        launch = threading.Thread(name='fictional-open', target=invoke, args=('open', lambda: s.open(request)))
+        with patch.object(s, 'lock', tracked), patch.object(s, '_decode_registered_folder', side_effect=held_decode):
+            try:
+                remove.start()
+                self.assertTrue(entered.wait(3))
+                launch.start()
+                self.assertTrue(open_at_lock.wait(3))
+                self.assertNotIn('open', outputs)
+                self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
+            finally:
+                release.set()
+                remove.join(5)
+                if launch.ident is not None:
+                    launch.join(5)
+        self.assertFalse(remove.is_alive() or launch.is_alive())
+        self.assertNotIn('remove', failures)
+        self.assertEqual(outputs['remove']['removed'], {'id': saved['id'], 'revision': saved['revision']})
+        self.assertIsInstance(failures.get('open'), NewChatError)
+        self.assertEqual(failures['open'].code, 'folder_changed')
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
         self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
 
     def test_codex_worktree_allows_fake_creation_only_after_an_explicit_attempt(self):

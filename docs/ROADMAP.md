@@ -10,10 +10,6 @@ This is a working study. The sections below distinguish shipped behavior, invest
 
 Planned work after v0.1.0, nearest first. "Designed" means the screens are drawn and agreed; it does not mean the work has started. The numbered [priorities](#priorities) further down are the longer view.
 
-### Next
-
-- **Remove a saved project folder.** New chat can now add a project folder with the Mac's own folder window. Removing one from Motet, without touching the folder itself, is the next step.
-
 ### Designed, not built
 
 - **Dictation on more devices.** Optional local desktop dictation uses a separately installed free recognizer and displays editable words before Send. Phone capture needs a reviewed secure connection; broader native-platform support also remains. See [local dictation](DICTATION.md).
@@ -38,6 +34,7 @@ Planned work after v0.1.0, nearest first. "Designed" means the screens are drawn
 - **Direct messaging where verified:** messages queue to eligible local Codex chats. Motet can also send to an exact local Claude chat that has registered through the Motet plugin and is connected. The stage and desk share drafts, histories and delivery records for each recipient.
 - **Motet:** questions about recorded context, cited evidence, and explicit supported message/control requests. Local Codex steering and interruption are available through Motet on the verified macOS desktop build. This sends a new instruction or stops a turn; it does not promote an existing queued message.
 - **New chat:** on verified macOS hosts, open a blank Codex chat or start work in a verified project folder, including one you choose in the Mac's folder window. Claude run by Motet starts work only with a supported local executable and a verified per-computer readiness record.
+- **Saved project folders:** remove a folder you added from Settings → Connections → Project folders. Only its saved registration is removed; the folder itself, its chats and recorded work stay intact. Independent discovery through a connected app can keep it available.
 - **Attachments:** keep a PDF or PNG in a Motet conversation or ask a file question with a current local spending policy. Eligible local Codex and plugin-connected Claude chats can receive PDF, PNG and JPEG files from the workspace. See [Files and New chat](PROVIDER_SUPPORT.md#files-and-new-chat) for host and chat requirements.
 - **Questions and permissions:** optional Claude Code permission hooks support Allow/Deny when Answer here is enabled. Supported native Codex questions and selected model/effort can be observed on the verified build; answering those questions or changing those settings is not enabled.
 - **Optional peer messaging:** the shared MCP bridge handles cross-provider messages between reachable Codex chats and eligible Claude chats. A Claude recipient must have a current plugin connection with agent messaging authorized. Peer messages confer no new authority and cannot invoke controls. An optional Antigravity plugin can send requests to Codex and Claude and retrieve replies; a separately configured shared pull inbox stores incoming requests, but never targets or wakes a native Antigravity chat.

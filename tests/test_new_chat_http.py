@@ -2,16 +2,20 @@
 from email.message import Message
 import io
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from new_chat_http import handle_http
 from new_chat_types import NewChatError
+from new_chat_service import NewChatService
 
 NATIVE = '11111111-1111-4111-8111-111111111111'
 EPOCH = '22222222-2222-4222-8222-222222222222'
+FOLDER, REVISION = 'a' * 64, 'b' * 64
 PREFIX = '/api/new-chat/'
 
 
@@ -44,6 +48,14 @@ class Service:
     def register_folder(self, data):
         self.calls.append(('register_folder', data))
         return {'schemaVersion': 1}
+
+    def saved_folders(self):
+        self.calls.append('saved_folders')
+        return {'schemaVersion': 1, 'savedFolders': [], 'complete': True, 'unreadableCount': 0}
+
+    def remove_saved_folder(self, ident, data):
+        self.calls.append(('remove_saved_folder', ident, data))
+        return {'schemaVersion': 1, 'removed': {'id': ident, 'revision': data['revision']}}
 
     def begin_folder_choice(self, data, connection, forwarded=False):
         self.calls.append(('begin_folder_choice', data, connection, forwarded))
@@ -185,6 +197,49 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(self.call(h, s)[0], status)
         self.assertEqual(len(s.calls), 6)
 
+    def test_saved_management_routes_forward_only_owner_metadata(self):
+        service = Service()
+        code, listing = self.call(Handler(PREFIX + 'folders'), service)
+        self.assertEqual((code, listing), (200, {'schemaVersion': 1, 'savedFolders': [], 'complete': True, 'unreadableCount': 0}))
+        code, receipt = self.call(self.post(PREFIX + 'folders/' + FOLDER + '/remove',
+                                          json.dumps({'revision': REVISION}).encode()), service)
+        self.assertEqual((code, receipt), (200, {'schemaVersion': 1, 'removed': {'id': FOLDER, 'revision': REVISION}}))
+        self.assertEqual(service.calls, ['saved_folders', ('remove_saved_folder', FOLDER, {'revision': REVISION})])
+
+    def test_saved_management_authentication_precedes_body_and_service_access(self):
+        class Explosive:
+            def __getattr__(self, name):
+                raise AssertionError('Unauthenticated management reached the service')
+        class Unreadable:
+            def read1(self, _):
+                raise AssertionError('Unauthenticated management consumed its body')
+        for route, method in ((PREFIX + 'folders', 'GET'), (PREFIX + 'folders/' + FOLDER + '/remove', 'POST')):
+            for extra in (('Host', 'evil.test'), ('Origin', 'https://fictional.invalid'), ('X-Live-Room-Key', 'fictional-key')):
+                handler = Handler(route, headers=[extra]) if method == 'GET' else self.post(route, headers=[extra])
+                handler.rfile = Unreadable()
+                self.assertEqual(self.call(handler, Explosive())[0], 403)
+
+    def test_saved_management_methods_paths_and_strict_body_boundary(self):
+        route = PREFIX + 'folders/' + FOLDER + '/remove'
+        for handler in (Handler(route), Handler(route, 'DELETE'), Handler(PREFIX + 'folders', 'PUT'),
+                        self.post(PREFIX + 'folders/' + FOLDER.upper() + '/remove'),
+                        self.post(PREFIX + 'folders/' + FOLDER[:-1] + '/remove'),
+                        self.post(route + '/')):
+            service = Service()
+            self.assertEqual(self.call(handler, service)[0], 404)
+            self.assertEqual(service.calls, [])
+        for raw in (b'[]', b'{', b'{"revision":"x","revision":"y"}', b'{"revision":NaN}', b'{"revision":"\xff"}'):
+            service = Service()
+            self.assertEqual(self.call(self.post(route, raw), service)[0], 400)
+            self.assertEqual(service.calls, [])
+        for suffix in ('?x=1', '#fragment', '?'):
+            self.assertEqual(self.call(Handler(PREFIX + 'folders' + suffix), Service())[0], 400)
+        self.assertEqual(self.call(Handler(PREFIX + 'folders', headers=[('Content-Length', '1')]), Service())[0], 400)
+        oversized = self.post(route)
+        oversized.headers.replace_header('Content-Length', '65537')
+        self.assertEqual(self.call(oversized, Service())[0], 413)
+        self.assertEqual(self.call(self.post(route, headers=[('Transfer-Encoding', 'chunked')]), Service())[0], 400)
+
     def test_retired_folder_registration_still_authenticates_and_never_registers(self):
         for extra in [('Host', '127.0.0.1:18801'), ('X-Live-Room-Key', 'fictional-key'),
                       ('Origin', 'https://fictional.invalid')]:
@@ -192,7 +247,7 @@ class HttpTests(unittest.TestCase):
             handler = self.post(PREFIX + 'folders', b'{"path":"/fictional/project"}', headers=[extra])
             self.assertEqual(self.call(handler, service)[0], 403)
             self.assertEqual(service.calls, [])
-        for method in ('GET', 'POST', 'PUT', 'DELETE', 'PATCH'):
+        for method in ('POST', 'PUT', 'DELETE', 'PATCH'):
             service = Service()
             handler = (self.post(PREFIX + 'folders', b'{"path":"/fictional/project"}') if method == 'POST'
                        else Handler(PREFIX + 'folders', method))
@@ -256,6 +311,58 @@ class HttpTests(unittest.TestCase):
         self.assertNotIn('raw-secret', json.dumps(view))
         s.context = lambda: (_ for _ in ()).throw(NewChatError('folder_changed', 'Review the folder.', 409))
         self.assertEqual(self.call(Handler(), s)[0], 409)
+
+
+@unittest.skipIf(os.name == 'nt', 'Saved folder management uses private POSIX storage.')
+class SavedFoldersServiceHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name).resolve()
+        self.folder = root / 'fictional-project'
+        self.folder.mkdir()
+        self.service = NewChatService(root / 'private-state', {}, lambda: [], enabled=True, home=root)
+        self.addCleanup(self.service.close)
+        self.saved = self.service.register_folder({'path': str(self.folder)})['folder']
+
+    def call(self, route, data=None):
+        raw = json.dumps(data).encode() if data is not None else b''
+        handler = Handler(route, 'POST', raw, [('Content-Type', 'application/json'), ('Content-Length', str(len(raw)))]) if data is not None else Handler(route)
+        handle_http(handler, self.service, 'fictional-key', 18801)
+        self.assertTrue(handler.close_connection)
+        return handler.result
+
+    def test_actual_service_partial_metadata_and_missing_target_removal_receipt(self):
+        self.folder.rmdir()
+        with self.service.db:
+            self.service.db.execute('INSERT INTO registered_folders VALUES (?,?)', ('0' * 64, '{'))
+        code, listing = self.call(PREFIX + 'folders')
+        expected = {key: self.saved[key] for key in ('id', 'revision', 'label', 'displayPath')}
+        self.assertEqual((code, listing), (200, {'schemaVersion': 1, 'savedFolders': [expected], 'complete': False, 'unreadableCount': 1}))
+        code, receipt = self.call(PREFIX + 'folders/' + self.saved['id'] + '/remove', {'revision': self.saved['revision']})
+        self.assertEqual((code, receipt), (200, {'schemaVersion': 1, 'removed': {'id': self.saved['id'], 'revision': self.saved['revision']}}))
+        self.assertEqual(self.call(PREFIX + 'folders')[1], {'schemaVersion': 1, 'savedFolders': [], 'complete': False, 'unreadableCount': 1})
+        self.assertFalse(self.folder.exists())
+
+    def test_actual_service_invalid_stale_unknown_corrupt_and_database_error_envelopes(self):
+        route = PREFIX + 'folders/' + self.saved['id'] + '/remove'
+        for data in ({}, {'revision': True}, {'revision': 'A' * 64}, {'revision': self.saved['revision'], 'force': True}):
+            code, result = self.call(route, data)
+            self.assertEqual((code, result['error']['code']), (400, 'invalid_request'))
+        code, result = self.call(route, {'revision': '0' * 64})
+        self.assertEqual((code, result['error']['code']), (409, 'saved_folder_changed'))
+        code, result = self.call(PREFIX + 'folders/' + '0' * 64 + '/remove', {'revision': self.saved['revision']})
+        self.assertEqual((code, result['error']['code']), (404, 'unknown_saved_folder'))
+        with self.service.db:
+            self.service.db.execute('UPDATE registered_folders SET data=?', ('{',))
+        code, result = self.call(route, {'revision': self.saved['revision']})
+        self.assertEqual((code, result['error']['code']), (409, 'unreadable_saved_folder'))
+        with self.service.db:
+            self.service.db.execute('DROP TABLE registered_folders')
+        for path, body in ((PREFIX + 'folders', None), (route, {'revision': self.saved['revision']})):
+            self.assertEqual(self.call(path, body), (503, {'schemaVersion': 1, 'error': {
+                'code': 'saved_folders_unavailable',
+                'message': 'Saved project folders are unavailable. Refresh saved folders to check.'}}))
 
 
 if __name__ == '__main__':
