@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from integrations.dictation.helper import HelperServer, main, probe
 from dictation_auth import request_headers
-from integrations.dictation.service import DictationService, ServiceError
+from integrations.dictation.service import COMMAND_WAIT_SECONDS, DictationService, ServiceError
 from integrations.dictation.state import PrivateState, StateError
 
 
@@ -55,6 +55,37 @@ class Engine:
 
     def close(self):
         self.closed = True
+
+
+class ControlledCommandLock:
+    """Observe admission while using a real lock, without a scheduler race.
+
+    A handoff waits for the holder's explicit release acknowledgement before
+    forwarding the caller's unchanged acquire arguments. The five-second event
+    waits are deadlock watchdogs, not a substitute command-admission budget.
+    Without a handoff, a real nonblocking probe models an exhausted budget.
+    """
+    def __init__(self, lock, waiting=None, released=None):
+        self.lock, self.waiting, self.released = lock, waiting, released
+        self.attempts = []
+        self.releases = 0
+
+    def acquire(self, blocking=True, timeout=-1):
+        self.attempts.append((blocking, timeout, self.lock.locked()))
+        if self.waiting is None and len(self.attempts) > 1:
+            raise AssertionError('An exhausted admission was retried instead of reported busy')
+        if self.waiting is None or not blocking or timeout == 0:
+            # The holder remains in place for this probe, so a command that
+            # declines to wait cannot accidentally win a release race.
+            return self.lock.acquire(blocking=False)
+        self.waiting.set()
+        if not self.released.wait(5):
+            raise AssertionError('The controlled lock holder did not release')
+        return self.lock.acquire(blocking, timeout)
+
+    def release(self):
+        self.releases += 1
+        self.lock.release()
 
 
 class ServiceTests(unittest.TestCase):
@@ -189,12 +220,58 @@ class ServiceTests(unittest.TestCase):
             self.service.events(ident, 0)
         self.assertEqual(error.exception.code, 'events_expired')
 
+    def test_command_admission_wait_is_exactly_100_milliseconds(self):
+        self.assertEqual(COMMAND_WAIT_SECONDS, .1)
+
+    def test_real_held_lock_refuses_terminal_commands_without_ending_the_take(self):
+        # Pin first: a 30-second policy mutant must fail before a real wait.
+        self.assertEqual(COMMAND_WAIT_SECONDS, .1)
+        for action in ('stop', 'cancel'):
+            with self.subTest(action=action):
+                ident = self.service.start(.25)['sessionId']
+                before = list(self.engine.calls)
+                # This is the unwrapped production lock. The holder cannot
+                # release before the refusal, so there is no success margin.
+                with self.service.command:
+                    with self.assertRaises(ServiceError) as error:
+                        self.service.control(ident, action)
+                    self.assertEqual((error.exception.status, error.exception.code), (409, 'busy'))
+                    self.assertEqual(self.engine.calls, before)
+                    self.assertFalse(self.service.sessions[ident]['ended'])
+                    self.assertEqual(self.service.status()['state'], 'listening')
+                self.assertTrue(self.service.control(ident, action)['ended'])
+                self.assertEqual(self.service.status()['state'], 'ready')
+
     def test_concurrent_command_is_rejected_instead_of_queued(self):
-        ident = self.service.start(.25)['sessionId']
-        with self.service.command:
-            with self.assertRaises(ServiceError) as error:
-                self.service.control(ident, 'cancel')
-        self.assertEqual(error.exception.code, 'busy')
+        for action in ('stop', 'cancel'):
+            with self.subTest(action=action):
+                ident = self.service.start(.25)['sessionId']
+                original = self.service.command
+                lock = ControlledCommandLock(original)
+                before = list(self.engine.calls)
+                self.service.command = lock
+                try:
+                    with original:
+                        with self.assertRaises(ServiceError) as error:
+                            self.service.control(ident, action)
+                        self.assertEqual(error.exception.code, 'busy')
+                        self.assertEqual(self.engine.calls, before)
+                        self.assertIs(self.service.current, self.service.sessions[ident])
+                        self.assertFalse(self.service.sessions[ident]['ended'])
+                        self.assertEqual(self.service.status()['state'], 'listening')
+                    self.assertEqual(len(lock.attempts), 1)
+                    blocking, timeout, contended = lock.attempts[0]
+                    self.assertTrue(blocking)
+                    self.assertEqual(timeout, COMMAND_WAIT_SECONDS)
+                    self.assertTrue(type(timeout) in (int, float) and 0 < timeout < float('inf'))
+                    self.assertTrue(contended)
+                    self.assertEqual(lock.releases, 0, 'A rejected command must not release another holder')
+                finally:
+                    self.service.command = original
+                self.assertTrue(self.service.control(ident, action)['ended'])
+                self.assertTrue(self.service.sessions[ident]['ended'])
+                self.assertEqual(self.service.status()['state'], 'ready')
+                self.assertEqual(self.engine.calls[len(before):], [(action, {})])
 
     def test_healthy_expiry_never_takes_the_command_lock(self):
         self.service.start(.25)
@@ -210,14 +287,40 @@ class ServiceTests(unittest.TestCase):
 
     def test_brief_housekeeping_contention_does_not_break_a_take(self):
         ident = self.service.start(.25)['sessionId']
-        held = threading.Event()
+        original = self.service.command
+        held, waiting, released = threading.Event(), threading.Event(), threading.Event()
+        holder_errors = []
+        lock = ControlledCommandLock(original, waiting, released)
         def hold():
-            with self.service.command:
-                held.set(); time.sleep(.03)
-        thread = threading.Thread(target=hold);thread.start()
-        self.assertTrue(held.wait(1))
-        self.assertTrue(self.service.control(ident, 'cancel')['ended'])
-        thread.join(1)
+            try:
+                with original:
+                    held.set()
+                    if not waiting.wait(5):
+                        holder_errors.append('The command never attempted admission')
+            finally:
+                released.set()
+        self.service.command = lock
+        thread = threading.Thread(target=hold)
+        thread.start()
+        try:
+            self.assertTrue(held.wait(5), 'The controlled holder did not acquire the real lock')
+            self.assertTrue(self.service.control(ident, 'cancel')['ended'])
+            self.assertEqual(len(lock.attempts), 1)
+            blocking, timeout, contended = lock.attempts[0]
+            self.assertTrue(blocking)
+            self.assertEqual(timeout, COMMAND_WAIT_SECONDS)
+            self.assertTrue(type(timeout) in (int, float) and 0 < timeout < float('inf'))
+            self.assertTrue(contended, 'Admission must begin while the real lock is held')
+            self.assertTrue(released.is_set())
+            self.assertEqual(lock.releases, 1)
+            self.assertEqual([action for action, _ in self.engine.calls], ['start', 'cancel'])
+            self.assertEqual(self.service.status()['state'], 'ready')
+        finally:
+            waiting.set()
+            thread.join(5)
+            self.service.command = original
+        self.assertFalse(thread.is_alive(), 'The controlled holder did not finish')
+        self.assertEqual(holder_errors, [])
 
     def test_failed_worker_reloads_only_on_the_next_explicit_start(self):
         engines = [Engine(), Engine()]

@@ -3,15 +3,36 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { spawnSync } = require('node:child_process');
 const { DraftModel, ManualJournal, textPatch } = require('../src/web/dictation_draft.js');
 const { PCMResampler } = require('../src/web/dictation_worklet.js');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/web/dictation.js'), 'utf8');
 const draftSource = fs.readFileSync(path.join(__dirname, '../src/web/dictation_draft.js'), 'utf8');
 const viewSource = fs.readFileSync(path.join(__dirname, '../src/web/dictation_view.js'), 'utf8');
+const EXPECTED_COPY = Object.freeze({
+  busy: 'Dictation is busy. If another window is dictating, stop it there. Otherwise wait a moment and try again.',
+  control: 'The microphone is off and your words are kept. Dictation did not confirm that it stopped, so wait a moment before dictating again.',
+  final: 'Dictation stopped, but the last words may be missing. The words you can see are kept.'
+});
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function flush() { for (let i = 0; i < 4; i++) await tick(); }
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
+
+class VirtualClock {
+  constructor() { this.now = 0; this.next = 0; this.timers = new Map(); }
+  setTimeout(callback, delay = 0) { const id = ++this.next;this.timers.set(id, { callback, at: this.now + Math.max(0, delay) });return id; }
+  clearTimeout(id) { this.timers.delete(id); }
+  async advance(milliseconds) {
+    const end = this.now + milliseconds;let iterations = 0;
+    while (true) {
+      const next = [...this.timers].filter(([,timer]) => timer.at <= end).sort((a,b) => a[1].at-b[1].at || a[0]-b[0])[0];
+      if (!next) break;
+      assert(++iterations < 10000, 'Virtual timers must converge');this.now = next[1].at;this.timers.delete(next[0]);next[1].callback();await flush();
+    }
+    this.now = end;await flush();
+  }
+}
 
 class Target {
   constructor() { this.listeners = new Map(); }
@@ -139,7 +160,10 @@ function environment(configuration = {}) {
       if (env.mediaError) throw env.mediaError;
       return env.mediaDeferred ? env.mediaDeferred.promise : newStream();
     } } },
-    console, setTimeout, clearTimeout, setInterval: setMeterInterval, clearInterval: clearMeterInterval, AbortController, ArrayBuffer,
+    console, setTimeout: env.clock ? env.clock.setTimeout.bind(env.clock) : setTimeout,
+    clearTimeout: env.clock ? env.clock.clearTimeout.bind(env.clock) : clearTimeout,
+    performance: env.noPerformance ? undefined : { now: () => env.clock ? env.clock.now : performance.now() },
+    setInterval: setMeterInterval, clearInterval: clearMeterInterval, AbortController, ArrayBuffer,
     matchMedia: query => query.includes('prefers-reduced-motion') ? motion : { matches: false },
     getComputedStyle: () => ({ fontFamily: 'system-ui', fontSize: '16px', fontWeight: '400', fontStyle: 'italic',
       lineHeight: '24px', paddingTop: '0px', paddingRight: '0px', paddingBottom: '0px', paddingLeft: '0px' }),
@@ -160,7 +184,8 @@ function environment(configuration = {}) {
     const route = url.replace('/api/dictation/', '');
     let data = config.body;
     if (typeof data === 'string') data = JSON.parse(data);
-    env.calls.push({ route, config, data });
+    env.calls.push({ route, config, data, at: env.clock ? env.clock.now : null });
+    if (env.apiHook) { const value = env.apiHook(route, data, config, env);if (value !== undefined) return value; }
     if (route === 'status') return { state: env.readiness, code: env.readinessCode || null };
     if (route === 'start') {
       if (env.readiness === 'failed' && !env.prepareReturnedSession) {
@@ -168,6 +193,7 @@ function environment(configuration = {}) {
       }
       env.sessionNumber++; env.epoch = 1; env.sequence = 0;
       const result = { sessionId: String(env.sessionNumber).padStart(48, '0'), epoch: 1 };
+      env.sessionId = result.sessionId;
       return env.startDeferred ? env.startDeferred.promise : result;
     }
     if (route === 'audio') {
@@ -181,19 +207,24 @@ function environment(configuration = {}) {
     }
     if (route === 'stop') {
       if (env.stopDeferred) return env.stopDeferred.promise;
-      const result = { epoch: env.epoch, ended: true };
+      const result = { sessionId: data.sessionId, epoch: env.epoch, ended: true };
       queueMicrotask(() => env.emit([
         ...(env.stopText ? [env.line(env.stopText, true)] : []),
         { id: ++env.nextId, type: 'ended', epoch: env.epoch }
       ], true));
       return result;
     }
-    if (route === 'cancel') return { epoch: env.epoch, ended: true };
+    if (route === 'cancel') return { sessionId: data.sessionId, epoch: env.epoch, ended: true };
     if (route === 'events') {
       const result = deferred();
       const item = { resolve: result.resolve, reject: result.reject, signal: config.signal };
       env.pendingEvents.push(item);
+      if (env.clock) item.timer = env.clock.setTimeout(() => {
+        const index = env.pendingEvents.indexOf(item);if (index !== -1) env.pendingEvents.splice(index, 1);
+        result.resolve({ events: [], ended: false, epoch: env.epoch });
+      }, 500);
       config.signal.addEventListener('abort', () => {
+        if (env.clock) env.clock.clearTimeout(item.timer);
         const index = env.pendingEvents.indexOf(item);
         if (index !== -1) env.pendingEvents.splice(index, 1);
         const error = new Error('aborted'); error.name = 'AbortError'; result.reject(error);
@@ -205,7 +236,7 @@ function environment(configuration = {}) {
   env.line = (text, complete = false, epoch = env.epoch, lineId = 'a') => ({ id: ++env.nextId, type: 'line', epoch, lineId, text, complete });
   env.emit = (events, ended = false) => {
     const entry = env.pendingEvents.shift();
-    assert(entry, 'Expected a pending event request'); entry.resolve({ events, ended, epoch: env.epoch });
+    assert(entry, 'Expected a pending event request');if (env.clock) env.clock.clearTimeout(entry.timer);entry.resolve({ events, ended, epoch: env.epoch });
   };
   env.controller = browser.MotetDictation.create(Object.assign({}, elements, {
     api: endpoint, demo: () => env.demo, canUse: () => env.allowed, target: () => env.target,
@@ -448,12 +479,12 @@ async function finishingEscapeProof(mutateController) {
     for (const ignored of [direct, local]) { assert.equal(ignored.defaultPrevented, false);assert.equal(ignored.stopped, undefined); }
     assert.equal(env.elements.textarea.value, visible);assert.equal(env.controller.state, 'finishing');
     assert.equal(env.calls.filter(call => call.route === 'cancel').length, 0);
-    stopped.resolve({ epoch: env.epoch, ended: true });
+    stopped.resolve({ sessionId: env.sessionId, epoch: env.epoch, ended: true });
     env.emit([env.line('these words were kept by Stop and finalized', true), { id: ++env.nextId, type: 'ended', epoch: env.epoch }], true);
     await pending;await flush();
     assert.equal(env.elements.textarea.value, 'Typed. these words were kept by Stop and finalized');
     assert.equal(env.controller.active, false);assert.equal(env.stateChanges.at(-1).detail.reason, 'stop');
-  } finally { stopped.resolve({ epoch: env.epoch, ended: true });await env.close(); }
+  } finally { stopped.resolve({ sessionId: env.sessionId, epoch: env.epoch, ended: true });await env.close(); }
 }
 
 async function sendNoticeProof(mutateController, mutateView) {
@@ -518,7 +549,263 @@ async function deskIdentityProof(mutateController) {
   }
 }
 
+function apiError(code) { const error = new Error('Fictional API failure');error.code = code;return error; }
+async function speaking(configuration = {}) {
+  const env = environment(Object.assign({ clock: new VirtualClock(), fakeIntervals: true, withView: true }, configuration));
+  env.elements.textarea.value = 'Typed.';await env.controller.start();await flush();
+  assert.equal(env.controller.state, 'listening');env.emit([env.line('kept words')]);await flush();return env;
+}
+async function busyStopProof(mutateController) {
+  let attempts = 0;
+  const env = await speaking({ mutateController, apiHook(route, data, config, current) {
+    if (route === 'stop') { if (++attempts <= 2) throw apiError('busy');return { sessionId: data.sessionId, epoch: current.epoch, ended: true }; }
+  } });
+  try {
+    const ending = env.controller.stop();await flush();assert.equal(attempts, 1);assert(env.tracks.every(track=>track.stopped));
+    assert.equal(env.controller.state, 'finishing');assert.equal(env.controller.escape({ key:'Escape' }), false);
+    await env.clock.advance(99);assert.equal(attempts, 1);await env.clock.advance(1);assert.equal(attempts, 2);
+    env.emit([env.line('kept words while finishing')]);await flush();
+    await env.clock.advance(100);assert.equal(attempts, 3);assert.equal(env.controller.state, 'finishing');
+    const stops = env.calls.filter(call=>call.route==='stop');assert(stops.every(call=>call.data.sessionId===env.sessionId));
+    assert.deepEqual(stops.map(call=>call.at), [0,100,200]);
+    env.emit([env.line('kept words finalized', true),{ id:++env.nextId,type:'ended',epoch:env.epoch }], true);await ending;await flush();
+    assert.equal(env.elements.textarea.value, 'Typed. kept words finalized');assert.equal(env.controller.active, false);
+    assert.equal(env.calls.filter(call=>call.route==='cancel').length, 0);assert.equal(env.calls.filter(call=>call.route==='audio').length, 0);
+  } finally { await env.close(); }
+}
+async function cleanupFenceProof(mutateController) {
+  const audio = deferred();let attempts = 0;
+  const env = await speaking({ mutateController, audioDeferred: audio, apiHook(route, data, config, current) {
+    if (route==='cancel') { if (++attempts<=2) throw apiError('busy');return {sessionId:data.sessionId,epoch:current.epoch,ended:true}; }
+  } });
+  try {
+    const oldSession=env.sessionId;env.worklets[0].pcm();await flush();env.controller.cancel();await flush();
+    assert.equal(env.elements.textarea.value,'Typed.');assert(env.tracks.every(track=>track.stopped));assert.equal(attempts,0);
+    const next=env.controller.start();await flush();assert.equal(env.mediaCalls,1,'A new take cannot get a microphone before cleanup');
+    await env.clock.advance(500);assert.equal(attempts,0,'Cleanup waits for the one in-flight audio request');
+    audio.resolve({acceptedSequence:0,epoch:1});await flush();assert.equal(attempts,1);
+    await env.clock.advance(200);await next;await flush();assert.equal(attempts,3);assert.equal(env.mediaCalls,2);
+    assert(env.calls.filter(call=>call.route==='cancel').every(call=>call.data.sessionId===oldSession));
+    assert(env.calls.filter(call=>call.route==='cancel').every(call=>call.config.keepalive===true),'Every cleanup attempt retains keepalive');
+    assert.equal(env.calls.filter(call=>call.route==='audio').length,1,'Audio is never replayed');assert.equal(env.elements.textarea.value,'Typed.');
+  } finally { audio.resolve({acceptedSequence:0,epoch:1});env.apiHook=undefined;await env.close(); }
+}
+async function terminalBudgetProof(mutateController) {
+  for(const action of ['stop','cancel']){
+    let abortedAt=null;const held=deferred();
+    const env=await speaking({mutateController,apiHook(route,data,config){
+      if(route===action){if(env.clock.now<19000)throw apiError('busy');config.signal.addEventListener('abort',()=>{abortedAt=env.clock.now});return held.promise;}
+    }});
+    try{
+      env.browser.Date={now:()=>9000000000000}; // Wall-clock changes cannot extend the performance-clock budget.
+      const ending=action==='stop'?env.controller.stop():(env.controller.cancel(),null);await flush();
+      await env.clock.advance(19999);assert.equal(env.calls.filter(call=>call.route===action).at(-1).at,19000);assert.equal(abortedAt,null);
+      await env.clock.advance(1);if(ending)await ending;await flush();assert.equal(abortedAt,20000,'Last HTTP attempt uses only the remaining one second');
+      assert.equal(env.controller.active,false);assert(env.tracks.every(track=>track.stopped));assert.equal(env.view.status.textContent,action==='stop'?EXPECTED_COPY.final:EXPECTED_COPY.control);
+      assert.equal(env.elements.textarea.value,action==='stop'?'Typed. kept words':'Typed.');
+      if(action==='stop')assert.equal(env.calls.filter(call=>call.route==='cancel').length,0,'Stop fallback gets no fresh twenty-second budget');
+      const count=env.calls.length;await env.clock.advance(12000);assert.equal(env.calls.length,count,'No terminal request continues after the budget');
+    }finally{held.resolve({sessionId:env.sessionId,epoch:1,ended:true});await env.close();}
+  }
+}
+async function queueBudgetProof(mutateController) {
+  const first=deferred(),second=deferred();let packets=0;
+  const env=await speaking({mutateController,apiHook(route){if(route==='audio')return ++packets===1?first.promise:second.promise;}});
+  try{
+    env.worklets[0].pcm();env.worklets[0].pcm();await flush();const ending=env.controller.stop();await flush();
+    await env.clock.advance(11000);first.resolve({acceptedSequence:0,epoch:1});await flush();assert.equal(packets,2);
+    await env.clock.advance(9000);assert.equal(env.controller.active,false,'Twenty seconds includes pre-existing ordered audio');
+    await ending;assert.equal(env.view.status.textContent,EXPECTED_COPY.final);assert.equal(env.elements.textarea.value,'Typed. kept words');
+    assert.equal(env.calls.filter(call=>['stop','cancel'].includes(call.route)).length,0);
+  }finally{first.resolve({acceptedSequence:0,epoch:1});second.resolve({acceptedSequence:1,epoch:1});await env.close();}
+}
+async function terminalAckProof(mutateController) {
+  for(const outcome of ['ack','ended','unknown_session','mismatch','not-ended','timeout','transport']){
+    let abortAt=null;const env=await speaking({mutateController,apiHook(route,data,config,current){
+      if(route!=='cancel')return;
+      if(['ended','unknown_session'].includes(outcome))throw apiError(outcome);
+      if(outcome==='transport')throw new TypeError('Fictional transport loss');
+      if(outcome==='timeout'){config.signal.addEventListener('abort',()=>{abortAt=current.clock.now});return new Promise(()=>{});}
+      return {sessionId:outcome==='mismatch'?'wrong-session':data.sessionId,epoch:current.epoch,ended:outcome!=='not-ended'};
+    }});
+    try{
+      env.controller.cancel();await flush();if(outcome==='timeout')await env.clock.advance(12000);
+      assert.equal(env.calls.filter(call=>call.route==='cancel').length,1,'Only a confirmed busy can be retried');
+      assert.equal(env.controller.active,false);assert.equal(env.elements.textarea.value,'Typed.');
+      if(['ack','ended','unknown_session'].includes(outcome))assert.equal(env.view.status.textContent,'');
+      else assert.equal(env.view.status.textContent,EXPECTED_COPY.control);
+      if(outcome==='timeout')assert.equal(abortAt,12000);
+    }finally{await env.close();}
+  }
+  for(const outcome of ['mismatch','not-ended','unknown_session']){
+    const env=await speaking({mutateController,apiHook(route,data,config,current){
+      if(route==='stop'){if(outcome==='unknown_session')throw apiError(outcome);return {sessionId:outcome==='mismatch'?'wrong-session':data.sessionId,epoch:current.epoch,ended:outcome!=='not-ended'};}
+    }});
+    try{await env.controller.stop();await flush();assert.equal(env.elements.textarea.value,'Typed. kept words');assert.equal(env.calls.filter(call=>call.route==='stop').length,1);assert.equal(env.view.status.textContent,outcome==='unknown_session'?EXPECTED_COPY.final:EXPECTED_COPY.control);}finally{await env.close();}
+  }
+}
+async function cleanupFeedbackProof(mutateController) {
+  for(const change of ['none','edit-and-return','context','new-take','send']){
+    const failed=deferred(),readiness=deferred(),microphone=deferred();let statuses=0,returnedStream;
+    const env=await speaking({mutateController,apiHook(route){if(route==='cancel')return failed.promise;if(route==='status'&&++statuses>1)return readiness.promise;}});
+    try{
+      env.controller.cancel();await flush();const patches=env.patches;let next;
+      if(change==='edit-and-return'){env.elements.textarea.value='Typed. correction';env.elements.textarea.dispatch('input');env.elements.textarea.value='Typed.';env.elements.textarea.dispatch('input');}
+      if(change==='context'){env.target='other-desk';env.elements.textarea.value='Other draft';env.controller.contextChanged('desk');}
+      if(change==='new-take'){env.mediaDeferred=microphone;next=env.controller.start();await flush();assert.equal(env.mediaCalls,1);}
+      if(change==='send')assert.equal(env.controller.beforeSend(),'Typed.');
+      const transition=env.stateChanges.length;failed.reject(apiError('failed'));await flush();
+      if(change==='new-take'){
+        assert.equal(env.controller.state,'checking','A held new readiness reply cannot mask an old cleanup warning');
+        assert(!env.stateChanges.slice(transition).some(row=>row.detail.reason==='cleanup_unconfirmed'),'A transient warning during the new take is also forbidden');
+        readiness.resolve({state:'ready'});await flush();assert.equal(env.controller.state,'preparing');assert.equal(env.mediaCalls,2);assert(!env.stateChanges.slice(transition).some(row=>row.detail.reason==='cleanup_unconfirmed'));
+        env.controller.cancel();microphone.resolve(returnedStream=env.newStream());await next;await flush();
+      }
+      if(change==='none')assert.equal(env.view.status.textContent,EXPECTED_COPY.control);
+      else assert.notEqual(env.view.status.textContent,EXPECTED_COPY.control,'Late cleanup cannot overwrite another action or manual edit');
+      assert.equal(env.patches,patches,'Cleanup feedback never writes the draft');assert.equal(env.elements.textarea.value,change==='context'?'Other draft':'Typed.');
+    }finally{failed.resolve({sessionId:env.sessionId,epoch:1,ended:true});readiness.resolve({state:'ready'});if(change==='new-take')microphone.resolve(returnedStream||(returnedStream=env.newStream()));await env.close();}
+  }
+}
+async function lateStopPollProof(mutateController) {
+  for(const composing of [false,true]){
+    const held=deferred();let signal;
+    const env=await speaking({mutateController,apiHook(route,data,config){if(route==='stop'){signal=config.signal;return held.promise;}}});
+    try{
+      let settled=false;const ending=env.controller.stop().then(()=>{settled=true});await flush();if(composing)env.elements.textarea.dispatch('compositionstart');
+      env.emit([env.line('kept words finalized',true),{id:++env.nextId,type:'ended',epoch:env.epoch}],true);await flush();
+      assert(signal.aborted,'Confirmed terminal events retire the outstanding Stop HTTP request immediately');
+      if(composing){assert.equal(env.controller.state,'finishing');assert(env.controller.active);env.elements.textarea.dispatch('compositionend');await flush();}
+      assert.equal(settled,true);await ending;assert.equal(env.elements.textarea.value,'Typed. kept words finalized');assert.equal(env.stateChanges.at(-1).detail.reason,'stop');
+      assert.equal(env.calls.filter(call=>call.route==='cancel').length,0);assert.equal(env.clock.now,0,'No twelve-second wait after the poll proves completion');
+    }finally{held.resolve({sessionId:env.sessionId,epoch:1,ended:true});await env.close();}
+  }
+}
+async function ambiguousStartProof(mutateController) {
+  for(const readiness of ['ready','failed'])for(const outcome of ['held','malformed','not_running','unavailable','invalid_response','fictional_failure']){
+    const held=deferred();let statuses=0;
+    const env=environment({mutateController,clock:new VirtualClock(),fakeIntervals:true,withView:true,readiness,apiHook(route){
+      if(route==='status')return {state:++statuses===1?readiness:'listening'};
+      if(route==='start'){if(outcome==='malformed')return {epoch:1};if(outcome==='held')return held.promise;throw apiError(outcome);}
+    }});
+    try{
+      env.elements.textarea.value='Typed.';const beginning=env.controller.start();await flush();
+      if(outcome==='held'){env.controller.cancel();await env.clock.advance(12000);}await beginning;await flush();
+      assert.equal(env.view.status.textContent,EXPECTED_COPY.control,'An ambiguous Start with no session ID cannot silently claim closure');
+      assert.equal(env.calls.filter(call=>call.route==='cancel').length,0,'Never invent a session ID for cleanup');
+      const microphones=env.mediaCalls;await env.controller.start();await flush();assert.equal(env.mediaCalls,microphones);assert.equal(env.controller.state,'busy');
+      if(readiness==='failed')assert.equal(env.mediaCalls,0,'Failed-state preparation never requests a microphone');
+    }finally{held.resolve({sessionId:'1'.padStart(48,'0'),epoch:1});await env.close();}
+  }
+}
+async function startRefusalProof(mutateController) {
+  for(const readiness of ['ready','failed'])for(const code of ['busy','loading','not_configured','not_installed','dependency_missing','runtime_version','model_missing_or_invalid','demo']){
+    const env=environment({mutateController,clock:new VirtualClock(),fakeIntervals:true,withView:true,apiHook(route){if(route==='status')return {state:readiness};if(route==='start')throw apiError(code);}});
+    try{
+      env.elements.textarea.value='Typed.';await env.controller.start();await flush();
+      assert.equal(env.stateChanges.at(-1).detail.reason,code,'A known pre-execution refusal retains its original feedback');
+      assert.notEqual(env.view.status.textContent,EXPECTED_COPY.control);assert.equal(env.calls.filter(call=>call.route==='cancel').length,0);assert.equal(env.calls.filter(call=>call.route==='start').length,1,'Start is never replayed, including busy');assert.equal(env.elements.textarea.value,'Typed.');
+      if(code==='busy')assert.equal(env.view.status.textContent,EXPECTED_COPY.busy);
+      if(code==='not_installed'){assert.equal(env.controller.state,'not_installed');assert.equal(env.view.settings.hidden,false,'Setup instructions remain available');}
+      if(readiness==='failed')assert.equal(env.mediaCalls,0);
+    }finally{await env.close();}
+  }
+}
+async function implicitTimeoutProof(mutateController) {
+  let cancels=0,live=false;const audio=deferred();
+  const env=await speaking({mutateController,audioDeferred:audio,apiHook(route,data,config,current){
+    if(route==='status')return {state:live?'listening':'ready'};
+    if(route==='start'){live=true;return;}
+    if(route==='cancel'){cancels++;if(current.clock.now<15000)throw apiError('busy');live=false;return {sessionId:data.sessionId,epoch:current.epoch,ended:true};}
+  }});
+  try{
+    const oldSession=env.sessionId;env.worklets[0].pcm();await flush();await env.clock.advance(12000);assert.equal(env.controller.active,false);assert(env.tracks.every(track=>track.stopped));assert.equal(cancels,1);
+    const next=env.controller.start();await flush();await env.clock.advance(2999);assert.equal(env.mediaCalls,1,'Native work still owns the take between the twelve-second HTTP and fifteen-second runtime limits');
+    await env.clock.advance(1);await next;assert.equal(cancels,31);assert.equal(env.mediaCalls,2);assert.equal(env.calls.filter(call=>call.route==='status').at(-1).at,15000);
+    assert(env.calls.filter(call=>call.route==='cancel').every(call=>call.data.sessionId===oldSession));
+    assert.equal(env.calls.filter(call=>call.route==='audio').length,1);assert.equal(env.elements.textarea.value,'Typed. kept words');
+    assert.equal(env.calls.filter(call=>call.route==='cancel')[0].at,12000,'Automatic retirement gets its own first cleanup budget');
+  }finally{audio.resolve({acceptedSequence:0,epoch:1});await env.close();}
+}
+async function monotonicClockProof(mutateController) {
+  const env=environment({mutateController,noPerformance:true,withView:true});
+  try{env.elements.textarea.value='Typed.';await env.controller.start();await flush();assert.equal(env.controller.state,'unsupported');assert.equal(env.mediaCalls,0);assert.equal(env.calls.length,0);assert.equal(env.controller.active,false);assert.equal(env.elements.textarea.value,'Typed.');}
+  finally{await env.close();}
+}
+async function lockedCleanupProof(mutateController) {
+  for(const scenario of ['locked-local-refusal','other-context','helper-failure']){
+    let refused=0,wire=0;
+    const env=await speaking({mutateController,apiHook(route,data,config,current){if(route==='cancel'){if(!current.allowed){refused++;throw apiError(scenario==='helper-failure'?'failed':'unavailable');}wire++;}}});
+    try{
+      env.allowed=false;env.controller.contextChanged(scenario==='other-context'?'desk':'locked');await flush();
+      assert.equal(refused,1);assert.equal(wire,0,'No request bypasses the revoked adapter permission');
+      assert(env.tracks.every(track=>track.stopped));assert.equal(env.elements.textarea.value,'Typed. kept words');
+      if(scenario==='locked-local-refusal'){assert.equal(env.view.status.textContent,'Dictation stopped when you locked the stage.');assert.equal(env.stateChanges.at(-1).detail.reason,'locked');}
+      else assert.equal(env.view.status.textContent,EXPECTED_COPY.control,'Unexpected cleanup failures still warn');
+      const count=env.calls.length;await env.controller.start();assert.equal(env.calls.length,count);assert.equal(env.mediaCalls,1,'A locked stage cannot request another microphone');
+    }finally{await env.close();}
+  }
+}
+async function acknowledgedDrainTimerProof(mutateController) {
+  for(const acknowledged of ['response','ended-error']){
+    const env=await speaking({mutateController,apiHook(route,data,config,current){if(route==='stop'){if(acknowledged==='ended-error')throw apiError('ended');return {sessionId:data.sessionId,epoch:current.epoch,ended:true};}}});
+    try{
+      let settled=false;const ending=env.controller.stop().then(()=>{settled=true});await flush();
+      await env.clock.advance(19999);assert.equal(env.controller.state,'finishing');assert.equal(settled,false);assert.equal(env.view.status.textContent,'Finishing the last words…');
+      await env.clock.advance(1);assert.equal(env.controller.active,false,'A closure ACK cannot leave final-event draining unbounded');assert.equal(settled,true);await ending;
+      assert.equal(env.view.status.textContent,EXPECTED_COPY.final);assert.equal(env.stateChanges.at(-1).detail.reason,'finalize_unconfirmed');assert.equal(env.elements.textarea.value,'Typed. kept words');assert(env.tracks.every(track=>track.stopped));
+      assert.equal(env.calls.filter(call=>call.route==='stop').length,1);assert.equal(env.calls.filter(call=>call.route==='cancel').length,0,'A confirmed closed take needs no fallback Cancel');
+    }finally{await env.close();}
+  }
+  const env=await speaking({mutateController,apiHook(route,data,config,current){if(route==='stop')return {sessionId:data.sessionId,epoch:current.epoch,ended:true};}});
+  try{env.controller.stop();await flush();env.controller.contextChanged('desk');await flush();assert.equal(env.calls.filter(call=>call.route==='cancel').length,0,'Retiring before the drain deadline also respects a validated closure ACK');assert.equal(env.view.status.textContent,'Dictation stopped when you changed desks.');}
+  finally{await env.close();}
+}
+async function retireStopAbortProof(mutateController) {
+  const held=deferred();let signal;
+  const env=await speaking({mutateController,apiHook(route,data,config){if(route==='stop'){signal=config.signal;return held.promise;}}});
+  try{
+    let settled=false;const ending=env.controller.stop().then(()=>{settled=true});await flush();env.controller.contextChanged('desk');
+    assert(signal.aborted,'Retirement immediately aborts an outstanding Stop request');await flush();assert.equal(settled,true);await ending;
+    assert.equal(env.view.status.textContent,'Dictation stopped when you changed desks.');
+    const cancels=env.calls.filter(call=>call.route==='cancel');assert.equal(cancels.length,1);assert.equal(cancels[0].config.keepalive,true);assert.equal(cancels[0].data.sessionId,env.sessionId);
+    held.resolve({sessionId:env.sessionId,epoch:1,ended:true});await env.clock.advance(12000);assert.equal(env.calls.filter(call=>call.route==='stop').length,1);assert.equal(env.elements.textarea.value,'Typed. kept words');assert.equal(env.stateChanges.at(-1).detail.reason,'desk');
+  }finally{held.resolve({sessionId:env.sessionId,epoch:1,ended:true});await env.close();}
+}
+function incompleteRunProof() {
+  const filename=__filename,test=fs.readFileSync(filename,'utf8');
+  function child(controller) {
+    const content=test.replace("const source = fs.readFileSync(path.join(__dirname, '../src/web/dictation.js'), 'utf8');",'const source = '+JSON.stringify(controller)+';');
+    const bootstrap="const Module=require('node:module'),path=require('node:path');const m=new Module("+JSON.stringify(filename)+",module);m.filename="+JSON.stringify(filename)+";m.paths=Module._nodeModulePaths(path.dirname(m.filename));m._compile("+JSON.stringify(content)+",m.filename);";
+    return spawnSync(process.execPath,['-'],{input:bootstrap,encoding:'utf8',timeout:30000,maxBuffer:1024*1024,env:Object.assign({},process.env,{MOTET_DICTATION_CHILD:'1'})});
+  }
+  const normal=child(source);assert.equal(normal.error,undefined);assert.equal(normal.signal,null);assert.equal(normal.status,0,normal.stderr);assert(normal.stdout.includes('Dictation page checks passed.'));
+  const mutants=[
+    ['thirty-second budget',s=>s.replace('TERMINAL_BUDGET_MS = 20000','TERMINAL_BUDGET_MS = 30000')],
+    ['twenty-one-second budget',s=>s.replace('TERMINAL_BUDGET_MS = 20000','TERMINAL_BUDGET_MS = 21000')],
+    ['unbounded queue wait',s=>s.replace("await withinDeadline(queue(current, () => terminalRequest(current, 'stop', deadline)), deadline);","await queue(current, () => terminalRequest(current, 'stop', deadline));")],
+    ['quiet unknown Stop',s=>s.replace("if (action === 'stop' && error && error.code === 'unknown_session') throw problem('finalize_unconfirmed');","if (action === 'stop' && error && error.code === 'unknown_session') return;")],
+    ['hanging Stop promise',s=>s.replace('return current.done;\n    }\n    function cancel()', 'return new Promise(()=>{});\n    }\n    function cancel()')]
+  ];
+  for(const [name,mutate] of mutants){const altered=mutate(source);assert.notEqual(altered,source,name+' targets current source');const result=child(altered);assert.equal(result.error,undefined,name+' must fail itself, not time out');assert.equal(result.signal,null);assert.equal(result.status,1,name+' incomplete main must exit nonzero');assert(!result.stdout.includes('Dictation page checks passed.'));assert(result.stderr.includes('Dictation page checks did not complete.'),name+' must exercise the completion guard');}
+}
+
 async function main() {
+  await test('Stop retries only busy for the same session and keeps final words',()=>busyStopProof());
+  await test('Cancel closes locally and fences a new microphone through queued-audio cleanup',()=>cleanupFenceProof());
+  await test('terminal requests share one monotonic twenty-second budget and remaining HTTP deadline',()=>terminalBudgetProof());
+  await test('Stop total budget includes pre-existing ordered audio',()=>queueBudgetProof());
+  await test('terminal acknowledgements validate session and closure; ambiguous failures are not retried',()=>terminalAckProof());
+  await test('late cleanup feedback never writes a draft or overrides typing, context, Send or a new take',()=>cleanupFeedbackProof());
+  await test('final poll events immediately retire a pending Stop request including deferred IME',()=>lateStopPollProof());
+  await test('both Start paths retain ambiguity without inventing a cleanup session',()=>ambiguousStartProof());
+  await test('both Start paths preserve proven pre-execution refusals and setup guidance',()=>startRefusalProof());
+  await test('an audio HTTP timeout still gets bounded busy-only cleanup without audio replay',()=>implicitTimeoutProof());
+  await test('a missing monotonic clock fails closed before helper requests or microphone permission',()=>monotonicClockProof());
+  await test('locking preserves its reason only for the expected local adapter refusal',()=>lockedCleanupProof());
+  await test('a Stop closure ACK without final events ends at exactly twenty seconds with final-words copy',()=>acknowledgedDrainTimerProof());
+  await test('retirement immediately aborts Stop while cleanup keeps its same-session keepalive',()=>retireStopAbortProof());
+  if(process.env.MOTET_DICTATION_CHILD!=='1')await test('actual subprocesses reject incomplete budget, queue, unknown-session and hanging-promise runs',()=>incompleteRunProof());
   await test('recognition revisions preserve collapsed end and interior carets', () => caretProof());
   await test('native edits reconcile before older page autosize/paint refresh listeners', () => legacyInputProof());
   await test('history shortcuts follow Latin key meaning on German and Dvorak layouts', () => layoutKeyProof());
@@ -978,6 +1265,28 @@ async function main() {
       assert.notEqual(mutate(original), original, name + ' must target the current implementation');
       await assert.rejects(async () => proof(mutate), assert.AssertionError, name + ' must fail its behavioral proof');
     }
+    await caught('terminal busy-only retry',value=>value.replace("if (!error || error.code !== 'busy') throw error;",'throw error;'),busyStopProof);
+    await caught('retired same-session cleanup still runs',value=>value.replace('while (now() < deadline) {',"while (now() < deadline) { if (action === 'cancel' && !valid(current)) return;"),cleanupFenceProof);
+    await caught('terminal ACK validates closure and session',value=>value.replace("if (result.sessionId !== current.sessionId || result.ended !== true) throw problem('control_unconfirmed');",''),terminalAckProof);
+    await caught('HTTP attempt uses remaining budget',value=>value.replace('Math.min(12000, deadline - now())','12000'),terminalBudgetProof);
+    await caught('Stop fallback retains the original deadline',value=>value.replace('if (current.terminalDeadline === undefined)','if (true)'),terminalBudgetProof);
+    await caught('queue-inclusive Stop deadline',value=>value.replace("current.finishTimer = setTimeout(() => fail(current, problem('finalize_unconfirmed')), Math.max(0, deadline - now()));",'')
+      .replace("await withinDeadline(queue(current, () => terminalRequest(current, 'stop', deadline)), deadline);","await queue(current, () => terminalRequest(current, 'stop', deadline));"),queueBudgetProof);
+    await caught('typing invalidates late cleanup warning',value=>value.replace('feedbackVersion !== stamp.feedback','false'),cleanupFeedbackProof);
+    await caught('confirmed poll retires pending Stop request',value=>value.replace("current.backendEnded = true; current.transportClosed = true; current.acceptFrames = false;\n      if (current.stopAbort) current.stopAbort.abort();",'current.backendEnded = true; current.transportClosed = true; current.acceptFrames = false;'),lateStopPollProof);
+    await caught('intentional terminal abort preserves IME',value=>value.replace("} catch (error) {\n          if (action === 'stop' && (!valid(current) || current.backendEnded)) return;",'} catch (error) {'),lateStopPollProof);
+    await caught('ambiguous Start is never reported as closed',value=>value.replace("if (!current.sessionId && current.startUnconfirmed) throw problem('control_unconfirmed');",''),ambiguousStartProof);
+    await caught('both Start branches share ambiguity tracking',value=>value.replace('current.startPromise = startRequest(current);',"current.startPromise = request('start', { intervalSeconds: .25 }).then(result => { current.sessionId = result.sessionId; return result; });"),ambiguousStartProof);
+    await caught('known Start refusals retain setup guidance',value=>value.replace('if (!refused) current.startUnconfirmed = true;','current.startUnconfirmed = true;'),startRefusalProof);
+    await caught('monotonic clock is required before capture',value=>value.replace('scope.performance.now.bind(scope.performance) : null;','scope.performance.now.bind(scope.performance) : Date.now;'),monotonicClockProof);
+    await caught('routine lock keeps its context reason',value=>value.replace("if (detail.reason === 'locked' && error && error.code === 'unavailable' && !canUse()) return;",''),lockedCleanupProof);
+    await caught('ACK without final events still has a deadline',value=>value.replace("current.finishTimer = setTimeout(() => fail(current, problem('finalize_unconfirmed')), Math.max(0, deadline - now()));",''),acknowledgedDrainTimerProof);
+    await caught('closure ACK remains distinct from the event drain',value=>value.replace("if (action === 'stop') current.stopAcknowledged = true;",''),acknowledgedDrainTimerProof);
+    await caught('late cleanup preserves final-words feedback',value=>value.replace('[COPY.control_unconfirmed,COPY.finalize_unconfirmed].includes(detail.message)','detail.message === COPY.control_unconfirmed'),terminalBudgetProof);
+    await caught('new-take guards cannot be masked by readiness',value=>value.replace('destroyed || take || composing','destroyed || composing').replace('operation !== stamp.operation || ','').replace('statusVersion !== stamp.status || ',''),cleanupFeedbackProof);
+    await caught('Start is never retried on busy',value=>value.replace('const refused = error &&',"if(error && error.code === 'busy' && !current.startRetried){current.startRetried=true;return startRequest(current);}const refused = error &&"),startRefusalProof);
+    await caught('cleanup retains keepalive',value=>value.replace("action === 'cancel' ? { keepalive: true } : {}",'{}'),cleanupFenceProof);
+    await caught('retirement aborts the pending Stop request',value=>value.replace('if (current.stopAbort) current.stopAbort.abort();',''),retireStopAbortProof);
     await caught('collapsed caret mapping', value => value.replace('textarea.setSelectionRange(mapped.start, mapped.end, mapped.direction);', ''), caretProof);
     await caught('native edit capture ordering', value => value.replace("bind(textarea, 'input', onEdit, true);", "bind(textarea, 'input', onEdit);"), legacyInputProof);
     await caught('semantic keyboard layout', value => value.replace("const undoKey = key === 'z', redoKey = key === 'y';",
@@ -1001,4 +1310,6 @@ async function main() {
   console.log('Dictation page checks passed.');
 }
 
-main().catch(error => { console.error(error); process.exitCode = 1; });
+let mainSettled=false;
+process.once('exit',()=>{if(!mainSettled){console.error('Dictation page checks did not complete.');process.exitCode=1;}});
+main().then(()=>{mainSettled=true;},error=>{mainSettled=true;console.error(error);process.exitCode=1;});

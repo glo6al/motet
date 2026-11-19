@@ -1,5 +1,25 @@
 #!/usr/bin/env node
 'use strict';
+const {spawnSync}=require('node:child_process');
+let mainCompleted=false;
+const incompleteMain='test_message_box.js'+': async main did not finish';
+process.once('exit',code=>{
+  if(code===0&&!mainCompleted){console.error(incompleteMain);process.exitCode=1}
+});
+function unfinishedMainProof(){
+  const driver=`const fs=require('node:fs'),path=require('node:path'),Module=require('node:module');
+const filename=path.resolve(process.argv[1]),marker=process.argv[2];let source=fs.readFileSync(filename,'utf8');
+if(source.split(marker).length!==2)throw Error('Expected one async-main marker');
+source=source.replace(marker,marker+'await new Promise(()=>{});');
+const entry=new Module(filename,module);entry.filename=filename;entry.paths=Module._nodeModulePaths(path.dirname(filename));entry._compile(source,filename);`;
+  // The first await is deliberately left unresolved. It precedes this proof,
+  // so the child cannot recursively spawn another copy of itself.
+  const result=spawnSync(process.execPath,['-e',driver,__filename,'(async'+'()=>{' ],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+  assert.ifError(result.error);assert.equal(result.signal,null);
+  assert.equal(result.status,1,'An unfinished actual async main must exit nonzero');
+  assert(result.stderr.includes(incompleteMain),'The completion sentinel must explain the failure');
+  assert(!result.stdout.includes('Message-box checks completed.'),'An unfinished main cannot print its completion line');
+}
 /* Real desktop-stage layout functions, executed with identity-preserving DOM nodes. */
 const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
 const html=fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8').replace(/\r\n?/g,'\n');
@@ -278,4 +298,6 @@ function sendRevealProof(mutate=x=>x){
   for(const name of ['cuSend','ofSendOrdinary'])assert.throws(()=>sendRevealProof(source=>source.startsWith('async function '+name+'(')?source.replace('const q=(suggestion??ofIn.value).trim();','const q=(suggestion??ofIn.value).trim();workspaceOfficerShowHistory();').replace('const id=cuTarget(),a=A[id],q=ofIn.value.trim();','const id=cuTarget(),a=A[id],q=ofIn.value.trim();workspaceOfficerShowHistory();'):source),assert.AssertionError,name+' early automatic reveal selects stale geometry');
   console.log('ok message-box motion: wide/phone/narrow 200ms open-close intent, retained Suggestions icon, filled-effect cleanup, rapid reversal, stale teardown and reduced-motion paths; seven causal mutants, browser geometry measured separately');
   console.log('ok actual Send reveals: direct and Motet message/refusal content is present before sizing, pending stub transport only, no destination change; two early-reveal mutants');
-})().catch(error=>{console.error(error);process.exitCode=1});
+  unfinishedMainProof();
+  console.log('Message-box checks completed.');
+})().then(()=>{mainCompleted=true}).catch(error=>{console.error(error);process.exitCode=1});

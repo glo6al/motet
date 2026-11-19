@@ -8,6 +8,10 @@ import threading
 import time
 import base64
 
+# A fast, bounded admission wait, not a deadline for terminal completion.
+# A refused Stop/Cancel does not itself end the take.
+COMMAND_WAIT_SECONDS = .1
+
 
 class ServiceError(Exception):
     def __init__(self, code, message, status=400):
@@ -78,7 +82,7 @@ class DictationService:
 
     @contextlib.contextmanager
     def _command(self):
-        if not self.command.acquire(timeout=.1):
+        if not self.command.acquire(timeout=COMMAND_WAIT_SECONDS):
             raise ServiceError('busy', 'Another audio command is still running.', 409)
         try:
             if self.closed:
