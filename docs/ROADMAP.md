@@ -4,11 +4,29 @@
 
 Motet brings supported sessions, their context, and their available capabilities into one interface. The stage provides an overview; the desk brings a conversation and its work together. Multi-agent supervision is one use of that workspace. The broader goal is to help you find, understand, and continue a conversation without having to remember which tool holds it.
 
-This is a working study. The sections below distinguish shipped behavior, investigated gaps, proposed priorities, and longer-term ideas. Priorities are a direction for planning, not release dates or promises of access to a provider's private interfaces. The [README capability table](../README.md#current-provider-capabilities) is the reference for what users can do today.
+This is a working study. The sections below distinguish shipped behavior, investigated gaps, proposed priorities, and longer-term ideas. Priorities are a direction for planning, not release dates or promises of access to a provider's private interfaces. The [capability table](PROVIDER_SUPPORT.md#current-provider-capabilities) is the reference for what users can do today.
 
-## Next after v0.1.0
+## What is next
 
-- **Enable file delivery for Claude setups first created with an older Python.** Design an explicit, owner-approved adoption or migration of their existing managed-chat storage before enabling files. Do not migrate automatically. Preserve ordinary messaging, retained identities and every existing file-protection check throughout.
+Planned work after v0.1.0, nearest first. "Designed" means the screens are drawn and agreed; it does not mean the work has started. The numbered [priorities](#priorities) further down are the longer view.
+
+### Being built
+
+- **Your own project folders in New chat.** Type in a folder Motet does not know yet and start its first chat there, with a clear way forward when a folder has moved or gone. Removing a folder added by mistake follows as its own step.
+
+### Designed, not built
+
+- **A roomier message box.** The suggested questions move out of the box to a quiet line above it. The top row carries who you are talking to, the model choice and one arrow that opens the conversation on the stage. The bottom row is left for your words and Send. Every control that exists today stays.
+- **Voice to text.** A microphone beside Send. Your words appear in the message box as you speak and can be edited while it is still listening; nothing is sent until you press Send. The intended design works the words out on your own computer with a free, open-source recognizer in an optional helper, so the audio does not leave it. A separate proof of that recognizer comes first, and nothing is built into Motet until it holds up. Dictating from a phone needs a secure connection to the computer and comes later.
+- **A live browser at the desk.** A real page you open and operate yourself in a desk's Browser tab, kept apart from the record of what the agent's tools fetched. Nothing opens until you ask.
+- **Permission requests at phone width.** The same request cards on a phone-sized screen. Today a request can only be answered on the computer that runs Motet; answering from another device has to be proven safe before this is built.
+
+### Asked for, not designed
+
+- **Enable file delivery for Claude setups first created with an older Python.** Design an explicit, owner-approved adoption or migration of their existing managed-chat storage before enabling files. Do not migrate automatically. Preserve ordinary messaging, retained identities and every existing file-protection check throughout. The notice people see today will also be reworded, because it applies to every agent and not only Claude.
+- **Steer a queued message, answer an agent's own questions, and change its model or effort from Motet.** Still to be evaluated; see [priority 2](#2-make-actions-reliable-within-the-conversation).
+- **Find and return to older sessions.** See [priority 1](#1-make-supported-conversations-easy-to-find-and-return-to).
+- **Git state per session, New chat for more apps, linked handoffs and review verdicts, and optional holds.** See [priority 4](#4-deepen-work-context-and-coordination).
 
 ## Available today
 
@@ -20,7 +38,7 @@ This is a working study. The sections below distinguish shipped behavior, invest
 - **Direct messaging where verified:** messages queue to eligible local Codex chats. Motet can also send to an exact local Claude chat that has registered through the Motet plugin and is connected. The stage and desk share drafts, histories and delivery records for each recipient.
 - **Motet:** questions about recorded context, cited evidence, and explicit supported message/control requests. Local Codex steering and interruption are available through Motet on the verified macOS desktop build. This sends a new instruction or stops a turn; it does not promote an existing queued message.
 - **New chat:** on verified macOS hosts, open a blank Codex chat or start work in a verified project folder. Claude run by Motet starts work only with a supported local executable and a verified per-computer readiness record.
-- **Attachments:** keep a PDF or PNG in a Motet conversation or ask a file question with a current local spending policy. Eligible local Codex and plugin-connected Claude chats can receive PDF, PNG and JPEG files from the workspace. See the [README](../README.md#workspace-interface-preview) for host and chat requirements.
+- **Attachments:** keep a PDF or PNG in a Motet conversation or ask a file question with a current local spending policy. Eligible local Codex and plugin-connected Claude chats can receive PDF, PNG and JPEG files from the workspace. See [Files and New chat](PROVIDER_SUPPORT.md#files-and-new-chat) for host and chat requirements.
 - **Questions and permissions:** optional Claude Code permission hooks support Allow/Deny when Answer here is enabled. Supported native Codex questions and selected model/effort can be observed on the verified build; answering those questions or changing those settings is not enabled.
 - **Optional peer messaging:** the shared MCP bridge handles cross-provider messages between reachable Codex chats and eligible Claude chats. A Claude recipient must have a current plugin connection with agent messaging authorized. Peer messages confer no new authority and cannot invoke controls.
 - **Recorded session facts:** model, branch, context counts, summarisation markers, step timing, and stop hooks where available. Missing facts are shown as not recorded.
@@ -79,7 +97,7 @@ Once users can reliably find and interact with existing sessions, extend what th
 
 These run alongside the product priorities; broader messaging support does not remove them.
 
-- **Windows:** automated tests run in CI, but the application has not been validated on a Windows desktop with real logs or a browser. Hooks and Motet requests are not available there. Preview assets need a directory-handle-based folder walk; until then previews serve the page alone, with Python 3.12 or later required. File IDs can be reused after deletion; 8.3 names, `subst` drives, and restart/port behavior still need testing. See the [README](../README.md#windows) and [Windows guide](WINDOWS.md) for setup and current restrictions.
+- **Windows:** automated tests run in CI, but the application has not been validated on a Windows desktop with real logs or a browser. Hooks and Motet requests are not available there. Preview assets need a directory-handle-based folder walk; until then previews serve the page alone, with Python 3.12 or later required. File IDs can be reused after deletion; 8.3 names, `subst` drives, and restart/port behavior still need testing. See [what differs on Windows](SETUP.md#windows) and the [Windows guide](WINDOWS.md) for setup and current restrictions.
 - **Real devices and scale:** measure large session collections and previews; test actual trackpad gestures, physical phones, and short windows. Browser emulation and synthetic gesture events do not establish those results.
 - **Provider operations:** the recorded live checks cover specific Codex steering/interruption cases and one Allow and one Deny on real Claude prompts. Expand coverage of provider updates, unavailable or stale targets, lost replies, and the native app's behavior while a request is held. Open-in-app links still need end-to-end validation.
 - **Preview compatibility:** previews are known not to render in Claude desktop's built-in browser pane; they render in Chrome. This needs continued compatibility testing, not a claim of universal browser support.
@@ -107,6 +125,9 @@ These run alongside the product priorities; broader messaging support does not r
 - Fleet-wide running cost estimates where reliable cumulative usage and pricing inputs are available. API accounting for Motet’s own model calls is separate; native context-window snapshots must not be presented as billable usage or subscription charges.
 - A stage overview that uses portrait-screen height more effectively.
 - Broader transcript fixtures and provider compatibility checks.
+- Motet acting on a standing request from the owner: watching for a named event, following up with an agent, or keeping two agents in step. Not agreed or designed. It would stay inside the rules below: the owner decides in advance what it may do, and nothing in a log or a peer message can widen that.
+- Running Motet's own questions on a model provider other than Anthropic.
+- Linux as a tested platform.
 
 ## Rules that carry forward
 

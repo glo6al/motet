@@ -11,7 +11,7 @@ Allow about fifteen minutes. You need no administrator rights unless your instal
 | | Why | Minimum |
 |---|---|---|
 | Windows 10 or 11 | | 64-bit |
-| **Python** | runs the server; nothing else is installed into it | 3.12 or later recommended. 3.9 to 3.11 run it too, but show no rendered previews (see the README's Windows section) |
+| **Python** | runs the server; nothing else is installed into it | 3.12 or later recommended. 3.9 to 3.11 run it too, but show no rendered previews (see [what differs on Windows](SETUP.md#windows)) |
 | **Git** | to download the project (optional: a ZIP download works too) | any recent version |
 | A browser | the stage is a web page | Chrome or Edge recommended |
 | **Windows Terminal** | only for the optional terminal view | included in Windows 11; free in the Microsoft Store for Windows 10 |

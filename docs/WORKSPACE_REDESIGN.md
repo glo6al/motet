@@ -7,4 +7,4 @@ Open `http://127.0.0.1:8793/` while Motet is running to use Workspace on desktop
 - The bell shows alerts and requests. Configure notifications and local recording under Settings.
 - **New chat** and attachment controls appear where the local app, session and host configuration support them. Use [Motet file reading](MOTET_FILE_READING.md) to set up PDF and PNG questions.
 
-For current provider capabilities, see the [README](../README.md#current-provider-capabilities).
+For current provider capabilities, see [What works with what](PROVIDER_SUPPORT.md#current-provider-capabilities).

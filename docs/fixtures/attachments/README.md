@@ -52,7 +52,7 @@ then request ID. These sample dates do not establish actual runtime completion t
 
 These samples cover retention, expiry, cleanup and follow-up states in memory. For live Motet storage
 and follow-ups, see [Motet file reading](../../MOTET_FILE_READING.md). For copies sent to agents, see
-the [trust boundary](../../../README.md#trust-boundary).
+the [trust boundary](../../TRUST_BOUNDARY.md).
 
 ## Scenarios
 

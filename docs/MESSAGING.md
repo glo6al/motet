@@ -1,0 +1,65 @@
+# Messaging and controlling agents
+
+Sending to an agent, asking through Motet, steering and stopping Codex, native questions, and the Claude plugin. Part of the [Motet README](../README.md).
+
+<a id="messaging-from-the-room-or-desk"></a>
+
+## Messaging from the stage or desk
+
+Both the stage panel and agent desk offer **To: Motet** and **To: an agent**. Choose the recipient in either place; selecting an agent on the stage does not open its desk. Drafts and conversation histories stay with their recipient and context. An agent draft follows that agent between stage and desk. Motet keeps a separate stage draft and separate station drafts; stage answers and station answers are shown in their own contexts.
+
+**To an agent** sends your text directly into that eligible Codex conversation’s queue. It does not interpret words such as “pause” as an immediate control. **To Motet** asks Motet to interpret your request: it can answer from the stage, queue an explicitly addressed message, or use the existing Codex steer and interrupt controls. Direct sends do not require Motet’s API key. Availability is checked for the exact selected agent; a connected provider alone is insufficient.
+
+Pending messages appear in a compact strip above the composer in the agent view. Expand a row to read the full message; its delivery and reply status stays with the target across stage and desk. A queue observed in an app's log does not confirm delivery, and an unknown outcome is not permission to resend. Promoting an already queued message into an active turn is not supported. Motet’s steering command sends a new instruction; it does not consume or remove an existing queued item.
+
+If you change recipient or context while Motet is answering, a **View Motet update** link lets you return to the original answer or error without replacing your current draft or moving you automatically. Speech citations select the relevant agent conversation and reveal the recorded message; work evidence opens in Work.
+
+## Asking an agent
+
+Ask Motet, for example, “Ask Atlas how far along its subagents are.” That request authorizes sending; there is no second Send button. Motet resolves the name uniquely, queues the question in that existing local Codex session and displays the attributed reply when the matching turn finishes. A busy session finishes its current work first. A different explicit message can be queued even while an earlier request is unresolved; each keeps its own delivery and reply status. Motet still blocks an identical unresolved message and never automatically resends the earlier request. Sending a new instruction does not cancel older queued instructions. Motet warns when an accepted message follows unresolved messages to the same agent. Up to eight unresolved deliveries can be retained in the pending queue, including expired or fulfilled requests without replies; reaching that limit blocks new messages because the older ones may still run. Reloading the page restores recorded request statuses.
+
+The Codex adapter uses the macOS desktop app’s bundled CLI. Claude owner messages use the optional plugin described below, in an existing connected chat. Cursor, cloud sessions and other platforms are not connected for messaging yet. Missing or unsupported connection support leaves the rest of Motet working. Delivery uncertainty and expiration do not mean a question was never received; Motet does not automatically resend. Replies must match the request and its corresponding completed main turn.
+
+The queue runs through the target agent’s existing account and may consume its normal model allowance. When addressed to Motet, a model interprets your intent from the current request; it can misunderstand you. Direct agent messages bypass that interpretation. In requests to Motet, quoted examples and hypothetical questions are not intended to authorize sending. Use a clear agent name and question. In the direct agent lane, pressing Send queues the text as written. The selected agent can use its existing tools when answering. Requests and replies are kept locally under `~/.live-room/`; the reply is displayed directly, without executing any actions it contains.
+
+## Background peer messaging
+
+One optional Motet MCP connection per client exposes eligible named Codex and Claude chats across projects. Agent-to-agent messages use Motet only between providers; Codex-to-Codex and Claude-to-Claude coordination uses native tools, with no Motet fallback when those tools are unavailable. Agents can resolve names, send a message, and retrieve its reply without per-chat enrollment or a new dashboard panel. Receiving is supported for reachable Codex chats and eligible Claude chats connected through the Motet plugin with agent messaging authorized. A loaded Claude chat can receive while absent from the live stage when its existing local identity is verified and its authenticated plugin lease is current. An offline or unloaded chat remains unavailable. Older Claude connections remain owner-only until upgraded; the legacy channel cannot receive peer messages. Service access and reply history are shared; declared sender names are not authenticated identities. Messages grant no new owner authority and cannot invoke steering or interruption. See [shared bridge setup and limitations](PEER_BRIDGE.md).
+
+Replies remain attached to the original request. The asking agent retrieves them with `get_reply` at a task checkpoint or when you ask for an update; the bridge does not inject reply-ready notifications or automatically wake a finished chat. Project agent instructions cover retaining request IDs, following up without polling loops, and using answers within the original task. See [retrieving replies](PEER_BRIDGE.md#retrieving-replies).
+
+## Steering and interrupting Codex
+
+Tell Motet “Steer Atlas: focus on the failing tests” or “Interrupt Atlas.” Use the exact name of one agent on the stage. These requests act on an existing local Codex desktop conversation without another Send button or a new session. Ordinary questions and messages still use the queue. Wording such as “Tell Atlas to pause its work” stops the current turn; “Tell Atlas to focus on tests right now” steers it. Explicitly deferred requests, such as “After this task, tell Atlas to pause,” stay queued. Pausing does not schedule automatic resumption.
+
+Steering sends your instruction into the turn active when Codex handles it. Acknowledgment means Codex accepted the instruction, not that the agent has acted on it. Interruption is pinned to the identified active turn and reports success only when Codex confirms that same turn stopped. Codex's normal stop behavior can also stop its subagents. Queued follow-ups are not cleared and may start later work. Steering requires a transcript updated within five minutes; interruption can target a quiet turn because Codex checks its exact ID before stopping it.
+
+These controls currently require macOS and the verified Codex desktop version `26.1016.62342`, build `21477`. Motet checks the installed bundle before using its undocumented local bridge. An app update, an unavailable owner, or an unreadable active turn disables the operation; Motet does not substitute a queued message or start a session. Claude Code and other runtimes do not have these controls yet.
+
+When Motet can verify that an earlier immediate pause request was fulfilled by a later confirmed interruption, that message shows **Pause completed by a later interrupt**. Its delivery status remains separate: a message that was accepted into the queue may still run later, and a written reply may still arrive. This historical completion does not mean the agent is still paused. Motet leaves the request unmarked when the original intent or interruption evidence is ambiguous; it never silently cancels or resends the old message.
+
+Control outcomes are shown as historical records and recovered through status polling after a lost response or browser reload, without sending the control again. An interrupted result confirms the recorded turn stopped; it does not mean the agent is still paused. Steering acknowledgement does not confirm that the instruction was acted on.
+
+Control outcomes are kept locally and become eligible for cleanup after one day. After details expire, Motet retains an ID-only replay guard so an old request identifier cannot dispatch again, including after a restart or timeout. An uncertain outcome stays uncertain; inspect the agent before making a new request. A new explicit interruption is allowed after an uncertain steering attempt. Motet interprets only your current request, with the same model-interpretation limitation as messaging; log contents cannot invoke these controls.
+
+## Native questions
+
+An unlocked, visible agent desk makes one bounded native read. On the verified Codex desktop build above, Session can show the model and reasoning level **Selected in app** for the **Next turn**. These settings describe the next-turn selection; they do not identify the model executing an already-running turn. Log observations are labelled **Last known**. When shown, an expired selection is explicitly historical and retains its original observation time in **More details**.
+
+Motet shows a **Questions from app** panel only when it has readable ordinary questions and their choices. Use **Check for questions** beside the conversation to read again, including after an empty or failed read; a visible question panel also offers **Refresh**. Native observations expire, and stale questions are labelled **Last observed**; an ended observation does not confirm that a question was answered.
+
+Questions are read-only here; use **Answer in app** to respond. Secret, unsupported and approval requests do not appear in this panel; use the native app for their details. Changing model or effort in Motet is not enabled. Existing optional Claude permission hooks retain their separate Allow/Deny flow. Claude native question and model reads are not connected yet.
+
+The new `/native/v1/read` and `/native/v1/agents/<agent-id>` routes require the owner key in a header and return private, non-cacheable snapshots. They do not accept answers or arbitrary native commands. Native snapshots stay out of the general event stream, Motet context and peer bridge; this does not change what existing transcript readers may independently record. The browser clears native information when it leaves the selected desk or becomes hidden. Already-started bounded server reads finish, and their in-memory cache expires.
+
+## Messaging an existing Claude chat
+
+Install the optional [Motet Claude plugin](../integrations/claude-mod/README.md#install-once-for-your-user-account) **once at user scope**. In an unlocked Motet window, choose a Claude chat as the recipient and select **Set up Claude**. Run the displayed one-time `/watch-setup` command in one existing Claude chat that has loaded the plugin. This authorizes automatic registration of eligible local parent Claude chats on this computer. Already-open chats need `/reload-plugins` once to load the plugin; new chats load it normally. Separate installations and pairing codes for each chat are unnecessary.
+
+Motet shows whether setup is needed, a chat is waiting for the plugin, or that exact chat is connected. **Send** enables only when that chat is registered and connected. Then tell Motet to message the agent by name, or send through the existing direct agent lane. A busy chat finishes its current turn first. **Disconnect automatic Claude connections** revokes the shared registration grant and its derived connections; existing manual connections are unchanged.
+
+This uses the chat's current model, sign-in, project context, tools, and permissions. The plugin relays the owner's request with plugin attribution; it does not change native tool permissions. Motet shows the matching reply when that main turn finishes. A dropped, interrupted, or uncertain delivery is reported without automatically sending the message again. Reconnecting restores the connection for new messages; it does not resend an earlier attempt.
+
+Keep the chat loaded while waiting for a message or reply; you can view another chat while its connection stays active. Clearing, resuming, forking, or replacing the native conversation during delivery can change which conversation receives queued input. Wait for queued work to settle, then reconnect the intended chat after such a change. Motet does not promise atomic targeting across these lifecycle changes.
+
+The global setup also offers agent messaging through the shared Motet MCP. This requires explicit authorization and plugin 0.3.2 or later in the receiving chat. Existing owner-only connections show **Enable agent messaging** in Motet; they are never upgraded silently. Peer messages remain untrusted information and their replies are shared with all connected clients across projects and providers. Claude live controls remain unavailable. The older development channel remains only for existing request recovery. The optional Claude permission hooks are separate and unchanged.

@@ -1,0 +1,53 @@
+# Setting up and running Motet
+
+Starting the server, the demo, the optional hooks, moving around, the terminal view, and what differs on Windows. Part of the [Motet README](../README.md).
+
+## Try it
+
+Two minutes, no install.
+
+The demos use fictional agents and projects. For public recordings, use `?demo` for Workspace or `?demo&ui=classic` for Classic. Live conversations and command output can contain personal information and absolute file paths.
+
+```bash
+git clone https://github.com/glo6al/motet.git && cd motet
+python3 src/server.py
+```
+
+On Windows, use `py src/server.py` (or `python`) instead of `python3`. [docs/WINDOWS.md](WINDOWS.md) walks through installing Python and Git and trying it, step by step; see [Windows](#windows) for what differs.
+
+Then open <http://127.0.0.1:8793/> for Workspace and press **Unlock**. The server asks your default browser to open a new, unlocked tab, and the stage fills with whatever Claude Code, Codex, Cursor or Antigravity sessions have been active in the last twenty minutes (`WINDOW_MIN` to change that, `PORT` to move it).
+
+**No sessions of your own?** Open <http://127.0.0.1:8793/?demo>. A synthetic fleet plays through a sample of what the stage can show: working, waiting on you, a question, a hand-off, a sub-agent, last words. Open <http://127.0.0.1:8793/?demo&ui=classic> to follow the Classic walkthrough in [the tour](TOUR.md#the-stage-and-the-desk). One agent holds a permission request you can answer on the page: click its APPROVE tag, then Allow or Deny, and a scripted outcome follows; nothing is sent anywhere, and the switches in the bar work on the page only. For a recording, open Bram’s desk to show a formatted review with a comparison table and code, then Ada’s **Work → Changes** for the recorded pricing edit. Cleo and Dov demonstrate the parent–child tree; Cleo also has the simulated permission prompt. Reload `?demo` to restart the sample story. There is no rendered preview and no summarisation marker. Direct messages and Motet answers in the demo are also scripted; they do not contact agents or a model. The demo page reads no logs and needs no key, and the bar says so. The server behind it is the ordinary one: it still creates its key and follows your real logs in the background, because it is the same process; after loading its page and icons, the demo makes no live-data or action requests to it, and it keeps its own project names rather than this browser's.
+
+**Optional hooks** (Claude Code on macOS only). In a second terminal, while the server is running:
+
+```bash
+python3 scripts/install_hooks.py            # --remove to undo
+```
+
+If you moved the server with `PORT`, run the installer with the same `PORT` and open the page on that port. The server, the hooks and the browser must all agree on it.
+
+This adds Notification, Stop, SubagentStop and PermissionRequest hooks to your Claude Code settings. The first three only tell Motet things sooner than the log would. The fourth lets Motet answer permission prompts for you, and is off until you switch it on in a window. Read the [trust boundary](TRUST_BOUNDARY.md) first.
+
+**Moving around:** two-finger scroll or drag to turn, or the arrow keys. Hover a monitor and it comes to your hand; click it to step up to its desk. The conversation is the main view. Open **Work** for **Preview**, **Changes** or **Activity**; when focus is outside the conversation and text fields, keys **1**, **2** and **3** open Activity, Preview and Changes respectively. Drag the Work divider or focus it and use the arrow keys to resize; double-click it to reset. **← Conversation** closes Work. Use **Back to the stage** to leave the desk; Escape first closes an active picker or drawer or handles conversation focus before leaving the desk.
+
+**In a terminal instead.** With the server running, in another terminal:
+
+```bash
+python3 src/watch_tty.py            # a board: one row per agent, those waiting on you first
+python3 src/watch_tty.py --tail     # one line per event, to read or grep
+python3 src/watch_tty.py --once     # one line such as "2 waiting · 3 working", for a tmux or prompt status bar
+python3 src/watch_tty.py --tab      # iTerm2: the board in a new window, then one tab per agent, each with its own log
+python3 src/watch_tty.py --split    # iTerm2: the same in one tab, the board on top and each agent in a pane below
+```
+
+The board and the tail ring the terminal bell when an agent starts waiting on you. In iTerm2 an agent's tab or pane is titled with its name and project and turns amber while it waits on you, and the board's tab shows a "2 waiting" badge. The board opens a tab for each agent active in the server's window, and for each new one as it appears, without taking the focus; a view you close stays closed. Panes halve the largest one as agents arrive, and a tab too small to split again gets a new tab. Each view is one of the twelve connections the server allows, browser windows included, so the board opens at most six and says how many it left out; a view the server turns away waits for a free connection for up to a minute. Run one board at a time: a second one can take the connections your browser window needs. `--tab` copies `src/iterm-profile.json` to `~/Library/Application Support/iTerm2/DynamicProfiles/project-watch.json`, replacing any earlier copy, and the first time, macOS asks whether your terminal may control iTerm2. The terminal reads the same stream as the page, with the same key, and it only watches: it cannot answer a prompt. Use the same `PORT` as the server.
+
+## Windows
+
+The server is written to run on Windows with the same standard-library Python. Only its automated tests have run there, in CI on every push: the Python suite imports the server and exercises the key, the preview checks and the port directly, and Node tests exercise page logic outside a browser. **The application has not been started on Windows, and its page has not been opened in a Windows browser**, so treat it as untried. To try it and tell us how it went, follow **[docs/WINDOWS.md](WINDOWS.md)**: installing everything from scratch, starting it, troubleshooting, and the questions only a real Windows PC can answer. What differs:
+
+- **Not available:** the hooks (Allow / Deny, and the earlier notices they give). They are shell scripts, and how Claude Code runs hook commands on Windows has not been checked; the installer says so and stops. Without them Motet still watches; Claude asks in its own app.
+- **Unverified:** where Claude's desktop app keeps its session records on Windows (`%APPDATA%\Claude` is assumed), so titles, settings and last-focused times from it may be missing; and how Cursor names a project folder there, so a Cursor agent's folder may show as not recorded.
+- **Private folders** for previews also include `AppData`.
+- **Previews show the page only, and need Python 3.12 or later.** A page an agent wrote is rendered without the styles, scripts and images it links to from files beside it (inline ones still apply), because no folder is granted on Windows yet (see the trust boundary); before Python 3.12 nothing is previewed there.
