@@ -18,6 +18,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 import dictation_proxy as proxy
+from dictation_auth import Authenticator
 
 OWNER = 'fictional-owner-key'
 HELPER_KEY = 'a' * 64
@@ -207,6 +208,27 @@ class Upstream(BaseHTTPRequestHandler):
         action = self.path.rsplit('/', 1)[-1]
         code, value = 200, {'schemaVersion': 1}
         mode = state.get('mode')
+        if action == 'challenge':
+            if mode in ('header_drip', 'body_drip'):
+                body = json.dumps(self.server.authentication.challenge(self.headers['X-Dictation-Client-Nonce'])).encode()
+                head = ('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(body)).encode()
+                try:
+                    if mode == 'body_drip':
+                        self.wfile.write(head); self.wfile.flush()
+                    for byte in (head if mode == 'header_drip' else body):
+                        self.wfile.write(bytes([byte])); self.wfile.flush(); threading.Event().wait(.015)
+                except OSError:
+                    pass
+                return
+            if mode == 'slow':
+                threading.Event().wait(.25)
+            body = json.dumps(self.server.authentication.challenge(self.headers['X-Dictation-Client-Nonce'])).encode()
+            self.send_response(200);self.send_header('Content-Type', 'application/json');self.send_header('Content-Length', str(len(body)));self.send_header('Connection', 'close');self.end_headers()
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+            return
         if mode == 'slow':
             threading.Event().wait(.25)
         if mode == 'error':
@@ -265,6 +287,7 @@ class LoopbackTests(unittest.TestCase):
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
         self.assertNotEqual(self.server.server_port, 8793)
         self.server.test_state = {'calls': [], 'epoch': 1}
+        self.server.authentication = Authenticator(HELPER_KEY, self.server.server_port)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.service = proxy.DictationProxy(self.home, self.server.server_port, enabled=True)
@@ -286,10 +309,38 @@ class LoopbackTests(unittest.TestCase):
         self.assertNotIn(HELPER_KEY, json.dumps(value))
         method, path, headers, raw = self.server.test_state['calls'][-1]
         self.assertEqual((method, path, raw), ('GET', '/v1/status', b''))
-        self.assertEqual(headers['X-Dictation-Key'], HELPER_KEY)
+        self.assertNotIn('X-Dictation-Key', headers)
+        self.assertIn('X-Dictation-Proof', headers)
+        self.assertTrue(all(HELPER_KEY not in str(call[2]) for call in self.server.test_state['calls']))
         self.assertNotIn('X-Live-Room-Key', headers)
         self.assertNotIn('Origin', headers)
         self.assertNotIn('privatePath', value)
+
+    def test_wrong_listener_and_cross_port_relay_cannot_receive_key_or_audio(self):
+        for key,authority in (('c'*64,self.server.server_port),(HELPER_KEY,self.server.server_port+1)):
+            self.server.test_state['calls'].clear()
+            self.server.authentication=Authenticator(key,authority)
+            with self.assertRaises(proxy.ProxyError) as caught:
+                self.service.request('audio',b'\0'*16,SESSION,0)
+            self.assertEqual(caught.exception.code,'helper_authentication_failed')
+            calls=self.server.test_state['calls']
+            self.assertEqual(len(calls),1)
+            self.assertEqual(calls[0][1],'/v1/challenge')
+            self.assertEqual(calls[0][3],b'')
+            self.assertNotIn('X-Dictation-Key',calls[0][2])
+            self.assertNotIn('X-Dictation-Proof',calls[0][2])
+            self.assertNotIn(HELPER_KEY,str(calls[0][2]))
+
+    def test_absolute_deadline_bounds_dripping_challenge_headers_and_body(self):
+        for mode in ('header_drip','body_drip'):
+            self.server.test_state['mode']=mode
+            began=time.monotonic()
+            with mock.patch.object(proxy,'HELPER_TIMEOUT',.12):
+                result=self.service.request('status')[1]
+            self.assertIn(result['state'],('not_running','failed'))
+            self.assertLess(time.monotonic()-began,.5)
+        self.server.test_state['mode']=None
+        self.assertEqual(self.service.request('status')[1]['state'],'ready')
 
     def test_actual_partial_final_audio_and_reset_protocol_is_preserved(self):
         _, start = self.service.request('start', {'intervalSeconds': .25})

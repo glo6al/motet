@@ -30,7 +30,9 @@ class DictationService:
 
     def load(self):
         with self.condition:
-            if self.closed or self.loading_thread is not None:
+            if self.closed or self.loading_thread is not None and self.loading_thread.is_alive():
+                return
+            if self.state in ('ready', 'listening', 'finishing'):
                 return
             self.state, self.reason = 'loading', None
             self.loading_thread = threading.Thread(target=self._load, daemon=True)
@@ -58,7 +60,7 @@ class DictationService:
             with self.condition:
                 if not self.closed:
                     self.reason = getattr(exc, 'code', 'worker_failed')
-                    self.state = 'not_installed' if self.reason == 'dependency_missing' else 'failed'
+                    self.state = 'not_installed' if self.reason in ('dependency_missing', 'runtime_version', 'model_missing_or_invalid') else 'failed'
             if runtime is not None:
                 runtime.close()
         finally:
@@ -76,7 +78,7 @@ class DictationService:
 
     @contextlib.contextmanager
     def _command(self):
-        if not self.command.acquire(blocking=False):
+        if not self.command.acquire(timeout=.1):
             raise ServiceError('busy', 'Another audio command is still running.', 409)
         try:
             if self.closed:
@@ -162,6 +164,9 @@ class DictationService:
             with self.condition:
                 if self.current and not self.current['ended']:
                     raise ServiceError('busy', 'A dictation take is already active.', 409)
+                if self.state == 'failed':
+                    self.load()
+                    raise ServiceError('loading', 'Reloading the local recognizer. Try again when it is ready.', 503)
                 if self.state != 'ready':
                     raise ServiceError(self.reason or self.state, 'The local recognizer is not ready.', 503)
                 now = self.clock()
@@ -250,25 +255,31 @@ class DictationService:
                     'events': [dict(event) for event in session['events'] if event['id'] > after]}
 
     def expire(self):
-        if not self.command.acquire(blocking=False):
+        # Healthy takes never contend with audio merely because the timer ran.
+        with self.condition:
+            now = self.clock()
+            self.sessions = {key: value for key, value in self.sessions.items()
+                             if not value['ended'] or now - value['touched'] < 60}
+            candidate = self.current
+            stale = candidate and not candidate['ended'] and (now - candidate['created'] > 180 or now - candidate['touched'] > 20)
+        if not stale or not self.command.acquire(blocking=False):
             return
         try:
             with self.condition:
                 session = self.current
-                deadline = session and self.clock() - session['created'] > 180
-                stale = session and not session['ended'] and (deadline or self.clock() - session['touched'] > 20)
-            if stale:
-                try:
-                    self._call(session, 'cancel')
-                except ServiceError:
-                    return
-                with self.condition:
-                    self._end(session, 'take_limit' if deadline else 'disconnected')
-                    if not self.closed:
-                        self.state = 'ready'
+                now = self.clock()
+                deadline = session and now - session['created'] > 180
+                stale = session is candidate and not session['ended'] and (deadline or now - session['touched'] > 20)
+            if not stale:
+                return
+            try:
+                self._call(session, 'cancel')
+            except ServiceError:
+                return
             with self.condition:
-                self.sessions = {key: value for key, value in self.sessions.items()
-                                 if not value['ended'] or self.clock() - value['touched'] < 60}
+                self._end(session, 'take_limit' if deadline else 'disconnected')
+                if not self.closed:
+                    self.state = 'ready'
         finally:
             self.command.release()
 

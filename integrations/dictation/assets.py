@@ -125,7 +125,7 @@ def _copy_verified(source, item, destination=None):
     output = None
     try:
         if destination is not None:
-            fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
             output = os.fdopen(fd, 'wb')
         with handle:
             while True:
@@ -144,6 +144,7 @@ def _copy_verified(source, item, destination=None):
             output.flush()
             os.fsync(output.fileno())
     finally:
+        handle.close()
         if output is not None:
             output.close()
 
@@ -228,7 +229,7 @@ def _opener():
 
 
 def _fetch(item, destination, opener, progress):
-    request = urllib.request.Request(item['url'], headers={'User-Agent': 'moonshine-voice/0.1.6'})
+    request = urllib.request.Request(item['url'], headers={'User-Agent': 'Motet-dictation (moonshine-voice/0.1.6)'})
     digest = hashlib.sha256()
     count = 0
     try:
@@ -237,7 +238,7 @@ def _fetch(item, destination, opener, progress):
             parsed = urllib.parse.urlsplit(final)
             if parsed.scheme != 'https' or parsed.netloc != 'download.moonshine.ai':
                 raise AssetsError('download_failed', 'The model service returned an unexpected location.')
-            fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
             with os.fdopen(fd, 'wb') as output:
                 while True:
                     chunk = response.read(min(CHUNK_BYTES, item['size'] + 1 - count))

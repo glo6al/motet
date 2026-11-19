@@ -45,8 +45,8 @@ class Opener:
         self.calls.append(name)
         if name == self.bad_file:
             raise OSError('sensitive local details must not be repeated')
-        if request.get_header('User-agent') != 'moonshine-voice/0.1.6':
-            raise AssertionError('The explicit model download identifies its package')
+        if request.get_header('User-agent') != 'Motet-dictation (moonshine-voice/0.1.6)':
+            raise AssertionError('The explicit model download identifies Motet and its selected package')
         response = Response(self.data[name], self.final_url or request.full_url)
         self.responses.append(response)
         return response
@@ -85,6 +85,16 @@ class AssetsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, code)
         self.assertNotIn(str(self.root), caught.exception.message)
         return caught.exception
+
+    def test_copy_closes_source_when_destination_cannot_open(self):
+        item = self.info['files'][0]
+        source = self.write(item['filename'], self.data[item['filename']])
+        handle, metadata = assets._open_read(source)
+        with mock.patch.object(assets, '_open_read', return_value=(handle, metadata)), \
+                mock.patch.object(assets.os, 'open', side_effect=OSError('fixture refusal')):
+            with self.assertRaises(OSError):
+                assets._copy_verified(source, item, self.root / 'refused')
+        self.assertTrue(handle.closed)
 
     def test_committed_manifest_exact_model_version_and_size(self):
         self.manifest.stop()
@@ -245,7 +255,10 @@ class AssetsTests(unittest.TestCase):
     def test_model_file_folder_and_lock_symlinks_are_rejected(self):
         outside = self.root / 'outside'
         outside.mkdir(mode=0o700)
-        self.model.symlink_to(outside, target_is_directory=True)
+        try:
+            self.model.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest('This host does not permit creating test symlinks')
         self.assert_error('unsafe_model_path', lambda: assets.download_model(
             self.model, self.info['bytes'], opener=Opener(self.data)))
         self.model.unlink()

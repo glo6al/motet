@@ -42,6 +42,12 @@ non-English non-streaming models governed by different terms.
 
 Source and licence: https://github.com/moonshine-ai/moonshine/blob/v0.1.6/LICENSE
 
+Checked 2026-11-19: the opening scope statement at that pinned tag explicitly
+includes every English-language and streaming speech-to-text model under MIT,
+then lists the legacy non-English non-streaming exceptions. Section 1 supplies
+the copyright and MIT terms reproduced below. The selected English Small
+Streaming model is within that scope; no Community License model is selected.
+
 MIT License
 
 Copyright (c) 2025 Useful Sensors, Inc. (dba Moonshine AI)
@@ -79,7 +85,7 @@ Training/finetuning extras are not needed by this integration.
 | PortAudio in applicable sounddevice wheels | [MIT-style licence](https://github.com/PortAudio/portaudio/blob/master/LICENSE.txt) |
 | Requests | [Apache-2.0](https://github.com/psf/requests/blob/main/LICENSE) |
 | tqdm | [MPL-2.0 and MIT](https://github.com/tqdm/tqdm/blob/master/LICENCE) |
-| filelock | [MIT](https://github.com/tox-dev/filelock/blob/main/LICENSE) |
+| filelock | [MIT](https://github.com/tox-dev/filelock/blob/main/LICENSE), checked 2026-11-19; verify the notice bundled with the version installed |
 | platformdirs | [MIT](https://github.com/tox-dev/platformdirs/blob/main/LICENSE) |
 | google-crc32c | [Apache-2.0](https://github.com/googleapis/python-crc32c/blob/main/LICENSE) |
 | CFFI | [MIT-0](https://github.com/python-cffi/cffi/blob/main/LICENSE) |

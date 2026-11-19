@@ -19,6 +19,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from integrations.dictation.helper import HelperServer, main, probe
+from dictation_auth import request_headers
 from integrations.dictation.service import DictationService, ServiceError
 from integrations.dictation.state import PrivateState, StateError
 
@@ -195,6 +196,58 @@ class ServiceTests(unittest.TestCase):
                 self.service.control(ident, 'cancel')
         self.assertEqual(error.exception.code, 'busy')
 
+    def test_healthy_expiry_never_takes_the_command_lock(self):
+        self.service.start(.25)
+        original = self.service.command
+        class ForbiddenLock:
+            def acquire(self, *args, **kwargs):
+                raise AssertionError('Healthy expiry competed with an audio command')
+        self.service.command = ForbiddenLock()
+        try:
+            self.service.expire()
+        finally:
+            self.service.command = original
+
+    def test_brief_housekeeping_contention_does_not_break_a_take(self):
+        ident = self.service.start(.25)['sessionId']
+        held = threading.Event()
+        def hold():
+            with self.service.command:
+                held.set(); time.sleep(.03)
+        thread = threading.Thread(target=hold);thread.start()
+        self.assertTrue(held.wait(1))
+        self.assertTrue(self.service.control(ident, 'cancel')['ended'])
+        thread.join(1)
+
+    def test_failed_worker_reloads_only_on_the_next_explicit_start(self):
+        engines = [Engine(), Engine()]
+        created = []
+        def factory():
+            engine = engines[len(created)];created.append(engine);return engine
+        service = DictationService(factory, lambda: None)
+        try:
+            service.load();service.loading_thread.join(2)
+            ident = service.start(.25)['sessionId'];engines[0].failure=True
+            with self.assertRaises(ServiceError):service.control(ident, 'stop')
+            self.assertEqual(service.status()['state'], 'failed');self.assertEqual(len(created),1)
+            with self.assertRaises(ServiceError) as caught:service.start(.25)
+            self.assertEqual(caught.exception.code, 'loading')
+            service.loading_thread.join(2)
+            self.assertEqual(service.status()['state'], 'ready');self.assertEqual(len(created),2)
+            self.assertTrue(engines[0].closed)
+            self.assertNotEqual(service.start(.25)['sessionId'],ident)
+        finally:service.close()
+
+    def test_wrong_runtime_version_is_a_setup_state(self):
+        class VersionError(Exception):code='runtime_version'
+        class WrongEngine(Engine):
+            def start(self):raise VersionError()
+        service=DictationService(WrongEngine,lambda:None)
+        try:
+            service.load();service.loading_thread.join(2)
+            self.assertEqual((service.status()['state'],service.status()['code']),('not_installed','runtime_version'))
+        finally:service.close()
+
     def test_missing_runtime_status_and_load_do_not_invoke_factory(self):
         factory = mock.Mock(side_effect=AssertionError('optional runtime was started'))
         service = DictationService(factory, lambda: 'dependency_missing')
@@ -231,7 +284,13 @@ class HttpTests(unittest.TestCase):
         connection.putrequest(verb, path, skip_host=True)
         connection.putheader('Host', '127.0.0.1:%d' % self.port)
         if key:
-            connection.putheader('X-Dictation-Key', self.key)
+            semantic = dict(headers)
+            if data is not None:
+                semantic.setdefault('Content-Type', 'application/json')
+                semantic.setdefault('Content-Length', str(len(data)))
+            proof = request_headers(self.key, self.port, verb, path, data, extra_headers=semantic)
+            for name, value in proof.items():
+                connection.putheader(name, value)
         if data is not None:
             connection.putheader('Content-Length', str(len(data)))
             connection.putheader('Content-Type', 'application/json')
@@ -267,7 +326,7 @@ class HttpTests(unittest.TestCase):
         for path in ('/v1/status?x=1', '/v1/status?', '/v1/%73tatus', 'http://localhost/v1/status', '/v1/status#x'):
             self.assertEqual(self.request(path)[0], 400)
         for headers in ([('Content-Length', '2')], [('Transfer-Encoding', 'chunked')], [('Content-Type', 'text/plain')]):
-            self.assertEqual(self.request('/v1/start', b'{}', headers=headers)[0], 400)
+            self.assertIn(self.request('/v1/start', b'{}', headers=headers)[0], (400, 403))
         self.assertEqual(self.request('/v1/start', b'x' * 4097)[0], 413)
 
     def test_stop_and_events_flow_without_any_messaging_route(self):
@@ -287,6 +346,74 @@ class HttpTests(unittest.TestCase):
         ident = self.request('/v1/start', {})[1]['sessionId']
         self.assertEqual(self.request('/v1/events', {'sessionId': ident, 'after': 123})[0], 409)
 
+    def signed(self,path,body=None,proof=None,headers=None):
+        verb='POST' if body is not None else 'GET'
+        extra=dict(headers or {})
+        if body is not None:extra.setdefault('Content-Type','application/octet-stream')
+        values=request_headers(self.key,self.port,verb,path,body,extra_headers=extra) if proof is None else proof
+        connection=http.client.HTTPConnection('127.0.0.1',self.port,timeout=2)
+        try:
+            connection.request(verb,path,body,{**values,**extra})
+            response=connection.getresponse();return response.status,json.loads(response.read())
+        finally:connection.close()
+
+    def test_slow_headers_have_absolute_deadline_and_cannot_occupy_authenticated_workers(self):
+        self.server.HEADER_SECONDS=.25
+        slow=[]
+        try:
+            for _ in range(8):
+                connection=socket.create_connection(('127.0.0.1',self.port),timeout=1)
+                connection.sendall(b'G');slow.append(connection)
+            began=time.monotonic()
+            self.assertEqual(self.request()[0],200)
+            self.assertLess(time.monotonic()-began,.5)
+            for _ in range(6):
+                for connection in slow:
+                    try:connection.sendall(b'x')
+                    except OSError:pass
+                time.sleep(.06)
+            for connection in slow:
+                connection.settimeout(1)
+                try:self.assertEqual(connection.recv(1),b'')
+                except ConnectionResetError:pass
+            self.assertTrue(self.server.admission_thread.is_alive())
+            self.assertEqual(self.request()[0],200)
+        finally:
+            for connection in slow:connection.close()
+
+    def test_bad_header_bytes_are_contained_per_connection(self):
+        from dictation_auth import HEADER_NAMES
+        cases=[('/v1/challenge',{'X-Dictation-Client-Nonce':b'\xff'})]
+        proof=request_headers(self.key,self.port,'GET','/v1/status')
+        for name in HEADER_NAMES:cases.append(('/v1/status',{**proof,name:b'\xff'}))
+        for route,headers in cases:
+            connection=http.client.HTTPConnection('127.0.0.1',self.port,timeout=2)
+            try:
+                connection.request('GET',route,headers=headers)
+                response=connection.getresponse();self.assertEqual(response.status,403);response.read()
+            finally:connection.close()
+            self.assertTrue(self.server.admission_thread.is_alive())
+            self.assertEqual(self.request()[0],200)
+
+    def test_replay_body_session_and_sequence_tampering_never_reaches_recognition(self):
+        proof=request_headers(self.key,self.port,'GET','/v1/status')
+        self.assertEqual(self.signed('/v1/status',proof=proof)[0],200)
+        self.assertEqual(self.signed('/v1/status',proof=proof)[0],403)
+        ident=self.request('/v1/start',{})[1]['sessionId']
+        body=b'\0'*16
+        base={'Content-Type':'application/octet-stream','X-Dictation-Session':ident,'X-Dictation-Sequence':'0'}
+        before=len(self.engine.calls)
+        for changes,actual in [({'X-Dictation-Sequence':'1'},body),({'X-Dictation-Session':'f'*48},body),({},struct.pack('<f',.5)*4),({'Content-Type':'application/json'},body)]:
+            proof=request_headers(self.key,self.port,'POST','/v1/audio',body,extra_headers=base)
+            self.assertEqual(self.signed('/v1/audio',actual,proof,{**base,**changes})[0],403)
+        self.assertEqual(len(self.engine.calls),before)
+
+    def test_busy_port_constructor_closes_safely_before_admission_start(self):
+        other=DictationService(Engine,lambda:None)
+        with self.assertRaises(OSError):HelperServer(self.port,self.key,other)
+        self.assertTrue(other.closed)
+        self.assertEqual(self.request()[0],200)
+
     def test_core_port_is_refused_before_binding(self):
         with self.assertRaises(ValueError):
             HelperServer(8793, self.key, self.service)
@@ -304,6 +431,23 @@ class StateTests(unittest.TestCase):
             self.assertEqual((state.root / 'header').stat().st_mode & 0o777, 0o600)
             self.assertEqual(probe(home, 1)['state'], 'not_running')
             self.assertEqual([p.name for p in state.root.iterdir()], ['header'])
+
+    def test_probe_wrong_or_malformed_listener_is_safe_and_never_sends_the_file_key(self):
+        with tempfile.TemporaryDirectory() as home:
+            key=PrivateState(home).key(create=True)
+            for response in (b'not-http\r\n\r\n',b''):
+                listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen(1)
+                received=[]
+                def answer():
+                    connection,_=listener.accept()
+                    with connection:
+                        received.append(connection.recv(4096))
+                        if response:connection.sendall(response)
+                thread=threading.Thread(target=answer);thread.start()
+                result=probe(home,listener.getsockname()[1]);thread.join(2);listener.close()
+                self.assertIn(result['state'],('failed','not_running'))
+                self.assertNotIn(key.encode(),b''.join(received))
+                self.assertNotIn(b'X-Dictation-Key:',b''.join(received))
 
     def test_status_without_state_creates_nothing(self):
         with tempfile.TemporaryDirectory() as home:

@@ -6,6 +6,8 @@
   "bytes": 142465862,
   "licence": "MIT",
   "licenceUrl": "https://github.com/moonshine-ai/moonshine/blob/v0.1.6/LICENSE",
+  "licenceCheckedAt": "2026-11-19",
+  "licenceScope": "The pinned upstream LICENSE expressly covers all English-language and streaming speech-to-text models under MIT (opening scope statement and section 1).",
   "files": [
     {
       "filename": "adapter.ort",

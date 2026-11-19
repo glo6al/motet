@@ -70,6 +70,20 @@ for raw in sys.stdin:
         self.assertEqual(caught.exception.code, 'dependency_missing')
         self.assertNotIn(self.directory.name, str(caught.exception))
 
+    def test_model_loading_has_its_own_bounded_deadline(self):
+        value=self.runtime('time.sleep(.12)\n'+READY+'for raw in sys.stdin:\n request=json.loads(raw)\n print(json.dumps('+GOOD+'),flush=True)\n')
+        value.timeout=.03;value.load_timeout=.5
+        value.start();self.assertTrue(value.ready)
+        self.assertEqual(value.call('start',interval=.25)['epoch'],1)
+        value.close()
+        value=self.runtime('time.sleep(2)\n'+READY)
+        value.load_timeout=.05
+        began=time.monotonic()
+        with self.assertRaises(RuntimeUnavailable) as caught:value.start()
+        self.assertEqual(caught.exception.code,'worker_timeout')
+        self.assertLess(time.monotonic()-began,1)
+        self.assertFalse(value.ready)
+
     def test_startup_failure_keeps_safe_code_even_when_worker_exits(self):
         value = self.runtime("print(json.dumps({'id':0,'ready':False,'code':'dependency_missing'}),flush=True)\n")
         with self.assertRaises(RuntimeUnavailable) as caught:

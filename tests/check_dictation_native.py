@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from integrations.dictation.assets import model_info
 from integrations.dictation.helper import HelperServer, make_service
+from dictation_auth import request_headers
 from integrations.dictation.state import PrivateState
 
 
@@ -51,14 +52,16 @@ def check(python, source):
         thread.start()
         def request(path, value=None, audio_headers=None):
             connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=20)
-            headers = {'X-Dictation-Key': key}
+            headers = {}
             if isinstance(value, dict):
                 value = json.dumps(value).encode()
                 headers['Content-Type'] = 'application/json'
             if audio_headers:
                 headers.update(audio_headers)
                 headers['Content-Type'] = 'application/octet-stream'
-            connection.request('POST' if value is not None else 'GET', path, value, headers)
+            verb = 'POST' if value is not None else 'GET'
+            headers.update(request_headers(key, server.server_port, verb, path, value, extra_headers=headers))
+            connection.request(verb, path, value, headers)
             response = connection.getresponse()
             result = json.loads(response.read())
             connection.close()

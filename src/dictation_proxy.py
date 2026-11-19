@@ -15,6 +15,7 @@ import stat
 import threading
 import time
 import urllib.parse
+from dictation_auth import AuthenticationError, request_headers, wire_json
 
 PROTOCOL = 1
 MAX_JSON = 4096
@@ -282,6 +283,10 @@ class DictationProxy:
             raise ProxyError(409, 'busy')
         try:
             status, value = self._forward(action, payload, session, sequence, key)
+        except AuthenticationError:
+            if action == 'status':
+                return 200, _availability('failed', 'helper_authentication_failed')
+            raise ProxyError(503, 'helper_authentication_failed') from None
         except (OSError, TimeoutError, http.client.HTTPException):
             if action == 'status':
                 return 200, _availability('not_running', 'connection_unavailable')
@@ -319,7 +324,7 @@ class DictationProxy:
             raise ProxyError(503, 'invalid_response') from None
 
     def _forward(self, action, payload, session, sequence, key):
-        headers = {'X-Dictation-Key': key, 'Accept': 'application/json', 'Connection': 'close'}
+        headers = {'Accept': 'application/json', 'Connection': 'close'}
         method, body = 'GET', None
         if action != 'status':
             method = 'POST'
@@ -332,47 +337,12 @@ class DictationProxy:
             else:
                 body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
                 headers['Content-Type'] = 'application/json'
-        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=HELPER_TIMEOUT)
-        timer = None
-        response = None
-        try:
-            began = time.monotonic()
-            connection.connect()
-            transport = connection.sock
-
-            def expired():
-                try:
-                    transport.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-            timer = threading.Timer(max(.001, HELPER_TIMEOUT - (time.monotonic() - began)), expired)
-            timer.daemon = True
-            timer.start()
-            connection.request(method, '/v1/' + action, body=body, headers=headers)
-            response = connection.getresponse()
-            types = response.headers.get_all('Content-Type', [])
-            lengths = response.headers.get_all('Content-Length', [])
-            if (len(types) != 1 or types[0].lower().replace(' ', '') not in ('application/json', 'application/json;charset=utf-8')
-                    or response.headers.get_all('Transfer-Encoding', []) or response.headers.get_all('Content-Encoding', [])
-                    or len(lengths) != 1 or not re.fullmatch(r'[0-9]{1,8}', lengths[0])
-                    or not 1 <= int(lengths[0]) <= MAX_RESPONSE):
-                raise ValueError()
-            raw = bytearray()
-            while len(raw) < int(lengths[0]):
-                if time.monotonic() - began >= HELPER_TIMEOUT:
-                    raise TimeoutError()
-                chunk = response.read1(min(65536, int(lengths[0]) - len(raw)))
-                if not chunk:
-                    raise ValueError()
-                raw.extend(chunk)
-            return response.status, _json(bytes(raw))
-        finally:
-            if timer is not None:
-                timer.cancel()
-            if response is not None:
-                response.close()
-            connection.close()
+        deadline = time.monotonic() + HELPER_TIMEOUT
+        headers.update(request_headers(key, self.port, method, '/v1/' + action, body,
+                                       deadline=min(deadline, time.monotonic() + 2), extra_headers=headers))
+        status, raw = wire_json(self.port, method, '/v1/' + action, body, headers,
+                                deadline=deadline, limit=MAX_RESPONSE)
+        return status, _json(raw)
 
 
 def from_environment(home, server_port, env=None):

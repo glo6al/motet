@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Separately launched, owner-authenticated loopback dictation helper."""
 import argparse
+import hashlib
+import http.client
+import hmac
+import io
+from email.parser import BytesHeaderParser
+import queue
+import selectors
 import json
 import math
 import os
@@ -23,22 +30,56 @@ from integrations.dictation.assets import AssetsError, MODEL_BYTES, download_mod
 from integrations.dictation.service import DictationService, ServiceError
 from integrations.dictation.state import PrivateState, StateError, authenticates
 
+# The shared wire protocol lives with the standard-library Motet adapter.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
+from dictation_auth import Authenticator, AuthenticationError, request_headers, wire_json
+
 PROTOCOL = 1
+
+
+class PrefixedInput(io.RawIOBase):
+    def __init__(self, connection, prefix):
+        self.prefix = io.BytesIO(prefix)
+        self.source = connection.makefile('rb', buffering=0)
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        chunk = self.prefix.read(len(buffer))
+        if chunk:
+            buffer[:len(chunk)] = chunk
+            return len(chunk)
+        return self.source.readinto(buffer)
+
+    def close(self):
+        self.prefix.close(); self.source.close(); super().close()
 
 
 class HelperServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
+    HEADER_SECONDS = 2.0
+    MAX_PENDING = 64
 
     def __init__(self, port, key, service):
         if type(port) is not int or port == 8793 or not 0 <= port <= 65535:
             raise ValueError('Use a separate helper port; the Motet port is reserved.')
-        if not authenticates(key, key):
+        if not authenticates(key, key) or not re.fullmatch(r'[0-9a-f]{64}', key):
             raise ValueError('A private helper credential is required.')
         self.key, self.service = key, service
         self.slots = threading.BoundedSemaphore(8)
+        self.public_slots = threading.BoundedSemaphore(4)
         self.stopped = threading.Event()
+        self.incoming = queue.Queue(maxsize=self.MAX_PENDING)
+        self.admitted = {}
+        self.admission_lock = threading.Lock()
         super().__init__(('127.0.0.1', port), HelperHandler)
+        self.authentication = Authenticator(key, self.server_port)
+        self.wake_read, self.wake_write = socket.socketpair()
+        self.wake_read.setblocking(False); self.wake_write.setblocking(False)
+        self.admission_thread = threading.Thread(target=self._admit, daemon=True)
+        self.admission_thread.start()
         threading.Thread(target=self._expire, daemon=True).start()
 
     def _expire(self):
@@ -46,26 +87,167 @@ class HelperServer(ThreadingHTTPServer):
             self.service.expire()
 
     def process_request(self, request, address):
-        if not self.slots.acquire(blocking=False):
-            self.shutdown_request(request)
-            return
+        # Header sockets occupy one bounded selector, never authenticated workers.
+        request.setblocking(False)
+        item = (request, address, time.monotonic())
         try:
-            super().process_request(request, address)
+            self.incoming.put_nowait(item)
+        except queue.Full:
+            try:
+                old, _, _ = self.incoming.get_nowait(); self.shutdown_request(old)
+            except queue.Empty:
+                pass
+            try:
+                self.incoming.put_nowait(item)
+            except queue.Full:
+                self.shutdown_request(request)
+        try:
+            self.wake_write.send(b'x')
+        except OSError:
+            pass
+
+    def _reject(self, request, code=403):
+        try:
+            body = json.dumps({'schemaVersion': 1, 'error': {
+                'code': 'busy' if code == 503 else 'forbidden',
+                'message': 'The helper is busy.' if code == 503 else 'Helper authentication required.'}}).encode()
+            request.sendall(('HTTP/1.1 %d Refused\r\nContent-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src \'none\'\r\nConnection: close\r\n\r\n' % (code, len(body))).encode() + body)
+        except OSError:
+            pass
+        self.shutdown_request(request)
+
+    def _admit_headers(self, request, address, data):
+        try:
+            line, rest = data.split(b'\r\n', 1)
+            method, path, version = line.decode('ascii').split(' ')
+            if version not in ('HTTP/1.1', 'HTTP/1.0') or len(path) > 2048:
+                raise ValueError()
+            headers = BytesHeaderParser().parsebytes(rest.split(b'\r\n\r\n', 1)[0] + b'\r\n\r\n')
+            local = ['127.0.0.1:%d' % self.server_port, 'localhost:%d' % self.server_port]
+            hosts, origins, sites = (headers.get_all(name, []) for name in ('Host', 'Origin', 'Sec-Fetch-Site'))
+            if (len(list(headers.keys())) > 64 or len(hosts) != 1 or hosts[0] not in local
+                    or len(origins) > 1 or origins and origins[0] not in ['http://' + host for host in local]
+                    or len(sites) > 1 or sites and sites[0] not in ('none', 'same-origin')
+                    or headers.get_all('X-Dictation-Key', [])):
+                raise ValueError()
+            challenge = method == 'GET' and path == '/v1/challenge'
+            if challenge:
+                clients = headers.get_all('X-Dictation-Client-Nonce', [])
+                if (len(clients) != 1 or type(clients[0]) is not str or not re.fullmatch(r'[0-9a-f]{64}', clients[0])
+                        or headers.get_all('Transfer-Encoding', [])
+                        or len(headers.get_all('Content-Length', [])) > 1
+                        or any(value != '0' for value in headers.get_all('Content-Length', []))):
+                    raise ValueError()
+                digest, slot = None, self.public_slots
+            else:
+                digest = self.authentication.verify(headers, method, path)
+                if digest is None:
+                    raise ValueError()
+                slot = self.slots
+            if not slot.acquire(blocking=False):
+                return self._reject(request, 503)
+            request.setblocking(True)
+            with self.admission_lock:
+                self.admitted[request] = (data, digest, slot, challenge)
+            try:
+                super().process_request(request, address)
+            except Exception:
+                with self.admission_lock:
+                    self.admitted.pop(request, None)
+                slot.release(); self.shutdown_request(request)
         except Exception:
-            self.slots.release()
-            raise
+            # Malformed untrusted headers cannot terminate the single admission loop.
+            self._reject(request)
+
+    def _admit(self):
+        pending = {}
+        selector = selectors.DefaultSelector()
+        selector.register(self.wake_read, selectors.EVENT_READ)
+        def drop(request):
+            try:
+                selector.unregister(request)
+            except (KeyError, ValueError):
+                pass
+            pending.pop(request, None); self.shutdown_request(request)
+        try:
+            while not self.stopped.is_set():
+                while True:
+                    try:
+                        request, address, began = self.incoming.get_nowait()
+                    except queue.Empty:
+                        break
+                    if len(pending) >= self.MAX_PENDING:
+                        drop(next(iter(pending)))
+                    pending[request] = [address, began, bytearray()]
+                    selector.register(request, selectors.EVENT_READ)
+                now = time.monotonic()
+                for request, (_, began, _) in list(pending.items()):
+                    if now - began >= self.HEADER_SECONDS:
+                        drop(request)
+                for key, _ in selector.select(.05):
+                    request = key.fileobj
+                    if request is self.wake_read:
+                        try:
+                            while self.wake_read.recv(4096):
+                                pass
+                        except OSError:
+                            pass
+                        continue
+                    if request not in pending:
+                        continue
+                    address, began, data = pending[request]
+                    try:
+                        chunk = request.recv(32769 - len(data))
+                        if not chunk:
+                            drop(request); continue
+                        data.extend(chunk)
+                        end = data.find(b'\r\n\r\n')
+                        if end < 0 and len(data) >= 32768 or time.monotonic() - began >= self.HEADER_SECONDS:
+                            drop(request); continue
+                        if end >= 0:
+                            selector.unregister(request); pending.pop(request)
+                            self._admit_headers(request, address, bytes(data))
+                    except Exception:
+                        drop(request)
+        finally:
+            for request in list(pending):
+                drop(request)
+            while True:
+                try:
+                    request, _, _ = self.incoming.get_nowait(); self.shutdown_request(request)
+                except queue.Empty:
+                    break
+            selector.close()
 
     def process_request_thread(self, request, address):
+        with self.admission_lock:
+            record = self.admitted.get(request)
         try:
             super().process_request_thread(request, address)
         finally:
-            self.slots.release()
+            with self.admission_lock:
+                self.admitted.pop(request, None)
+            if record is not None:
+                record[2].release()
 
     def handle_error(self, request, address):
-        pass  # Never log request bodies, transcript text or authentication headers.
+        pass
 
     def server_close(self):
         self.stopped.set()
+        wake_write = getattr(self, 'wake_write', None)
+        if wake_write is not None:
+            try:
+                wake_write.send(b'x')
+            except OSError:
+                pass
+        admission = getattr(self, 'admission_thread', None)
+        if admission is not None:
+            admission.join(2)
+        for name in ('wake_read', 'wake_write'):
+            stream = getattr(self, name, None)
+            if stream is not None:
+                stream.close()
         self.service.close()
         super().server_close()
 
@@ -78,6 +260,10 @@ class HelperHandler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(3)
+        with self.server.admission_lock:
+            prefix, self.expected_digest, _, self.challenge_request = self.server.admitted[self.connection]
+        self.rfile.close()
+        self.rfile = io.BufferedReader(PrefixedInput(self.connection, prefix))
 
     def log_message(self, *args):
         pass
@@ -105,13 +291,7 @@ class HelperHandler(BaseHTTPRequestHandler):
         return self.headers.get_all(name, [])
 
     def authenticate(self):
-        local = ['127.0.0.1:%d' % self.server.server_port, 'localhost:%d' % self.server.server_port]
-        hosts, origins, keys = self.values('Host'), self.values('Origin'), self.values('X-Dictation-Key')
-        sites = self.values('Sec-Fetch-Site')
-        return (len(hosts) == 1 and hosts[0] in local and len(origins) <= 1
-                and (not origins or origins[0] in ['http://' + host for host in local])
-                and len(keys) == 1 and authenticates(keys[0], self.server.key)
-                and len(sites) <= 1 and (not sites or sites[0] in ('none', 'same-origin')))
+        return self.expected_digest is not None
 
     def body(self, binary):
         lengths, types = self.values('Content-Length'), self.values('Content-Type')
@@ -135,6 +315,8 @@ class HelperHandler(BaseHTTPRequestHandler):
             if not chunk:
                 raise ServiceError('invalid_request', 'The request body was incomplete.')
             raw.extend(chunk)
+        if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), self.expected_digest):
+            raise ServiceError('forbidden', 'The request body proof did not match.', 403)
         if binary:
             return bytes(raw)
 
@@ -162,7 +344,9 @@ class HelperHandler(BaseHTTPRequestHandler):
 
     def dispatch(self):
         self.close_connection = True
-        # Authenticate before body consumption, service access or path-specific state.
+        if self.challenge_request:
+            return self.reply(200, self.server.authentication.challenge(self.values('X-Dictation-Client-Nonce')[0]))
+        # Admission verified the single-use request proof before any body or worker.
         if not self.authenticate():
             return self.error(403, 'forbidden', 'The helper owner credential is required.')
         try:
@@ -172,6 +356,8 @@ class HelperHandler(BaseHTTPRequestHandler):
                 raise ServiceError('invalid_request', 'Use a canonical helper route.')
             path = parsed.path
             if self.command == 'GET':
+                if self.expected_digest != hashlib.sha256(b'').hexdigest():
+                    raise ServiceError('forbidden', 'The request body proof did not match.', 403)
                 if self.values('Transfer-Encoding') or len(self.values('Content-Length')) > 1 or any(
                         value != '0' for value in self.values('Content-Length')):
                     raise ServiceError('invalid_request', 'GET requests cannot contain a body.')
@@ -213,6 +399,9 @@ class HelperHandler(BaseHTTPRequestHandler):
     do_OPTIONS = dispatch
     do_PUT = dispatch
     do_DELETE = dispatch
+    do_HEAD = dispatch
+    do_PATCH = dispatch
+    do_TRACE = dispatch
 
 
 def make_service(python, model):
@@ -234,23 +423,23 @@ def make_service(python, model):
 def probe(home, port):
     try:
         key = PrivateState(home).key()
-    except StateError:
+    except (StateError, OSError, UnicodeError, ValueError):
         return {'schemaVersion': 1, 'state': 'not_installed', 'code': 'helper_state_missing_or_unsafe'}
-    request = urllib.request.Request('http://127.0.0.1:%d/v1/status' % port,
-                                     headers={'X-Dictation-Key': key})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
-        with opener.open(request, timeout=2) as response:
-            raw = response.read(16385)
-            if len(raw) > 16384:
-                raise ValueError()
-            value = json.loads(raw)
-            if type(value) is not dict or value.get('schemaVersion') != 1 or 'state' not in value:
-                raise ValueError()
-            return value
-    except urllib.error.HTTPError as exc:
-        return {'schemaVersion': 1, 'state': 'failed', 'code': 'authentication_failed' if exc.code == 403 else 'invalid_response'}
-    except (OSError, ValueError, urllib.error.URLError):
+        deadline = time.monotonic() + 2
+        headers = request_headers(key, port, 'GET', '/v1/status', deadline=deadline)
+        status, raw = wire_json(port, 'GET', '/v1/status', headers=headers, deadline=deadline, limit=16384)
+        value = json.loads(raw)
+        if status == 403:
+            raise AuthenticationError()
+        if type(value) is not dict or value.get('schemaVersion') != 1 or 'state' not in value:
+            raise ValueError()
+        return value
+    except AuthenticationError:
+        return {'schemaVersion': 1, 'state': 'failed', 'code': 'authentication_failed'}
+    except (http.client.HTTPException, ValueError):
+        return {'schemaVersion': 1, 'state': 'failed', 'code': 'invalid_response'}
+    except (OSError, urllib.error.URLError):
         return {'schemaVersion': 1, 'state': 'not_running', 'code': 'connection_unavailable'}
 
 

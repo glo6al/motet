@@ -90,9 +90,12 @@ class Runtime:
     A timed-out child is retired before any subsequent command can run. An
     explicit start may create a fresh generation with its own response channel.
     """
-    def __init__(self, python, model, worker=None, timeout=15.0):
+    def __init__(self, python, model, worker=None, timeout=15.0, load_timeout=60.0):
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 120:
             raise ValueError('A finite bounded runtime timeout is required')
+        if type(load_timeout) not in (int, float) or not math.isfinite(load_timeout) or not 0 < load_timeout <= 180:
+            raise ValueError('A finite bounded model-load timeout is required')
+        self.load_timeout = float(load_timeout)
         self.python = Path(python)
         self.model = Path(model)
         self.worker = Path(worker) if worker is not None else Path(__file__).with_name('worker.py')
@@ -181,7 +184,7 @@ class Runtime:
                 raise RuntimeUnavailable('dependency_missing') from None
             threading.Thread(target=self._read, args=(self._process, channel), daemon=True).start()
             try:
-                value = self._receive(0, time.monotonic() + self.timeout)
+                value = self._receive(0, time.monotonic() + self.load_timeout)
                 if value.get('ready') is not True:
                     raise RuntimeUnavailable(value.get('code'))
                 if (set(value) != {'id', 'ready', 'loadMs'} or not _finite(value['loadMs'])

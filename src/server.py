@@ -4757,9 +4757,11 @@ def watch():
 
 
 # ---------------------------------------------------------------- HTTP
-# The page's one script runs under a per-request nonce, so nothing that reaches the page as data (an inline handler in
-# log text, say) can run even if some escape is missed. Styles stay inline: the page sets them from its own code.
-UI_CSP = ("default-src 'self'; script-src 'nonce-%s'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+# The page uses a per-request nonce. The only extra script sources are the exact
+# fixed AudioWorklet URLs: addModule() cannot carry a nonce. No general same-origin
+# script permission is granted. Preview policy remains independent.
+UI_CSP = ("default-src 'self'; script-src 'nonce-%s' http://127.0.0.1:%d/dictation-worklet.js "
+          "http://localhost:%d/dictation-worklet.js; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
           "font-src 'self' data:; connect-src 'self'; frame-src 'self' about: blob: data:; object-src 'none'; base-uri 'self'; "
           "form-action 'none'; frame-ancestors 'none'")
 
@@ -4775,7 +4777,7 @@ def same_request(what, msg):
     return bool(norm(what)) and norm(m.group(1) if m else msg) == norm(what)
 
 
-def page_with_nonce(*, officer_document_modules=True, native_agent_modules=False):
+def page_with_nonce(*, officer_document_modules=True, native_agent_modules=False, dictation_modules=True):
     """Embed the fixed local attachment modules under the page's single nonce."""
     nonce = secrets.token_urlsafe(18)
     with open(os.path.join(HERE, 'web', 'index.html'), 'rb') as source:
@@ -4787,13 +4789,20 @@ def page_with_nonce(*, officer_document_modules=True, native_agent_modules=False
     if native_agent_modules:
         modules += ('native-agent-attachments-journal.js', 'native-agent-attachments-client.js',
                     'native-agent-attachments-page.js')
+    if dictation_modules:
+        modules += ('dictation_draft.js', 'dictation.js', 'dictation_view.js')
+        with open(os.path.join(HERE, 'web', 'dictation.css'), 'rb') as source:
+            style = source.read(200001)
+        if len(style) > 200000 or b'</style' in style.lower():
+            raise RuntimeError('A fixed dictation style cannot be embedded')
+        body = body.replace(b'</style>', style + b'\n</style>', 1)
     for name in modules:
         with open(os.path.join(HERE, 'web', name), 'rb') as source:
             module = source.read(200001)
         if len(module) > 200000 or b'</script' in module.lower():
             raise RuntimeError('A fixed attachment script cannot be embedded')
         script += module + b'\n;\n'
-    return body.replace(b'<script>', script, 1), UI_CSP % nonce
+    return body.replace(b'<script>', script, 1), UI_CSP % (nonce, PORT, PORT)
 
 
 def accepts_page_gzip(values):
@@ -5035,13 +5044,31 @@ class H(BaseHTTPRequestHandler):
             workspace = query.get('ui', [''])[0] != 'classic'
             body, csp = page_with_nonce(officer_document_modules=workspace,
                                        native_agent_modules=ATTACHMENTS_ENABLED and NATIVE_AGENT_ATTACHMENTS_ENABLED
-                                       and os.environ.get('WATCH_DEMO') != '1')
+                                       and os.environ.get('WATCH_DEMO') != '1', dictation_modules=workspace)
             headers = [('Content-Security-Policy', csp), ('X-Frame-Options', 'DENY'), ('Vary', 'Accept-Encoding')]
             if accepts_page_gzip(self.headers.get_all('Accept-Encoding', ())):
                 body = gzip.compress(body, compresslevel=4, mtime=0)
                 headers.append(('Content-Encoding', 'gzip'))
             return self.send(200, body, 'text/html; charset=utf-8', headers)
         q = {} if u.path == '/agent-capabilities' else urllib.parse.parse_qs(u.query)
+        if u.path == '/dictation-worklet.js':
+            if self.path != '/dictation-worklet.js':
+                return self.send(404, b'not found')
+            with open(os.path.join(HERE, 'web', 'dictation_worklet.js'), 'rb') as source:
+                module = source.read(200001)
+            if len(module) > 200000:
+                return self.send(503, b'worklet unavailable')
+            return self.send(200, module, 'text/javascript; charset=utf-8',
+                             (('Content-Security-Policy', "default-src 'none'"),))
+        if u.path == '/dictation-help':
+            if self.path != '/dictation-help':
+                return self.send(404, b'not found')
+            with open(os.path.join(HERE, '..', 'docs', 'DICTATION.md'), 'rb') as source:
+                help_text = source.read(100001)
+            if len(help_text) > 100000:
+                return self.send(503, b'help unavailable')
+            return self.send(200, help_text, 'text/plain; charset=utf-8',
+                             (('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'"),))
         if u.path.startswith('/static/'):          # the page's own icon files, by exact name, nothing else
             name = u.path[len('/static/'):]
             if name in STATIC:
