@@ -2884,11 +2884,14 @@ html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-wor
 }
 /* End approved desktop stage message box. */
 /* Stage model choice belongs beside the microphone at every width. */
+html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer] #ofRow{flex-wrap:wrap;row-gap:6px}
+html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer] #ofRow>#ofCompose{flex:0 0 100%!important;width:100%;min-width:0;order:-1!important}
 html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer] #ofRow>#ofModelPicker{position:relative;flex:0 1 auto!important;max-width:35%;align-self:flex-end!important;margin:0;order:3!important}
 html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer] #ofModelMenu{right:0;max-width:min(320px,calc(100vw - 40px))}
 html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer].dictation-active #ofModelPicker{display:none!important}
-html.workspace.workspace-attachments body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer]:not(.dictation-active) #ofRow:has(>#ofModelPicker:not([hidden]))>#ofModelPicker{margin-left:auto!important}
-html.workspace.workspace-attachments body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer]:not(.dictation-active) #ofRow:has(>#ofModelPicker:not([hidden]))>.dictation-mic{margin-left:0!important}
+html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer]:not(.dictation-active) #ofRow>#ofModelPicker:not([hidden]){margin-left:auto!important}
+html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer]:not(.dictation-active) #ofRow>.dictation-mic{margin-left:auto!important}
+html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer]:not(.dictation-active) #ofRow:has(>#ofModelPicker:not([hidden]))>.dictation-mic{margin-left:0!important}
 /* End stage model choice placement. */
 /* Narrow stage keeps its real Suggestions menu and one conversation arrow. */
 html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer=narrow]:not(.docked) #workspaceOfficerHeader{flex-wrap:nowrap;gap:8px}
@@ -8747,6 +8750,7 @@ function workspaceAttachmentsInstall(client,options={}){
         if(snapshot.ui.surface==='room'){row.insertBefore(controls.plus,$('#ofCompose'));row.insertBefore(controls.files,$('#ofModelPicker').parentNode===row?$('#ofModelPicker'):$('#ofSend'))}else{row.insertBefore(controls.plus,recipient?.parentNode===row?recipient:$('#ofSend'));if(snapshot.ui.surface==='officer'&&$('#ofModelPicker').parentNode===recipient&&!(typeof workspaceDictationPlacesFiles==='function'&&workspaceDictationPlacesFiles()))recipient.insertBefore(controls.files,$('#ofModelPicker'));else row.insertBefore(controls.files,recipient?.parentNode===row?recipient.nextSibling:$('#ofSend'))}
         ofIn.setAttribute('aria-describedby',[saved.described,'workspaceAttachmentsLive'].filter(Boolean).join(' '));
       }
+      if(typeof workspaceDictationOrderControls==='function')workspaceDictationOrderControls();
       document.documentElement.classList.add('workspace-attachments');
       const c=mount.controls,normal=workspaceAttachmentsNormalize(snapshot);c.plus.disabled=normal.isRoom?!normal.roomInteractive:!snapshot.capabilities.available||!snapshot.draft.editable;c.plus.setAttribute('aria-expanded',String((!normal.isRoom||normal.roomInteractive)&&snapshot.ui.pickerOpen===true));
       const controls=workspaceAttachmentsCreateControls(document,snapshot);c.files.replaceChildren(...controls.files.childNodes);c.files.disabled=controls.files.disabled;if(!c.files.disabled){const authority=snapshot.management.context;managementBind({element:c.files,type:'open_files',authority})}if(modalFault){const view=viewIdentity,proof=managementRecoveryProof();c.files.disabled=!managementRecoveryAllowed(proof);c.files.onclick=c.files.disabled?null:()=>{if(current()&&view===viewIdentity&&managementRecoveryProof()===proof)recoverManagement()};}
@@ -9371,6 +9375,7 @@ function createWorkspaceOfficerDocumentsController(o){
     doc.documentElement.classList.add('workspace-attachments');doc.documentElement.classList.add('workspace-live-documents');
     if(!controls){const plus=button('Attach files',()=>{}),files=button('Files',()=>{}),refresh=button('Look again',lookAgain),picker=el('input');plus.className='workspace-attachments-plus';plus.replaceChildren(workspaceAttachmentsIcon(doc,'clip'));files.className='workspace-attachments-files';picker.type='file';picker.multiple=true;picker.hidden=true;row.append(picker);controls={plus,files,refresh,picker};plus.setAttribute('aria-haspopup','dialog');files.setAttribute('aria-haspopup','dialog');let pickerToken=null;picker.addEventListener('change',()=>{const chosen=Array.from(picker.files||[]),opened=pickerToken;pickerToken=null;picker.value='';if(chosen.length&&opened&&controls?.picker===picker&&picker.isConnected&&opened.view===view&&opened.edit===editGeneration&&current(opened)&&canMutate())void action('addFiles',[chosen]);});plus.onclick=()=>{if(controls?.picker===picker&&picker.isConnected&&canMutate()){pickerToken={...token(),view,edit:editGeneration};picker.click()}};files.onclick=()=>{if(!filesReadable()||dialog)return;opener=files;filesOpen=true;paintDialog()};}
     const placement=o.placement?.()||{},recipient=placement.recipient,model=placement.model,place=(host,node,next)=>{if(node.parentNode!==host||node.nextSibling!==next)host.insertBefore(node,next);};if(env().surface==='room'){place(row,controls.plus,compose);place(row,controls.files,model?.parentNode===row?model:o.send);}else{place(row,controls.plus,recipient?.parentNode===row?recipient:o.send);if(env().surface==='officer'&&recipient&&model?.parentNode===recipient&&!(typeof workspaceDictationPlacesFiles==='function'&&workspaceDictationPlacesFiles()))place(recipient,controls.files,model);else place(row,controls.files,recipient?.parentNode===row?recipient.nextSibling:o.send);}
+    if(typeof workspaceDictationOrderControls==='function')workspaceDictationOrderControls();
     controls.files.replaceChildren(workspaceAttachmentsIcon(doc,'file',14),el('span','','Files'));if(snapshot?.files.length)controls.files.append(el('small','',String(snapshot.files.length)));
     const fileRoute=route()==='documents';
     controls.plus.disabled=!canMutate();controls.plus.hidden=false;
@@ -9713,14 +9718,17 @@ function workspaceDictationCloseHiddenPopups(){
 function workspaceDictationOrderControls(){
   const current=workspaceDictationInit.current,row=$('#ofRow'),send=$('#ofSend'),mic=current?.view.mic;
   if(mic&&mic.parentNode===row&&send.parentNode===row&&mic.nextElementSibling!==send)row.insertBefore(mic,send);
-  if(!mic||mic.parentNode!==row)return;
+  const stage=WORKSPACE&&(ofEl.dataset.workspaceComposer==='desktop'||ofEl.dataset.workspaceComposer==='narrow')&&!ofEl.classList.contains('docked')&&!document.body.classList.contains('stepped')&&!document.body.classList.contains('workspace-officer-desk');
+  if(!stage&&(!mic||mic.parentNode!==row))return;
   const compose=$('#ofCompose'),active=ofEl.classList.contains('dictation-active');
   const controls=['.workspace-attachments-plus','.workspace-attachments-files'].map(selector=>row.querySelector(selector)).filter(node=>node&&node.parentNode===row);
-  const anchor=active?(current.view.cancel||mic):compose;
-  if(!controls.length||controls.every((node,index)=>node.nextElementSibling===(controls[index+1]||anchor)))return;
-  const held=document.activeElement,identity=workspaceDictationTarget();
+  const model=$('#ofModelPicker');
+  const modelAnchor=stage&&!active&&model.parentNode!==row&&typeof workspaceOfficerDesktopModelAnchor==='function'?workspaceOfficerDesktopModelAnchor():null;
+  const anchor=active?(current?.view.cancel||mic||send):stage?(model.parentNode===row?model:modelAnchor?.parentNode===row?modelAnchor:mic||send):compose;
+  if(!controls.length||controls.every((node,index)=>node.nextSibling===(controls[index+1]||anchor)))return;
+  const held=document.activeElement,heldControl=controls.includes(held),identity=heldControl?workspaceDictationTarget():null;
   for(const node of controls)row.insertBefore(node,anchor);
-  if(controls.includes(held)&&held.isConnected&&identity===workspaceDictationTarget()&&document.activeElement!==held)held.focus({preventScroll:true});
+  if(heldControl&&held.isConnected&&identity===workspaceDictationTarget()&&document.activeElement!==held)held.focus({preventScroll:true});
 }
 function workspaceDictationRefresh(){
   const current=workspaceDictationInit.current;if(!current)return;
@@ -9769,6 +9777,7 @@ function workspaceDictationInit(){
   const current={view:null,controller:null,identity:workspaceDictationTarget()};
   const view=MotetDictationView.attach({textarea:ofIn,row:$('#ofRow'),compose:$('#ofCompose'),host:ofEl,send:$('#ofSend'),onSettings:workspaceDictationSettings,disabled:()=>!workspaceDictationCanUse()});
   current.view=view;workspaceDictationInit.current=current;
+  workspaceDictationOrderControls();
   if(DEMO){view.render('idle');return}
   current.controller=MotetDictation.create({textarea:ofIn,mic:view.mic,cancel:view.cancel,send:view.send,wave:view.wave,status:view.status,settings:view.settings,
     api:workspaceDictationApi,target:workspaceDictationTarget,demo:()=>DEMO,canUse:workspaceDictationCanUse,captureNotice:workspaceDictationSendNotice,host:ofEl,canCancelEscape:workspaceDictationEscapeAllowed,workletUrl:'/dictation-worklet.js',

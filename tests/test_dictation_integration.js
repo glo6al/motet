@@ -12,7 +12,8 @@ function harness({demo=false,key='fictional-owner',workspace=true,modules=true,m
     constructor(name){this.name=name;this.attrs={};this.handlers={};this.children=[];this.value='exact draft Ω';this.disabled=false;this.readOnly=false;this.dataset={};this.isConnected=true;this.style={};this.parentNode=null;}
     set id(value){this._id=value;nodes.set('#'+value,this)}get id(){return this._id}
     setAttribute(k,v){this.attrs[k]=v}getAttribute(k){return this.attrs[k]??null}
-    get nextSibling(){return this.parentNode?.children[this.parentNode.children.indexOf(this)+1]||null}get nextElementSibling(){return this.nextSibling}
+    get nextSibling(){return this.parentNode?.children[this.parentNode.children.indexOf(this)+1]||null}get nextElementSibling(){let next=this.nextSibling;while(next?.nodeType===8)next=next.nextSibling;return next}
+    before(node){this.parentNode.insertBefore(node,this)}after(node){this.parentNode.insertBefore(node,this.nextSibling)}
     remove(){if(this.parentNode){const siblings=this.parentNode.children;siblings.splice(siblings.indexOf(this),1);this.parentNode=null}}
     contains(child){return child===this||this.children.some(node=>node.contains(child))}
     append(...children){for(const child of children){child.remove();this.children.push(child);child.parentNode=this}}appendChild(child){this.append(child);return child}
@@ -26,7 +27,7 @@ function harness({demo=false,key='fictional-owner',workspace=true,modules=true,m
   }
   const node=id=>{if(!nodes.has(id))nodes.set(id,new Node(id));return nodes.get(id)};
   const input=node('#ofIn'),host=node('#officer');
-  doc.createElement=tag=>new Node(tag);doc.activeElement=input;
+  doc.createElement=tag=>new Node(tag);doc.createComment=tag=>{const node=new Node(tag);node.nodeType=8;return node};doc.activeElement=input;doc.body=new Node('body');
   const controls={mic:node('mic'),cancel:node('cancel'),send:node('#ofSend'),wave:node('wave'),status:node('status'),settings:node('settings')};
   const view={...controls,render:(state,detail)=>{host.classList.toggle('dictation-active',['preparing','listening'].includes(state));calls.push(['render',state,detail])},refresh:()=>calls.push(['view refresh'])};
   const ctx={console,WORKSPACE:workspace,DEMO:demo,KEY:key,locked:false,claiming:false,document:doc,ofIn:input,ofEl:host,OFUI:{epoch:3,recipient:'watch',scope:'room',docked:false},cuTarget:()=>null,Headers,AbortController,Event,setTimeout,clearTimeout,
@@ -81,6 +82,55 @@ function orderProof(mutate=x=>x){
   assert(!h.calls.some(call=>call[0]==='move'&&(call[1]===compose||call[1]===h.input)),'The live editor and its wrapper are never reparented');
   assert.equal(h.input.value,originalText);assert.equal(h.input.selectionStart,3);assert.equal(h.input.selectionEnd,7);assert.equal(h.input.scrollTop,18);
   const moves=h.calls.filter(call=>call[0]==='move').length;h.ctx.workspaceDictationOrderControls();assert.equal(h.calls.filter(call=>call[0]==='move').length,moves,'Settled order makes no extra DOM moves');
+}
+function stageOrderProof(mutate=x=>x){
+  for(const owner of ['desktop','narrow'])for(const mounted of [true,false]){
+    const h=harness({mutate,modules:mounted}),row=h.node('#ofRow'),compose=h.node('#ofCompose'),model=h.node('#ofModelPicker'),plus=h.node('plus'),files=h.node('files');
+    h.host.dataset.workspaceComposer=owner;plus.className='workspace-attachments-plus';files.className='workspace-attachments-files';
+    compose.append(h.input);h.host.append(row);row.append(plus,files,compose,model,...(mounted?[h.controls.mic]:[]),h.controls.send);
+    h.input.focus();h.ctx.workspaceDictationTarget=()=>assert.fail('An unfocused layout move must not read capture/draft identity');
+    h.ctx.workspaceDictationOrderControls();
+    assert.deepEqual(row.children.map(node=>node.name),['#ofCompose','plus','files','#ofModelPicker',...(mounted?['mic']:[]),'#ofSend'],owner+' words precede control-row Attach/Files even without a mounted view');
+    assert.equal(h.doc.activeElement,h.input);assert.equal(h.input.parentNode,compose);assert.equal(h.input.value,'exact draft Ω');
+    h.ctx.workspaceDictationTarget=()=> 'fictional-stage-draft';files.focus();
+    // Repainting an attachment consumer can temporarily restore its legacy order.
+    row.insertBefore(plus,compose);row.insertBefore(files,model);files.focus();h.ctx.workspaceDictationOrderControls();assert.equal(h.doc.activeElement,files);
+    h.ctx.WS.settingsAnchors=new Map();vm.runInNewContext(sourceLine('workspaceSettingsMove')+'\n'+sourceLine('workspaceSettingsRestore')+'\n'+sourceLine('workspaceOfficerDesktopModelAnchor'),h.ctx);
+    const settings=h.node('settings');h.ctx.workspaceSettingsMove(model,settings);const anchor=h.ctx.WS.settingsAnchors.get(model);
+    assert.equal(anchor.nodeType,8,'Actual Settings borrowing uses a comment anchor');
+    h.ctx.workspaceDictationOrderControls();assert.equal(files.nextSibling,anchor,'Settings return anchor remains after Attach and Files');
+    const borrowedMoves=h.calls.filter(call=>call[0]==='move').length;h.ctx.workspaceDictationOrderControls();h.ctx.workspaceDictationOrderControls();assert.equal(h.calls.filter(call=>call[0]==='move').length,borrowedMoves,'A comment return anchor cannot create an order-observer mutation loop');
+    h.ctx.workspaceSettingsRestore(model);assert.equal(files.nextSibling,model,'Actual Settings return keeps Files before model even with no view or observer');h.ctx.workspaceDictationOrderControls();
+    if(mounted){
+      row.insertBefore(h.controls.cancel,model);row.insertBefore(h.controls.wave,model);h.host.classList.add('dictation-active');h.ctx.workspaceDictationOrderControls();
+      assert.deepEqual(row.children.map(node=>node.name),['#ofCompose','plus','files','cancel','wave','#ofModelPicker','mic','#ofSend']);
+      h.host.classList.remove('dictation-active');h.ctx.workspaceDictationOrderControls();assert.equal(files.nextSibling,model);
+    }
+    assert(!h.calls.some(call=>call[0]==='move'&&(call[1]===compose||call[1]===h.input)),'Neither editor node is moved');
+    const moves=h.calls.filter(call=>call[0]==='move').length;h.ctx.workspaceDictationOrderControls();assert.equal(h.calls.filter(call=>call[0]==='move').length,moves);
+  }
+  for(const excluded of ['docked','stepped','workspace-officer-desk']){
+    const h=harness({mutate}),row=h.node('#ofRow'),compose=h.node('#ofCompose'),plus=h.node('plus'),files=h.node('files');h.host.dataset.workspaceComposer='desktop';
+    if(excluded==='docked')h.host.classList.add(excluded);else h.doc.body.classList.add(excluded);
+    plus.className='workspace-attachments-plus';files.className='workspace-attachments-files';row.append(compose,plus,files,h.controls.mic,h.controls.send);
+    h.ctx.workspaceDictationOrderControls();assert.deepEqual(row.children.slice(0,3).map(node=>node.name),['plus','files','#ofCompose'],excluded+' retains existing desk order despite a stale stage marker');
+  }
+}
+function liveStagePlacementProof(mutate=x=>x){
+  const lines=html.split('\n'),at=lines.findIndex(line=>line.includes('const placement=o.placement?.()'));
+  assert(at>=0);assert(lines[at+1].includes('workspaceDictationOrderControls'));
+  for(const owner of ['desktop','narrow']){
+    const h=harness({modules:false,mutate}),row=h.node('#ofRow'),compose=h.node('#ofCompose'),model=h.node('#ofModelPicker'),plus=h.node('plus'),files=h.node('files');
+    h.host.dataset.workspaceComposer=owner;plus.className='workspace-attachments-plus';files.className='workspace-attachments-files';
+    compose.append(h.input);h.host.append(row);row.append(compose,model,h.controls.send);
+    Object.assign(h.ctx,{row,compose,controls:{plus,files},o:{placement:()=>({model}),send:h.controls.send},env:()=>({surface:'room'})});
+    const placement=mutate(lines[at]+'\n'+lines[at+1]);
+    for(let repeat=0;repeat<3;repeat++){
+      vm.runInNewContext('{'+placement+'}',h.ctx);
+      assert.deepEqual(row.children.map(node=>node.name),['#ofCompose','plus','files','#ofModelPicker','#ofSend'],'Actual live-document repaint preserves words-first order without a capture view/observer');
+      assert.equal(h.input.parentNode,compose);assert.equal(h.input.value,'exact draft Ω');
+    }
+  }
 }
 function identityProof(mutate=x=>x){
   const h=harness({mutate});let target='fictional-agent-one';h.ctx.cuTarget=()=>target;
@@ -181,11 +231,18 @@ function lifecycleProof(mutate=x=>x){
 }
 lifecycleProof();
 async function main(){
-  await apiProof();await sendProof();orderProof();identityProof();windowEscapeProof();hiddenPopupProof();openContextProof();
+  await apiProof();await sendProof();orderProof();stageOrderProof();liveStagePlacementProof();identityProof();windowEscapeProof();hiddenPopupProof();openContextProof();
   for(const [name,mutate,proof]of[
     ['control ordering',s=>s.replace('for(const node of controls)row.insertBefore(node,anchor);',''),orderProof],
     ['stationary editor',s=>s.replace('for(const node of controls)row.insertBefore(node,anchor);','row.insertBefore(compose,anchor);for(const node of controls)row.insertBefore(node,anchor);'),orderProof],
     ['held control focus',s=>s.replace('held.focus({preventScroll:true});','void 0;'),orderProof],
+    ['stage words precede controls',s=>s.replace("const stage=WORKSPACE&&(ofEl.dataset.workspaceComposer==='desktop'||ofEl.dataset.workspaceComposer==='narrow')&&!ofEl.classList.contains('docked')&&!document.body.classList.contains('stepped')&&!document.body.classList.contains('workspace-officer-desk');",'const stage=false;'),stageOrderProof],
+    ['stage without mounted mic',s=>s.replace('if(!stage&&(!mic||mic.parentNode!==row))return;','if(!mic||mic.parentNode!==row)return;'),stageOrderProof],
+    ['lazy identity for inert layout',s=>s.replace('identity=heldControl?workspaceDictationTarget():null','identity=workspaceDictationTarget()'),stageOrderProof],
+    ['Settings return anchor after Files',s=>s.replace('modelAnchor?.parentNode===row?modelAnchor:mic||send','mic||send'),stageOrderProof],
+    ['Settings comment anchor idempotence',s=>s.replace('node.nextSibling===(controls[index+1]||anchor)','node.nextElementSibling===(controls[index+1]||anchor)'),stageOrderProof],
+    ['stage marker cannot change desks',s=>s.replace("&&!document.body.classList.contains('workspace-officer-desk')",''),stageOrderProof],
+    ['live attachment repaint without capture view',s=>s.replace("if(typeof workspaceDictationOrderControls==='function')workspaceDictationOrderControls();",''),liveStagePlacementProof],
     ['presentation epoch isolation',s=>s.replace('JSON.stringify([KEY,cuDraftKey(cuTarget(),OFUI.recipient,OFUI.scope)])','JSON.stringify([KEY,OFUI.epoch,OFUI.docked,cuDraftKey(cuTarget(),OFUI.recipient,OFUI.scope)])'),identityProof],
     ['window Escape ordering',s=>s.replace("if(typeof workspaceDictationEscape==='function'&&workspaceDictationEscape(e))return;",''),windowEscapeProof],
     ['window IME guard',s=>s.replace('if(e.isComposing||e.keyCode===229)return;',''),windowEscapeProof],
@@ -199,6 +256,6 @@ async function main(){
   await assert.rejects(()=>sendProof(s=>s.replace("if(typeof workspaceDictationBeforeSend==='function')workspaceDictationBeforeSend();",'')),assert.AssertionError,'missing pre-send retirement mutation caught');
   assert.throws(()=>lifecycleProof(s=>s.replace("if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging();",'')),assert.AssertionError,'missing pre-context retirement mutation caught');
   assert(wiring.includes("help.href='/dictation-help'"));assert(wiring.includes("help.rel='noopener noreferrer'"));assert(!/X-Dictation-Key|127\.0\.0\.1:[0-9]|\.live-room|localStorage/.test(wiring),'page wiring contains no helper capability, private path or extra persistence');
-  console.log('ok dictation page wiring: inert demo/classic/load, Send/draft fences, stationary editor ordering/focus, real window Escape and hidden-popup precedence, private adapter, Settings help and fourteen causal mutations');
+  console.log('ok dictation page wiring: inert demo/classic/load, Send/draft fences, stage words before controls with no-view/live-paint/real-Settings-comment/desk boundaries, stationary editor focus, real Escape/popup precedence, private adapter and twenty-one causal mutations');
 }
 main().catch(error=>{console.error(error);process.exitCode=1});
