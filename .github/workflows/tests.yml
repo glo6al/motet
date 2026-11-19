@@ -44,6 +44,7 @@ jobs:
           python tests/test_dictation_assets.py
           python tests/test_dictation_runtime.py
           python tests/test_dictation_helper.py
+          python tests/test_dictation_proxy.py
       - run: python tests/test_native_sqlite_support.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5

@@ -76,6 +76,7 @@ CLAUDE_MANAGED = None
 CLAUDE_MANAGED_FAILED = False   # failed registry startup must not erase its ownership fence
 NEW_CHAT_CLAUDE_DIRECTORY = None
 ANTIGRAVITY_OPEN = None        # separate owner-only native navigation; never a peer capability
+DICTATION_PROXY = None        # optional owner-only loopback adapter; no runtime in this process
 HISTORY = None                 # initialized only by main; import never opens private state
 OFFICER_USAGE = None            # metadata-only accounting; never opens storage on import
 OFFICER_ERASURE_EVENT = threading.Event()
@@ -4988,6 +4989,8 @@ class H(BaseHTTPRequestHandler):
         return attachments_http.handle_http(self, ATTACHMENTS, KEY, PORT, native=native)
 
     def do_PUT(self):
+        if self.path.startswith('/api/dictation/'):
+            return self.dictation_http()
         if self.path.startswith('/api/attachments/'):
             return self.attachments_http()
         self.send_error(501, "Unsupported method")
@@ -4997,7 +5000,14 @@ class H(BaseHTTPRequestHandler):
     do_HEAD = do_PUT
     do_OPTIONS = do_PUT
 
+    def dictation_http(self):
+        import dictation_proxy
+        return dictation_proxy.handle_http(self, DICTATION_PROXY, KEY, PORT,
+                                          demo=os.environ.get('WATCH_DEMO') == '1')
+
     def do_GET(self):
+        if self.path.startswith('/api/dictation/'):
+            return self.dictation_http()
         if self.path.startswith('/api/attachments/'):
             return self.attachments_http()
         if self.path.startswith('/bridge-admin/'):
@@ -5177,6 +5187,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global LAST_PAIR, APPROVER
+        if self.path.startswith('/api/dictation/'):
+            return self.dictation_http()
         if self.path.startswith('/api/attachments/'):
             return self.attachments_http()
         if self.path.startswith('/bridge-admin/'):
@@ -6262,6 +6274,8 @@ def start_new_chat():
 
 if __name__ == '__main__':
     KEY = load_key()
+    from dictation_proxy import from_environment as dictation_from_environment
+    DICTATION_PROXY = dictation_from_environment(HOME, PORT)
     CLAUDE_MANAGED, CLAUDE_MANAGED_FAILED = start_managed_claude()
     NEW_CHAT = start_new_chat()
     ATTACHMENTS = start_attachments()

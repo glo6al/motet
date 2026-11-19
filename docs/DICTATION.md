@@ -182,3 +182,49 @@ accuracy for a person's voice, Undo or comfort while editing.
 
 Stop the helper before removing its dedicated state folder. No core rollback is
 needed to stop using this optional component.
+
+## Connecting through Motet's owner proxy
+
+The page connects to Motet's own `/api/dictation/` routes. Motet forwards only the
+documented recognition operations to the helper on `127.0.0.1`; it keeps the
+dedicated helper capability on the server. The page continues to authenticate
+with Motet's existing owner credential. Neither credential is included in a URL,
+and the Motet owner credential is never sent to the helper.
+
+The proxy is off by default. After deliberately setting up and starting the
+helper in the same selected home, opt in when starting Motet:
+
+```sh
+WATCH_DICTATION_ENABLED=1 WATCH_DICTATION_PORT=18879 python3 src/server.py
+```
+
+`WATCH_DICTATION_ENABLED` must be exactly `1`. The optional helper port defaults
+to `18879`, must be between 1 and 65535, and must differ from Motet's current port
+and the reserved port 8793. An invalid setting leaves the proxy off. A page
+request cannot select a different host, port, file or remote service. The proxy
+never starts the helper, installs a runtime, downloads a model or changes its
+private state. Status reports distinguish missing/unsafe helper state
+(`not_installed`) from a configured helper that gives no answer (`not_running`).
+
+The helper's private `header` is read from `.live-room/dictation` under the home
+selected for Motet, with no fallback to another home. The existing POSIX owner
+and private-file protections apply. Disabled and demo requests do not inspect
+helper state or open a connection. Browser microphone access remains a separate
+browser permission; the proxy does not request or infer it.
+
+Every proxy route requires Motet's owner header, a local Host, and an allowed
+Origin/fetch-site context. Canonical routes only are accepted: status is GET;
+start, audio, events, stop, cancel and reset are POST. Their bodies and the audio
+session/sequence headers follow the `/v1/` protocol above. The proxy validates
+bounded responses and forwards only documented readiness, session, timing,
+level and transcript fields. Native diagnostics and arbitrary helper fields
+are discarded. Requests have bounded deadlines and no redirect or environment
+proxy fallback. Errors keep a safe fixed code so the editor can retain its
+visible draft and offer the appropriate remedy.
+
+The proxy's ordinary tests require no helper installation, model or network
+service beyond their own ephemeral loopback fixture:
+
+```sh
+python3 tests/test_dictation_proxy.py
+```
