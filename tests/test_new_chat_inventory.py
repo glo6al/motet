@@ -2,9 +2,12 @@
 from dataclasses import replace
 import os
 import errno
-from pathlib import Path
+import ntpath
+from pathlib import Path, PureWindowsPath
+import stat
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -129,6 +132,75 @@ class InventoryTests(unittest.TestCase):
                 self.inventory.register(str(self.folder))
         self.assertEqual(caught.exception.message,
                          'Motet cannot use that folder.')
+
+    def _register_windows_path(self, entered, resolved):
+        # Only physical resolution/stat are fictional. Keep registration's
+        # frozen identity, shared validator and private-folder policy real.
+        class WindowsPaths:
+            def __getattr__(self, name):
+                return getattr(ntpath, name)
+
+            def isabs(self, value):
+                # Before Python 3.13, a single leading slash was absolute.
+                return ntpath.isabs(value) or value.startswith(('\\', '/'))
+
+            def realpath(self, value):
+                # Never consult a Windows drive or network share in this test.
+                return ntpath.normpath(value)
+
+        home = 'C:\\Users\\Fictional'
+        identities = {home: (7, 900)}
+        current = resolved
+        while True:
+            identities[current] = (7, 1000 + len(identities) - 1)
+            parent = ntpath.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
+        def directory(path, *, follow_symlinks):
+            self.assertIs(follow_symlinks, False)
+            if path not in identities:
+                raise FileNotFoundError(path)
+            device, inode = identities[path]
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_dev=device, st_ino=inode)
+
+        windows = SimpleNamespace(path=WindowsPaths(), stat=directory, fspath=os.fspath)
+        with patch('new_chat_inventory.os', windows), \
+                patch('new_chat_inventory.sys', SimpleNamespace(platform='win32')), \
+                patch('new_chat_inventory.PurePath', PureWindowsPath), \
+                patch('new_chat_inventory.Path') as paths:
+            paths.return_value.resolve.return_value = resolved
+            inventory = KnownFolderInventory(lambda: [], b'a' * 32, home=home)
+            folder = inventory.register(entered)
+            paths.assert_called_once_with(entered)
+            paths.return_value.resolve.assert_called_once_with(strict=True)
+            return folder
+
+    def test_registration_refuses_resolved_windows_drive_and_unc_roots(self):
+        roots = [('/', 'C:\\'), ('C:\\', 'C:\\'), ('D:/', 'D:\\'),
+                 ('C:\\Orchard\\..', 'C:\\'),
+                 ('\\\\fictional-server\\share', '\\\\fictional-server\\share'),
+                 ('\\\\fictional-server\\share\\', '\\\\fictional-server\\share\\'),
+                 ('\\\\?\\C:\\', '\\\\?\\C:\\'),
+                 ('\\\\?\\UNC\\fictional-server\\share', '\\\\?\\UNC\\fictional-server\\share'),
+                 ('\\\\?\\UNC\\fictional-server\\share\\', '\\\\?\\UNC\\fictional-server\\share\\')]
+        for entered, resolved in roots:
+            with self.subTest(entered=entered, resolved=resolved):
+                with self.assertRaises(NewChatError) as caught:
+                    self._register_windows_path(entered, resolved)
+                self.assertEqual((caught.exception.status, caught.exception.code, caught.exception.message),
+                                 (400, 'invalid_folder', 'Motet cannot use that folder.'))
+
+    def test_registration_preserves_resolved_windows_drive_and_unc_descendant_identity(self):
+        for path in ('C:\\Projects\\Orchard', '\\\\fictional-server\\share\\Orchard'):
+            with self.subTest(path=path):
+                folder = self._register_windows_path(path, path)
+                alias = self._register_windows_path(path + '\\child\\..', path)
+                self.assertEqual(folder, alias)
+                self.assertEqual((folder.path, folder.label, folder.device, folder.inode),
+                                 (path, 'Orchard', 7, 1000))
+                self.assertEqual((len(folder.id), len(folder.revision)), (64, 64))
 
     def test_registered_rows_survive_discovery_failure_but_not_directory_replacement(self):
         saved = self.inventory.register(str(self.folder))

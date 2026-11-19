@@ -53,15 +53,90 @@ class FakeNative:
 
 
 class FakeChooser:
-    def __init__(self):
+    def __init__(self, native_factory=FakeNative):
         self.calls, self.natives = [], []
+        self.native_factory = native_factory
     def open(self, initial_path=None, before_spawn=None):
         if before_spawn:
             before_spawn()
         self.calls.append(initial_path)
-        value = FakeNative()
+        value = self.native_factory()
         self.natives.append(value)
         return value
+
+
+class PendingNative(FakeNative):
+    def result(self):
+        # Manual timer tests must not progress because a wall-clock wait ended.
+        self.release.wait()
+        self.dead = self.stop_works
+        return self.value
+
+
+class ManualTimer:
+    def __init__(self, delay, callback):
+        self.delay, self.callback = delay, callback
+        self.daemon, self.started, self.cancelled, self.fired = False, False, False, 0
+    def start(self):
+        self.started = True
+    def cancel(self):
+        self.cancelled = True
+    def fire(self):
+        # Deliberately deliver even after cancel, modelling a queued callback.
+        assert self.started
+        self.fired += 1
+        self.callback()
+
+
+class ManualTimers:
+    def __init__(self):
+        self.created = []
+    def __call__(self, delay, callback):
+        timer = ManualTimer(delay, callback)
+        self.created.append(timer)
+        return timer
+    @property
+    def pending(self):
+        return [timer for timer in self.created if timer.started and not timer.cancelled and not timer.fired]
+
+
+def assert_manual_early_expiry(test, factory):
+    adapter, now, timers = FakeChooser(PendingNative), [0.], ManualTimers()
+    coordinator = factory(adapter, clock=lambda: now[0], retention=.05, timer_factory=timers)
+    try:
+        ident = uid()
+        coordinator.begin({'requestId': ident, 'epoch': coordinator.epoch, 'gesture': {'trusted': True}},
+                          Connection(), lambda: None)
+        row, first = coordinator.operations[ident], timers.created[0]
+        test.assertEqual(len(timers.created), 1)
+        test.assertTrue(first.daemon)
+        test.assertEqual(first.delay, .05)
+        original_at = row['at']
+        now[0] = .046875
+        first.fire()
+        test.assertNotIn(ident, coordinator.retired)
+        test.assertEqual(row['at'], original_at)
+        test.assertFalse(adapter.natives[0].dead)
+        test.assertEqual(len(timers.created), 2, 'An early callback must re-arm the remaining deadline')
+        replacement = timers.created[-1]
+        test.assertIs(row['timer'], replacement)
+        test.assertAlmostEqual(replacement.delay, .003125)
+        test.assertEqual(timers.pending, [replacement])
+        first.fire()  # a stale queued delivery must not create a third timer
+        test.assertEqual(len(timers.created), 2)
+        test.assertEqual(timers.pending, [replacement])
+        now[0] = .0625
+        replacement.fire()  # no status()/expire() polling drives retirement
+        test.assertIn(ident, coordinator.retired)
+        test.assertTrue(adapter.natives[0].dead)
+        test.assertIsNone(coordinator.active)
+        test.assertNotIn(ident, coordinator.operations)
+        test.assertEqual(row['at'], original_at)
+        test.assertEqual(timers.pending, [])
+        replacement.fire()
+        test.assertEqual(len(timers.created), 2)
+    finally:
+        coordinator.close()
 
 
 def saved():
@@ -311,17 +386,82 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn('private', json.dumps(value))
 
     def test_daemon_expiry_cancels_without_polling_status(self):
-        adapter = FakeChooser()
-        coordinator = chooser.FolderChooser(adapter, retention=.05)
+        assert_manual_early_expiry(self, chooser.FolderChooser)
+
+    def test_repeated_early_timers_keep_original_exact_deadline(self):
+        adapter, now, timers = FakeChooser(PendingNative), [0.], ManualTimers()
+        coordinator = chooser.FolderChooser(adapter, clock=lambda: now[0], retention=.05, timer_factory=timers)
         try:
             ident = uid()
             coordinator.begin({'requestId': ident, 'epoch': coordinator.epoch, 'gesture': {'trusted': True}},
                               Connection(), self.guard)
-            end = time.monotonic() + 2
-            while ident not in coordinator.retired and time.monotonic() < end:
-                time.sleep(.005)
+            row = coordinator.operations[ident]
+            for tick in (.015625, .03125, .046875):
+                now[0] = tick
+                timers.created[-1].fire()
+                self.assertNotIn(ident, coordinator.retired)
+                self.assertEqual(row['at'], 0.)
+                self.assertEqual(len(timers.pending), 1)
+                self.assertAlmostEqual(timers.pending[0].delay, .05 - tick)
+            self.assertEqual(len(timers.created), 4)
+            now[0] = .05
+            timers.created[-1].fire()
             self.assertIn(ident, coordinator.retired)
             self.assertTrue(adapter.natives[0].dead)
+            self.assertEqual(timers.pending, [])
+        finally:
+            coordinator.close()
+
+    def test_queued_callbacks_after_close_or_retirement_never_rearm(self):
+        for close in (True, False):
+            with self.subTest(close=close):
+                adapter, now, timers = FakeChooser(PendingNative), [0.], ManualTimers()
+                coordinator = chooser.FolderChooser(adapter, clock=lambda: now[0], retention=.05, timer_factory=timers)
+                try:
+                    ident = uid()
+                    coordinator.begin({'requestId': ident, 'epoch': coordinator.epoch, 'gesture': {'trusted': True}},
+                                      Connection(), self.guard)
+                    now[0] = .046875
+                    timers.created[0].fire()
+                    latest = timers.created[-1]
+                    with patch.object(adapter.natives[0], 'cancel', wraps=adapter.natives[0].cancel) as cancel:
+                        if close:
+                            coordinator.close()
+                        else:
+                            now[0] = .0625
+                            coordinator.expire()
+                        calls = cancel.call_count
+                        self.assertTrue(latest.cancelled)
+                        for timer in list(timers.created):
+                            timer.fire()
+                        self.assertEqual(cancel.call_count, calls)
+                    self.assertEqual(len(timers.created), 2)
+                    self.assertEqual(timers.pending, [])
+                    self.assertIn(ident, coordinator.retired)
+                finally:
+                    coordinator.close()
+
+    def test_timer_callback_requires_exact_row_and_keeps_unreaped_lease(self):
+        adapter, now, timers = FakeChooser(PendingNative), [0.], ManualTimers()
+        coordinator = chooser.FolderChooser(adapter, clock=lambda: now[0], retention=.05, timer_factory=timers)
+        try:
+            ident = uid()
+            coordinator.begin({'requestId': ident, 'epoch': coordinator.epoch, 'gesture': {'trusted': True}},
+                              Connection(), self.guard)
+            row, timer = coordinator.operations[ident], timers.created[0]
+            now[0] = .046875
+            coordinator._timer_fired(dict(row), timer)
+            self.assertIs(row['timer'], timer)
+            self.assertEqual(len(timers.created), 1)
+            adapter.natives[0].stop_works = False
+            now[0] = .0625
+            timer.fire()
+            self.assertIn(ident, coordinator.retired)
+            self.assertIs(coordinator.active, row)
+            self.assertFalse(adapter.natives[0].dead)
+            self.assertNotIn('timer', row)
+            timer.fire()
+            self.assertEqual(len(timers.created), 1)
         finally:
             coordinator.close()
 
@@ -741,6 +881,11 @@ class CausalTests(unittest.TestCase):
         namespace = {'__name__': 'fictional_chooser_mutant'}
         exec(compile(source.replace(old, new, 1), '<fictional chooser mutant>', 'exec'), namespace)
         return namespace[name]
+
+    def test_early_timer_rearm_mutation_is_caught(self):
+        assert_manual_early_expiry(self, chooser.FolderChooser)
+        with self.assertRaises(AssertionError):
+            assert_manual_early_expiry(self, self.mutant('self._arm_expiry(row, remaining)', 'pass'))
 
     def test_unknown_cancel_expiry_and_no_refresh_mutations_are_caught(self):
         def scenario(factory):

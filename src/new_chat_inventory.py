@@ -10,7 +10,7 @@ import itertools
 import json
 import errno
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import stat
 import sys
 import threading
@@ -175,7 +175,8 @@ class KnownFolderInventory:
                     directory = os.fstat(fd)
                 finally:
                     os.close(fd)
-            if not _valid_path(resolved) or resolved == os.path.sep:
+            physical = PurePath(resolved)
+            if not _valid_path(resolved) or physical.parent == physical:
                 raise ValueError()
             folder = self._folder(resolved, directory)
             return self.require_allowed(validate_folder(folder))

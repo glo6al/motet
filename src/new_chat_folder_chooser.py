@@ -192,10 +192,11 @@ class MacChooser:
 
 class FolderChooser:
     def __init__(self, adapter, proof=None, *, clock=time.monotonic, maximum=128,
-                 known_limit=65536, retention=150, schedule=True):
+                 known_limit=65536, retention=150, schedule=True, timer_factory=None):
         self.adapter, self.proof = adapter, proof if proof is not None else LocalityProof()
         self.clock, self.maximum, self.known_limit, self.retention = clock, maximum, known_limit, retention
         self.schedule, self.epoch = schedule, str(uuid.uuid4())
+        self.timer_factory = timer_factory if timer_factory is not None else threading.Timer
         self.lock = threading.RLock()
         self.operations, self.retired, self.active, self.closed = {}, set(), None, False
         self.unknown_cancels = {}
@@ -244,10 +245,31 @@ class FolderChooser:
                 if now >= deadline:
                     del self.unknown_cancels[ident]
             for row in list(self.operations.values()):
-                if now - row['at'] >= self.retention:
+                if now >= row['at'] + self.retention:
                     self._retire(row)
             if self.active is not None:
                 self._release(self.active)
+
+    def _arm_expiry(self, row, delay):
+        timer = self.timer_factory(delay, lambda: self._timer_fired(row, timer))
+        timer.daemon = True
+        row['timer'] = timer
+        timer.start()
+
+    def _timer_fired(self, row, timer):
+        with self.lock:
+            if (self.closed or self.operations.get(row['id']) is not row
+                    or row.get('timer') is not timer):
+                return
+            row.pop('timer')
+            remaining = row['at'] + self.retention - self.clock()
+            if remaining > 0:
+                # Windows' coarse monotonic clock can still precede the fixed
+                # deadline when a Timer fires. This callback is consumed; keep
+                # exactly one replacement without extending the original TTL.
+                self._arm_expiry(row, remaining)
+            else:
+                self._retire(row)
 
     def _reserve(self, ident):
         self._known_capacity()
@@ -256,10 +278,7 @@ class FolderChooser:
         row = {'id': ident, 'state': 'pending', 'at': self.clock(), 'native': None}
         self.operations[ident] = row
         if self.schedule:
-            timer = threading.Timer(self.retention, self.expire)
-            timer.daemon = True
-            row['timer'] = timer
-            timer.start()
+            self._arm_expiry(row, self.retention)
         return row
 
     def _get(self, ident):
