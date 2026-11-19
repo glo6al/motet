@@ -23,9 +23,11 @@ class EmbedTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / 'src' / 'server.py'
         module = ast.parse(source.read_text())
         method = next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == 'page_with_nonce')
-        scope = {'os': os, 'secrets': secrets, 'HERE': str(self.root), 'UI_CSP': "script-src 'nonce-%s'"}
+        scope = {'os': os, 'secrets': secrets, 'HERE': str(self.root), 'PORT': 18801,
+                 'UI_CSP': "script-src 'nonce-%s' http://127.0.0.1:%d/dictation-worklet.js http://localhost:%d/dictation-worklet.js"}
         exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), scope)
-        self.render = scope['page_with_nonce']
+        # This seam isolates attachment embedding; dictation has real-HTTP coverage separately.
+        self.render = lambda **options: scope['page_with_nonce'](dictation_modules=False, **options)
 
     def tearDown(self):
         self.temp.cleanup()

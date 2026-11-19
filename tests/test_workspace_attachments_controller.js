@@ -9,8 +9,9 @@ const liveDocuments=html.split('/* Workspace live Officer documents: separate as
 const names=['Install','Dispose','Sync','DraftRestore','BeforeRestore','OwnsInput','InterceptSend','InterceptSuggestion','Escape'];
 function sourceFunction(name){const a=html.indexOf('function '+name+'('),b=html.indexOf('\nfunction ',a+10);return html.slice(a,b).replace(/^function /,'function ')}
 class Node{
- constructor(doc,tag='span',text=''){this.doc=doc;this.tagName=tag.toUpperCase();this.childNodes=[];this.attributes={};this.style={position:'',height:'',overflowY:''};this.className='';this._text=text;this.value='';this.hidden=false;this.disabled=false;this.readOnly=false;this.maxLength=2000;this.selectionStart=this.selectionEnd=0;this.selectionDirection='none';this.scrollTop=0;this.scrollHeight=600;this.clientHeight=600;this.handlers=new Map();this.classList={add:n=>{this.className+=' '+n},remove:n=>{this.className=this.className.split(' ').filter(k=>k!==n).join(' ')},contains:n=>this.className.split(' ').includes(n)};}
+ constructor(doc,tag='span',text=''){this.doc=doc;this.tagName=tag.toUpperCase();this.childNodes=[];this.attributes={};this.dataset={};this.style={position:'',height:'',overflowY:''};this.className='';this._text=text;this.value='';this.hidden=false;this.disabled=false;this.readOnly=false;this.maxLength=2000;this.selectionStart=this.selectionEnd=0;this.selectionDirection='none';this.scrollTop=0;this.scrollHeight=600;this.clientHeight=600;this.handlers=new Map();this.classList={add:n=>{this.className+=' '+n},remove:n=>{this.className=this.className.split(' ').filter(k=>k!==n).join(' ')},contains:n=>this.className.split(' ').includes(n)};}
  get parentNode(){return this.parentElement||null}get nextSibling(){if(!this.parentNode)return null;const a=this.parentNode.childNodes;return a[a.indexOf(this)+1]||null}get children(){return this.childNodes}
+ get nextElementSibling(){let next=this.nextSibling;while(next?.nodeType===8)next=next.nextSibling;return next}
  append(...nodes){for(const n of nodes){n.remove();n.parentElement=this;this.childNodes.push(n)}}
  insertBefore(node,next){if(node===next)return;node.remove();node.parentElement=this;const i=this.childNodes.indexOf(next);if(i<0)this.childNodes.push(node);else this.childNodes.splice(i,0,node)}
  before(node){this.parentNode?.insertBefore(node,this)}
@@ -74,7 +75,7 @@ function harness(fixture,{query='?ui=workspace&demo&attachments=a03-five',worksp
  // Retained callbacks from a previous installation/draft cannot mutate a new canonical instance.
  h=harness(fixture('a01-picker'));h.install();choice=h.ids['#ofBody'].all().find(n=>n.classList.contains('workspace-attachments-picker-choice'));const callback=choice.onclick;h.api.workspaceAttachmentsDispose();h.install();const n=h.calls.length;callback();assert.equal(h.calls.length,n);count++;
  // Causal proof: remove each real send guard and the actual extracted path hits an undefined legacy global.
- for(const entry of ['cuSend','ofSend']){const prefix="async function "+entry+"(){\n  if(typeof workspaceLiveDocumentsSend==='function'&&workspaceLiveDocumentsSend())return;",guard=prefix+"\n  if(typeof workspaceAttachmentsInterceptSend==='function'&&workspaceAttachmentsInterceptSend())return;";assert(sends.includes(guard));const code=sends.replace(guard,prefix);const m=harness(fixture('a03-one'));m.install();m.context.workspaceAttachmentsInterceptSend=m.api.workspaceAttachmentsInterceptSend;m.run(code+';globalThis.actual='+entry);await assert.rejects(m.context.actual(),error=>error.name==='ReferenceError')}count++;
+ for(const entry of ['cuSend','ofSend']){const prefix="async function "+entry+"(){\n  if(typeof workspaceDictationBeforeSend==='function')workspaceDictationBeforeSend();\n  if(typeof workspaceLiveDocumentsSend==='function'&&workspaceLiveDocumentsSend())return;",guard=prefix+"\n  if(typeof workspaceAttachmentsInterceptSend==='function'&&workspaceAttachmentsInterceptSend())return;";assert(sends.includes(guard));const code=sends.replace(guard,prefix);const m=harness(fixture('a03-one'));m.install();m.context.workspaceAttachmentsInterceptSend=m.api.workspaceAttachmentsInterceptSend;m.run(code+';globalThis.actual='+entry);await assert.rejects(m.context.actual(),error=>error.name==='ReferenceError')}count++;
  // The fixed demo table is validated in full, including unused entries. No name or provider fallback.
  const expectedBindings=()=>({projectId:'fixture-orchard',agents:{ada:'c:demo-ada',bram:'x:demo-bram',cloud:'e:demo-dot'}});
  for(const key of ['ada','bram','cloud']){
@@ -165,6 +166,89 @@ function harness(fixture,{query='?ui=workspace&demo&attachments=a03-five',worksp
    const busy=harness(fixture('a02-preparing'),{mutate});busy.install();assert.equal(busy.ids['#ofSend'].disabled,true,'actual preparing files still disable Send');
  }
  emptySendAppearance();for(const [from,to] of [["ordinaryEmpty?saved.disabled:!normal.sendEnabled","!normal.sendEnabled"],["!snapshot.draft.fileIds.length&&!ofIn.value.trim()?'':snapshot.draft.sendBlockedReason","snapshot.draft.sendBlockedReason"],["!next.draft.fileIds.length&&!next.draft.text.trim()?'':next.draft.sendBlockedReason","next.draft.sendBlockedReason"]]){assert(controller.includes(from));assert.throws(()=>emptySendAppearance(s=>s.replace(from,to)),assert.AssertionError)}count++;
+ // Motet's model lives inside the address cluster, which is hidden while listening.
+ // Mounted dictation must keep the actual Files control out of that hidden ancestor.
+ function nestedFilesProof(mutate=x=>x){
+   for(const mounted of [false,true]){
+     const q=harness(fixture('a01-officer'),{mutate,globals:{workspaceDictationPlacesFiles:()=>mounted}});
+     q.officer(true);q.context.OFUI.recipient='watch';q.context.OFUI.scope='station';
+     const row=q.ids['#ofRow'],address=q.ids['#ofAddress'],model=q.ids['#ofModelPicker'];
+     row.insertBefore(address,q.ids['#ofSend']);address.append(model);assert.equal(q.install(),true);
+     const files=q.ids['#officer'].all().find(node=>node.classList.contains('workspace-attachments-files'));
+     assert(files);assert.equal(files.parentNode,mounted?row:address,'Canonical attachment paint respects mounted dictation placement');
+     q.api.workspaceAttachmentsSync();assert.equal(files.parentNode,mounted?row:address,'Subsequent attachment paint cannot nest Files back into the hidden address');
+   }
+ }
+ nestedFilesProof();const dictationPlacement="&&!(typeof workspaceDictationPlacesFiles==='function'&&workspaceDictationPlacesFiles())";
+ assert(controller.includes(dictationPlacement));assert.throws(()=>nestedFilesProof(s=>s.replace(dictationPlacement,'')),assert.AssertionError);count++;
+ // Run the exact live-document placement statement too: that independent consumer must
+ // make the same choice even when it repaints after the dictation row observer runs.
+ const livePlacement=liveDocuments.split('\n').find(line=>line.includes('const placement=o.placement?.()'));
+ assert(livePlacement);
+ function liveNestedFilesProof(mutate=x=>x){
+   for(const mounted of [false,true])for(const surface of ['officer','station','room']){
+     const doc={activeElement:null},row=new Node(doc),compose=new Node(doc),send=new Node(doc),address=new Node(doc),model=new Node(doc),plus=new Node(doc),files=new Node(doc);
+     row.append(compose,address,send);address.append(model);
+     const ctx={row,compose,controls:{plus,files},o:{placement:()=>({recipient:address,model}),send},env:()=>({surface}),workspaceDictationPlacesFiles:()=>mounted};
+     vm.runInNewContext('{'+mutate(livePlacement)+'}',ctx);
+     assert.equal(files.parentNode,surface==='officer'&&!mounted?address:row,'Live documents '+surface+' Files placement');
+     if(mounted){address.hidden=true;assert.equal(address.contains(files),false,'Visible Files cannot depend on the hidden dictation address cluster');}
+     vm.runInNewContext('{'+mutate(livePlacement)+'}',ctx);assert.equal(files.parentNode,surface==='officer'&&!mounted?address:row);
+   }
+ }
+ liveNestedFilesProof();assert(livePlacement.includes(dictationPlacement));assert.throws(()=>liveNestedFilesProof(s=>s.replace(dictationPlacement,'')),assert.AssertionError);count++;
+ // The canonical attachment painter and real stage layout share the same model,
+ // Files, editor and microphone nodes through repeated idle/listening paints.
+ function stageModelWithAttachments(mutate=x=>x,mutateController=x=>x){
+  for(const mounted of [true,false]){
+   const q=harness(fixture('a01-room'),{mutate:mutateController,globals:{workspaceDictationPlacesFiles:()=>mounted}}),row=q.ids['#ofRow'],model=q.ids['#ofModelPicker'],compose=q.ids['#ofCompose'],send=q.ids['#ofSend'];q.ids['#officer'].dataset.workspaceComposer='desktop';
+   q.context.focus=null;q.context.OFUI.recipient='watch';q.context.OFUI.scope='room';
+   const mic=new Node(q.doc),cancel=new Node(q.doc),wave=new Node(q.doc),header=new Node(q.doc),toggle=new Node(q.doc);mic.className='dictation-mic';cancel.hidden=wave.hidden=true;if(mounted){row.insertBefore(cancel,send);row.insertBefore(wave,send);row.insertBefore(mic,send)}header.append(model,toggle);q.ids['#officer'].append(header);
+   q.context.WSO={active:true,header,desktop:{toggle}};q.context.workspaceOfficerDesktopEligible=()=>true;q.context.workspaceOfficerNarrowRestore=()=>{};q.context.workspaceOfficerDesktopHistoryPaint=()=>{};
+   const init=()=>{};if(mounted)init.current={view:{mic,cancel,wave}};q.context.workspaceDictationInit=init;q.context.workspaceDictationTarget=()=> 'fictional-room-draft';
+   q.run(mutate(sourceFunction('workspaceOfficerDesktopPaint'))+'\n'+sourceFunction('workspaceDictationOrderControls'));
+   assert.equal(q.install(),true);const draft=q.input.value;assert(row.childNodes.indexOf(compose)<row.childNodes.indexOf(row.querySelector('.workspace-attachments-plus')),'Initial attachment paint orders words before Attach without waiting for a capture observer');
+   for(const active of mounted?[false,true,false,true,false]:[false,false]){
+     if(active)q.ids['#officer'].classList.add('dictation-active');else q.ids['#officer'].classList.remove('dictation-active');
+     q.run('workspaceOfficerDesktopPaint()');q.api.workspaceAttachmentsSync();q.run('workspaceDictationOrderControls()');
+     const plus=row.querySelector('.workspace-attachments-plus'),files=row.querySelector('.workspace-attachments-files');assert(plus&&files);
+     assert.equal(model.parentNode,row,'Attachments never return the model to the stage header');assert.equal(model.nextSibling,mounted?mic:send);if(mounted)assert.equal(mic.nextSibling,send);
+     assert.equal(q.input.parentNode,compose);assert.equal(q.input.value,draft,'Layout paints do not change the current canonical draft');
+     const controls=row.childNodes;
+     assert(controls.indexOf(compose)<controls.indexOf(plus),'Words precede the attachment control row');
+     if(active)assert(controls.indexOf(files)<controls.indexOf(cancel));else assert(controls.indexOf(files)<controls.indexOf(model));
+   }
+  }
+ }
+ stageModelWithAttachments();assert.throws(()=>stageModelWithAttachments(s=>s.replace('row.insertBefore(model,slot);','WSO.header.insertBefore(model,WSO.desktop.toggle);')),assert.AssertionError);assert.throws(()=>stageModelWithAttachments(x=>x,s=>s.replace("if(typeof workspaceDictationOrderControls==='function')workspaceDictationOrderControls();",'')),assert.AssertionError);count++;
+ // Exercise the canonical painter with the real dictation ordering function at
+ // both desks. The editor stays first through repeated attachment repaints.
+ function deskAttachmentOrderProof(mutate=x=>x){
+  for(const officer of [false,true]){
+   const q=harness(fixture(officer?'a01-officer':'a03-one'),{globals:{workspaceDictationPlacesFiles:()=>true}});
+   const row=q.ids['#ofRow'],compose=q.ids['#ofCompose'],send=q.ids['#ofSend'],address=q.ids['#ofAddress'],toolbar=q.ids['#workspaceStationToolbar'];
+   q.doc.body.classList.add(officer?'workspace-officer-desk':'stepped');
+   const recipient=officer?address:toolbar;
+   if(officer){q.officer(true);q.context.OFUI.recipient='watch';q.context.OFUI.scope='station';toolbar.remove();row.insertBefore(address,send);address.append(q.ids['#ofModelPicker']);}
+   const mic=new Node(q.doc),cancel=new Node(q.doc),wave=new Node(q.doc);mic.className='dictation-mic';cancel.className='dictation-cancel';wave.className='dictation-wave';row.insertBefore(cancel,send);row.insertBefore(wave,send);row.insertBefore(mic,send);
+   const init=()=>{};init.current={view:{mic,cancel,wave}};q.context.workspaceDictationInit=init;q.context.workspaceDictationTarget=()=> 'fictional-desk-draft';
+   q.run(mutate(sourceFunction('workspaceDictationOrderControls')));
+   assert.equal(q.install(),true);const draft=q.input.value;
+   q.input.setSelectionRange(2,5,'backward');q.input.scrollTop=17;
+   for(const active of [false,true,false,true,false]){
+    if(active)q.ids['#officer'].classList.add('dictation-active');else q.ids['#officer'].classList.remove('dictation-active');
+    q.api.workspaceAttachmentsSync();
+    const plus=row.querySelector('.workspace-attachments-plus'),files=row.querySelector('.workspace-attachments-files');
+    assert(plus&&files);assert.equal(row.children[0]===compose,true,'The desk words remain above its control row');
+    if(active){assert.equal(plus.nextSibling,files);assert.equal(files.nextSibling,cancel);}
+    else {assert.equal(plus.nextSibling,recipient);assert.equal(recipient.nextSibling,files);}
+    assert.equal(mic.nextSibling,send);assert.equal(q.input.parentNode,compose);assert.equal(q.input.value,draft);
+    assert.deepEqual([q.input.selectionStart,q.input.selectionEnd,q.input.selectionDirection,q.input.scrollTop],[2,5,'backward',17]);
+    files.focus();const before=row.children.slice();q.context.workspaceDictationOrderControls();assert.deepEqual(row.children,before,'Settled desk controls do not move');assert.equal(q.doc.activeElement,files);
+   }
+  }
+ }
+ deskAttachmentOrderProof();assert.throws(()=>deskAttachmentOrderProof(s=>s.replace('if(!stage&&!active){','if(false){')),assert.AssertionError,'Stage ordering must not replace the desk idle row');count++;
  console.log('ok workspace attachments controller: '+count+' behavior groups, canonical fixture and causal send guards');
 })().catch(error=>{console.error(error);process.exitCode=1});
 module.exports={harness,Node,sourceFunction,html,controller,extendedBindings};

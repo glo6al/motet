@@ -38,6 +38,26 @@ jobs:
           python -u -X faulthandler -c "import faulthandler, runpy; print('parser checks started', flush=True); faulthandler.dump_traceback_later(60, repeat=True); runpy.run_path('tests/test_parsers.py', run_name='__main__')"
       - run: python tests/test_app_icons.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_dictation_assets.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+      - run: python tests/test_dictation_runtime.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+      - run: python tests/test_dictation_helper.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+      - run: python tests/test_dictation_proxy.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+      - name: Check dictation routes and nonce delivery over real local HTTP
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python tests/test_dictation_server.py
+      - name: Check synthetic dictation fixture without a microphone
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python tests/test_dictation_fixture.py
       - run: python tests/test_native_sqlite_support.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
@@ -318,6 +338,18 @@ jobs:
       - run: node tests/test_page.js      # the page's path helpers, outside a browser
         if: ${{ !cancelled() }}
         timeout-minutes: 7
+      - name: Check desktop stage message-box ownership
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: node tests/test_message_box.js
+      - name: Check dictation controller without a microphone
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: node tests/test_dictation_page.js
+      - name: Check shared composer dictation integration
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: node tests/test_dictation_integration.js
       - run: node --test docs/fixtures/attachments/fixture.test.mjs
         if: ${{ !cancelled() }}
       - run: node tests/test_attachments_client.js

@@ -1,0 +1,39 @@
+html.workspace #officer button.dictation-tool,html.workspace #officer button.dictation-settings{box-sizing:border-box;flex:none;width:36px;height:36px;min-width:36px;min-height:36px;border:0;border-radius:50%;padding:0;background:transparent;color:#66635d;display:inline-flex;align-items:center;justify-content:center;align-self:flex-end;cursor:pointer;margin:0 0 1px}
+#officer .dictation-tool svg,#officer .dictation-settings svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round}
+#officer .dictation-tool [hidden],#officer .dictation-tool[hidden],#officer .dictation-wave[hidden],#officer .dictation-feedback[hidden],#officer .dictation-settings[hidden],#officer .dictation-mirror[hidden]{display:none!important}
+html.workspace #officer.dictation-active button.dictation-tool{background:#efeeea;color:#1c1b19}
+#officer.dictation-active .dictation-mic rect{fill:#1c1b19;stroke:none}
+#officer .dictation-tool:focus-visible,#officer .dictation-settings:focus-visible{outline:2px solid #1c1b19;outline-offset:2px}
+#officer .dictation-tool:disabled{opacity:.45;cursor:default}
+#officer .dictation-mic{position:relative}
+#officer .dictation-mic-blocked{position:absolute;inset:8px}
+#officer .dictation-wave{flex:1 1 0;min-width:0;overflow:hidden;display:flex;align-items:center;justify-content:flex-end;gap:3px;height:36px;align-self:flex-end;margin:0 10px 1px}
+#officer .dictation-wave .dictation-wave-bar{display:block;flex:none;width:2px;min-height:2px;height:2px;border-radius:1px;background:#9a968e}
+#officer.dictation-active #ofRow{flex-wrap:wrap;align-items:flex-end}
+#officer.dictation-active #ofCompose{flex:0 0 100%;width:100%}
+#officer #ofCompose{position:relative}
+#officer.dictation-listening #ofIn{font-style:italic;caret-color:#1c1b19}
+#officer .dictation-mirror{box-sizing:border-box;position:absolute;overflow:hidden;pointer-events:none;z-index:2;color:#1c1b19}
+#officer .dictation-mirror-ink{box-sizing:border-box;min-height:100%;color:#1c1b19;margin:0;border:0}
+#officer .dictation-provisional{color:#9a968e}
+#officer .dictation-announcer{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+html.workspace body.workspace-officer-desk #officer.dictation-active #ofAddress{display:none!important}
+html.workspace #officer.dictation-mounted #ofRow>.dictation-mic{order:4}
+html.workspace #officer.dictation-mounted #ofRow>#ofSend{order:5}
+html.workspace #officer.dictation-active #ofRow>.dictation-cancel{order:0}
+html.workspace #officer.dictation-active #ofRow>.dictation-wave{order:3}
+html.workspace #officer.dictation-active #ofRow>#ofCompose{order:-1}
+html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>.dictation-mic{order:4!important}
+html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>#ofSend{order:5!important}
+html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>.dictation-mic{margin-left:auto!important}
+html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>#ofSend{margin-left:0!important}
+html.workspace.workspace-attachments body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer].dictation-mounted #ofRow>.workspace-attachments-plus{order:0!important;align-self:flex-end}
+html.workspace.workspace-attachments body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer].dictation-mounted #ofRow>.workspace-attachments-files{order:1!important;align-self:flex-end}
+html.workspace.workspace-attachments #officer.dictation-active #ofRow>.dictation-cancel{order:2!important}
+html.workspace.workspace-attachments #officer.dictation-active #ofRow>.dictation-wave{order:3!important}
+html.workspace.workspace-attachments #officer.dictation-active #ofRow>#ofCompose{order:-1!important}
+#officer .dictation-feedback{display:flex;align-items:center;gap:10px;flex:none;margin:8px 0 4px;font:400 13px/18px system-ui;color:#66635d}
+#officer .dictation-status{flex:1;min-width:0;overflow-wrap:anywhere}
+body.stepped #officer.dictation-active #workspaceStationToolbar{display:none!important}
+@media(max-width:580px){#officer.dictation-active #ofModelPicker{display:none!important}}
+@media(forced-colors:active){#officer .dictation-mirror{display:none!important}#officer.dictation-listening #ofIn{color:CanvasText!important}}

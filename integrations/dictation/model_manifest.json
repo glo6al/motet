@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "engine": "Moonshine Small Streaming English",
+  "packageVersion": "0.1.6",
+  "modelId": "small-streaming-en/quantized_26_11_02",
+  "bytes": 142465862,
+  "licence": "MIT",
+  "licenceUrl": "https://github.com/moonshine-ai/moonshine/blob/v0.1.6/LICENSE",
+  "licenceCheckedAt": "2026-11-19",
+  "licenceScope": "The pinned upstream LICENSE expressly covers all English-language and streaming speech-to-text models under MIT (opening scope statement and section 1).",
+  "files": [
+    {
+      "filename": "adapter.ort",
+      "url": "https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/adapter.ort",
+      "size": 2870320,
+      "sha256": "100d4806a3ba19b739fa9ae5c952e4d5267983090eea4a085e08d3e0bfd6875b",
+      "crc32c": "yw6hxQ==",
+      "licence": "MIT"
+    },
+    {
+      "filename": "cross_kv.ort",
+      "url": "https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/cross_kv.ort",
+      "size": 5356496,
+      "sha256": "aa0ed033b7065ef744c36dce00228c708b43f2f2410e8ec782a960105c8595f7",
+      "crc32c": "1rJswQ==",
+      "licence": "MIT"
+    },
+    {
+      "filename": "decoder_kv.ort",
+      "url": "https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/decoder_kv.ort",
+      "size": 82043616,
+      "sha256": "e4fae3869851b861177b5e1619c77ec9262365b2747ec322298d11753e88b38d",
+      "crc32c": "+Q3U0Q==",
+      "licence": "MIT"
+    },
+    {
+      "filename": "encoder.ort",
+      "url": "https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/encoder.ort",
+      "size": 44148536,
+      "sha256": "f61486dc7b017cee99196366dcc977a173f45f2f387b0b7977695d0f0565d234",
+      "crc32c": "vJtYUQ==",
+      "licence": "MIT"
+    },
+    {
+      "filename": "frontend.model.ort",
+      "url": "https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/frontend.model.ort",
+      "size": 26992,
+      "sha256": "4a8d5ef7e99a5e3011dbf09ffac4176056587f2aec20f885d606b9f55fbed408",
+      "crc32c": "PJW8eA==",
+      "licence": "MIT"
+    },
+    {
+      "filename": "frontend.weights.ort",
+      "url": "https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/frontend.weights.ort",
+      "size": 7769416,
+      "sha256": "5379f3dfebe849c6cbacf84f0aa7441956f9572efe1720d44aa267e7dff93056",
+      "crc32c": "Fdny+w==",
+      "licence": "MIT"
+    },
+    {
+      "filename": "streaming_config.json",
+      "url": "https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/streaming_config.json",
+      "size": 512,
+      "sha256": "26f02b6afb22d60871a5efd85c3d38e569cc0ddb6c5eb6e93d3260152ae8a47a",
+      "crc32c": "dPbFiw==",
+      "licence": "MIT"
+    },
+    {
+      "filename": "tokenizer.bin",
+      "url": "https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/tokenizer.bin",
+      "size": 249974,
+      "sha256": "6884b35fd6377d4c4d32336a0bc152f36b64d1e45b6503683cdc238250a8472d",
+      "crc32c": "B7s10Q==",
+      "licence": "MIT"
+    }
+  ],
+  "metadataSource": "https://github.com/moonshine-ai/moonshine/blob/v0.1.6/core/moonshine-model-file-metadata.generated.cpp",
+  "sizeSource": "Pinned upstream model catalogue",
+  "crc32cSource": "Pinned upstream model catalogue",
+  "sha256Source": "Maintainer-computed integrity pins from downloaded runtime-matched files; not upstream-published SHA-256",
+  "integrityRecordedAt": "2026-11-19"
+}
