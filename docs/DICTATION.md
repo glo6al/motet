@@ -297,13 +297,18 @@ final-event waiting. Each request is limited to the remaining budget or twelve
 seconds, whichever is shorter. Cleanup after a failed Stop shares its original
 budget. A completed event stream can finish Stop before its HTTP reply arrives.
 
-If closure cannot be confirmed, the page says that the microphone is off and
-the visible draft has been kept. A late cleanup warning does not replace a
-newer status or alter a subsequently edited draft. The next take waits for
-cleanup and checks readiness before asking for the microphone. This is a
-bounded recovery attempt, not a guarantee that the helper is idle at the
-deadline: already admitted native work can outlive an HTTP request. A lost
-Start reply can also leave the page without a session ID to cancel. Readiness
+If Cancel cleanup cannot be confirmed, the page says that the microphone is
+off and the visible words are kept. Stop's deadline reports that the last
+words may be missing, including when Stop was acknowledged but final events
+did not arrive. A closure acknowledgement does not prove the final words were
+received. A late cleanup warning does not replace this explanation or a newer
+status, and never alters a subsequently edited draft. When Lock prevents
+cleanup, the page keeps the routine locked-stage ending reason; it does not bypass the
+locked API boundary. The next take waits for cleanup and checks readiness
+before asking for the microphone. This is a bounded recovery attempt, not a
+guarantee that the helper is idle at the deadline: already admitted native
+work can outlive an HTTP request. A lost Start reply can also leave the page
+without a session ID to cancel. Readiness
 checks prevent another take while the helper reports occupied; the helper's
 existing inactivity expiry provides recovery after requests stop. An
 unconfirmed Stop may lose final words that were not yet visible.

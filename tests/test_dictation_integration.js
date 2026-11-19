@@ -1,5 +1,25 @@
 #!/usr/bin/env node
 'use strict';
+const {spawnSync}=require('node:child_process');
+let mainCompleted=false;
+const incompleteMain='test_dictation_integration.js'+': async main did not finish';
+process.once('exit',code=>{
+  if(code===0&&!mainCompleted){console.error(incompleteMain);process.exitCode=1}
+});
+function unfinishedMainProof(){
+  const driver=`const fs=require('node:fs'),path=require('node:path'),Module=require('node:module');
+const filename=path.resolve(process.argv[1]),marker=process.argv[2];let source=fs.readFileSync(filename,'utf8');
+if(source.split(marker).length!==2)throw Error('Expected one async-main marker');
+source=source.replace(marker,marker+'await new Promise(()=>{});');
+const entry=new Module(filename,module);entry.filename=filename;entry.paths=Module._nodeModulePaths(path.dirname(filename));entry._compile(source,filename);`;
+  // The first await is deliberately left unresolved. It precedes this proof,
+  // so the child cannot recursively spawn another copy of itself.
+  const result=spawnSync(process.execPath,['-e',driver,__filename,'async '+'function main(){'],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+  assert.ifError(result.error);assert.equal(result.signal,null);
+  assert.equal(result.status,1,'An unfinished actual async main must exit nonzero');
+  assert(result.stderr.includes(incompleteMain),'The completion sentinel must explain the failure');
+  assert(!result.stdout.includes('Dictation integration checks completed.'),'An unfinished main cannot print its completion line');
+}
 /* Page wiring only: fictional keys/drafts, no browser microphone or external requests. */
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 const html=fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8').replace(/\r\n?/g,'\n');
@@ -269,5 +289,7 @@ async function main(){
   for(const target of ["if(e.key==='Escape'&&typeof workspaceAttachmentsEscape==='function'&&workspaceAttachmentsEscape(e))return;","if(e.key==='Escape'&&DESK.drawer){e.preventDefault();e.stopImmediatePropagation();deskCloseDrawer();render();return}"])assert.throws(()=>windowEscapeProof(s=>s.replace(target,'')),assert.AssertionError,'Foreground Escape precedence mutation caught');
   assert(wiring.includes("help.href='/dictation-help'"));assert(wiring.includes("help.rel='noopener noreferrer'"));assert(!/X-Dictation-Key|127\.0\.0\.1:[0-9]|\.live-room|localStorage/.test(wiring),'page wiring contains no helper capability, private path or extra persistence');
   console.log('ok dictation page wiring: inert demo/classic/load, Send/draft fences, stage words before controls with no-view/live-paint/real-Settings-comment/desk boundaries, stationary editor focus, real Escape/popup precedence, private adapter, desk attachment ordering, exact stop reasons and causal mutation checks');
+  unfinishedMainProof();
+  console.log('Dictation integration checks completed.');
 }
-main().catch(error=>{console.error(error);process.exitCode=1});
+main().then(()=>{mainCompleted=true}).catch(error=>{console.error(error);process.exitCode=1});

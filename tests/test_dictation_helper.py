@@ -220,6 +220,28 @@ class ServiceTests(unittest.TestCase):
             self.service.events(ident, 0)
         self.assertEqual(error.exception.code, 'events_expired')
 
+    def test_command_admission_wait_is_exactly_100_milliseconds(self):
+        self.assertEqual(COMMAND_WAIT_SECONDS, .1)
+
+    def test_real_held_lock_refuses_terminal_commands_without_ending_the_take(self):
+        # Pin first: a 30-second policy mutant must fail before a real wait.
+        self.assertEqual(COMMAND_WAIT_SECONDS, .1)
+        for action in ('stop', 'cancel'):
+            with self.subTest(action=action):
+                ident = self.service.start(.25)['sessionId']
+                before = list(self.engine.calls)
+                # This is the unwrapped production lock. The holder cannot
+                # release before the refusal, so there is no success margin.
+                with self.service.command:
+                    with self.assertRaises(ServiceError) as error:
+                        self.service.control(ident, action)
+                    self.assertEqual((error.exception.status, error.exception.code), (409, 'busy'))
+                    self.assertEqual(self.engine.calls, before)
+                    self.assertFalse(self.service.sessions[ident]['ended'])
+                    self.assertEqual(self.service.status()['state'], 'listening')
+                self.assertTrue(self.service.control(ident, action)['ended'])
+                self.assertEqual(self.service.status()['state'], 'ready')
+
     def test_concurrent_command_is_rejected_instead_of_queued(self):
         for action in ('stop', 'cancel'):
             with self.subTest(action=action):

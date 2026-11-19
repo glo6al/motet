@@ -5,9 +5,9 @@
     not_installed: 'Dictation is not set up on this computer yet. Turn it on in Settings.',
     not_running: 'Dictation is not running. Start it, then press the microphone again.',
     loading: 'Dictation is loading on this computer. Try again in a moment.',
-    busy: 'Dictation is busy on this computer. Wait a moment, then try again.',
-    control_unconfirmed: 'The microphone is off, but the local dictation take could not be confirmed closed. Your visible draft has been kept. Wait a moment before dictating again.',
-    finalize_unconfirmed: 'Dictation stopped here, but its final words could not be confirmed. Your visible words are kept.',
+    busy: 'Dictation is busy. If another window is dictating, stop it there. Otherwise wait a moment and try again.',
+    control_unconfirmed: 'The microphone is off and your words are kept. Dictation did not confirm that it stopped, so wait a moment before dictating again.',
+    finalize_unconfirmed: 'Dictation stopped, but the last words may be missing. The words you can see are kept.',
     microphone_blocked: 'Motet cannot use the microphone. Allow it for this page in your browser’s settings, then press the microphone again.',
     microphone_missing: 'No microphone was found. Connect one and try again.',
     insecure_context: 'The microphone needs a secure connection. Open Motet using localhost or a trusted HTTPS connection.',
@@ -193,12 +193,14 @@
           const result = await request(action, { sessionId: current.sessionId }, action === 'cancel' ? { keepalive: true } : {},
             action === 'stop' ? current : null, false, deadline);
           if (result.sessionId !== current.sessionId || result.ended !== true) throw problem('control_unconfirmed');
+          if (action === 'stop') current.stopAcknowledged = true;
           return result;
         } catch (error) {
           if (action === 'stop' && (!valid(current) || current.backendEnded)) return;
           if (action === 'cancel' && error && ['ended','unknown_session'].includes(error.code)) return;
-          if (action === 'stop' && error && error.code === 'ended') return; // Let the event poll drain final words.
+          if (action === 'stop' && error && error.code === 'ended') { current.stopAcknowledged = true;return; } // Still drain final events.
           if (action === 'stop' && error && error.code === 'unknown_session') throw problem('finalize_unconfirmed');
+          if (action === 'stop' && now() >= deadline) throw problem('finalize_unconfirmed');
           if (!error || error.code !== 'busy') throw error;
           if (action === 'stop' && (!valid(current) || current.backendEnded)) return;
           const remaining = deadline - now();
@@ -206,29 +208,31 @@
           await withinDeadline(new Promise(resolve => setTimeout(resolve, Math.min(BUSY_RETRY_MS, remaining))), deadline);
         }
       }
-      throw problem('control_unconfirmed');
+      throw problem(action === 'stop' ? 'finalize_unconfirmed' : 'control_unconfirmed');
     }
     function rememberCleanup(current) {
       if (current && current.cancelScheduled) current.cleanupFeedback = {
         operation, target: target(), text: textarea.value, feedback: feedbackVersion, status: statusVersion
       };
     }
-    function cleanupWarning(current) {
+    function cleanupWarning(current, error) {
       const stamp = current.cleanupFeedback;
       if (destroyed || take || composing || !stamp || operation !== stamp.operation || target() !== stamp.target
           || current.target !== stamp.target || textarea.value !== stamp.text || feedbackVersion !== stamp.feedback
-          || statusVersion !== stamp.status || detail.message === COPY.control_unconfirmed) return;
+          || statusVersion !== stamp.status || [COPY.control_unconfirmed,COPY.finalize_unconfirmed].includes(detail.message)) return;
+      // Lock intentionally revokes adapter access; keep its explicit context reason.
+      if (detail.reason === 'locked' && error && error.code === 'unavailable' && !canUse()) return;
       setState('idle', { code: 'control_unconfirmed', reason: 'cleanup_unconfirmed',
         message: COPY.control_unconfirmed, announcement: COPY.control_unconfirmed });
     }
     function scheduleCancel(current) {
-      if (!current || current.cancelScheduled || (!current.sessionId && !current.startPromise)) return;
+      if (!current || current.cancelScheduled || current.backendEnded || current.stopAcknowledged || (!current.sessionId && !current.startPromise)) return;
       current.cancelScheduled = true;
       const prior = cleanup, deadline = terminalDeadline(current);
       cleanup = withinDeadline(Promise.allSettled([prior, current.queue, current.startPromise]), deadline).then(() => {
-        if (current.sessionId && !current.backendEnded) return terminalRequest(current, 'cancel', deadline);
+        if (current.sessionId && !current.backendEnded && !current.stopAcknowledged) return terminalRequest(current, 'cancel', deadline);
         if (!current.sessionId && current.startUnconfirmed) throw problem('control_unconfirmed');
-      }).catch(() => cleanupWarning(current));
+      }).catch(error => cleanupWarning(current, error));
     }
     function retire(current) {
       if (!current) return;
@@ -497,7 +501,7 @@
       if (state !== 'listening') { abandon(current, 'idle', '', { reason: 'stop', announcement: 'Dictation stopped' }); return; }
       setState('finishing', { message: 'Finishing the last words…' });
       releaseCapture(current);
-      current.finishTimer = setTimeout(() => fail(current, problem('control_unconfirmed')), Math.max(0, deadline - now()));
+      current.finishTimer = setTimeout(() => fail(current, problem('finalize_unconfirmed')), Math.max(0, deadline - now()));
       try {
         await new Promise((resolve, reject) => {
           const timer = setTimeout(() => { current.flushResolver = null; reject(problem('failed')); }, 750);
@@ -507,7 +511,7 @@
         current.acceptFrames = false; closeGraph(current);
         if (!still(current)) return;
         await withinDeadline(queue(current, () => terminalRequest(current, 'stop', deadline)), deadline);
-      } catch (error) { fail(current, error); }
+      } catch (error) { fail(current, now() >= deadline ? problem('finalize_unconfirmed') : error); }
       return current.done;
     }
     function cancel() {
