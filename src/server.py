@@ -4884,8 +4884,15 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
+        # HTTP/1.1 clients pool sockets unless the response advertises closure.
+        # A route that closes must not be reopened by an extra keep-alive header.
+        must_close = self.close_connection
         for k, v in extra:
+            if must_close and k.lower() == 'connection':
+                continue
             self.send_header(k, v)
+        if must_close:
+            self.send_header('Connection', 'close')
         self.end_headers()
         self.wfile.write(body)
 
