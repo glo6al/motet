@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import {Readable} from 'node:stream';
 import {randomUUID,createHash,createHmac} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
@@ -13,6 +14,20 @@ const here=path.dirname(new URL(import.meta.url).pathname),script=process.env.WA
 const {PeerClient}=await import(new URL(script,'file://').href);
 const hash=v=>createHash('sha256').update(v).digest('hex');
 const hmac=(secret,lines)=>createHmac('sha256',Buffer.from(secret,'hex')).update(lines.join('\n')).digest('hex');
+async function readRequestText(req){
+ const chunks=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
+ return Buffer.concat(chunks).toString('utf8');
+}
+test('fixture preserves UTF-8 across every request chunk boundary',async()=>{
+ const text=JSON.stringify({message:'Fictional ASCII, café, Ω, 中文 and 😀.'}),bytes=Buffer.from(text),secret='a'.repeat(64);
+ const signature=body=>hmac(secret,['fixture-request',hash(body)]);
+ for(let cut=1;cut<bytes.length;cut++){
+  const body=await readRequestText(Readable.from([bytes.subarray(0,cut),bytes.subarray(cut)]));
+  assert.equal(body,text,'UTF-8 boundary '+cut);
+  assert.equal(hash(body),hash(text),'body digest at '+cut);
+  assert.equal(signature(body),signature(text),'request signature at '+cut);
+ }
+});
 async function fixture(){
  const root=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'watch-peer-'));await fs.chmod(root,0o700);
  const config=path.join(root,'peer-credentials');await fs.mkdir(config,{mode:0o700});
@@ -21,7 +36,7 @@ async function fixture(){
  const native=randomUUID(),agent='x:'+native,target={agent_id:agent,name:'Worker',provider:'codex',project_id:'c'.repeat(64),project_label:'Example / Project',identity_revision:'d'.repeat(64)};
  let mode='normal';const seen=[],run=randomUUID(),sockets=new Set();
  const server=http.createServer(async(req,res)=>{
-  let raw='';for await(const b of req)raw+=b;seen.push({path:req.url,raw,headers:req.headers,socket:req.socket});
+  const raw=await readRequestText(req);seen.push({path:req.url,raw,headers:req.headers,socket:req.socket});
   if(mode==='hang')return;
   if(req.url==='/bridge/v2/challenge'){
    const p=JSON.parse(raw);assert.deepEqual(Object.keys(p),['credential_id','nonce']);assert.equal(p.credential_id,credential.credential_id);assert.match(p.nonce,/^[a-f0-9]{64}$/);
@@ -154,7 +169,7 @@ test('unsafe service credential startup prints no paths, credentials or stdout',
 test('a relay on another port cannot forward the real proof and obtain a sensitive RPC body',async()=>{
  const f=await fixture(),seen=[],sockets=new Set();
  const relay=http.createServer(async(req,res)=>{
-  let raw='';for await(const b of req)raw+=b;seen.push({path:req.url,raw});
+  const raw=await readRequestText(req);seen.push({path:req.url,raw});
   const upstream=http.request({host:'127.0.0.1',port:f.credential.port,path:req.url,method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(raw)}},response=>{const chunks=[];response.on('data',b=>chunks.push(b));response.on('end',()=>{const body=Buffer.concat(chunks);res.writeHead(response.statusCode,{'Content-Length':body.length});res.end(body)})});upstream.on('error',()=>res.destroy());upstream.end(raw);
  });
  relay.on('connection',s=>{sockets.add(s);s.on('close',()=>sockets.delete(s))});await new Promise(r=>relay.listen(0,'127.0.0.1',r));
