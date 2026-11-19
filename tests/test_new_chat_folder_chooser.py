@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 import uuid
 from unittest.mock import patch
@@ -230,12 +231,50 @@ class LifecycleTests(unittest.TestCase):
             self.begin()
         self.now[0] += 151
         self.coordinator.expire()
-        self.assertEqual(len(self.coordinator.retired), 2)
+        self.assertEqual(len(self.coordinator.retired), 1)
+        self.assertEqual(self.coordinator.unknown_cancels, {})
+        self.cancel(uid())
         self.cancel(uid())
         with self.assertRaises(NewChatError) as error:
             self.begin()
         self.assertEqual(error.exception.status, 429)
-        self.assertEqual(len(self.coordinator.operations) + len(self.coordinator.retired), 3)
+        self.assertEqual(len(self.coordinator.operations) + len(self.coordinator.retired) + len(self.coordinator.unknown_cancels), 3)
+
+    def test_unknown_cancel_ttl_blocks_late_begin_then_frees_capacity_without_refresh(self):
+        self.coordinator.known_limit = 1
+        data = self.data()
+        self.cancel(data['requestId'])
+        deadline = self.coordinator.unknown_cancels[data['requestId']]
+        self.now[0] += 149
+        self.cancel(data['requestId'])
+        self.assertEqual(self.coordinator.unknown_cancels[data['requestId']], deadline)
+        with self.assertRaises(NewChatError) as error:
+            self.begin(data)
+        self.assertEqual(error.exception.status, 410)
+        with self.assertRaises(NewChatError) as error:
+            self.cancel(uid())
+        self.assertEqual(error.exception.status, 429)
+        self.assertEqual(self.adapter.calls, [])
+        self.now[0] += 2
+        # The finite pre-begin cancellation boundary is intentional: after TTL
+        # this previously unseen ID may begin, and actual begun IDs stay known.
+        self.assertEqual(self.begin(data)[1]['state'], 'pending')
+        self.assertEqual(len(self.adapter.calls), 1)
+        self.assertNotIn(data['requestId'], self.coordinator.unknown_cancels)
+
+    def test_unknown_cancel_expiry_never_releases_active_native(self):
+        unknown = uid()
+        self.cancel(unknown)
+        self.now[0] += 10
+        data, _ = self.begin()
+        active = self.coordinator.active
+        self.adapter.natives[-1].stop_works = False
+        self.now[0] += 141
+        self.coordinator.expire()
+        self.assertNotIn(unknown, self.coordinator.unknown_cancels)
+        self.assertIs(self.coordinator.active, active)
+        self.assertIn(data['requestId'], self.coordinator.operations)
+        self.assertFalse(self.adapter.natives[-1].dead)
 
     def test_payload_capacity_recovers_after_expiry_without_evicting_id_protection(self):
         self.coordinator.maximum = 2
@@ -288,6 +327,29 @@ class LifecycleTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_mac_protocol_and_receipt_ignore_host_windows_isabs_rule(self):
+        path = '/fictional/Caf\u00e9 Orchard'
+        encoded = b'selected:' + base64.b64encode(path.encode('utf-8'))
+        imitation = SimpleNamespace(isabs=lambda value: str(value).startswith('\\\\')
+                                    or len(str(value)) > 2 and str(value)[1:3] in (':\\', ':/'))
+        adapter = FakeChooser()
+        coordinator = chooser.FolderChooser(adapter, schedule=False)
+        try:
+            ident = uid()
+            coordinator.begin({'requestId': ident, 'epoch': coordinator.epoch, 'gesture': {'trusted': True}},
+                              Connection(), lambda: None)
+            adapter.natives[-1].release.set()
+            token = settle(coordinator, ident, 'selected')['selectionToken']
+            with patch.object(os, 'path', imitation):
+                self.assertFalse(os.path.isabs(path), 'Fixture imitates modern Windows single-slash handling')
+                self.assertTrue(chooser._path(path))
+                self.assertFalse(chooser._path('C:\\fictional\\Orchard'))
+                self.assertEqual(native.decode_choice(encoded), {'state': 'selected', 'path': path})
+                result = coordinator.accept(ident, {'selectionToken': token}, lambda _: saved(), lambda: None)
+                self.assertEqual(result['state'], 'saved')
+        finally:
+            coordinator.close()
+
     def test_accented_space_protocol_strict_decoding_and_no_typed_fallback(self):
         path = '/fictional/Caf\u00e9 Orchard/'
         value = b'selected:' + base64.b64encode(path.encode('utf-8')) + b'\n'
@@ -523,14 +585,213 @@ class NativeTests(unittest.TestCase):
                 self.assertNotIn({'state': 'started'}, frames)
                 self.assertEqual(frames[-1]['state'], 'cancelled' if parent_loss else 'failed')
 
+    def test_opened_window_deadlines_cancel_but_launch_and_io_failures_do_not(self):
+        for outcome in ('watchdog', 'collection_deadline', 'script_timeout', 'io_timeout', 'decode_error', 'launch_error'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as root:
+                _, fd, identity = self.lease(root)
+                process, frames = FakeProcess(), []
+                def popen(*args, **kw):
+                    if outcome == 'launch_error':
+                        raise OSError('fictional launch failure')
+                    return process
+                def collect(child, stopped, *args, **kw):
+                    if outcome == 'watchdog':
+                        self.assertTrue(stopped.wait(1))
+                        raise native.CollectionStopped()
+                    if outcome == 'collection_deadline':
+                        raise native.CollectionTimeout()
+                    if outcome == 'io_timeout':
+                        raise TimeoutError('fictional unrelated pipe I/O timeout')
+                    if outcome == 'decode_error':
+                        return b'not a chooser result'
+                    child.returncode = 0
+                    return b'cancelled\n'  # AppleScript -1712 protocol result
+                with patch.object(native, 'collect', side_effect=collect):
+                    native.helper({'parent': 42, 'fd': fd, 'lease': list(identity), 'initial': ''},
+                                  parent=lambda: 42, popen=popen, emit=frames.append,
+                                  lifetime=.02 if outcome == 'watchdog' else 120)
+                expected = 'cancelled' if outcome in ('watchdog', 'collection_deadline', 'script_timeout') else 'failed'
+                self.assertEqual(frames[-1], {'state': expected})
+                if outcome == 'launch_error':
+                    self.assertEqual(frames, [{'state': 'failed'}])
+                else:
+                    self.assertEqual(frames[0], {'state': 'started'})
+                    self.assertIsNotNone(process.returncode, 'Every opened child is killed/reaped or exited')
+
+    def test_observed_error_survives_cleanup_deadline_and_selected_remains_fenced(self):
+        def scenario(helper, native_module):
+            for outcome in ('io', 'protocol', 'failed_protocol', 'selected'):
+                with tempfile.TemporaryDirectory() as root:
+                    _, fd, identity = self.lease(root)
+                    process, frames, stop_events = FakeProcess(), [], []
+                    def collect(child, stopped, *args, **kw):
+                        stop_events.append(stopped)
+                        if outcome == 'io':
+                            raise OSError('fictional immediate read failure')
+                        if outcome == 'protocol':
+                            return b'fictional invalid protocol'
+                        if outcome == 'failed_protocol':
+                            child.returncode = 0
+                            return b'failed\n'
+                        child.returncode = 0
+                        return b'selected:' + base64.b64encode(b'/fictional/Orchard')
+                    original_stop = native_module.stop_child
+                    def slow_cleanup(child):
+                        self.assertTrue(stop_events[0].wait(1), 'Cleanup must cross the watchdog deadline')
+                        return original_stop(child)
+                    with patch.object(native_module, 'collect', side_effect=collect), \
+                            patch.object(native_module, 'stop_child', side_effect=slow_cleanup):
+                        helper({'parent': 42, 'fd': fd, 'lease': list(identity), 'initial': ''},
+                               parent=lambda: 42, popen=lambda *a, **kw: process,
+                               emit=frames.append, lifetime=.02)
+                    self.assertEqual(frames, [{'state': 'started'},
+                                             {'state': 'cancelled' if outcome == 'selected' else 'failed'}])
+                    self.assertIsNotNone(process.returncode)
+        scenario(native.helper, native)
+        source = Path(native.__file__).read_text()
+        for old, new in (
+            ('not stopped.is_set() or preserve_error', 'not stopped.is_set()'),
+            ("observed_error = value['state'] == 'failed'", 'observed_error = False'),
+        ):
+            self.assertIn(old, source)
+            namespace = {'__name__': 'fictional_cleanup_deadline_mutant'}
+            exec(compile(source.replace(old, new, 1), '<fictional cleanup deadline mutant>', 'exec'), namespace)
+            # Patch the actual mutant function's globals; no mirrored helper.
+            mutant_module = SimpleNamespace(**namespace)
+            def run_mutant(*args, **kwargs):
+                with patch.dict(namespace, {'collect': mutant_module.collect, 'stop_child': mutant_module.stop_child}):
+                    return namespace['helper'](*args, **kwargs)
+            with self.assertRaises(AssertionError):
+                scenario(run_mutant, mutant_module)
+
+    def test_parent_and_explicit_cancel_keep_precedence_during_slow_cleanup(self):
+        for reason in ('parent', 'cancel'):
+            for outcome in ('selected', 'io', 'failed_protocol'):
+                with self.subTest(reason=reason, outcome=outcome), tempfile.TemporaryDirectory() as root:
+                    _, fd, identity = self.lease(root)
+                    process, frames, stop_events, current_parent = FakeProcess(), [], [], [42]
+                    def collect(child, stopped, *args, **kw):
+                        stop_events.append(stopped)
+                        if outcome == 'io':
+                            raise OSError('fictional immediate read failure')
+                        child.returncode = 0
+                        if outcome == 'failed_protocol':
+                            return b'failed\n'
+                        return b'selected:' + base64.b64encode(b'/fictional/Orchard')
+                    original_stop = native.stop_child
+                    def slow_cleanup(child):
+                        if reason == 'parent':
+                            current_parent[0] = 43
+                        else:
+                            # Invoke the installed helper handler directly; no
+                            # OS signal, native process or chooser is involved.
+                            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                        self.assertTrue(stop_events[0].wait(1))
+                        threading.Event().wait(.12)  # cross deadline/watchdog tick
+                        return original_stop(child)
+                    with patch.object(native, 'collect', side_effect=collect), \
+                            patch.object(native, 'stop_child', side_effect=slow_cleanup):
+                        native.helper({'parent': 42, 'fd': fd, 'lease': list(identity), 'initial': ''},
+                                      parent=lambda: current_parent[0], popen=lambda *a, **kw: process,
+                                      emit=frames.append, lifetime=.02)
+                    self.assertEqual(frames, [{'state': 'started'}, {'state': 'cancelled'}])
+                    self.assertIsNotNone(process.returncode)
+
+    def test_collection_deadline_and_stop_have_distinct_non_io_exceptions(self):
+        read_fd, write_fd = os.pipe()
+        process, stopped = FakeProcess(), threading.Event()
+        process.stdout = os.fdopen(read_fd, 'rb')
+        try:
+            with self.assertRaises(native.CollectionTimeout):
+                native.collect(process, stopped, .01)
+            stopped.set()
+            with self.assertRaises(native.CollectionStopped):
+                native.collect(process, stopped, .01)
+            stopped.clear()
+            os.write(write_fd, b'x')
+            with patch.object(native.os, 'read', side_effect=TimeoutError('fictional I/O timeout')):
+                with self.assertRaises(TimeoutError):
+                    native.collect(process, stopped, .01)
+        finally:
+            os.close(write_fd)
+            process.stdout.close()
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'AppleScript handler runtime is available only on macOS.')
+    def test_actual_applescript_error_handler_only_maps_user_cancel_and_timeout(self):
+        def scenario(source):
+            body = source.split('    on error number errorNumber\n', 1)[1].split('    end try', 1)[0]
+            script = ('on run argv\ntry\nerror number ((item 1 of argv) as integer)\n'
+                      'on error number errorNumber\n' + body + 'end try\nend run\n')
+            self.assertNotIn('activate', script)
+            self.assertNotIn('choose folder', script)
+            for code, expected in ((-128, b'cancelled'), (-1712, b'cancelled'), (-1, b'failed')):
+                result = subprocess.run(['/usr/bin/osascript', '-', str(code)], input=script.encode('utf-8'),
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        env=native.ENV, timeout=5, check=True)
+                self.assertEqual(result.stdout.strip(), expected)
+        scenario(native.APPLE_SCRIPT)
+        with self.assertRaises(AssertionError):
+            scenario(native.APPLE_SCRIPT.replace(' or errorNumber is -1712', '', 1))
+
 
 class CausalTests(unittest.TestCase):
-    def mutant(self, old, new):
+    def mutant(self, old, new, name='FolderChooser'):
         source = Path(chooser.__file__).read_text()
         self.assertIn(old, source)
         namespace = {'__name__': 'fictional_chooser_mutant'}
         exec(compile(source.replace(old, new, 1), '<fictional chooser mutant>', 'exec'), namespace)
-        return namespace['FolderChooser']
+        return namespace[name]
+
+    def test_unknown_cancel_expiry_and_no_refresh_mutations_are_caught(self):
+        def scenario(factory):
+            adapter, now = FakeChooser(), [100]
+            coordinator = factory(adapter, clock=lambda: now[0], schedule=False, known_limit=1)
+            ident = uid()
+            data = {'requestId': ident, 'epoch': coordinator.epoch, 'gesture': {'trusted': True}}
+            try:
+                coordinator.cancel(ident, {'epoch': coordinator.epoch})
+                deadline = coordinator.unknown_cancels[ident]
+                now[0] += 149
+                coordinator.cancel(ident, {'epoch': coordinator.epoch})
+                self.assertEqual(coordinator.unknown_cancels[ident], deadline)
+                with self.assertRaises(NewChatError):
+                    coordinator.begin(data, Connection(), lambda: None)
+                now[0] += 2
+                self.assertEqual(coordinator.begin(data, Connection(), lambda: None)['state'], 'pending')
+                self.assertEqual(len(adapter.calls), 1)
+                now[0] += 151
+                coordinator.expire()
+                self.assertIn(ident, coordinator.retired, 'An actually begun ID has permanent replay protection')
+                with self.assertRaises(NewChatError) as error:
+                    coordinator.begin(data, Connection(), lambda: None)
+                self.assertEqual(error.exception.status, 410)
+            finally:
+                coordinator.close()
+        scenario(chooser.FolderChooser)
+        for old, new in (
+            ('del self.unknown_cancels[ident]', 'pass'),
+            ("if ident in self.unknown_cancels:\n                    return", "if ident in self.unknown_cancels:\n                    self.unknown_cancels[ident] = self.clock() + self.retention\n                    return"),
+        ):
+            with self.assertRaises((AssertionError, NewChatError)):
+                scenario(self.mutant(old, new))
+
+    def test_posix_validator_mutations_fail_under_windows_rule(self):
+        path = '/fictional/Caf\u00e9 Orchard'
+        encoded = b'selected:' + base64.b64encode(path.encode('utf-8'))
+        imitation = SimpleNamespace(isabs=lambda value: False)
+        def scenario(validate, decode):
+            with patch.object(os, 'path', imitation):
+                self.assertTrue(validate(path))
+                self.assertEqual(decode(encoded), {'state': 'selected', 'path': path})
+        scenario(chooser._path, native.decode_choice)
+        with self.assertRaises(AssertionError):
+            scenario(self.mutant('posixpath.isabs(value)', 'os.path.isabs(value)', '_path'), native.decode_choice)
+        source = Path(native.__file__).read_text()
+        namespace = {'__name__': 'fictional_posix_decoder_mutant'}
+        exec(compile(source.replace('posixpath.isabs(path)', 'os.path.isabs(path)', 1),
+                     '<fictional posix decoder mutant>', 'exec'), namespace)
+        with self.assertRaises(ValueError):
+            scenario(chooser._path, namespace['decode_choice'])
 
     def test_expired_id_replay_guard_mutation_is_caught(self):
         def scenario(factory):
@@ -547,7 +808,7 @@ class CausalTests(unittest.TestCase):
                 coordinator.close()
         scenario(chooser.FolderChooser)
         with self.assertRaises(AssertionError):
-            scenario(self.mutant("if data['requestId'] in self.retired:", 'if False:'))
+            scenario(self.mutant("if data['requestId'] in self.retired or data['requestId'] in self.unknown_cancels:", 'if False:'))
 
     def test_epoch_guard_mutation_is_caught(self):
         def scenario(factory):
@@ -573,12 +834,12 @@ class CausalTests(unittest.TestCase):
                 with self.assertRaises(NewChatError) as error:
                     coordinator.cancel(uid(), {'epoch': coordinator.epoch})
                 self.assertEqual(error.exception.status, 429)
-                self.assertEqual(len(coordinator.retired), 2)
+                self.assertEqual(len(coordinator.unknown_cancels), 2)
             finally:
                 coordinator.close()
         scenario(chooser.FolderChooser)
         with self.assertRaises(AssertionError):
-            scenario(self.mutant('if len(self.operations) + len(self.retired) >= self.known_limit:', 'if False:'))
+            scenario(self.mutant('if len(self.operations) + len(self.retired) + len(self.unknown_cancels) >= self.known_limit:', 'if False:'))
 
     def test_unknown_commit_guard_mutation_is_caught(self):
         def scenario(factory):

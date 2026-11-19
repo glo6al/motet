@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import selectors
 import signal
 import stat
@@ -37,7 +38,7 @@ on run argv
         set dataBytes to value's dataUsingEncoding:(current application's NSUTF8StringEncoding)
         return "selected:" & ((dataBytes's base64EncodedStringWithOptions:0) as text)
     on error number errorNumber
-        if errorNumber is -128 then return "cancelled"
+        if errorNumber is -128 or errorNumber is -1712 then return "cancelled"
         return "failed"
     end try
 end run
@@ -61,7 +62,7 @@ def decode_choice(raw):
     if not text.startswith('selected:'):
         raise ValueError()
     path = base64.b64decode(text[9:], validate=True).decode('utf-8', 'strict')
-    if (not os.path.isabs(path) or len(path) > 4096
+    if (not posixpath.isabs(path) or len(path) > 4096
             or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in path)):
         raise ValueError()
     return {'state': 'selected', 'path': path}
@@ -89,6 +90,14 @@ def stop_child(child):
     return child.poll() is not None
 
 
+class CollectionStopped(Exception):
+    """The watchdog or explicit cancellation stopped a collection."""
+
+
+class CollectionTimeout(Exception):
+    """Only our bounded collection deadline, not an unrelated I/O timeout."""
+
+
 def collect(child, stop, timeout, *, maximum=LIMIT):
     end, raw = time.monotonic() + timeout, bytearray()
     with selectors.DefaultSelector() as selector:
@@ -105,7 +114,9 @@ def collect(child, stop, timeout, *, maximum=LIMIT):
             raw.extend(chunk)
             if len(raw) > maximum:
                 raise ValueError()
-    raise TimeoutError()
+    if stop.is_set():
+        raise CollectionStopped()
+    raise CollectionTimeout()
 
 
 def helper(data, *, popen=subprocess.Popen, parent=os.getppid, emit=None, lifetime=120):
@@ -116,24 +127,34 @@ def helper(data, *, popen=subprocess.Popen, parent=os.getppid, emit=None, lifeti
         emit({'state': 'cancelled'})
         return
     stopped, finished = threading.Event(), threading.Event()
+    opened = threading.Event()
     why = ['failed']
+    stop_reason = ['']
+    stop_lock = threading.RLock()
     deadline = time.monotonic() + lifetime
+    def request_stop(reason):
+        with stop_lock:
+            if reason == 'deadline' and stop_reason[0] in ('parent', 'cancel'):
+                return
+            stop_reason[0] = reason
+            why[0] = 'cancelled' if reason != 'deadline' or opened.is_set() else 'failed'
+            stopped.set()
     def watch():
         while not finished.wait(.1):
+            if stopped.is_set():
+                return
             if parent() != expected_parent:
-                why[0] = 'cancelled'
-                stopped.set()
+                request_stop('parent')
                 return
             if time.monotonic() >= deadline:
-                stopped.set()
+                request_stop('deadline')
                 return
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     previous = None
     if threading.current_thread() is threading.main_thread():
         def cancelled(*_):
-            why[0] = 'cancelled'
-            stopped.set()
+            request_stop('cancel')
         previous = signal.signal(signal.SIGTERM, cancelled)
     children = []
     try:
@@ -147,7 +168,7 @@ def helper(data, *, popen=subprocess.Popen, parent=os.getppid, emit=None, lifeti
                 value = json.loads(collect(resolver, stopped, 2))
                 if type(value) is str and (not value or os.path.isabs(value)):
                     initial = value
-            except (ValueError, OSError, TimeoutError, subprocess.SubprocessError):
+            except (ValueError, OSError, CollectionTimeout, CollectionStopped, subprocess.SubprocessError):
                 if not stop_child(resolver):
                     raise RuntimeError()
             finally:
@@ -161,15 +182,27 @@ def helper(data, *, popen=subprocess.Popen, parent=os.getppid, emit=None, lifeti
         children.append(native)
         native.stdin.write(APPLE_SCRIPT.encode('utf-8'))
         native.stdin.close()
+        opened.set()
         emit({'state': 'started'})
+        observed_error = False
         try:
             value = decode_choice(collect(native, stopped, max(.01, deadline - time.monotonic())))
-        except (ValueError, OSError, TimeoutError, subprocess.SubprocessError):
+            observed_error = value['state'] == 'failed'
+        except CollectionTimeout:
+            value = {'state': 'cancelled'}
+        except CollectionStopped:
             value = {'state': why[0]}
+        except (ValueError, OSError, subprocess.SubprocessError):
+            value = {'state': 'failed'}
+            observed_error = True
         if not stop_child(native):
             raise RuntimeError()
         native.stdout.close()
-        emit(value if not stopped.is_set() else {'state': why[0]})
+        # Cleanup can cross the deadline after a genuine error was observed.
+        # That later deadline must not relabel the failure. Parent/explicit
+        # cancellation still wins, and every stopped valid selection is fenced.
+        preserve_error = observed_error and stop_reason[0] == 'deadline'
+        emit(value if not stopped.is_set() or preserve_error else {'state': why[0]})
     except Exception:
         emit({'state': 'failed'})
     finally:

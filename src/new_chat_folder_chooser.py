@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import selectors
 import signal
@@ -26,7 +27,7 @@ def _failure(code='invalid_request', status=400):
 
 
 def _path(value):
-    return (type(value) is str and os.path.isabs(value) and len(value) <= 4096
+    return (type(value) is str and posixpath.isabs(value) and len(value) <= 4096
             and not any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in value))
 
 
@@ -197,6 +198,7 @@ class FolderChooser:
         self.schedule, self.epoch = schedule, str(uuid.uuid4())
         self.lock = threading.RLock()
         self.operations, self.retired, self.active, self.closed = {}, set(), None, False
+        self.unknown_cancels = {}
 
     def _view(self, row):
         out = {'schemaVersion': 1, 'requestId': row['id'], 'state': row['state']}
@@ -215,7 +217,7 @@ class FolderChooser:
             _failure('choice_epoch_changed', 409)
 
     def _known_capacity(self):
-        if len(self.operations) + len(self.retired) >= self.known_limit:
+        if len(self.operations) + len(self.retired) + len(self.unknown_cancels) >= self.known_limit:
             _failure('chooser_capacity', 429)
 
     def _release(self, row):
@@ -238,6 +240,9 @@ class FolderChooser:
     def expire(self):
         with self.lock:
             now = self.clock()
+            for ident, deadline in list(self.unknown_cancels.items()):
+                if now >= deadline:
+                    del self.unknown_cancels[ident]
             for row in list(self.operations.values()):
                 if now - row['at'] >= self.retention:
                     self._retire(row)
@@ -260,7 +265,7 @@ class FolderChooser:
     def _get(self, ident):
         if not canonical_uuid(ident):
             _failure()
-        if ident in self.retired:
+        if ident in self.retired or ident in self.unknown_cancels:
             _failure('choice_expired', 410)
         row = self.operations.get(ident)
         if row is None:
@@ -280,7 +285,7 @@ class FolderChooser:
             if self.closed:
                 _failure('chooser_closed', 503)
             self.expire()
-            if data['requestId'] in self.retired:
+            if data['requestId'] in self.retired or data['requestId'] in self.unknown_cancels:
                 _failure('choice_expired', 410)
             if data['requestId'] in self.operations:
                 return self._view(self.operations[data['requestId']])
@@ -368,8 +373,10 @@ class FolderChooser:
                 _failure('choice_expired', 410)
             row = self.operations.get(ident)
             if row is None:
+                if ident in self.unknown_cancels:
+                    return {'schemaVersion': 1, 'requestId': ident, 'state': 'cancelled'}
                 self._known_capacity()
-                self.retired.add(ident)
+                self.unknown_cancels[ident] = self.clock() + self.retention
                 return {'schemaVersion': 1, 'requestId': ident, 'state': 'cancelled'}
             if row['state'] not in ('saved', 'unknown'):
                 row['state'] = 'cancelled'
