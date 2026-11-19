@@ -302,6 +302,46 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(sqlite3.Error):
             s.context()
 
+    def test_invalid_utf8_saved_text_is_skipped_without_poisoning_healthy_rows(self):
+        s = self.service()
+        healthy = s.register_folder({'path': str(self.folder)})['folder']
+        other = self.root / 'other-project'
+        other.mkdir()
+        damaged = s.register_folder({'path': str(other)})['folder']
+        original = s.db.execute('SELECT data FROM registered_folders WHERE id=?', (damaged['id'],)).fetchone()[0]
+        for kind in ('data', 'id-before', 'id-after'):
+            with self.subTest(kind=kind):
+                with s.db:
+                    s.db.execute('DELETE FROM registered_folders WHERE id!=?', (healthy['id'],))
+                    s.db.execute('INSERT INTO registered_folders VALUES (?,?)', (damaged['id'], original))
+                    if kind == 'data':
+                        s.db.execute("UPDATE registered_folders SET data=CAST(x'7bff7d' AS TEXT) WHERE id=?", (damaged['id'],))
+                    else:
+                        invalid = (b'0' if kind == 'id-before' else b'f') * 63 + b'\xff'
+                        s.db.execute('UPDATE registered_folders SET id=CAST(? AS TEXT) WHERE id=?', (invalid, damaged['id']))
+                before = s.db.execute('SELECT CAST(id AS BLOB),CAST(data AS BLOB) FROM registered_folders ORDER BY id').fetchall()
+                self.assertEqual(s.context()['folders'], [healthy])
+                choice = dict(provider='codex', folderId=healthy['id'], folderRevision=healthy['revision'])
+                self.assertIn('requestId', s.prepare(choice))
+                self.assertEqual(s.db.execute('SELECT CAST(id AS BLOB),CAST(data AS BLOB) FROM registered_folders ORDER BY id').fetchall(), before)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
+
+    def test_codex_worktree_allows_fake_creation_only_after_an_explicit_attempt(self):
+        s = self.service()
+        project = self.root / '.codex' / 'worktrees' / 'orchard'
+        project.mkdir(parents=True)
+        saved = s.register_folder({'path': str(project)})['folder']
+        self.seed = self.adapter.make_identity(project)
+        self.assertEqual(s.context()['folders'], [saved])
+        choice = dict(provider='codex', folderId=saved['id'], folderRevision=saved['revision'])
+        intent = s.prepare(choice)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
+        _, attempt = s.open(dict(choice, requestId=intent['requestId']))
+        self.settle(s)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (1, 1))
+        s.process_admissions(lambda identity, folder, permit: 'x:' + identity.native_id if permit() else None)
+        self.assertEqual(s.status(attempt['attemptId'])['state'], 'added')
+
     def test_corrupt_saved_revision_cannot_override_independent_discovery(self):
         s = self.service()
         saved = s.register_folder({'path': str(self.folder)})['folder']

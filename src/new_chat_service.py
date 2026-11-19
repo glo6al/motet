@@ -77,13 +77,15 @@ def _text(value, maximum):
 class NewChatService:
     def __init__(self, state_dir, adapter, inventory_source, *, enabled=False, demo=False,
                  clock=time.monotonic, wall=time.time, host_id='local', host_label='This computer',
-                 max_intents=128, max_active=32, max_attempts=1024, intent_rate=10, home=None):
+                 max_intents=128, max_active=32, max_attempts=1024, intent_rate=10, home=None,
+                 folder_chooser=None):
         self.adapters = dict(adapter) if isinstance(adapter, dict) else {'codex': adapter}
         if any(provider not in PROVIDERS for provider in self.adapters):
             raise ValueError('Unknown New chat adapter provider.')
         # Preserve the original single-Codex injection seam for callers.
         self.adapter = self.adapters.get('codex')
         self.enabled, self.demo = enabled is True, demo is True
+        self.folder_chooser = folder_chooser
         self.clock, self.wall = clock, wall
         self.host = {'id': host_id, 'label': host_label}
         self.max_intents, self.max_active, self.max_attempts, self.intent_rate = max_intents, max_active, max_attempts, intent_rate
@@ -213,12 +215,16 @@ class NewChatService:
         with self.lock:
             # API writes already cap the row count. Bound individual transfers
             # too, so a damaged row cannot force an unbounded JSON allocation.
-            rows = self.db.execute("SELECT CASE WHEN typeof(id)='text' AND length(id)=64 THEN id END,"
-                                   'substr(data,1,65537) FROM registered_folders ORDER BY id')
-            for ident, raw in rows:
+            rows = self.db.execute("SELECT CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB))=64 "
+                                   "THEN CAST(id AS BLOB) END,CASE WHEN typeof(data)='text' "
+                                   'THEN substr(CAST(data AS BLOB),1,65537) END '
+                                   'FROM registered_folders ORDER BY id')
+            for ident_bytes, raw_bytes in rows:
                 try:
-                    if type(raw) is not str or len(raw) > 65536:
+                    if type(ident_bytes) is not bytes or type(raw_bytes) is not bytes or len(raw_bytes) > 65536:
                         continue
+                    ident = ident_bytes.decode('utf-8')
+                    raw = raw_bytes.decode('utf-8')
                     value = json.loads(raw, object_pairs_hook=unique)
                     folders.append(self.inventory.restore_registered(ident, value))
                 except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
@@ -240,6 +246,27 @@ class NewChatService:
             self.db.execute('INSERT OR REPLACE INTO registered_folders VALUES (?, ?)',
                             (folder.id, json.dumps(asdict(folder), ensure_ascii=True)))
         return {'schemaVersion': 1, 'folder': dict(public_folder(folder), registered=True)}
+
+    def _chooser(self):
+        self._guard()
+        if self.folder_chooser is None:
+            _error('chooser_unavailable', 'The folder window is unavailable on this host.', 503)
+        return self.folder_chooser
+
+    def begin_folder_choice(self, data, connection):
+        return self._chooser().begin(data, connection, self._guard)
+
+    def folder_choice_status(self, ident):
+        return self._chooser().status(ident)
+
+    def cancel_folder_choice(self, ident, data):
+        chooser = self._chooser()
+        if type(data) is not dict or data:
+            _error('invalid_request', 'Invalid folder window cancellation.', 400)
+        return chooser.cancel(ident)
+
+    def accept_folder_choice(self, ident, data):
+        return self._chooser().accept(ident, data, self.register_folder, self._guard)
 
     def _inventory(self, registered):
         rows = self.inventory.refresh(registered)
@@ -270,6 +297,7 @@ class NewChatService:
                               'unavailableReason': None if available else _reason(code)})
         return {'schemaVersion': 1, 'fixture': False, 'host': dict(self.host),
                 'canRegisterFolders': can_register,
+                'canChooseFolders': can_register and self.folder_chooser is not None,
                 'folders': [dict(public_folder(f), registered=True) if registered_revisions.get(f.id) == f.revision else public_folder(f)
                             for f in folders], 'providers': providers,
                 'limits': {'observationWindowMs': WINDOW * 1000,
@@ -985,6 +1013,9 @@ class NewChatService:
                 return
             self.closing = True
             jobs = list(self.jobs.values())
+        # accept holds chooser -> service lock; never reverse that order here.
+        if self.folder_chooser is not None:
+            self.folder_chooser.close()
         for adapter in {id(adapter): adapter for adapter in self.adapters.values()}.values():
             try:
                 adapter.close()

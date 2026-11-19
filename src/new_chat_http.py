@@ -48,6 +48,9 @@ def handle_http(handler, service, owner_key, port):
                 raise NewChatError('invalid_request', 'GET requests cannot contain a body.', 400)
             if route == '/api/new-chat/context':
                 return reply(200, service.context())
+            match = re.fullmatch(r'/api/new-chat/folders/choose/([0-9a-f-]{36})', route)
+            if match:
+                return reply(200, service.folder_choice_status(match[1]))
             match = re.fullmatch(r'/api/new-chat/requests/([0-9a-f-]{36})', route)
             if match:
                 return reply(200, service.request_status(match[1]))
@@ -104,6 +107,13 @@ def handle_http(handler, service, owner_key, port):
                 raise ValueError()
         except (ValueError, UnicodeError, OSError, RecursionError):
             raise NewChatError('invalid_request', 'Invalid JSON request body.', 400) from None
+        if route == '/api/new-chat/folders/choose':
+            return reply(202, service.begin_folder_choice(data, handler.connection))
+        match = re.fullmatch(r'/api/new-chat/folders/choose/([0-9a-f-]{36})/(cancel|accept)', route)
+        if match:
+            if match[2] == 'cancel':
+                return reply(200, service.cancel_folder_choice(match[1], data))
+            return reply(200, service.accept_folder_choice(match[1], data))
         if route == '/api/new-chat/folders':
             return reply(201, service.register_folder(data))
         if route == '/api/new-chat/intents':

@@ -44,6 +44,22 @@ class Service:
         self.calls.append(('register_folder', data))
         return {'schemaVersion': 1}
 
+    def begin_folder_choice(self, data, connection):
+        self.calls.append(('begin_folder_choice', data, connection))
+        return {'schemaVersion': 1, 'requestId': NATIVE, 'state': 'pending'}
+
+    def folder_choice_status(self, ident):
+        self.calls.append(('folder_choice_status', ident))
+        return {'schemaVersion': 1, 'requestId': ident, 'state': 'pending'}
+
+    def cancel_folder_choice(self, ident, data):
+        self.calls.append(('cancel_folder_choice', ident, data))
+        return {'schemaVersion': 1, 'requestId': ident, 'state': 'cancelled'}
+
+    def accept_folder_choice(self, ident, data):
+        self.calls.append(('accept_folder_choice', ident, data))
+        return {'schemaVersion': 1, 'requestId': ident, 'state': 'saved'}
+
     def prepare(self, data):
         self.calls.append(('prepare', data))
         return {'requestId': NATIVE}
@@ -84,6 +100,42 @@ class HttpTests(unittest.TestCase):
             h.rfile = Unreadable()
             self.assertEqual(self.call(h)[0], 403)
         self.assertEqual(self.call(Handler())[0], 503)
+
+    def test_chooser_routes_authenticate_before_any_probe_or_service_access(self):
+        class Explosive:
+            def __getattr__(self, name):
+                raise AssertionError('Unauthenticated chooser reached the service')
+        for suffix, method in (('folders/choose', 'POST'),
+                               ('folders/choose/' + NATIVE, 'GET'),
+                               ('folders/choose/' + NATIVE + '/cancel', 'POST'),
+                               ('folders/choose/' + NATIVE + '/accept', 'POST')):
+            h = self.post(PREFIX + suffix) if method == 'POST' else Handler(PREFIX + suffix)
+            h.headers.replace_header('X-Live-Room-Key', 'wrong')
+            self.assertEqual(self.call(h, Explosive())[0], 403)
+
+    def test_chooser_routes_pass_real_accepted_connection_only_to_begin(self):
+        service = Service()
+        h = self.post(PREFIX + 'folders/choose', b'{"requestId":"' + NATIVE.encode() + b'"}')
+        self.assertEqual(self.call(h, service)[0], 202)
+        self.assertIs(service.calls[-1][2], h.connection)
+        base = PREFIX + 'folders/choose/' + NATIVE
+        for handler in (Handler(base), self.post(base + '/cancel'),
+                        self.post(base + '/accept', b'{"selectionToken":"' + NATIVE.encode() + b'"}')):
+            self.assertEqual(self.call(handler, service)[0], 200)
+        self.assertEqual([row[0] for row in service.calls], ['begin_folder_choice', 'folder_choice_status',
+                         'cancel_folder_choice', 'accept_folder_choice'])
+
+    def test_chooser_rejects_cross_origin_duplicate_auth_and_read_side_effect_routes(self):
+        for suffix in ('folders/choose', 'folders/choose/' + NATIVE + '/cancel',
+                       'folders/choose/' + NATIVE + '/accept'):
+            for headers in ((('Origin', 'https://fictional.invalid'),),
+                            (('X-Live-Room-Key', 'fictional-key'),)):
+                service = Service()
+                self.assertEqual(self.call(self.post(PREFIX + suffix, headers=headers), service)[0], 403)
+                self.assertEqual(service.calls, [])
+            service = Service()
+            self.assertEqual(self.call(Handler(PREFIX + suffix), service)[0], 404)
+            self.assertEqual(service.calls, [])
 
     def test_duplicate_auth_host_origin_and_cross_origin_rejected(self):
         for extra in [('Host', '127.0.0.1:18801'), ('X-Live-Room-Key', 'fictional-key'),

@@ -100,8 +100,33 @@ async function registrationChecks(){
   const baseline=h.requests.length;h.client.projectsChanged('initial');h.client.projectsChanged('new-root');h.client.projectsChanged('newer-root');assert.equal(h.jobs.filter(j=>j.ms===500).length,1,'observed project changes use one bounded refresh');const refreshJob=h.jobs.find(j=>j.ms===500);const running=refreshJob.f();await tick();release(inventory());await running;assert.equal(h.requests.length,baseline+1);assert.equal(h.requests.filter(r=>r.body).length,0);
   console.log('ok Add project folder client: cached display freshness, revision rejection, validated receipts, unknown no-repeat, saved-GET failure, auth isolation, refresh ordering, one-time recovery and bounded project refresh');
 }
+async function chooserChecks(factory=create){
+  const token='33333333-3333-4333-8333-333333333333',saved={...folder,registered:true},data={requestId,gesture:{visible:true,focused:true,trusted:true}};
+  let accepted=false,reads=0;
+  const h=harness({create:factory,route:(route,body)=>{
+    if(route==='context'){reads++;return {...context(),canChooseFolders:true,folders:accepted?[saved]:[]}}
+    if(route==='folders/choose'){assert.deepEqual(body,data);return {schemaVersion:1,requestId,state:'pending'}}
+    if(route==='folders/choose/'+requestId)return {schemaVersion:1,requestId,state:'selected',selectionToken:token};
+    if(route.endsWith('/accept')){assert.deepEqual(body,{selectionToken:token});accepted=true;return {schemaVersion:1,requestId,state:'saved',folder:saved}}
+    if(route.endsWith('/cancel'))return {schemaVersion:1,requestId,state:'saved',folder:saved};
+    throw Error('Unexpected route');
+  }});await h.boot();assert.equal(h.client.canChooseFolders(),true);
+  assert.equal((await h.client.beginFolderChoice(data)).state,'pending');assert.equal((await h.client.folderChoiceStatus(requestId)).selectionToken,token);assert.equal(accepted,false,'status cannot save a choice');
+  const receipt=await h.client.acceptFolderChoice(requestId,token);assert.equal(receipt.folder.availabilityChecked,true);assert.equal(h.client.isRegistered(folder.displayPath),true);assert.equal(reads,2);
+  assert.equal((await h.client.cancelFolderChoice(requestId)).state,'saved','cancel cannot claim to undo a completed save');assert.equal(h.requests.filter(r=>r.route.endsWith('/accept')).length,1);assert.equal(h.store.size,0,'chooser IDs and selected paths are not stored in the browser');assert.equal(h.requests.filter(r=>['intents','attempts'].includes(r.route)).length,0);
+  await assert.rejects(h.client.folderChoiceStatus('not-an-id'));await assert.rejects(h.client.acceptFolderChoice(requestId,'not-a-token'));
+  for(const bad of [{requestId:attemptId,state:'pending'},{requestId,state:'selected',selectionToken:'not-a-token'},{requestId,state:'saved',folder:{...saved,registered:false}},{requestId,state:'invented'}]){
+    const b=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true}:{schemaVersion:1,...bad}});await b.boot();await assert.rejects(b.client.beginFolderChoice(data),'a mismatched or malformed chooser receipt is not authority');await assert.rejects(b.client.folderChoiceStatus(requestId));
+  }
+  let response;const l=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true}:new Promise(resolve=>response=resolve)});await l.boot();const pending=l.client.beginFolderChoice(data);await tick();l.setKey('changed-owner');l.client.sync();response({schemaVersion:1,requestId,state:'selected',selectionToken:token});await assert.rejects(pending,/authentication/);
+  let recoveredReads=0;const recovered=harness({create:factory,route:route=>route==='context'?(recoveredReads++,{...context(),canChooseFolders:true,folders:recoveredReads===1?[]:[saved]}):{schemaVersion:1,requestId,state:'saved',folder:saved}});await recovered.boot();const recoveredReceipt=await recovered.client.folderChoiceStatus(requestId);assert.equal(recoveredReceipt.folder.availabilityChecked,true,'a saved GET receipt refreshes availability just as the accept reply does');assert.equal(recovered.client.isRegistered(folder.displayPath),true);assert.equal(recovered.requests.filter(r=>r.body).length,0);
+  let posts=0;const u=harness({create:factory,route:(route,body)=>{if(route==='context')return {...context(),canChooseFolders:true};if(body){posts++;throw Error('lost response')}return {schemaVersion:1,requestId,state:'pending'}}});await u.boot();await assert.rejects(u.client.beginFolderChoice(data));await u.client.folderChoiceStatus(requestId);assert.equal(posts,1,'unknown begin is never automatically repeated');
+}
 (async()=>{
   await checkProductionTimerWiring();
+  await chooserChecks();
+  {const marker="return savedChoice(await choiceRequest(id,'',undefined),e,k)";assert(source.includes(marker));await assert.rejects(chooserChecks(vm.runInNewContext(source.replace(marker,"return choiceRequest(id,'',undefined)")+';createNewChatClient')),'unrefreshed saved GET receipt mutation must fail')}
+  {const marker="value.state==='selected'&&!uuid.test(value.selectionToken||'')";assert(source.includes(marker));await assert.rejects(chooserChecks(vm.runInNewContext(source.replaceAll(marker,'false')+';createNewChatClient')),'unchecked selection token mutation must fail')}
   await folderChecks();await registrationChecks();await serverFailureReceiptCheck();await descriptiveProviderCheck();await knownHostReasonCheck();
   {const from="error.status===503&&error.code==='unavailable'&&error.message==='New chat is unavailable on this host.'";assert(source.includes(from));await assert.rejects(knownHostReasonCheck(vm.runInNewContext(source.replace(from,'false')+';createNewChatClient')),'known host explanation mutation must fail')}
   {const from='...api.apps.claude,';assert(source.includes(from));await assert.rejects(descriptiveProviderCheck(vm.runInNewContext(source.replace(from,'')+';createNewChatClient')),'dropped cached managed-provider description mutation must fail')}

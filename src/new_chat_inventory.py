@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import itertools
 import json
+import errno
 import os
 from pathlib import Path
 import stat
@@ -31,18 +32,46 @@ def _valid_path(value):
 
 
 def _physical_path(path):
-    resolved = str(Path(path).resolve())
-    if sys.platform == 'darwin':
-        import fcntl
+    # Resolving links does not read a directory. stat identities below handle
+    # physical equivalence where realpath preserves case or volume aliases.
+    return os.path.realpath(path)
+
+
+def _directory_identity(path):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            # realpath is best-effort on Python 3.9. A remaining link means
+            # resolution was incomplete or raced, rather than proven absence.
+            raise OSError(errno.ELOOP, 'Folder anchor could not be resolved.')
+        return (info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else None
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _ancestry(path):
+    rows = []
+    while True:
+        info = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError()
+        rows.append((path, (info.st_dev, info.st_ino)))
+        parent = os.path.dirname(path)
+        if parent == path:
+            return rows
+        path = parent
+
+
+def _contains(root, ancestry):
+    current = _physical_path(root)
+    for spelling in (root, current):
         try:
-            fd = os.open(resolved, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        except (FileNotFoundError, NotADirectoryError):
-            return resolved
-        try:
-            resolved = os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b'\0', 1)[0])
-        finally:
-            os.close(fd)
-    return resolved
+            if os.path.commonpath((ancestry[0][0], spelling)) == spelling:
+                return True
+        except ValueError:
+            pass  # Distinct Windows drives cannot be ancestors of one another.
+    identity = _directory_identity(current)
+    return identity is not None and any(row[1] == identity for row in ancestry)
 
 
 def validate_folder(folder):
@@ -82,16 +111,31 @@ class KnownFolderInventory:
         """Apply target-directory policy without changing shared physical proof."""
         try:
             path = _physical_path(folder.path)
-            home = _physical_path(self.home)
-            roots = [os.path.join(self.home, name) for name in ('.live-room', '.codex', '.claude')]
+            ancestry = _ancestry(path)
+            if ancestry[0][1] != (folder.device, folder.inode):
+                raise ValueError()
+            if path == _physical_path(self.home) or ancestry[0][1] == _directory_identity(_physical_path(self.home)):
+                raise ValueError()
+            roots = [os.path.join(self.home, name) for name in ('.live-room', '.claude')]
             if self.state_root is not None:
                 roots.append(self.state_root)
-            # Retain the configured physical state path even if an anchor is
-            # replaced or retargeted, and also check each anchor's current path.
-            blocked = set(roots)
-            blocked.update(_physical_path(root) for root in roots)
-            if path == home or any(os.path.commonpath((path, root)) == root for root in blocked):
+            # These exclusions always win, even if an anchor points at a worktree.
+            if any(_contains(root, ancestry) for root in roots):
                 raise ValueError()
+            codex = os.path.join(self.home, '.codex')
+            if _contains(codex, ancestry):
+                current_codex = _physical_path(codex)
+                worktrees = os.path.join(current_codex, 'worktrees')
+                # The exception is a genuine directory below the Codex root,
+                # never a symlink laundering sessions or the entire private root.
+                worktree_identity = _directory_identity(worktrees)
+                if worktree_identity is None:
+                    raise ValueError()
+                worktree_ancestry = _ancestry(worktrees)
+                codex_identity = _directory_identity(current_codex)
+                if (codex_identity is None or codex_identity not in [row[1] for row in worktree_ancestry[1:]]
+                        or not _contains(worktrees, ancestry)):
+                    raise ValueError()
         except (OSError, RuntimeError, TypeError, ValueError):
             raise NewChatError('invalid_folder', 'Motet cannot use that folder.', 400) from None
         return folder

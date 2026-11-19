@@ -1,6 +1,7 @@
 """Fictional metadata/directory proof boundaries; no provider operations."""
 from dataclasses import replace
 import os
+import errno
 from pathlib import Path
 import sys
 import tempfile
@@ -218,6 +219,144 @@ class InventoryTests(unittest.TestCase):
         for name in ('.codex', '.claude'):
             (self.root / name).write_text('Fictional non-directory state anchor.')
         self.assertEqual(self.inventory.register(str(self.folder)).path, str(self.folder))
+
+    def test_genuine_codex_worktrees_root_and_projects_are_available(self):
+        worktrees = self.root / '.codex' / 'worktrees'
+        project = worktrees / 'orchard'
+        project.mkdir(parents=True)
+        saved = self.inventory.register(str(project))
+        self.assertEqual(self.inventory.register(str(worktrees)).path, str(worktrees))
+        self.rows = [replace(self.identity, cwd=str(project))]
+        self.assertEqual(self.inventory.refresh([saved]), [saved])
+        self.assertEqual(self.inventory.get(saved.id, saved.revision, [saved]), saved)
+        for name in ('sessions', 'worktrees-backup', 'worktree'):
+            private = worktrees.parent / name
+            private.mkdir()
+            with self.subTest(name=name), self.assertRaises(NewChatError):
+                self.inventory.register(str(private))
+
+    @unittest.skipIf(os.name == 'nt', 'Creating directory symlinks requires Windows privileges.')
+    def test_worktree_aliases_allow_projects_but_cannot_launder_private_roots(self):
+        codex = self.root / '.codex'
+        worktrees = codex / 'worktrees'
+        project = worktrees / 'orchard'
+        project.mkdir(parents=True)
+        sessions = codex / 'sessions'
+        sessions.mkdir()
+        alias = self.root / 'project-alias'
+        alias.symlink_to(project, target_is_directory=True)
+        saved = self.inventory.register(str(project))
+        self.assertEqual(self.inventory.register(str(alias)), saved)
+        self.rows = [replace(self.identity, cwd=str(alias))]
+        self.assertEqual(self.inventory.refresh(), [saved])
+        escape = project / 'private-alias'
+        escape.symlink_to(sessions, target_is_directory=True)
+        with self.assertRaises(NewChatError):
+            self.inventory.register(str(escape))
+        former = codex / 'former-worktrees'
+        worktrees.rename(former)
+        for target in (codex, sessions):
+            worktrees.symlink_to(target, target_is_directory=True)
+            try:
+                with self.subTest(target=target), self.assertRaises(NewChatError):
+                    self.inventory.register(str(worktrees))
+            finally:
+                worktrees.unlink()
+        former.rename(worktrees)
+        for name in ('.claude', '.live-room', 'private-state'):
+            private = self.root / name
+            private.symlink_to(project, target_is_directory=True)
+            try:
+                with self.subTest(name=name), self.assertRaises(NewChatError):
+                    self.inventory.register(str(project))
+            finally:
+                private.unlink()
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Case-equivalent directory spellings require macOS.')
+    def test_worktree_case_alias_uses_stat_identity_without_rewriting_the_frozen_folder(self):
+        project = self.root / '.codex' / 'worktrees' / 'orchard'
+        project.mkdir(parents=True)
+        alias = self.root / '.CODEX' / 'WORKTREES' / 'ORCHARD'
+        if not alias.exists():
+            self.skipTest('This volume is case-sensitive.')
+        self.rows = [replace(self.identity, cwd=str(alias))]
+        folder = self.inventory.refresh()[0]
+        before = (folder.id, folder.revision, folder.path, folder.device, folder.inode)
+        self.assertIs(self.inventory.require_allowed(folder), folder)
+        self.assertEqual((folder.id, folder.revision, folder.path, folder.device, folder.inode), before)
+        self.assertEqual(self.inventory.get(folder.id, folder.revision), folder)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX permission semantics.')
+    def test_unreadable_private_anchor_does_not_refuse_an_unrelated_project(self):
+        private = self.root / '.codex'
+        private.mkdir()
+        private.chmod(0)
+        try:
+            self.assertEqual(self.inventory.register(str(self.folder)).path, str(self.folder))
+            self.assertEqual(self.inventory.refresh()[0].path, str(self.folder))
+        finally:
+            private.chmod(0o700)
+        child = private / 'private-project'
+        child.mkdir()
+        stat_call = os.stat
+
+        def unavailable_anchor(path, *args, **kwargs):
+            if os.fspath(path) == str(private):
+                raise PermissionError('Fictional inaccessible anchor.')
+            return stat_call(path, *args, **kwargs)
+
+        # A stat failure is uncertainty, unlike a readable stat of a mode000 directory.
+        with patch('new_chat_inventory.os.stat', side_effect=unavailable_anchor):
+            self.assertEqual(self.inventory.refresh(), [])
+            with self.assertRaises(NewChatError):
+                self.inventory.register(str(child))
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX permission semantics.')
+    def test_unresolved_private_anchor_cannot_hide_its_accessible_sibling_target(self):
+        if os.geteuid() == 0:
+            self.skipTest('Root bypasses the permission barrier used by this fixture.')
+        home = self.root / 'private-home'
+        home.mkdir()
+        (home / '.claude').symlink_to(self.folder, target_is_directory=True)
+        inventory = KnownFolderInventory(lambda: self.rows, b'f' * 32, home=home,
+                                         state_root=self.root / 'private-state')
+        folder = inventory._folder(str(self.folder), self.folder.stat())
+        home.chmod(0)
+        try:
+            with self.assertRaises(NewChatError) as caught:
+                inventory.require_allowed(folder)
+            self.assertEqual(caught.exception.message, 'Motet cannot use that folder.')
+            self.assertEqual(inventory.refresh([folder]), [])
+        finally:
+            home.chmod(0o700)
+
+    def test_anchor_io_error_is_unresolved_but_proven_absence_is_not(self):
+        private = self.root / '.claude'
+        stat_call = os.stat
+
+        def unavailable_anchor(path, *args, **kwargs):
+            if os.fspath(path) == str(private):
+                raise OSError(errno.EIO, 'Fictional metadata I/O failure.')
+            return stat_call(path, *args, **kwargs)
+
+        self.assertEqual(self.inventory.refresh()[0].path, str(self.folder))
+        with patch('new_chat_inventory.os.stat', side_effect=unavailable_anchor):
+            self.assertEqual(self.inventory.refresh(), [])
+
+    @unittest.skipIf(os.name == 'nt', 'Creating directory symlinks requires Windows privileges.')
+    def test_unresolved_anchor_symlink_loop_is_not_proven_absence(self):
+        private = self.root / '.claude'
+        other = self.root / 'private-loop'
+        private.symlink_to(other, target_is_directory=True)
+        other.symlink_to(private, target_is_directory=True)
+        self.assertEqual(self.inventory.refresh(), [])
+
+    def test_refresh_and_get_never_open_project_or_private_directories(self):
+        saved = self.inventory.register(str(self.folder))
+        with patch('new_chat_inventory.os.open', side_effect=AssertionError('Refresh cannot open a directory.')) as opened:
+            self.assertEqual(self.inventory.refresh([saved]), [saved])
+            self.assertEqual(self.inventory.get(saved.id, saved.revision, [saved]), saved)
+            opened.assert_not_called()
 
 
 if __name__ == '__main__':
