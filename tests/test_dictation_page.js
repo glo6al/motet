@@ -782,6 +782,45 @@ async function lockedCleanupProof(mutateController) {
     }finally{packet.resolve({acceptedSequence:0,epoch:1});await env.close();}
   }
 }
+async function keychangedCleanupProof(mutateController) {
+  const reason='Dictation stopped because the owner key changed.';
+  for(const scenario of ['local-claim','upstream-usable','upstream-unusable','late-edit','late-status']){
+    const packet=deferred(),failure=deferred(),readiness=deferred(),microphone=deferred();
+    let adapterClaiming=false,refused=0,wire=0,statuses=0,lastFailure,returnedStream;
+    const env=await speaking({mutateController,audioDeferred:packet,apiHook(route,data,config,current){
+      if(route==='status'&&++statuses>1&&scenario==='late-status')return readiness.promise;
+      if(route==='cancel'){
+        if(adapterClaiming){refused++;lastFailure=current.localRefusal(apiError('unavailable'));throw lastFailure;}
+        wire++;lastFailure=apiError('unavailable');lastFailure.localRefusal=true;
+        if(scenario.startsWith('late-'))return failure.promise;
+        throw lastFailure;
+      }
+    }});
+    try{
+      env.worklets[0].pcm();await flush();
+      env.controller.contextChanged('keychanged');adapterClaiming=true;env.allowed=false;
+      assert.equal(env.view.status.textContent,reason);assert(env.tracks.every(track=>track.stopped));
+      if(scenario!=='local-claim'){adapterClaiming=false;env.allowed=scenario!=='upstream-unusable';env.elements.textarea.readOnly=!env.allowed;}
+      packet.resolve({acceptedSequence:0,epoch:1});await flush();
+      assert.equal(refused,scenario==='local-claim'?1:0);assert.equal(wire,scenario==='local-claim'?0:1);assert.equal(env.isLocalRefusal(lastFailure),scenario==='local-claim');
+      if(scenario==='local-claim'){
+        assert.equal(env.view.status.textContent,reason);assert.equal(env.stateChanges.at(-1).detail.reason,'keychanged');
+        const count=env.calls.length;await env.controller.start();assert.equal(env.calls.length,count);assert.equal(env.mediaCalls,1);
+      }else if(!scenario.startsWith('late-'))assert.equal(env.view.status.textContent,EXPECTED_COPY.control,'Real unmarked helper failures still warn after a claim');
+      else{
+        let next;
+        if(scenario==='late-edit'){env.elements.textarea.value='Typed. kept words edited';env.elements.textarea.dispatch('input');}
+        else{env.mediaDeferred=microphone;next=env.controller.start();await flush();assert.equal(env.controller.state,'checking');}
+        const history=env.stateChanges.length,text=env.elements.textarea.value,patches=env.patches;
+        failure.reject(lastFailure);await flush();
+        assert(!env.stateChanges.slice(history).some(row=>row.detail.reason==='cleanup_unconfirmed'));assert.equal(env.elements.textarea.value,text);assert.equal(env.patches,patches);
+        if(next){assert.equal(env.controller.state,'checking');readiness.resolve({state:'ready'});await flush();assert.equal(env.controller.state,'preparing');env.controller.cancel();microphone.resolve(returnedStream=env.newStream());await next;}
+        else assert.equal(env.view.status.textContent,reason);
+      }
+      if(scenario!=='late-status')assert.equal(env.mediaCalls,1,'Ending the take never asks for another microphone');
+    }finally{packet.resolve({acceptedSequence:0,epoch:1});failure.resolve({sessionId:env.sessionId,epoch:1,ended:true});readiness.resolve({state:'ready'});if(scenario==='late-status')microphone.resolve(returnedStream||(returnedStream=env.newStream()));await env.close();}
+  }
+}
 async function acknowledgedDrainTimerProof(mutateController) {
   for(const acknowledged of ['response','ended-error']){
     const env=await speaking({mutateController,apiHook(route,data,config,current){if(route==='stop'){if(acknowledged==='ended-error')throw apiError('ended');return {sessionId:data.sessionId,epoch:current.epoch,ended:true};}}});
@@ -845,6 +884,7 @@ async function main() {
   await test('an audio HTTP timeout still gets bounded busy-only cleanup without audio replay',()=>implicitTimeoutProof());
   await test('a missing monotonic clock fails closed before helper requests or microphone permission',()=>monotonicClockProof());
   await test('locking preserves its reason only for the expected local adapter refusal',()=>lockedCleanupProof());
+  await test('an owner-key claim preserves its reason only on local refusal and keeps later feedback owned',()=>keychangedCleanupProof());
   await test('a Stop closure ACK without final events ends at exactly twenty seconds with final-words copy',()=>acknowledgedDrainTimerProof());
   await test('retirement immediately aborts Stop while cleanup keeps its same-session keepalive',()=>retireStopAbortProof());
   if(!proofChild)await test('actual subprocesses reject incomplete budget, queue, unknown-session and hanging-promise runs',()=>incompleteRunProof());
@@ -1323,6 +1363,7 @@ async function main() {
     await caught('known Start refusals retain setup guidance',value=>value.replace('if (!refused) current.startUnconfirmed = true;','current.startUnconfirmed = true;'),startRefusalProof);
     await caught('monotonic clock is required before capture',value=>value.replace('scope.performance.now.bind(scope.performance) : null;','scope.performance.now.bind(scope.performance) : Date.now;'),monotonicClockProof);
     await caught('routine lock requires verified local provenance',value=>value.replace('&& options.isLocalRefusal && options.isLocalRefusal(error) === true',''),lockedCleanupProof);
+    await caught('owner-key claim local refusal retains its reason',value=>value.replace("['locked','keychanged'].includes(detail.reason)","detail.reason === 'locked'"),keychangedCleanupProof);
     await caught('ACK without final events still has a deadline',value=>value.replace("current.finishTimer = setTimeout(() => fail(current, problem('finalize_unconfirmed')), Math.max(0, deadline - now()));",''),acknowledgedDrainTimerProof);
     await caught('closure ACK remains distinct from the event drain',value=>value.replace("if (action === 'stop') current.stopAcknowledged = true;",''),acknowledgedDrainTimerProof);
     await caught('late cleanup preserves final-words feedback',value=>value.replace('[COPY.control_unconfirmed,COPY.finalize_unconfirmed].includes(detail.message)','detail.message === COPY.control_unconfirmed'),terminalBudgetProof);

@@ -104,6 +104,35 @@ function orderProof(mutate=x=>x){
   assert.equal(h.input.value,originalText);assert.equal(h.input.selectionStart,3);assert.equal(h.input.selectionEnd,7);assert.equal(h.input.scrollTop,18);
   const moves=h.calls.filter(call=>call[0]==='move').length;h.ctx.workspaceDictationOrderControls();assert.equal(h.calls.filter(call=>call[0]==='move').length,moves,'Settled order makes no extra DOM moves');
 }
+function officerFilesProof(mutate=x=>x){
+  const h=harness({mutate}),row=h.node('#ofRow'),compose=h.node('#ofCompose'),address=h.node('#ofAddress'),model=h.node('#ofModelPicker'),scope=h.node('scope'),plus=h.node('plus'),files=h.node('files');
+  h.doc.body.classList.add('workspace-officer-desk');
+  plus.className='workspace-attachments-plus';files.className='workspace-attachments-files';
+  compose.append(h.input);address.append(scope,model);h.host.append(row);
+  row.append(compose,plus,address,files,h.controls.cancel,h.controls.wave,h.controls.mic,h.controls.send);
+  h.input.selectionStart=3;h.input.selectionEnd=7;h.input.scrollTop=18;
+  const originalText=h.input.value;
+  const placement=html.split('\n').find(line=>line.includes('const placement=o.placement?.()'));
+  const canonical=html.split('\n').find(line=>line.includes("if(snapshot.ui.surface==='room'){row.insertBefore(controls.plus"));
+  assert(placement&&canonical);
+  Object.assign(h.ctx,{row,compose,recipient:address,controls:{plus,files},snapshot:{ui:{surface:'officer'}},env:()=>({surface:'officer'}),o:{placement:()=>({recipient:address,model}),send:h.controls.send}});
+  for(const [label,state] of [['idle','idle'],['listening','listening'],['Stop finalization','finishing'],['Stop completed','idle'],['second take','listening'],['Cancel','idle']]){
+    files.focus();h.options.onState(state,{});
+    const active=state==='listening';
+    assert.equal(h.ctx.workspaceDictationPlacesFiles(),active,label+' relocates Files only with the visible capture controls');
+    for(const repaint of [null,canonical,placement]){
+      if(repaint){(repaint===canonical?h.input:files).focus();vm.runInNewContext('{'+mutate(repaint)+'}',h.ctx);h.ctx.workspaceDictationOrderControls();}
+      assert.equal(h.doc.activeElement===(repaint===canonical?h.input:files),true,label+' preserves the held control or editor during placement');
+      if(active){assert.equal(files.parentNode===row,true,label+' keeps Files outside the hidden scope group');assert.equal(plus.nextSibling===files,true);assert.equal(files.nextSibling===h.controls.cancel,true);}
+      else {assert.equal(files.parentNode===address,true,label+' restores Files inside the scope group');assert.equal(scope.nextSibling===files,true);assert.equal(files.nextSibling===model,true,label+' places Files immediately left of model');assert.equal(plus.nextSibling===address,true);}
+      const before=h.calls.filter(call=>call[0]==='move').length;h.ctx.workspaceDictationOrderControls();
+      assert.equal(h.calls.filter(call=>call[0]==='move').length,before,label+' settles without observer moves');
+      assert.equal(h.controls.mic.nextSibling,h.controls.send);assert.equal(h.input.parentNode,compose);assert.equal(h.input.value,originalText);
+      assert.deepEqual([h.input.selectionStart,h.input.selectionEnd,h.input.scrollTop],[3,7,18]);
+    }
+  }
+  assert(!h.calls.some(call=>call[0]==='move'&&(call[1]===compose||call[1]===h.input)),'Motet Files moves never reparent the editor');
+}
 function stageOrderProof(mutate=x=>x){
   for(const owner of ['desktop','narrow'])for(const mounted of [true,false]){
     const h=harness({mutate,modules:mounted}),row=h.node('#ofRow'),compose=h.node('#ofCompose'),model=h.node('#ofModelPicker'),plus=h.node('plus'),files=h.node('files');
@@ -282,7 +311,7 @@ function lifecycleProof(mutate=x=>x){
 }
 lifecycleProof();
 async function main(){
-  await apiProof();await adapterProvenanceProof();await sendProof();await rejectedKeyProof();orderProof();stageOrderProof();liveStagePlacementProof();identityProof();windowEscapeProof();hiddenPopupProof();openContextProof();
+  await apiProof();await adapterProvenanceProof();await sendProof();await rejectedKeyProof();orderProof();officerFilesProof();stageOrderProof();liveStagePlacementProof();identityProof();windowEscapeProof();hiddenPopupProof();openContextProof();
   for(const [name,mutate,proof]of[
     ['control ordering',s=>s.replace('for(const node of controls)row.insertBefore(node,anchor);',''),orderProof],
     ['stationary editor',s=>s.replace('for(const node of controls)row.insertBefore(node,anchor);','row.insertBefore(compose,anchor);for(const node of controls)row.insertBefore(node,anchor);'),orderProof],
@@ -312,6 +341,12 @@ async function main(){
   for(const [reason,proof] of [['desk',lifecycleProof],['scope',lifecycleProof],['scope',openContextProof]])assert.throws(()=>proof(s=>s.replaceAll("'"+reason+"'","'recipient'")),assert.AssertionError,reason+' stop reason mutation caught');
   await assert.rejects(()=>rejectedKeyProof(s=>s.replace("workspaceDictationContextChanging('keychanged')","workspaceDictationContextChanging('recipient')")),assert.AssertionError,'Rejected-key reason mutation caught');
   for(const target of ["if(e.key==='Escape'&&typeof workspaceAttachmentsEscape==='function'&&workspaceAttachmentsEscape(e))return;","if(e.key==='Escape'&&DESK.drawer){e.preventDefault();e.stopImmediatePropagation();deskCloseDrawer();render();return}"])assert.throws(()=>windowEscapeProof(s=>s.replace(target,'')),assert.AssertionError,'Foreground Escape precedence mutation caught');
+  for(const [label,from,to] of [
+    ['Motet idle Files group','recipient===address&&model.parentNode===address?address:row','row'],
+    ['nested Files can reach capture row',"node.parentNode===row||node.parentNode===address&&address.parentNode===row","node.parentNode===row"],
+    ['Files focus survives group relocation','held.focus({preventScroll:true});','void 0;'],
+    ['idle repaint does not eject Files',"workspaceDictationInit.current?.view&&ofEl.classList.contains('dictation-active')","workspaceDictationInit.current?.view"]
+  ])assert.throws(()=>officerFilesProof(s=>s.replaceAll(from,to)),assert.AssertionError,label+' mutation caught');
   assert(wiring.includes("help.href='/dictation-help'"));assert(wiring.includes("help.rel='noopener noreferrer'"));assert(!/X-Dictation-Key|127\.0\.0\.1:[0-9]|\.live-room|localStorage/.test(wiring),'page wiring contains no helper capability, private path or extra persistence');
   console.log('ok dictation page wiring: inert demo/classic/load, Send/draft fences, stage words before controls with no-view/live-paint/real-Settings-comment/desk boundaries, stationary editor focus, real Escape/popup precedence, private adapter, desk attachment ordering, exact stop reasons and causal mutation checks');
   unfinishedMainProof();

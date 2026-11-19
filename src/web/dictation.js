@@ -220,8 +220,8 @@
       if (destroyed || composing || !stamp || target() !== stamp.target
           || current.target !== stamp.target || textarea.value !== stamp.text || feedbackVersion !== stamp.feedback
           || statusVersion !== stamp.status || [COPY.control_unconfirmed,COPY.finalize_unconfirmed].includes(detail.message)) return;
-      // Only the adapter can attest that Lock refused this request locally.
-      if (detail.reason === 'locked' && error && error.code === 'unavailable' && !canUse()
+      // Only the adapter can attest that Lock or an owner-key claim refused locally.
+      if (['locked','keychanged'].includes(detail.reason) && error && error.code === 'unavailable' && !canUse()
           && options.isLocalRefusal && options.isLocalRefusal(error) === true) return;
       setState('idle', { code: 'control_unconfirmed', reason: 'cleanup_unconfirmed',
         message: COPY.control_unconfirmed, announcement: COPY.control_unconfirmed });
