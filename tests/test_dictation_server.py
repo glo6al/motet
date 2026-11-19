@@ -152,6 +152,16 @@ class DictationServerTests(unittest.TestCase):
             self.assertEqual(headers['Content-Type'], 'text/plain; charset=utf-8')
             self.assertEqual(headers['Content-Security-Policy'], "default-src 'none'; frame-ancestors 'none'")
 
+    def test_missing_fixed_assets_return_404_instead_of_dropping_connection(self):
+        real_open = open
+        def unavailable(path, *args, **kwargs):
+            if str(path).endswith(('dictation_worklet.js', 'DICTATION.md')):
+                raise FileNotFoundError('fictional missing fixture asset')
+            return real_open(path, *args, **kwargs)
+        with running() as (_, port), mock.patch('builtins.open', side_effect=unavailable):
+            for route in ('/dictation-worklet.js', '/dictation-help'):
+                self.assertEqual(request(port, route)[0], 404)
+
     def test_exact_worklet_and_local_help_routes(self):
         self.assert_fixed_routes()
 

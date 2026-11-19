@@ -2,7 +2,7 @@
 
 The helper is a separate, optional component. Motet runs as usual without it.
 The page adds a microphone beside Send. The helper and its server proxy are
-separately enabled; normal typing works without either one.
+separately enabled; normal typing works without either one. Page checks use generated audio plus an earlier real-microphone proof; the native engine has been verified only on Apple Silicon macOS.
 
 Recognition uses Moonshine Small Streaming English on this computer, without an
 account or inference service. The helper accepts audio supplied by an authorized
@@ -64,6 +64,8 @@ Motet's demo displays an inactive microphone and never requests microphone acces
 
 ## Deliberate installation
 
+Set `DICTATION_PYTHON` to an already installed Python 3.10+ executable; for example, use its absolute path after checking `--version`. This guide does not install Python.
+
 Choose an existing, permanent private home and start/stop the helper once to create its
 private state folder. The default folder is `.live-room/dictation` in that home.
 For installation use `DICTATION_INSTALL_HOME`, never the temporary preview home.
@@ -87,7 +89,8 @@ install the pinned package into that environment:
 ```sh
 DICTATION_INSTALL_HOME="$HOME"
 DICTATION_STATE="$DICTATION_INSTALL_HOME/.live-room/dictation"
-python3 -m venv "$DICTATION_STATE/.venv"
+: "${DICTATION_PYTHON:?Set this to an existing Python 3.10+ executable}"
+"$DICTATION_PYTHON" -m venv "$DICTATION_STATE/.venv"
 "$DICTATION_STATE/.venv/bin/python" -m pip install 'moonshine-voice==0.1.6'
 ```
 
@@ -129,7 +132,7 @@ processes with access to the same private files.
 This is request authentication over unencrypted loopback HTTP, not isolation
 from every other local process. The challenge and recognition request use
 separate connections: if the helper stops and another process takes its port
-between them, that process can receive the next request body. It cannot obtain
+between them, that process can receive the next request body and return a forged response, including text that could enter the draft; responses have no MAC. It cannot obtain
 the secret or replay the proof against a fresh helper instance. Audio stays on
 this computer; connection-bound confidentiality would require a different
 transport.
@@ -192,6 +195,7 @@ explicit Send action.
 | `finishing` | Helper: Stop is finalizing; await final events or a safe error |
 | `failed` | Helper: recoverable worker/load/recognition failure; keep the draft and retry |
 | `disabled` | Explicit demo mode; no state, model or helper access |
+| `busy` | Client probe only: transient request capacity; retry without changing credentials |
 | Microphone blocked/disconnected | Browser capture state; the helper cannot infer browser permission |
 
 Readiness uses `schemaVersion: 1`, one of the fixed state strings above, and a
@@ -201,7 +205,7 @@ have a null code. Setup reasons are `dependency_missing`, `runtime_version`,
 `helper_state_missing_or_unsafe`. Worker failures use `worker_failed`,
 `worker_timeout`, `model_error`, `protocol_error`, `recognition_failed` or
 `invalid_request`.
-The stopped client probe uses `connection_unavailable`; an authentication or
+A client probe reports `busy/busy` for temporary admission or worker capacity. The model service itself keeps its existing readiness state. The stopped client probe uses `connection_unavailable`; an authentication or
 response failure uses `authentication_failed` or `invalid_response`. Demo uses
 `demo`. Motet's disabled proxy adds `not_configured`; a missing private helper
 credential adds `not_installed`. Those are codes, not additional state names.
@@ -227,7 +231,7 @@ on the code and never parse the message. The route-specific vocabulary is:
 | Error event | `worker_failed`, `take_limit`, `disconnected` |
 
 Common helper errors are `forbidden`, `invalid_request`, `body_too_large`,
-`unknown_route`, `not_running` and `unavailable`. The owner proxy additionally
+`unknown_route`, `not_running`, `busy` and `unavailable`. The owner proxy additionally
 uses `not_configured`, `demo`, `not_installed`, `invalid_response` and
 `helper_authentication_failed`; upstream messages are never copied to the page.
 Unknown codes fail closed with a kept draft rather than inventing a readiness
@@ -270,8 +274,7 @@ the engine finalizes it; completed phrases use normal ink. Stop keeps the draft
 and restores upright text. Cancel removes untouched dictated phrases from the
 current take while retaining manually edited phrases. Send stops capture and
 sends exactly the visible draft through the existing message path. Late text
-cannot extend a sent message. The microphone also stops on context changes,
-locking, hidden tabs and capture errors.
+cannot extend a sent message. The microphone stops on recipient/draft changes, locking, hidden tabs and errors, with a reason when it ends automatically. Opening or closing the stage conversation and changing its model do not stop a take.
 
 The native textarea remains the editor. A pointer-inert, screen-reader-hidden
 display layer colors provisional text and follows its measured wrapping and
@@ -331,3 +334,13 @@ service beyond their own ephemeral loopback fixture:
 ```sh
 python3 tests/test_dictation_proxy.py
 ```
+
+## Manifest provenance
+
+The pinned model catalogue at
+[Moonshine v0.1.6](https://github.com/moonshine-ai/moonshine/blob/v0.1.6/core/moonshine-model-file-metadata.generated.cpp)
+supplies file URLs, expected sizes and CRC32C values. The manifest's SHA-256
+values are maintainer-computed integrity pins, recorded from the downloaded,
+runtime-matched files on 2026-11-19; they are not claimed as upstream-published
+SHA-256 values. The manifest records that distinction and verifies every required
+file before loading. No model or native binary is shipped in this repository.

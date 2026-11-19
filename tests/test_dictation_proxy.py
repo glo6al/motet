@@ -280,6 +280,75 @@ class Upstream(BaseHTTPRequestHandler):
     do_POST = dispatch
 
 
+class BusyTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'Private helper state integration')
+    def test_actual_pool_pressure_returns_busy_over_owner_http_without_model_failure(self):
+        sys.path.insert(0, str(ROOT))
+        from integrations.dictation.helper import HelperServer
+        from integrations.dictation.service import DictationService
+        from integrations.dictation.state import PrivateState
+        from dictation_auth import REQUEST_CAPACITY
+        with tempfile.TemporaryDirectory() as home:
+            key = PrivateState(home).key(create=True)
+            service = DictationService(lambda: None, lambda: None)
+            helper = HelperServer(0, key, service)
+            helper_thread = threading.Thread(target=helper.serve_forever, daemon=True)
+            helper_thread.start()
+            adapter = proxy.DictationProxy(home, helper.server_port, enabled=True)
+            class OwnerHandler(BaseHTTPRequestHandler):
+                def log_message(self, *args): pass
+                def do_GET(self): proxy.handle_http(self, adapter, OWNER, self.server.server_port)
+                def send(self, status, body, mime, extra=()):
+                    self.send_response(status)
+                    self.send_header('Content-Type', mime)
+                    self.send_header('Content-Length', str(len(body)))
+                    for name, value in extra: self.send_header(name, value)
+                    self.end_headers(); self.wfile.write(body)
+            owner = ThreadingHTTPServer(('127.0.0.1', 0), OwnerHandler)
+            owner_thread = threading.Thread(target=owner.serve_forever, daemon=True)
+            owner_thread.start()
+            def status():
+                import http.client
+                connection = http.client.HTTPConnection('127.0.0.1', owner.server_port, timeout=3)
+                try:
+                    connection.request('GET', '/api/dictation/status', headers={'X-Live-Room-Key': OWNER})
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+                finally: connection.close()
+            try:
+                with mock.patch.object(service, 'status', wraps=service.status) as model_status:
+                    for name in ('public_slots', 'slots'):
+                        pool = getattr(helper, name)
+                        for _ in range(REQUEST_CAPACITY): pool.acquire()
+                        try:
+                            with self.subTest(pool=name):
+                                code, value = status()
+                                self.assertEqual(code, 503)
+                                self.assertEqual(value['error']['code'], 'busy')
+                                self.assertNotIn('state', value, 'admission pressure is not a failed model')
+                                model_status.assert_not_called()
+                        finally:
+                            for _ in range(REQUEST_CAPACITY): pool.release()
+                    code, value = status()
+                    self.assertEqual((code, value['state']), (200, 'not_installed'))
+                    model_status.assert_called_once()
+            finally:
+                owner.shutdown(); owner.server_close(); owner_thread.join(2)
+                helper.shutdown(); helper.server_close(); helper_thread.join(2)
+            self.assertFalse(owner_thread.is_alive())
+            self.assertFalse(helper_thread.is_alive())
+
+    def test_saturated_challenge_is_retryable_not_a_setup_error(self):
+        from dictation_auth import BusyError
+        adapter = proxy.DictationProxy(Path('fictional-home'), 18879, enabled=True)
+        with mock.patch.object(proxy, '_read_helper_key', return_value=HELPER_KEY), \
+                mock.patch.object(adapter, '_forward', side_effect=BusyError()):
+            for action in ('status', 'start'):
+                with self.assertRaises(proxy.ProxyError) as caught:
+                    adapter.request(action, {})
+                self.assertEqual((caught.exception.status, caught.exception.code), (503, 'busy'))
+
+
 class LoopbackTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

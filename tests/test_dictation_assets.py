@@ -96,6 +96,23 @@ class AssetsTests(unittest.TestCase):
                 assets._copy_verified(source, item, self.root / 'refused')
         self.assertTrue(handle.closed)
 
+    def test_finder_metadata_is_ignored_without_weakening_model_checks(self):
+        for name, data in self.data.items(): self.write(name, data)
+        metadata = self.write('.DS_Store', b'fictional Finder metadata')
+        metadata.chmod(0o644)
+        self.assertTrue(assets.validate_model(self.model))
+        self.write('unrelated.txt', b'not a model file')
+        self.assert_error('unsafe_model_path', lambda: assets.validate_model(self.model))
+        (self.model / 'unrelated.txt').unlink()
+        self.write('adapter.ort', b'corrupted model')
+        self.assert_error('model_integrity', lambda: assets.validate_model(self.model))
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX links')
+    def test_finder_metadata_cannot_be_a_link(self):
+        for name, data in self.data.items(): self.write(name, data)
+        (self.model / '.DS_Store').symlink_to(self.model / 'adapter.ort')
+        self.assert_error('unsafe_model_path', lambda: assets.validate_model(self.model))
+
     def test_committed_manifest_exact_model_version_and_size(self):
         self.manifest.stop()
         with mock.patch.object(urllib.request, 'urlopen', side_effect=AssertionError('No network')):

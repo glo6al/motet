@@ -1,4 +1,5 @@
 """Optional local recognizer process; importing this module starts nothing."""
+import io
 import json
 import math
 import os
@@ -179,6 +180,9 @@ class Runtime:
                      '--model', os.fspath(self.model.absolute())],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     bufsize=0, env=self._environment())
+                # Keep stdin unbuffered for deadline-bounded writes, but read
+                # native output in chunks rather than one raw syscall per byte.
+                self._process.stdout = io.BufferedReader(self._process.stdout)
             except (OSError, ValueError):
                 self._retire()
                 raise RuntimeUnavailable('dependency_missing') from None

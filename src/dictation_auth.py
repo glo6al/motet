@@ -16,10 +16,15 @@ import time
 
 AUTH = 'hmac-sha256-v1'
 TTL = 10
+REQUEST_CAPACITY = 8
 HEADER_NAMES = ('X-Dictation-Client-Nonce', 'X-Dictation-Server-Nonce',
                 'X-Dictation-Content-SHA256', 'X-Dictation-Proof')
 HEX64 = re.compile(r'[0-9a-f]{64}')
 SERVER_NONCE = re.compile(r'[0-9a-f]{112}')
+
+
+class BusyError(Exception):
+    """The bounded helper admission queue is full; retry without setup changes."""
 
 
 class AuthenticationError(ValueError):
@@ -151,6 +156,8 @@ def request_headers(key, port, method, path, body=None, deadline=None, extra_hea
                 result[name] = value
             return result
         value = json.loads(raw, object_pairs_hook=unique)
+        if status == 503 and type(value) is dict and type(value.get('error')) is dict and value['error'].get('code') == 'busy':
+            raise BusyError('The helper is busy')
         if (status != 200 or type(value) is not dict
                 or set(value) != {'schemaVersion', 'authentication', 'clientNonce', 'serverNonce', 'serverProof'}
                 or type(value['schemaVersion']) is not int or value['schemaVersion'] != 1 or value['authentication'] != AUTH

@@ -15,7 +15,7 @@ import stat
 import threading
 import time
 import urllib.parse
-from dictation_auth import AuthenticationError, request_headers, wire_json
+from dictation_auth import AuthenticationError, BusyError, REQUEST_CAPACITY, request_headers, wire_json
 
 PROTOCOL = 1
 MAX_JSON = 4096
@@ -259,7 +259,7 @@ class DictationProxy:
         self.port = port
         self.enabled = (enabled is True and type(port) is int and 1 <= port <= 65535 and port != 8793)
         self.demo = demo is True
-        self._slots = threading.BoundedSemaphore(8)
+        self._slots = threading.BoundedSemaphore(REQUEST_CAPACITY)
 
     def disabled_status(self, demo=False):
         if demo or self.demo:
@@ -283,6 +283,8 @@ class DictationProxy:
             raise ProxyError(409, 'busy')
         try:
             status, value = self._forward(action, payload, session, sequence, key)
+        except BusyError:
+            raise ProxyError(503, 'busy') from None
         except AuthenticationError:
             if action == 'status':
                 return 200, _availability('failed', 'helper_authentication_failed')
@@ -304,6 +306,8 @@ class DictationProxy:
         if status != 200:
             code = value.get('error', {}).get('code') if type(value) is dict and type(value.get('error')) is dict else None
             code = code if code in SAFE_CODES else 'unavailable'
+            if code == 'busy':
+                raise ProxyError(503, 'busy')
             if action == 'status':
                 return 200, _availability('failed', code)
             if status not in (400, 404, 409, 413, 503):

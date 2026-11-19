@@ -5054,8 +5054,11 @@ class H(BaseHTTPRequestHandler):
         if u.path == '/dictation-worklet.js':
             if self.path != '/dictation-worklet.js':
                 return self.send(404, b'not found')
-            with open(os.path.join(HERE, 'web', 'dictation_worklet.js'), 'rb') as source:
-                module = source.read(200001)
+            try:
+                with open(os.path.join(HERE, 'web', 'dictation_worklet.js'), 'rb') as source:
+                    module = source.read(200001)
+            except OSError:
+                return self.send(404, b'not found')
             if len(module) > 200000:
                 return self.send(503, b'worklet unavailable')
             return self.send(200, module, 'text/javascript; charset=utf-8',
@@ -5063,8 +5066,11 @@ class H(BaseHTTPRequestHandler):
         if u.path == '/dictation-help':
             if self.path != '/dictation-help':
                 return self.send(404, b'not found')
-            with open(os.path.join(HERE, '..', 'docs', 'DICTATION.md'), 'rb') as source:
-                help_text = source.read(100001)
+            try:
+                with open(os.path.join(HERE, '..', 'docs', 'DICTATION.md'), 'rb') as source:
+                    help_text = source.read(100001)
+            except OSError:
+                return self.send(404, b'not found')
             if len(help_text) > 100000:
                 return self.send(503, b'help unavailable')
             return self.send(200, help_text, 'text/plain; charset=utf-8',

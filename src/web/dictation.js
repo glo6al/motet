@@ -14,7 +14,22 @@
     take_limit: 'Dictation stopped after three minutes. Your words are kept; press the microphone to continue.',
     draft_limit: 'The message is full. Your words are kept; edit or send it before dictating more.',
     events_expired: 'Dictation lost its place. Your visible words are kept; start a new take.',
-    failed: 'Dictation stopped. Your visible words are kept; press the microphone to try again.'
+    backlog: 'Dictation stopped because recognition fell behind. Your words are kept.',
+    capture_failed: 'Dictation stopped because audio capture failed. Your words are kept.',
+    audio_start_failed: 'Dictation could not start because the microphone did not become ready. Your words are kept.',
+    audio_interrupted: 'Dictation stopped because the microphone was interrupted. Your words are kept.',
+    timeout: 'Dictation stopped because the local recognizer did not answer. Your words are kept.',
+    failed: 'Dictation stopped because the local recognizer failed. Your words are kept; press the microphone to try again.'
+  };
+  const END_REASON = {
+    recipient: 'Dictation stopped when you changed the recipient.',
+    scope: 'Dictation stopped when you changed the scope.',
+    hidden: 'Dictation stopped when you left this tab.',
+    locked: 'Dictation stopped when you locked the stage.',
+    keychanged: 'Dictation stopped because the owner key changed.',
+    draft_changed: 'Dictation stopped because the draft changed elsewhere.',
+    unavailable: 'Dictation stopped because this message box became unavailable.',
+    destroyed: 'Dictation stopped because this message box closed.'
   };
   function problem(code) { const error = new Error(COPY[code] || COPY.failed); error.code = code; return error; }
   function create(options) {
@@ -24,11 +39,15 @@
     const DraftModel = scope.MotetDictationDraft && scope.MotetDictationDraft.DraftModel;
     const ManualJournal = scope.MotetDictationDraft && scope.MotetDictationDraft.ManualJournal;
     const textPatch = scope.MotetDictationDraft && scope.MotetDictationDraft.textPatch;
-    if (!DraftModel || !ManualJournal || !textPatch) throw new TypeError('The dictation draft model must be loaded first.');
+    const mapSelection = scope.MotetDictationDraft && scope.MotetDictationDraft.mapSelection;
+    if (!DraftModel || !ManualJournal || !textPatch || !mapSelection) throw new TypeError('The dictation draft model must be loaded first.');
     const model = new DraftModel(textarea.value);
     const journal = new ManualJournal(textarea.value);
     const listeners = [], originalFont = textarea.style.fontStyle;
     const bars = [];
+    const motionQuery = scope.matchMedia ? scope.matchMedia('(prefers-reduced-motion: reduce)') : null;
+    const prepareTimeout = Number.isInteger(options.prepareTimeoutMs) && options.prepareTimeoutMs > 0 && options.prepareTimeoutMs <= 10000
+      ? options.prepareTimeoutMs : 3000;
     const maximum = () => Number.isInteger(options.maxLength) && options.maxLength > 0 ? options.maxLength
       : textarea.maxLength > 0 ? textarea.maxLength : 64000;
     let state = 'idle', detail = {}, take = null, operation = 0, destroyed = false, composing = false;
@@ -36,9 +55,9 @@
     const demo = () => !!(options.demo && options.demo());
     const canUse = () => !destroyed && !demo() && (!options.canUse || !!options.canUse());
     const target = () => options.target ? options.target() : '';
-    const bind = (element, event, handler) => {
+    const bind = (element, event, handler, capture = false) => {
       if (!element) return;
-      element.addEventListener(event, handler); listeners.push(() => element.removeEventListener(event, handler));
+      element.addEventListener(event, handler, capture); listeners.push(() => element.removeEventListener(event, handler, capture));
     };
     function notifyDraft() { if (options.onDraftChange) options.onDraftChange(textarea.value); }
     function selection() {
@@ -72,15 +91,19 @@
         active: on, composing, ranges: model.provisionalRanges(), epoch: take ? take.epoch : 0
       }));
     }
-    function setState(next, value = {}) { state = next; detail = Object.assign({ code: next }, value); render(); }
+    function setState(next, value = {}) {
+      state = next; detail = Object.assign({ code: next, notice: take ? take.notice : '' }, value); render();
+    }
     function patchText(patch, announce = true, source = 'engine') {
       if (!patch) return;
       const top = textarea.scrollTop, left = textarea.scrollLeft;
+      const mapped = mapSelection(patch, selection(), textarea.value.length);
       if (source === 'engine') {
         if (journal.text !== textarea.value) journal.reset(textarea.value);
         journal.enginePatch(patch);
       }
       textarea.setRangeText(patch.text, patch.start, patch.end, 'preserve');
+      textarea.setSelectionRange(mapped.start, mapped.end, mapped.direction);
       textarea.scrollTop = top; textarea.scrollLeft = left;
       if (announce) changed();
     }
@@ -88,11 +111,11 @@
     function still(current) {
       if (!valid(current)) return false;
       if (!canUse() || target() !== current.target) {
-        abandon(current, 'idle'); return false;
+        endForContext(current, canUse() ? 'recipient' : 'unavailable'); return false;
       }
       if (!composing && !applying && textarea.value !== model.text) {
         journal.reset(textarea.value);
-        abandon(current, 'idle'); return false;
+        endForContext(current, 'draft_changed'); return false;
       }
       return true;
     }
@@ -113,7 +136,7 @@
         return response;
       } catch (error) {
         if (error && error.code) throw error;
-        throw problem(error && error.name === 'TypeError' ? 'not_running' : 'failed');
+        throw problem(error && error.name === 'AbortError' ? 'timeout' : error && error.name === 'TypeError' ? 'not_running' : 'failed');
       } finally {
         clearTimeout(timer);
         if (polling && current && current.pollAbort === controller) current.pollAbort = null;
@@ -149,21 +172,29 @@
       if (current.pollResolve) current.pollResolve();
       if (current.pollAbort) current.pollAbort.abort();
       if (current.flushResolver) current.flushResolver();
+      for (const cancel of current.prepareWaiters || []) cancel();
       closeGraph(current); scheduleCancel(current);
       if (current.resolveDone) current.resolveDone();
     }
-    function abandon(current, next = 'idle', message) {
+    function abandon(current, next = 'idle', message, ending = {}) {
       if (current && take !== current) return;
       operation++; retire(current); take = null;
       journal.barrier();
       model.reset(textarea.value);
-      setState(next, { message: message || COPY[next] || '' });
+      const shown = message === undefined ? COPY[next] || '' : message;
+      setState(next, Object.assign({ message: shown, reason: next, announcement: shown }, ending));
+    }
+    function endForContext(current, reason) {
+      const code = Object.prototype.hasOwnProperty.call(END_REASON, reason) ? reason : 'recipient';
+      abandon(current, 'idle', END_REASON[code], { reason: code, announcement: END_REASON[code] });
     }
     function fail(current, error) {
       if (!valid(current)) return;
       const code = error && error.code;
       const next = Object.prototype.hasOwnProperty.call(COPY, code) ? code : 'failed';
-      abandon(current, next, COPY[next]);
+      const message = current.hasListened && code === 'not_running'
+        ? 'Dictation stopped because the local recognizer is not running. Your words are kept.' : COPY[next];
+      abandon(current, next, message, { reason: typeof code === 'string' ? code : 'failed', announcement: message });
     }
     function queue(current, task) {
       const next = current.queue.then(() => !still(current) || current.transportClosed ? undefined : task());
@@ -173,12 +204,12 @@
     function pcm(current, buffer) {
       if (!still(current) || !current.acceptFrames) return;
       if (!(buffer instanceof ArrayBuffer) || !buffer.byteLength || buffer.byteLength > 64000 || buffer.byteLength % 4) {
-        fail(current, problem('failed')); return;
+        fail(current, problem('capture_failed')); return;
       }
       const samples = buffer.byteLength / 4;
       current.lastFrameAt = Date.now();
       current.queuedSamples += samples;
-      if (current.queuedSamples > 32000) { fail(current, problem('failed')); return; }
+      if (current.queuedSamples > 32000) { fail(current, problem('backlog')); return; }
       const sequence = current.sequence++;
       queue(current, async () => {
         try {
@@ -191,16 +222,21 @@
       }).catch(() => {});
     }
     function beginMeter(current) {
+      if (current.meterTimer) clearInterval(current.meterTimer);
+      const reduced = !!(motionQuery && motionQuery.matches);
+      if (options.wave) options.wave.classList.toggle('dictation-wave-still', reduced);
+      if (reduced) bars.forEach((bar, index) => { bar.style.height = (index % 11 === 5 ? 6 : index % 11 === 4 || index % 11 === 6 ? 4 : 2) + 'px'; });
       const values = new Float32Array(current.analyser.fftSize);
       current.meterTimer = setInterval(() => {
         if (!still(current)) return;
-        if (state === 'listening' && Date.now() - current.lastFrameAt > 2500) { fail(current, problem('failed')); return; }
+        if (state === 'listening' && Date.now() - current.lastFrameAt > 2500) { fail(current, problem('capture_failed')); return; }
+        if (reduced) return;
         current.analyser.getFloatTimeDomainData(values);
         let peak = 0;
         for (const sample of values) peak = Math.max(peak, Math.abs(sample));
         current.heights.shift(); current.heights.push(Math.min(24, 2 + Math.sqrt(peak) * 35));
         bars.forEach((bar, index) => { bar.style.height = `${current.heights[index]}px`; });
-      }, 65);
+      }, reduced ? 500 : 65);
     }
     function resetAfterEdit(current) {
       current.acceptEvents = false;
@@ -232,7 +268,7 @@
       }
       if (textarea.value !== model.text) {
         journal.reset(textarea.value);
-        abandon(current, 'idle'); return;
+        endForContext(current, 'draft_changed'); return;
       }
       const patch = model.line(event);
       if (model.text.length > maximum()) { model.reset(textarea.value); fail(current, problem('draft_limit')); return; }
@@ -247,7 +283,8 @@
       take = null; model.commitTake();
       journal.barrier();
       if (current.resolveDone) current.resolveDone();
-      setState('idle');
+      const message = current.stopRequested ? '' : 'Dictation stopped because the local recognizer ended this take. Your words are kept.';
+      setState('idle', { message, reason: current.stopRequested ? 'stop' : 'ended', announcement: message || 'Dictation stopped' });
     }
     function pausePoll(current) {
       return new Promise(resolve => {
@@ -276,6 +313,15 @@
         if (!result.events.length) await pausePoll(current);
       }
     }
+    function prepare(current, action, code) {
+      let timer, cancel;
+      const pending = new Promise((resolve, reject) => {
+        cancel = () => resolve(false); current.prepareWaiters.add(cancel);
+        timer = setTimeout(() => reject(problem(code)), prepareTimeout);
+        Promise.resolve().then(action).then(() => resolve(true), () => reject(problem(code)));
+      });
+      return pending.finally(() => { clearTimeout(timer); current.prepareWaiters.delete(cancel); });
+    }
     async function start() {
       if (!canUse() || take) return;
       if (journal.text !== textarea.value) journal.reset(textarea.value);
@@ -283,7 +329,8 @@
       const token = ++operation;
       const current = { token, target: target(), sessionId: null, epoch: 1, sequence: 0, after: 0,
         queue: Promise.resolve(), queuedSamples: 0, closed: false, acceptFrames: false, acceptEvents: true,
-        heights: Array(130).fill(2), compositionEvents: new Map(), resetting: false, editVersion: 0 };
+        heights: Array(130).fill(2), compositionEvents: new Map(), resetting: false, editVersion: 0,
+        prepareWaiters: new Set(), notice: options.captureNotice ? String(options.captureNotice() || '').slice(0, 1024) : '' };
       current.done = new Promise(resolve => { current.resolveDone = resolve; });
       take = current; model.reset(textarea.value); model.beginTake(); setState('checking', { message: 'Checking dictation…' });
       try {
@@ -312,15 +359,16 @@
         if (!scope.AudioContext || !scope.AudioWorkletNode) throw problem('unsupported');
         setState('preparing', { message: 'Allow microphone access for this page, then speak when it is listening.' });
         current.context = new scope.AudioContext();
-        const resume = current.context.resume(); resume.catch(() => {});
+        try { Promise.resolve(current.context.resume()).catch(() => {}); } catch (_) {}
+        if (!await prepare(current, () => current.context.audioWorklet.addModule(options.workletUrl || '/dictation-worklet.js'), 'capture_failed')) return;
+        if (!still(current) || token !== operation) return;
         const stream = await scope.navigator.mediaDevices.getUserMedia({ audio: {
           channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true
         }, video: false });
         current.stream = stream;
         if (!still(current) || token !== operation) { closeGraph(current); return; }
-        await resume;
-        if (!still(current) || token !== operation) return;
-        await current.context.audioWorklet.addModule(options.workletUrl || '/dictation-worklet.js');
+        if (!await prepare(current, () => current.context.resume(), 'audio_start_failed')) return;
+        if (current.context.state !== 'running') throw problem('audio_start_failed');
         if (!still(current) || token !== operation) return;
         current.startPromise = request('start', { intervalSeconds: .25 }).then(result => {
           current.sessionId = result.sessionId; return result;
@@ -334,7 +382,7 @@
           numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1]
         });
         if (current.worklet.addEventListener) current.worklet.addEventListener('processorerror', () => {
-          if (valid(current)) fail(current, problem('failed'));
+          if (valid(current)) fail(current, problem('capture_failed'));
         });
         current.worklet.port.onmessage = ({ data }) => {
           if (!data || !valid(current)) return;
@@ -347,12 +395,12 @@
         current.worklet.connect(current.context.destination);
         current.acceptFrames = true; current.lastFrameAt = Date.now();
         for (const track of stream.getAudioTracks()) track.addEventListener('ended', () => {
-          if (valid(current) && state === 'listening') fail(current, problem('failed'));
+          if (valid(current) && state === 'listening') fail(current, problem('audio_interrupted'));
         });
         if (current.context.addEventListener) current.context.addEventListener('statechange', () => {
-          if (valid(current) && state === 'listening' && current.context.state !== 'running') fail(current, problem('failed'));
+          if (valid(current) && state === 'listening' && current.context.state !== 'running') fail(current, problem('audio_interrupted'));
         });
-        beginMeter(current); setState('listening'); poll(current);
+        current.hasListened = true; beginMeter(current); setState('listening'); poll(current).catch(error => fail(current, error));
       } catch (error) {
         if (!valid(current)) { closeGraph(current); return; }
         if (error && error.name === 'NotAllowedError') error = problem('microphone_blocked');
@@ -365,7 +413,8 @@
       if (!current) return;
       journal.barrier();
       if (state === 'finishing') return current.done;
-      if (state !== 'listening') { abandon(current); return; }
+      current.stopRequested = true;
+      if (state !== 'listening') { abandon(current, 'idle', '', { reason: 'stop', announcement: 'Dictation stopped' }); return; }
       setState('finishing', { message: 'Finishing the last words…' });
       releaseCapture(current);
       try {
@@ -384,19 +433,19 @@
     function cancel() {
       const current = take;
       if (!current) return;
-      if (!composing && textarea.value !== model.text) { journal.reset(textarea.value); abandon(current); return; }
+      if (!composing && textarea.value !== model.text) { journal.reset(textarea.value); endForContext(current, 'draft_changed'); return; }
       model.userEdit(textarea.value);
       const patches = model.cancelTake();
       operation++; retire(current); take = null;
       for (const patch of patches) patchText(patch, false);
-      model.reset(textarea.value); setState('idle');
+      model.reset(textarea.value); setState('idle', { reason: 'cancel', announcement: 'Dictation cancelled' });
       journal.barrier();
       if (patches.some(Boolean)) changed();
     }
     function beforeSend() {
       const visible = textarea.value;
       journal.barrier();
-      if (take) abandon(take);
+      if (take) abandon(take, 'idle', '', { reason: 'send', announcement: 'Dictation stopped' });
       else { model.reset(visible); render(); }
       return visible;
     }
@@ -404,7 +453,7 @@
       if (destroyed || composing || textarea.readOnly || textarea.disabled || !journal.enabled) return false;
       if (journal.text !== textarea.value) {
         journal.reset(textarea.value);
-        if (take) abandon(take); else model.reset(textarea.value);
+        if (take) endForContext(take, 'draft_changed'); else model.reset(textarea.value);
         return false;
       }
       pendingInput = null;
@@ -433,12 +482,21 @@
       if (journal.text !== textarea.value) journal.reset(textarea.value);
       pendingInput = { type: event.inputType || 'manual', selection: selection() };
     }
+    function onComposerEscape(event) {
+      if (!event || destroyed || !take || event.key !== 'Escape' || event.defaultPrevented || composing || event.isComposing
+          || (options.canCancelEscape && !options.canCancelEscape())) return false;
+      event.preventDefault();
+      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      else if (event.stopPropagation) event.stopPropagation();
+      cancel(); return true;
+    }
     function onHistoryKey(event) {
-      if (destroyed || composing || textarea.readOnly || textarea.disabled || event.isComposing || event.altKey
+      if (destroyed || composing || event.isComposing) return;
+      if (textarea.readOnly || textarea.disabled || event.altKey
           || !(event.metaKey || event.ctrlKey) || !journal.enabled) return;
-      const key = String(event.key || '').toLowerCase();
-      const undoKey = key === 'z' || event.code === 'KeyZ';
-      const redoKey = key === 'y' || event.code === 'KeyY';
+      const letter = String(event.key || '').toLowerCase();
+      const key = /^[a-z]$/.test(letter) ? letter : event.code === 'KeyZ' ? 'z' : event.code === 'KeyY' ? 'y' : '';
+      const undoKey = key === 'z', redoKey = key === 'y';
       if (!undoKey && !redoKey) return;
       event.preventDefault(); if (event.stopPropagation) event.stopPropagation();
       applyHistory(redoKey || event.shiftKey ? 'redo' : 'undo');
@@ -458,14 +516,14 @@
       }
       render();
     }
-    function contextChanged() {
-      if (take) abandon(take);
+    function contextChanged(reason = 'recipient') {
+      if (take) endForContext(take, reason);
       model.reset(textarea.value); journal.reset(textarea.value); pendingInput = null; render();
     }
-    function refresh() { if (take && !canUse()) abandon(take); render(); }
+    function refresh() { if (take) still(take); render(); }
     function destroy() {
       if (destroyed) return;
-      if (take) abandon(take);
+      if (take) endForContext(take, 'destroyed');
       destroyed = true; operation++;
       for (const unbind of listeners.splice(0)) unbind();
       textarea.style.fontStyle = originalFont;
@@ -484,9 +542,13 @@
     }
     bind(options.mic, 'click', () => { if (take) stop(); else start(); });
     bind(options.cancel, 'click', cancel);
+    const escapeBoundary = options.host || options.mic && options.mic.parentElement || textarea;
+    bind(escapeBoundary, 'keydown', onComposerEscape, true);
     bind(textarea, 'beforeinput', onBeforeInput);
     bind(textarea, 'keydown', onHistoryKey);
-    bind(textarea, 'input', onEdit);
+    // Reconcile the native edit before older bubble listeners autosize/save and
+    // synchronously refresh this controller's draft-ownership fence.
+    bind(textarea, 'input', onEdit, true);
     bind(textarea, 'compositionstart', () => {
       if (journal.text !== textarea.value) journal.reset(textarea.value);
       compositionSelection = selection(); pendingInput = null; journal.barrier();
@@ -501,12 +563,15 @@
       current.compositionEvents.clear();
       if (current.deferredEnd) finish(current);
     });
-    bind(document, 'visibilitychange', () => { if (document.hidden && take) abandon(take); });
+    function motionChanged() { if (take && take.analyser && state === 'listening') beginMeter(take); }
+    if (motionQuery && motionQuery.addEventListener) bind(motionQuery, 'change', motionChanged);
+    bind(document, 'visibilitychange', () => { if (document.hidden && take) endForContext(take, 'hidden'); });
     bind(scope, 'pagehide', () => {
-      if (take) abandon(take);
+      if (take) endForContext(take, 'hidden');
     });
     render();
     return { start, stop, cancel, beforeSend, contextChanged, refresh, destroy,
+      escape: onComposerEscape,
       undo: () => applyHistory('undo'), redo: () => applyHistory('redo'),
       get active() { return !!take; }, get state() { return state; },
       get ranges() { return model.provisionalRanges(); }, get composing() { return composing; } };

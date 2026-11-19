@@ -9,6 +9,20 @@
     if (prefix === before.length && prefix === after.length) return null;
     return { start: prefix, end: before.length - suffix, text: after.slice(prefix, after.length - suffix) };
   }
+  function mapSelection(patch, selected, oldLength) {
+    const delta = patch.text.length - (patch.end - patch.start), length = Math.max(0, oldLength + delta);
+    function point(value, afterInsertion) {
+      const at = Number.isInteger(value) ? value : 0;
+      if (at < patch.start) return Math.max(0, at);
+      if (at > patch.end) return Math.min(length, at + delta);
+      if (patch.start === patch.end) return patch.start + (afterInsertion ? patch.text.length : 0);
+      if (at === patch.end) return patch.start + patch.text.length;
+      return patch.start + Math.min(at - patch.start, patch.text.length);
+    }
+    const collapsed = selected.start === selected.end;
+    const start = point(selected.start, collapsed), end = collapsed ? start : point(selected.end, true);
+    return { start, end, direction: collapsed ? 'none' : selected.direction || 'none' };
+  }
   class ManualJournal {
     constructor(text = '', { maxEntries = 100, maxUnits = 131072 } = {}) {
       this.maxEntries = maxEntries; this.maxUnits = maxUnits; this.serial = 0; this.reset(text);
@@ -208,6 +222,6 @@
       return patches;
     }
   }
-  scope.MotetDictationDraft = { DraftModel, ManualJournal, textPatch };
-  if (typeof module !== 'undefined' && module.exports) module.exports = { DraftModel, ManualJournal, textPatch };
+  scope.MotetDictationDraft = { DraftModel, ManualJournal, textPatch, mapSelection };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { DraftModel, ManualJournal, textPatch, mapSelection };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

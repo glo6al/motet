@@ -54,7 +54,7 @@ def _checked_info(info):
 
 
 def model_info():
-    """Return published model metadata. This never contacts a download service."""
+    """Return the pinned model manifest and its recorded provenance. No network I/O."""
     try:
         path = Path(__file__).with_name('model_manifest.json')
         return _checked_info(json.loads(path.read_text(encoding='utf-8')))
@@ -155,6 +155,15 @@ def _existing_files(path, info):
     known = {item['filename'] for item in info['files']}
     try:
         for entry in path.iterdir():
+            if entry.name == '.DS_Store':
+                metadata = entry.lstat()
+                # Finder metadata is not model input. Ignore only this exact
+                # regular owner file, never links, special files or substitutes
+                # for required manifest entries.
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                        or os.name == 'posix' and metadata.st_uid != os.getuid()):
+                    raise AssetsError('unsafe_model_path', 'Unsafe model folder metadata.')
+                continue
             if entry.name not in known:
                 raise AssetsError('unsafe_model_path', 'The model folder contains unrelated files.')
             _private(entry.lstat())

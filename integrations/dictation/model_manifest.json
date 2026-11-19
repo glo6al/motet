@@ -73,5 +73,10 @@
       "crc32c": "B7s10Q==",
       "licence": "MIT"
     }
-  ]
+  ],
+  "metadataSource": "https://github.com/moonshine-ai/moonshine/blob/v0.1.6/core/moonshine-model-file-metadata.generated.cpp",
+  "sizeSource": "Pinned upstream model catalogue",
+  "crc32cSource": "Pinned upstream model catalogue",
+  "sha256Source": "Maintainer-computed integrity pins from downloaded runtime-matched files; not upstream-published SHA-256",
+  "integrityRecordedAt": "2026-11-19"
 }

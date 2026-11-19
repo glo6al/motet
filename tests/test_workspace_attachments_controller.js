@@ -165,6 +165,59 @@ function harness(fixture,{query='?ui=workspace&demo&attachments=a03-five',worksp
    const busy=harness(fixture('a02-preparing'),{mutate});busy.install();assert.equal(busy.ids['#ofSend'].disabled,true,'actual preparing files still disable Send');
  }
  emptySendAppearance();for(const [from,to] of [["ordinaryEmpty?saved.disabled:!normal.sendEnabled","!normal.sendEnabled"],["!snapshot.draft.fileIds.length&&!ofIn.value.trim()?'':snapshot.draft.sendBlockedReason","snapshot.draft.sendBlockedReason"],["!next.draft.fileIds.length&&!next.draft.text.trim()?'':next.draft.sendBlockedReason","next.draft.sendBlockedReason"]]){assert(controller.includes(from));assert.throws(()=>emptySendAppearance(s=>s.replace(from,to)),assert.AssertionError)}count++;
+ // Motet's model lives inside the address cluster, which is hidden while listening.
+ // Mounted dictation must keep the actual Files control out of that hidden ancestor.
+ function nestedFilesProof(mutate=x=>x){
+   for(const mounted of [false,true]){
+     const q=harness(fixture('a01-officer'),{mutate,globals:{workspaceDictationPlacesFiles:()=>mounted}});
+     q.officer(true);q.context.OFUI.recipient='watch';q.context.OFUI.scope='station';
+     const row=q.ids['#ofRow'],address=q.ids['#ofAddress'],model=q.ids['#ofModelPicker'];
+     row.insertBefore(address,q.ids['#ofSend']);address.append(model);assert.equal(q.install(),true);
+     const files=q.ids['#officer'].all().find(node=>node.classList.contains('workspace-attachments-files'));
+     assert(files);assert.equal(files.parentNode,mounted?row:address,'Canonical attachment paint respects mounted dictation placement');
+     q.api.workspaceAttachmentsSync();assert.equal(files.parentNode,mounted?row:address,'Subsequent attachment paint cannot nest Files back into the hidden address');
+   }
+ }
+ nestedFilesProof();const dictationPlacement="&&!(typeof workspaceDictationPlacesFiles==='function'&&workspaceDictationPlacesFiles())";
+ assert(controller.includes(dictationPlacement));assert.throws(()=>nestedFilesProof(s=>s.replace(dictationPlacement,'')),assert.AssertionError);count++;
+ // Run the exact live-document placement statement too: that independent consumer must
+ // make the same choice even when it repaints after the dictation row observer runs.
+ const livePlacement=liveDocuments.split('\n').find(line=>line.includes('const placement=o.placement?.()'));
+ assert(livePlacement);
+ function liveNestedFilesProof(mutate=x=>x){
+   for(const mounted of [false,true])for(const surface of ['officer','station','room']){
+     const doc={activeElement:null},row=new Node(doc),compose=new Node(doc),send=new Node(doc),address=new Node(doc),model=new Node(doc),plus=new Node(doc),files=new Node(doc);
+     row.append(compose,address,send);address.append(model);
+     const ctx={row,compose,controls:{plus,files},o:{placement:()=>({recipient:address,model}),send},env:()=>({surface}),workspaceDictationPlacesFiles:()=>mounted};
+     vm.runInNewContext('{'+mutate(livePlacement)+'}',ctx);
+     assert.equal(files.parentNode,surface==='officer'&&!mounted?address:row,'Live documents '+surface+' Files placement');
+     if(mounted){address.hidden=true;assert.equal(address.contains(files),false,'Visible Files cannot depend on the hidden dictation address cluster');}
+     vm.runInNewContext('{'+mutate(livePlacement)+'}',ctx);assert.equal(files.parentNode,surface==='officer'&&!mounted?address:row);
+   }
+ }
+ liveNestedFilesProof();assert(livePlacement.includes(dictationPlacement));assert.throws(()=>liveNestedFilesProof(s=>s.replace(dictationPlacement,'')),assert.AssertionError);count++;
+ // The canonical attachment painter and real stage layout share the same model,
+ // Files, editor and microphone nodes through repeated idle/listening paints.
+ function stageModelWithAttachments(mutate=x=>x){
+   const q=harness(fixture('a01-room'),{globals:{workspaceDictationPlacesFiles:()=>true}}),row=q.ids['#ofRow'],model=q.ids['#ofModelPicker'],compose=q.ids['#ofCompose'],send=q.ids['#ofSend'];
+   q.context.focus=null;q.context.OFUI.recipient='watch';q.context.OFUI.scope='room';
+   const mic=new Node(q.doc),cancel=new Node(q.doc),wave=new Node(q.doc),header=new Node(q.doc),toggle=new Node(q.doc);mic.className='dictation-mic';cancel.hidden=wave.hidden=true;row.insertBefore(cancel,send);row.insertBefore(wave,send);row.insertBefore(mic,send);header.append(model,toggle);q.ids['#officer'].append(header);
+   q.context.WSO={active:true,header,desktop:{toggle}};q.context.workspaceOfficerDesktopEligible=()=>true;q.context.workspaceOfficerNarrowRestore=()=>{};q.context.workspaceOfficerDesktopHistoryPaint=()=>{};
+   const init=()=>{};init.current={view:{mic,cancel,wave}};q.context.workspaceDictationInit=init;q.context.workspaceDictationTarget=()=> 'fictional-room-draft';
+   q.run(mutate(sourceFunction('workspaceOfficerDesktopPaint'))+'\n'+sourceFunction('workspaceDictationOrderControls'));
+   assert.equal(q.install(),true);const draft=q.input.value;
+   for(const active of [false,true,false,true,false]){
+     if(active)q.ids['#officer'].classList.add('dictation-active');else q.ids['#officer'].classList.remove('dictation-active');
+     q.run('workspaceOfficerDesktopPaint()');q.api.workspaceAttachmentsSync();q.run('workspaceDictationOrderControls()');
+     const plus=row.querySelector('.workspace-attachments-plus'),files=row.querySelector('.workspace-attachments-files');assert(plus&&files);
+     assert.equal(model.parentNode,row,'Attachments never return the model to the stage header');assert.equal(model.nextSibling,mic);assert.equal(mic.nextSibling,send);
+     assert.equal(q.input.parentNode,compose);assert.equal(q.input.value,draft,'Layout paints do not change the current canonical draft');
+     const controls=row.childNodes;
+     if(active){assert(controls.indexOf(compose)<controls.indexOf(plus));assert(controls.indexOf(files)<controls.indexOf(cancel));}
+     else assert(controls.indexOf(files)<controls.indexOf(compose));
+   }
+ }
+ stageModelWithAttachments();assert.throws(()=>stageModelWithAttachments(s=>s.replace('row.insertBefore(model,slot);','WSO.header.insertBefore(model,WSO.desktop.toggle);')),assert.AssertionError);count++;
  console.log('ok workspace attachments controller: '+count+' behavior groups, canonical fixture and causal send guards');
 })().catch(error=>{console.error(error);process.exitCode=1});
 module.exports={harness,Node,sourceFunction,html,controller,extendedBindings};

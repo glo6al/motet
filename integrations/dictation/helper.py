@@ -18,10 +18,9 @@ import socket
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -32,9 +31,10 @@ from integrations.dictation.state import PrivateState, StateError, authenticates
 
 # The shared wire protocol lives with the standard-library Motet adapter.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
-from dictation_auth import Authenticator, AuthenticationError, request_headers, wire_json
+from dictation_auth import Authenticator, AuthenticationError, BusyError, REQUEST_CAPACITY, request_headers, wire_json
 
 PROTOCOL = 1
+WIN = os.name == 'nt'
 
 
 class PrefixedInput(io.RawIOBase):
@@ -61,6 +61,15 @@ class HelperServer(ThreadingHTTPServer):
     block_on_close = False
     HEADER_SECONDS = 2.0
     MAX_PENDING = 64
+    allow_reuse_address = not WIN
+
+    def server_bind(self):
+        # Match the core server: Windows SO_REUSEADDR allows another listener
+        # beside this one; EXCLUSIVEADDRUSE reserves the helper authority.
+        if WIN:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def __init__(self, port, key, service):
         if type(port) is not int or port == 8793 or not 0 <= port <= 65535:
@@ -68,8 +77,8 @@ class HelperServer(ThreadingHTTPServer):
         if not authenticates(key, key) or not re.fullmatch(r'[0-9a-f]{64}', key):
             raise ValueError('A private helper credential is required.')
         self.key, self.service = key, service
-        self.slots = threading.BoundedSemaphore(8)
-        self.public_slots = threading.BoundedSemaphore(4)
+        self.slots = threading.BoundedSemaphore(REQUEST_CAPACITY)
+        self.public_slots = threading.BoundedSemaphore(REQUEST_CAPACITY)
         self.stopped = threading.Event()
         self.incoming = queue.Queue(maxsize=self.MAX_PENDING)
         self.admitted = {}
@@ -430,22 +439,21 @@ def probe(home, port):
         headers = request_headers(key, port, 'GET', '/v1/status', deadline=deadline)
         status, raw = wire_json(port, 'GET', '/v1/status', headers=headers, deadline=deadline, limit=16384)
         value = json.loads(raw)
+        if status == 503 and type(value) is dict and type(value.get('error')) is dict and value['error'].get('code') == 'busy':
+            raise BusyError()
         if status == 403:
             raise AuthenticationError()
         if type(value) is not dict or value.get('schemaVersion') != 1 or 'state' not in value:
             raise ValueError()
         return value
+    except BusyError:
+        return {'schemaVersion': 1, 'state': 'busy', 'code': 'busy'}
     except AuthenticationError:
         return {'schemaVersion': 1, 'state': 'failed', 'code': 'authentication_failed'}
     except (http.client.HTTPException, ValueError):
         return {'schemaVersion': 1, 'state': 'failed', 'code': 'invalid_response'}
-    except (OSError, urllib.error.URLError):
+    except OSError:
         return {'schemaVersion': 1, 'state': 'not_running', 'code': 'connection_unavailable'}
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # Never forward the capability to a redirect target.
 
 
 def main(argv=None):

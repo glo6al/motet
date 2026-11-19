@@ -8,31 +8,53 @@ const { PCMResampler } = require('../src/web/dictation_worklet.js');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/web/dictation.js'), 'utf8');
 const draftSource = fs.readFileSync(path.join(__dirname, '../src/web/dictation_draft.js'), 'utf8');
+const viewSource = fs.readFileSync(path.join(__dirname, '../src/web/dictation_view.js'), 'utf8');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function flush() { for (let i = 0; i < 4; i++) await tick(); }
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 
 class Target {
   constructor() { this.listeners = new Map(); }
-  addEventListener(name, handler) {
+  addEventListener(name, handler, capture = false) {
     if (!this.listeners.has(name)) this.listeners.set(name, new Set());
     this.listeners.get(name).add(handler);
+    if (!this.listenerOptions) this.listenerOptions = new Map();
+    this.listenerOptions.set(handler, capture);
   }
   removeEventListener(name, handler) { this.listeners.get(name)?.delete(handler); }
-  dispatch(name, value = {}) { for (const handler of [...(this.listeners.get(name) || [])]) handler(value); }
+  dispatch(name, value = {}) {
+    const handlers = [...(this.listeners.get(name) || [])];
+    for (const capture of [true, false]) for (const handler of handlers)
+      if (!!this.listenerOptions?.get(handler) === capture) handler(value);
+  }
 }
 class Element extends Target {
   constructor(document) {
-    super(); this.ownerDocument = document; this.style = {}; this.hidden = false; this.disabled = false;
+    super(); this.ownerDocument = document; this.style = new Proxy({}, { set(target, name, value) {
+      if (name === 'height') document.heightWrites = (document.heightWrites || 0) + 1;
+      target[name] = value; return true;
+    } }); this.hidden = false; this.disabled = false;
     this.value = ''; this.maxLength = 50000; this.scrollTop = 17; this.scrollLeft = 3;
     this.selectionStart = 0; this.selectionEnd = 0; this.attributes = new Map(); this.children = [];
     const names = new Set();
     this.classList = { toggle(name, on) { if (on) names.add(name); else names.delete(name); },
-      remove(name) { names.delete(name); }, contains(name) { return names.has(name); } };
+      add(...values) { for (const name of values) names.add(name); },
+      remove(...values) { for (const name of values) names.delete(name); }, contains(name) { return names.has(name); } };
   }
+  get textContent() { return this._textContent || ''; }
+  set textContent(value) { this._textContent = String(value); this.textWrites = (this.textWrites || 0) + 1; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
   removeAttribute(name) { this.attributes.delete(name); }
+  toggleAttribute(name, on) { if (on) this.attributes.set(name, ''); else this.attributes.delete(name); if (name === 'hidden') this.hidden = on; }
   appendChild(child) { child.parent = this; this.children.push(child); }
+  insertBefore(child, before) {
+    const at = before ? this.children.indexOf(before) : this.children.length; assert(at >= 0);
+    child.parent = this; this.children.splice(at, 0, child); return child;
+  }
+  append(...children) { for (const child of children) this.appendChild(child); }
+  after(node) { assert(this.parent); node.parent = this.parent; this.parent.children.splice(this.parent.children.indexOf(this) + 1, 0, node); }
+  replaceChildren(...children) { for (const child of this.children) child.parent = null; this.children = []; this.append(...children); }
   remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); }
   setRangeText(text, start, end, mode) {
     assert.equal(mode, 'preserve');
@@ -45,6 +67,7 @@ class Element extends Target {
   setSelectionRange(start, end, direction = 'none') {
     this.selectionStart = start; this.selectionEnd = end; this.selectionDirection = direction;
   }
+  focus() { this.ownerDocument.activeElement = this; }
 }
 
 function input(env, text, { start, end = start, after = start + Math.max(0, text.length - env.elements.textarea.value.length + end - start), type = 'insertText' } = {}) {
@@ -63,11 +86,19 @@ function historyKey(env, { redo = false, ctrl = false } = {}) {
 function environment(configuration = {}) {
   const document = new Target(); document.hidden = false;
   document.createElement = () => new Element(document);
-  const elements = Object.fromEntries(['textarea', 'mic', 'cancel', 'send', 'wave', 'status', 'settings'].map(name => [name, new Element(document)]));
+  document.createElementNS = (namespace, tag) => { const element = new Element(document); element.namespaceURI = namespace; return element; };
+  document.createTextNode = text => { const element = new Element(document); element.textContent = text; return element; };
+  const elements = Object.fromEntries(['host', 'textarea', 'mic', 'cancel', 'send', 'wave', 'status', 'settings'].map(name => [name, new Element(document)]));
+  elements.host.append(elements.textarea, elements.mic, elements.cancel, elements.send);
   const env = { document, elements, demo: false, allowed: true, target: 'stage:all', readiness: 'ready', epoch: 1,
     calls: [], mediaCalls: 0, contexts: [], worklets: [], tracks: [], pendingEvents: [], nextId: 0, sequence: 0,
-    patches: 0, stateChanges: [], sessionNumber: 0 };
+    patches: 0, stateChanges: [], sessionNumber: 0, resumeCalls: 0, intervals: [], drafts: new Map() };
   Object.assign(env, configuration);
+  // The page binds its native draft-save/autosize/paint listeners before the
+  // optional controller is constructed. Their synchronous refresh is real.
+  if (env.legacyRefresh) elements.textarea.addEventListener('input', () => {
+    env.legacyRefreshCalls = (env.legacyRefreshCalls || 0) + 1; env.controller?.refresh();
+  });
   function newStream() {
     const track = new Target(); track.stopped = false;
     track.stop = () => { track.stopped = true; };
@@ -76,11 +107,11 @@ function environment(configuration = {}) {
   }
   class AudioContext extends Target {
     constructor() {
-      super(); this.state = 'running'; this.sampleRate = 48000; this.destination = {};
+      super(); this.state = env.contextState || 'running'; this.sampleRate = 48000; this.destination = {};
       this.audioWorklet = { addModule: url => { env.moduleUrl = url; return env.moduleDeferred ? env.moduleDeferred.promise : Promise.resolve(); } };
       env.contexts.push(this);
     }
-    resume() { return Promise.resolve(); }
+    resume() { env.resumeCalls++; return env.resume ? env.resume(this, env.resumeCalls) : Promise.resolve(); }
     close() { this.state = 'closed'; return Promise.resolve(); }
     createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
     createAnalyser() { return { fftSize: 256, connect() {}, disconnect() {}, getFloatTimeDomainData(values) { values.fill(.02); } }; }
@@ -98,15 +129,23 @@ function environment(configuration = {}) {
     pcm(bytes = 6400) { this.port.onmessage?.({ data: { type: 'pcm', buffer: new ArrayBuffer(bytes) } }); }
   }
   const browser = new Target();
+  const motion = new Target(); motion.matches = !!env.reducedMotion; env.motion = motion;
+  const setMeterInterval = env.fakeIntervals ? (fn, delay) => { const timer = { fn, delay, active: true }; env.intervals.push(timer); return timer; } : setInterval;
+  const clearMeterInterval = env.fakeIntervals ? timer => { timer.active = false; } : clearInterval;
   Object.assign(browser, { document, isSecureContext: true, AudioContext, AudioWorkletNode,
     navigator: { mediaDevices: { getUserMedia: async () => {
       env.mediaCalls++;
+      env.noticeBeforeMicrophone = env.stateChanges.at(-1)?.detail.notice;
       if (env.mediaError) throw env.mediaError;
       return env.mediaDeferred ? env.mediaDeferred.promise : newStream();
     } } },
-    console, setTimeout, clearTimeout, setInterval, clearInterval, AbortController, ArrayBuffer,
+    console, setTimeout, clearTimeout, setInterval: setMeterInterval, clearInterval: clearMeterInterval, AbortController, ArrayBuffer,
+    matchMedia: query => query.includes('prefers-reduced-motion') ? motion : { matches: false },
+    getComputedStyle: () => ({ fontFamily: 'system-ui', fontSize: '16px', fontWeight: '400', fontStyle: 'italic',
+      lineHeight: '24px', paddingTop: '0px', paddingRight: '0px', paddingBottom: '0px', paddingLeft: '0px' }),
     Float32Array, Float64Array, Date, Promise, Map, Set });
-  vm.createContext(browser); vm.runInContext(draftSource, browser); vm.runInContext(source, browser);
+  vm.createContext(browser); vm.runInContext(env.mutateDraft ? env.mutateDraft(draftSource) : draftSource, browser);
+  vm.runInContext(env.mutateController ? env.mutateController(source) : source, browser);
   env.browser = browser; env.newStream = newStream;
   const endpoint = async (url, config) => {
     const route = url.replace('/api/dictation/', '');
@@ -160,7 +199,9 @@ function environment(configuration = {}) {
   };
   env.controller = browser.MotetDictation.create(Object.assign({}, elements, {
     api: endpoint, demo: () => env.demo, canUse: () => env.allowed, target: () => env.target,
-    onDraftChange: () => { env.patches++; elements.textarea.dispatch('input'); },
+    prepareTimeoutMs: env.prepareTimeoutMs, captureNotice: () => env.captureNotice || '',
+    canCancelEscape: () => !env.foreground,
+    onDraftChange: () => { env.patches++; env.drafts.set(env.target, elements.textarea.value); elements.textarea.dispatch('input'); },
     onState: (state, detail) => env.stateChanges.push({ state, detail })
   }));
   env.close = async () => { env.controller.destroy(); await flush(); };
@@ -171,7 +212,309 @@ async function test(name, action) {
   await action(); console.log('PASS ' + name);
 }
 
+async function caretProof(mutateController) {
+  for (const place of ['end', 'interior']) {
+    const env = environment({ mutateController });
+    try {
+      await env.controller.start(); await flush(); env.emit([env.line('first phrase')]); await flush();
+      const textarea = env.elements.textarea, position = place === 'end' ? textarea.value.length : 8;
+      textarea.setSelectionRange(position, position);
+      env.emit([env.line('first sentence now')]); await flush();
+      assert.equal(textarea.selectionStart, textarea.selectionEnd, place + ' caret must stay collapsed');
+      assert.equal(textarea.selectionStart, place === 'end' ? textarea.value.length : position);
+    } finally { await env.close(); }
+  }
+}
+
+async function legacyInputProof(mutateController) {
+  const env = environment({ mutateController, legacyRefresh: true });
+  try {
+    const textarea = env.elements.textarea; textarea.value = 'Typed prefix. ';
+    await env.controller.start(); await flush(); env.emit([env.line('Which colleague changed pricing')]); await flush();
+    const original = textarea.value, at = original.indexOf('colleague') + 2;
+    input(env, original.slice(0, at) + 'x' + original.slice(at), { start: at, after: at + 1 }); await flush();
+    assert.equal(env.controller.state, 'listening', 'A native edit must reconcile before older autosize/paint input listeners refresh ownership');
+    assert(env.legacyRefreshCalls >= 2, 'Both recognition input and native input reached the older page listener');
+    assert(textarea.value.includes('coxlleague'));
+    env.emit([env.line('Later sentence stays')]); await flush();
+    assert(textarea.value.startsWith('Typed prefix. Which coxlleague changed pricing')); assert(textarea.value.includes('Later sentence stays'));
+    textarea.dispatch('compositionstart');
+    input(env, textarea.value + '途中', { start: textarea.value.length, after: textarea.value.length + 2 });
+    assert.equal(env.controller.state, 'listening', 'Legacy refresh during IME cannot misclassify composition as replacement');
+    textarea.dispatch('compositionend'); await flush(); assert.equal(env.controller.state, 'listening');
+    const replacement = 'A genuinely replaced draft';textarea.value = replacement;env.controller.refresh();
+    assert.equal(env.controller.active, false, 'A programmatic replacement without an input edit still retires old recognition');
+    assert.equal(textarea.value, replacement);assert.equal(env.stateChanges.at(-1).detail.reason, 'draft_changed');
+  } finally { await env.close(); }
+}
+
+async function layoutKeyProof(mutateController) {
+  const env = environment({ mutateController });
+  try {
+    input(env, 'Original', { start: 0, after: 8 });
+    await env.controller.start(); await flush(); env.emit([env.line('spoken words')]); await flush();
+    input(env, 'Edited spoken words', { start: 0, end: 8, after: 6 });
+    function key(value, code, control = false) {
+      const event = { key: value, code, metaKey: !control, ctrlKey: control, defaultPrevented: false,
+        preventDefault() { this.defaultPrevented = true; }, stopPropagation() {} };
+      env.elements.textarea.dispatch('keydown', event); return event;
+    }
+    assert(key('z', 'KeyY').defaultPrevented, 'German semantic Z means Undo');
+    assert.equal(env.elements.textarea.value, 'Original spoken words');
+    assert(key('y', 'KeyZ').defaultPrevented, 'German semantic Y means Redo');
+    assert.equal(env.elements.textarea.value, 'Edited spoken words');
+    assert.equal(key('f', 'KeyY', true).defaultPrevented, false, 'Dvorak Ctrl+F is not a history command');
+    assert(key('я', 'KeyZ').defaultPrevented, 'Non-Latin key falls back to the physical history shortcut');
+    assert.equal(env.elements.textarea.value, 'Original spoken words');
+  } finally { await env.close(); }
+}
+
+async function motionProof(mutateController) {
+  const env = environment({ reducedMotion: true, fakeIntervals: true, mutateController });
+  try {
+    await env.controller.start(); await flush();
+    assert(env.elements.wave.classList.contains('dictation-wave-still'));
+    const writes = env.document.heightWrites;
+    for (const timer of env.intervals.filter(timer => timer.active)) { timer.fn(); timer.fn(); timer.fn(); }
+    assert.equal(env.document.heightWrites, writes, 'Reduced-motion meter must not animate bar heights');
+    env.motion.matches = false; env.motion.dispatch('change');
+    const moving = env.document.heightWrites;
+    for (const timer of env.intervals.filter(timer => timer.active)) timer.fn();
+    assert(env.document.heightWrites > moving, 'The control case must exercise the live meter');
+  } finally { await env.close(); }
+}
+
+async function resumeProof(mutateController) {
+  const env = environment({ mutateController, contextState: 'suspended',
+    resume: (context, calls) => { if (calls === 1) return new Promise(() => {}); context.state = 'running'; return Promise.resolve(); } });
+  try {
+    await env.controller.start(); await flush();
+    assert.equal(env.resumeCalls, 2, 'Audio must resume again after the microphone stream arrives');
+    assert.equal(env.controller.state, 'listening');
+  } finally { await env.close(); }
+}
+
+async function resumeTimeoutProof(mutateController) {
+  const env = environment({ mutateController, prepareTimeoutMs: 15, resume: () => new Promise(() => {}) });
+  try {
+    const starting = env.controller.start();
+    const result = await Promise.race([starting.then(() => 'settled'), new Promise(resolve => setTimeout(() => resolve('hung'), 100))]);
+    assert.equal(result, 'settled', 'A live microphone cannot wait indefinitely for resume');
+    assert.equal(env.controller.state, 'audio_start_failed');
+    assert.equal(env.controller.active, false); assert(env.tracks.length > 0 && env.tracks.every(track => track.stopped));
+    assert.equal(env.calls.filter(call => call.route === 'start').length, 0);
+  } finally { await env.close(); }
+}
+
+function viewFixture(mutateView = value => value) {
+  const document = new Target(); document.createElement = () => new Element(document);
+  document.createElementNS = namespace => { const node = new Element(document); node.namespaceURI = namespace; return node; };
+  document.createTextNode = text => { const node = new Element(document); node.textContent = text; return node; };
+  const host = new Element(document), row = new Element(document), compose = new Element(document),
+    textarea = new Element(document), send = new Element(document);
+  host.appendChild(row); row.append(compose, send); compose.appendChild(textarea);
+  textarea.value = 'Some current words'; textarea.clientWidth = 500; textarea.clientHeight = 60;
+  textarea.offsetLeft = textarea.offsetTop = textarea.clientLeft = textarea.clientTop = 0;
+  const scope = new Target(); Object.assign(scope, { document, getComputedStyle: () => ({ fontFamily: 'system-ui',
+    fontSize: '16px', lineHeight: '24px', fontStyle: 'italic', paddingTop: '0px', paddingRight: '0px', paddingBottom: '0px', paddingLeft: '0px' }),
+  matchMedia: () => ({ matches: false }) });
+  vm.createContext(scope); vm.runInContext(mutateView(viewSource), scope);
+  const view = scope.MotetDictationView.attach({ textarea, row, compose, host, send });
+  return { view, host, textarea, document };
+}
+
+function announcerProof(mutateView) {
+  const { view, host } = viewFixture(mutateView);
+  try {
+    view.render('listening', { message: '', ranges: [] });
+    assert.equal(view.announcer.parent, host, 'The live region must remain outside hidden feedback');
+    assert.equal(view.announcer.hidden, false); assert.equal(view.status.parent.hidden, true);
+    assert.equal(view.announcer.getAttribute('role'), 'status');
+    assert.equal(view.announcer.getAttribute('aria-live'), 'polite');
+    assert.equal(view.announcer.textContent, 'Listening');
+    const writes = view.announcer.textWrites;
+    for (let i = 0; i < 10; i++) view.render('listening', { message: '', ranges: [] });
+    assert.equal(view.announcer.textWrites, writes, 'Partials must not repeat Listening');
+    view.render('idle', { reason: 'stop', announcement: 'Dictation stopped' });
+    assert.equal(view.announcer.textContent, 'Dictation stopped');
+    view.render('listening'); view.render('idle', { reason: 'cancel', announcement: 'Dictation cancelled' });
+    assert.equal(view.announcer.textContent, 'Dictation cancelled');
+  } finally { view.destroy(); }
+}
+
+async function contextReasonProof(mutateController) {
+  for (const reason of ['recipient', 'scope', 'locked', 'keychanged', 'unavailable']) {
+    const env = environment({ mutateController });
+    try {
+      await env.controller.start(); await flush(); env.emit([env.line('Keep these words')]); await flush();
+      env.controller.contextChanged(reason);
+      assert.equal(env.controller.active, false); assert(env.tracks.every(track => track.stopped));
+      assert.equal(env.elements.textarea.value, 'Keep these words');
+      const detail = env.stateChanges.at(-1).detail;
+      assert.equal(detail.reason, reason); assert.match(detail.message, /Dictation stopped/);
+      assert(detail.message.length > 25); assert.equal(detail.announcement, detail.message);
+    } finally { await env.close(); }
+  }
+}
+
+async function escapeProof(mutateController) {
+  const env = environment({ mutateController });
+  try {
+    env.elements.textarea.value = 'Typed first'; await env.controller.start(); await flush();
+    env.emit([env.line('dictated next')]); await flush();
+    const event = { key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {} };
+    env.elements.host.dispatch('keydown', event);
+    assert(event.defaultPrevented); assert.equal(env.elements.textarea.value, 'Typed first', 'Escape has Cancel semantics, not Stop');
+    assert.equal(env.controller.active, false); assert.equal(env.stateChanges.at(-1).detail.announcement, 'Dictation cancelled');
+    assert(env.tracks.every(track => track.stopped));
+  } finally { await env.close(); }
+}
+
+async function focusedEscapeProof(mutateController) {
+  for (const control of ['mic', 'cancel', 'send']) {
+    const env = environment({ mutateController });
+    try {
+      env.elements.textarea.value = 'Typed prefix'; env.elements.mic.focus(); env.elements.mic.dispatch('click'); await flush();
+      assert.equal(env.controller.state, 'listening'); assert.equal(env.document.activeElement, env.elements.mic);
+      env.emit([env.line('spoken words')]); await flush(); env.elements[control].focus();
+      const event = { key: 'Escape', target: env.elements[control], defaultPrevented: false,
+        preventDefault() { this.defaultPrevented = true; }, stopImmediatePropagation() { this.immediate = true; } };
+      env.elements.host.dispatch('keydown', event);
+      assert(event.defaultPrevented); assert(event.immediate);
+      assert.equal(env.controller.active, false, control + '-focused Escape must cancel');
+      assert.equal(env.elements.textarea.value, 'Typed prefix'); assert(env.tracks.every(track => track.stopped));
+      assert([...env.elements.host.listeners.get('keydown')].some(handler => env.elements.host.listenerOptions.get(handler) === true));
+      await flush(); assert.equal(env.calls.filter(call => call.route === 'cancel').length, 1);
+    } finally { await env.close(); }
+  }
+}
+
+async function publicEscapeProof(mutateController) {
+  const env = environment({ mutateController });
+  const event = (extra = {}) => Object.assign({ key: 'Escape', target: env.elements.mic, defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; }, stopImmediatePropagation() { this.immediate = true; } }, extra);
+  try {
+    assert.equal(env.controller.escape(event()), false, 'Idle Escape belongs to the surrounding application');
+    env.elements.textarea.value = 'Typed prefix'; env.elements.mic.focus();
+    env.elements.mic.dispatch('click'); await flush(); env.emit([env.line('spoken words')]); await flush();
+    for (const blocked of [event({ isComposing: true }), event({ defaultPrevented: true }), event({ key: 'Enter' })]) {
+      assert.equal(env.controller.escape(blocked), false); assert(env.controller.active);
+      assert.equal(blocked.immediate, undefined);
+    }
+    env.elements.textarea.dispatch('compositionstart');
+    assert.equal(env.controller.escape(event()), false); assert(env.controller.active);
+    env.elements.textarea.dispatch('compositionend'); await flush();
+    env.foreground = true;
+    assert.equal(env.controller.escape(event()), false, 'A foreground popup has first refusal'); assert(env.controller.active);
+    env.foreground = false;
+    const accepted = event();
+    assert.equal(env.controller.escape(accepted), true, 'The earlier window capture handler can cancel a mic-focused take');
+    assert(accepted.defaultPrevented); assert(accepted.immediate); assert.equal(env.controller.active, false);
+    assert.equal(env.elements.textarea.value, 'Typed prefix'); assert(env.tracks.every(track => track.stopped));
+    assert.equal(env.controller.escape(event()), false, 'Host fallback cannot cancel the same take twice');
+    await flush(); assert.equal(env.calls.filter(call => call.route === 'cancel').length, 1);
+  } finally { await env.close(); }
+}
+
+function viewEndProof(mutateView) {
+  const { view, host } = viewFixture(mutateView);
+  try {
+    for (const ending of [
+      ['finishing', { message: 'Finishing the last words…' }], ['idle', { reason: 'stop', announcement: 'Dictation stopped' }],
+      ['idle', { reason: 'cancel', announcement: 'Dictation cancelled' }], ['idle', { reason: 'send', announcement: 'Dictation stopped' }],
+      ['idle', { reason: 'recipient', message: 'Dictation stopped when you changed the recipient.' }],
+      ['failed', { code: 'failed', message: 'Dictation stopped because the local recognizer failed.' }]
+    ]) {
+      view.render('listening'); assert(host.classList.contains('dictation-active'));
+      view.render(...ending);
+      assert.equal(host.classList.contains('dictation-active'), false, ending[0] + ' returns stage and desk controls');
+      assert.equal(view.cancel.hidden, true); assert.equal(view.wave.hidden, true);
+      assert.equal(view.mic.getAttribute('aria-label'), 'Dictate a message');
+    }
+  } finally { view.destroy(); }
+}
+
+async function deskIdentityProof(mutateController) {
+  for (const desk of ['watch:room', 'agent:claude', 'agent:codex', 'agent:cursor', 'agent:antigravity',
+    'agent:sub-agent', 'agent:ended', 'agent:unavailable-send', 'agent:attachments']) {
+    const env = environment({ target: desk, mutateController });
+    try {
+      env.drafts.set('unrelated:watch', 'Unchanged Motet draft');
+      env.elements.textarea.value = 'Desk prefix'; await env.controller.start(); await flush();
+      env.emit([env.line('words for this desk')]); await flush();
+      const previous = env.pendingEvents[0], saved = env.elements.textarea.value;
+      env.target = 'different:' + desk; env.drafts.set(env.target, saved);
+      env.controller.refresh();
+      assert.equal(env.controller.active, false, desk + ' target identity must retire even with an identical visible draft');
+      previous.resolve({ events: [env.line('late old desk words')], ended: false }); await flush();
+      assert.equal(env.elements.textarea.value, saved);
+      assert.equal(env.drafts.get(desk), saved); assert.equal(env.drafts.get(env.target), saved);
+      assert.equal(env.drafts.get('unrelated:watch'), 'Unchanged Motet draft');
+      assert(env.tracks.every(track => track.stopped));
+    } finally { await env.close(); }
+  }
+}
+
 async function main() {
+  await test('recognition revisions preserve collapsed end and interior carets', () => caretProof());
+  await test('native edits reconcile before older page autosize/paint refresh listeners', () => legacyInputProof());
+  await test('history shortcuts follow Latin key meaning on German and Dvorak layouts', () => layoutKeyProof());
+  await test('reduced motion keeps the sound indicator still and responds to preference changes', () => motionProof());
+  await test('audio resumes again after the microphone stream arrives', () => resumeProof());
+  await test('resume has a bounded timeout that releases the live microphone', () => resumeTimeoutProof());
+  await test('listening, stopped and cancelled use one permanent quiet live announcer', () => announcerProof());
+  await test('every non-user context stop has one explicit reason and keeps its words', () => contextReasonProof());
+  await test('Escape cancels dictation and preserves the pre-existing draft', () => escapeProof());
+  await test('composer capture cancels Escape with the microphone, Cancel or Send focused', () => focusedEscapeProof());
+  await test('window Escape interception preserves IME and foreground-popup precedence', () => publicEscapeProof());
+  await test('stage and desk controls return on Stop, Cancel, Send and every interruption', () => viewEndProof());
+  await test('Motet and all synthetic agent desk identities cannot share late dictated words', () => deskIdentityProof());
+  await test('a cancelled pending resume settles and releases capture', async () => {
+    const env = environment({ resume: () => new Promise(() => {}), prepareTimeoutMs: 200 });
+    try {
+      const beginning = env.controller.start(); await flush();
+      assert.equal(env.resumeCalls, 2); assert(env.tracks.some(track => !track.stopped));
+      env.controller.cancel(); await beginning;
+      assert.equal(env.controller.active, false); assert(env.tracks.every(track => track.stopped));
+      assert.equal(env.calls.filter(call => call.route === 'start').length, 0);
+    } finally { await env.close(); }
+  });
+  await test('missing worklet preparation fails before asking for a microphone', async () => {
+    const env = environment({ moduleDeferred: deferred(), prepareTimeoutMs: 15 });
+    try {
+      await env.controller.start();
+      assert.equal(env.controller.state, 'capture_failed'); assert.equal(env.mediaCalls, 0);
+      assert.equal(env.contexts[0].state, 'closed');
+    } finally { await env.close(); }
+  });
+  await test('an unavailable-Send notice exists before capture and remains while listening', async () => {
+    const notice = 'This desk cannot receive a message. You can dictate a draft, but cannot send it here.';
+    const env = environment({ captureNotice: notice });
+    try {
+      env.elements.send.disabled = true; await env.controller.start(); await flush();
+      assert.equal(env.noticeBeforeMicrophone, notice); assert.equal(env.stateChanges.at(-1).detail.notice, notice);
+      assert.equal(env.controller.state, 'listening');
+      const { view } = viewFixture();
+      try {
+        view.render('listening', { notice }); assert.equal(view.status.textContent, notice);
+        assert(view.announcer.textContent.includes(notice));
+      } finally { view.destroy(); }
+      env.emit([env.line('A draft only')]); await flush();
+      assert.equal(env.elements.textarea.value, 'A draft only');
+      assert(!env.calls.some(call => ['ask', 'send'].includes(call.route)));
+    } finally { await env.close(); }
+  });
+  await test('ordinary refresh and view changes leave a take listening', async () => {
+    const env = environment();
+    try {
+      await env.controller.start(); await flush();
+      env.controller.refresh(); env.controller.refresh(); env.browser.dispatch('resize');
+      assert.equal(env.controller.state, 'listening'); assert(env.tracks.some(track => !track.stopped));
+      env.document.hidden = true; env.document.dispatch('visibilitychange');
+      assert.equal(env.stateChanges.at(-1).detail.reason, 'hidden');
+      assert.match(env.elements.status.textContent, /left this tab/);
+    } finally { await env.close(); }
+  });
   await test('no capture or API activity on construction, demo, or missing key', async () => {
     for (const configuration of [{}, { demo: true }, { allowed: false }]) {
       const env = environment(configuration);
@@ -581,6 +924,27 @@ async function main() {
       converter.feed(Float32Array.from({ length: rate }, (_, index) => Math.floor(index / 311) % 2 ? 1 : -1));
       converter.flush(); assert(output.every(value => Math.abs(value) <= 1));
     }
+  });
+  await test('causal mutations break the caret, layout-key, accessibility, motion, resume and lifecycle proofs', async () => {
+    async function caught(name, mutate, proof, original = source) {
+      assert.notEqual(mutate(original), original, name + ' must target the current implementation');
+      await assert.rejects(async () => proof(mutate), assert.AssertionError, name + ' must fail its behavioral proof');
+    }
+    await caught('collapsed caret mapping', value => value.replace('textarea.setSelectionRange(mapped.start, mapped.end, mapped.direction);', ''), caretProof);
+    await caught('native edit capture ordering', value => value.replace("bind(textarea, 'input', onEdit, true);", "bind(textarea, 'input', onEdit);"), legacyInputProof);
+    await caught('semantic keyboard layout', value => value.replace("const undoKey = key === 'z', redoKey = key === 'y';",
+      "const undoKey = letter === 'z' || event.code === 'KeyZ', redoKey = letter === 'y' || event.code === 'KeyY';"), layoutKeyProof);
+    await caught('permanent live-region placement', value => value.replace('host.appendChild(announcer);', 'statusRow.appendChild(announcer);'), announcerProof, viewSource);
+    await caught('live announcement deduplication', value => value.replace('announcement && key !== announcementKey', 'announcement'), announcerProof, viewSource);
+    await caught('reduced-motion still meter', value => value.replace('const reduced = !!(motionQuery && motionQuery.matches);', 'const reduced = false;'), motionProof);
+    await caught('resume after stream permission', value => value.replace("if (!await prepare(current, () => current.context.resume(), 'audio_start_failed')) return;", ''), resumeProof);
+    await caught('bounded preparation deadline', value => value.replace('timer = setTimeout(() => reject(problem(code)), prepareTimeout);', 'timer = setTimeout(() => {}, prepareTimeout);'), resumeTimeoutProof);
+    await caught('explicit interruption reason', value => value.replace('if (take) endForContext(take, reason);', 'if (take) abandon(take);'), contextReasonProof);
+    await caught('Escape is Cancel', value => value.replace('cancel(); return true;', 'stop(); return true;'), escapeProof);
+    await caught('Escape composer capture binding', value => value.replace("bind(escapeBoundary, 'keydown', onComposerEscape, true);", ''), focusedEscapeProof);
+    await caught('Escape foreground precedence', value => value.replace('(options.canCancelEscape && !options.canCancelEscape())', 'false'), publicEscapeProof);
+    await caught('finishing returns desk controls', value => value.replace("active = ['preparing','listening'].includes(state);", "active = ['preparing','listening','finishing'].includes(state);"), viewEndProof, viewSource);
+    await caught('actual desk identity guard', value => value.replace('!canUse() || target() !== current.target', '!canUse() || false'), deskIdentityProof);
   });
   console.log('Dictation page checks passed.');
 }

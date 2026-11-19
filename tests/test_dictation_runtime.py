@@ -3,6 +3,7 @@ import ast
 import base64
 import importlib.metadata
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -63,6 +64,25 @@ for raw in sys.stdin:
         self.assertEqual(value.call('start', interval=.25), {'epoch': 1, 'events': [], 'commandMs': .2})
         self.assertEqual(value.call('cancel')['events'], [])
 
+    def test_native_stdout_is_chunk_buffered_without_changing_stdin(self):
+        value = self.runtime(READY + 'time.sleep(1)\n')
+        value.start()
+        self.assertIsInstance(value._process.stdout, io.BufferedReader)
+        self.assertIsInstance(value._process.stdin, io.FileIO)
+        class CountingRaw(io.RawIOBase):
+            def __init__(self): self.remaining = 100000; self.reads = 0
+            def readable(self): return True
+            def readinto(self, buffer):
+                self.reads += 1
+                count = min(len(buffer), self.remaining)
+                buffer[:count] = b'x' * count
+                self.remaining -= count
+                return count
+        raw = CountingRaw()
+        with io.BufferedReader(raw) as buffered:
+            self.assertEqual(len(buffered.readline(100000)), 100000)
+            self.assertLess(raw.reads, 20)
+
     def test_missing_interpreter_is_safe_dependency_error(self):
         value = Runtime(Path(self.directory.name) / 'absent', 'model', timeout=.1)
         with self.assertRaises(RuntimeUnavailable) as caught:
@@ -72,9 +92,18 @@ for raw in sys.stdin:
 
     def test_model_loading_has_its_own_bounded_deadline(self):
         value=self.runtime('time.sleep(.12)\n'+READY+'for raw in sys.stdin:\n request=json.loads(raw)\n print(json.dumps('+GOOD+'),flush=True)\n')
-        value.timeout=.03;value.load_timeout=.5
-        value.start();self.assertTrue(value.ready)
-        self.assertEqual(value.call('start',interval=.25)['epoch'],1)
+        value.timeout=2;value.load_timeout=5
+        deadlines = []
+        receive = value._receive
+        def observed(request_id, deadline):
+            deadlines.append(deadline - time.monotonic())
+            return receive(request_id, deadline)
+        with mock.patch.object(value, '_receive', side_effect=observed):
+            value.start();self.assertTrue(value.ready)
+            self.assertEqual(value.call('start',interval=.25)['epoch'],1)
+        self.assertGreater(deadlines[0], 4, 'loading uses its own five-second budget')
+        self.assertLess(deadlines[1], 3, 'commands use the separate two-second budget')
+        self.assertIsInstance(value._process.stdout, io.BufferedReader)
         value.close()
         value=self.runtime('time.sleep(2)\n'+READY)
         value.load_timeout=.05
@@ -149,6 +178,7 @@ print(json.dumps({'id':request['id'],'ok':True,'epoch':99,'events':[],'commandMs
 
     def test_oversized_response_is_rejected(self):
         value = self.runtime(READY + "sys.stdin.readline()\nprint('x'*(1024*1024+1),flush=True)\ntime.sleep(1)\n")
+        value.timeout = 10
         value.start()
         with self.assertRaises(RuntimeUnavailable) as caught:
             value.call('stop')
@@ -170,6 +200,7 @@ for raw in sys.stdin:
     print(json.dumps({'id':request['id'],'ok':True,'epoch':1,'events':[{'type':'line','text':'hello'}],'commandMs':0}),flush=True)
 """
         value = self.runtime(body)
+        value.timeout = 10
         value.start()
         with self.assertRaises(RuntimeUnavailable) as caught:
             value.call('stop')
@@ -183,6 +214,7 @@ for raw in sys.stdin:
     print(json.dumps({'id':request['id'],'ok':False,'code':[]}),flush=True)
 """
         value = self.runtime(body)
+        value.timeout = 10
         value.start()
         with self.assertRaises(RuntimeUnavailable) as caught:
             value.call('stop')
@@ -196,6 +228,7 @@ for raw in sys.stdin:
     print(json.dumps({'id':request['id'],'ok':False,'code':'recognition_failed'}),flush=True)
 """
         value = self.runtime(body)
+        value.timeout = 10
         value.start()
         with self.assertRaises(RuntimeUnavailable) as caught:
             value.call('stop')
