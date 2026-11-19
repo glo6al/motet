@@ -3847,3 +3847,86 @@ require('./test_attachments_officer_direct.js');
 require('./test_attachments_history_time.js');
 require('./test_officer_documents_page.js');
 require('./test_officer_documents_page_http.js');
+
+/* Stored owner-message time travels through actual merge, card, paint and order paths. */
+function ownerTimestampHarness(code=messageCode,storage=new Map(),workspace=false){
+  const h=messaging(code,storage),ctx=h.ctx,log={children:[],dataset:{},scrollTop:37,scrollHeight:900};
+  Object.defineProperty(log,'firstElementChild',{get:()=>log.children[0]||null});
+  log.insertBefore=(el,at)=>{const old=log.children.indexOf(el);if(old>=0)log.children.splice(old,1);const index=at?log.children.indexOf(at):log.children.length;assert(index>=0);log.children.splice(index,0,el)};
+  const add=ctx.ofAdd;
+  ctx.ofAdd=(cls,markup,meta={})=>{
+    const el=add(cls,markup,meta);el.dataset={};el.isConnected=true;el.classList={contains:()=>false};el.contains=()=>false;
+    Object.defineProperty(el,'nextElementSibling',{get:()=>log.children[log.children.indexOf(el)+1]||null});
+    if(meta.id)Object.assign(ctx.CU.nodes.get(meta.id),{context:meta.context||null,ts:meta.ts||0,kind:meta.kind||'watch',global:!!meta.global});
+    return el;
+  };
+  Object.assign(ctx,{WORKSPACE:workspace,focus:request.agent,A:{[request.agent]:{id:request.agent,story:[],q:[]}},
+    OFUI:{recipient:'agent',scope:'station',docked:true},ofLog:log,document:{activeElement:{fictionalFocus:true}},
+    cuTarget:()=>request.agent,ofCurrent:()=>({context:{scope:'station'}}),cuPendingPaint(){},
+    cuScrollSnapshot:()=>({near:false,top:log.scrollTop,anchor:null}),nearEnd:()=>false});
+  const lines=html.split('\n'),card=lines.find(line=>line.startsWith('function cuCard(')),
+    order=lines.find(line=>line.startsWith('function workspaceConversationRows(')),
+    visible=lines.find(line=>line.startsWith('function cuLaneVisible(')),
+    paint=html.slice(html.indexOf('function cuPaint('),html.indexOf('function cuPendingPaint('));
+  vm.runInContext(card+'\n'+order+'\n'+visible+'\n'+paint,ctx);
+  return {...h,log};
+}
+async function ownerTimestampChecks(code=messageCode){
+  const created=1800000000.25,api={request_id:request.request_id,agent:request.agent,name:request.name,
+    question:request.question,state:'answered',reply:'Fictional retained reply.',error:'',created};
+  for(const workspace of [false,true]){
+    const storage=new Map([['liveRoomMessages',JSON.stringify([{...request,created:0}])]]),h=ownerTimestampHarness(code,storage,workspace);
+    h.ctx.connected=false;h.ofMessageLoad();assert.equal(h.gets.length,0);
+    const record=h.OFM.records.get(request.request_id),el=record.el,row=h.ctx.CU.nodes.get('message:'+request.request_id),focused=h.ctx.document.activeElement;
+    assert.equal(row.el,el);assert.equal(row.ts,0);assert.match(el.innerHTML,/time not recorded/);
+    h.ctx.ofAdd('source','Fictional earlier activity',{id:'source:earlier',ts:created-.25,kind:'source',context:{scope:'station',agent:request.agent}});
+    h.ctx.ofAdd('source','Fictional later activity',{id:'source:later',ts:created+1,kind:'source',context:{scope:'station',agent:request.agent}});
+    h.ctx.cuPaint();const ordered=()=>h.log.children.filter(node=>[el,h.ctx.CU.nodes.get('source:earlier').el,h.ctx.CU.nodes.get('source:later').el].includes(node));
+    assert.equal(ordered()[0],el,'unknown-time cached card starts before recorded activity');
+    for(const mismatch of [{agent:'x:other'}, {question:'Different original question'}]){
+      h.ofMessageMerge([{...api,...mismatch}]);assert.equal(record.created,0,'matching request ID alone cannot hydrate a different message');assert.equal(row.ts,0);
+    }
+    for(const invalid of [undefined,null,true,'1800000000',0,-1,NaN,Infinity,-Infinity]){
+      h.ofMessageMerge([{...api,created:invalid}]);assert.equal(record.created,0);assert.equal(row.ts,0);
+    }
+    h.ctx.connected=true;h.ctx.response={ok:true,json:async()=>({requests:[api],controls:[],available:true,reason:''})};await h.ofMessagePoll();
+    assert.equal(record.created,created);assert.equal(row.ts,created,'the existing owned CU row receives the recovered timestamp');
+    assert.equal(record.el,el);assert.equal(h.ctx.CU.nodes.get('message:'+request.request_id),row);
+    assert.deepEqual(ordered(),[h.ctx.CU.nodes.get('source:earlier').el,el,h.ctx.CU.nodes.get('source:later').el],'actual CU ordering uses recovered time');
+    assert.match(el.innerHTML,new RegExp(String(created).replace('.','\\.')));assert.doesNotMatch(el.innerHTML,/time not recorded/);
+    assert.equal(h.ctx.document.activeElement,focused);assert.equal(h.log.scrollTop,37,'timestamp hydration preserves existing non-follow scroll rule');
+    assert.equal(JSON.parse(storage.get('liveRoomMessages'))[0].created,created);
+    const paints=el.paints;await h.ofMessagePoll();assert.equal(el.paints,paints,'unchanged authoritative poll keeps the existing DOM');
+    const reload=ownerTimestampHarness(code,storage,workspace);reload.ctx.connected=false;reload.ofMessageLoad();
+    assert.equal(reload.OFM.records.get(request.request_id).created,created);assert.equal(reload.ctx.CU.nodes.get('message:'+request.request_id).ts,created);
+    assert.doesNotMatch(reload.OFM.records.get(request.request_id).el.innerHTML,/time not recorded/);
+    h.ctx.OFUI.recipient='watch';h.ctx.cuPaint();assert.equal(el.hidden,true,'timestamp updates do not broaden recipient visibility');
+
+    // A stale/replaced CU row must not inherit the retained record's timestamp.
+    const stale=ownerTimestampHarness(code,new Map(),workspace);stale.ofMessageMerge([{...request,created:0}]);
+    const own=stale.ctx.CU.nodes.get('message:'+request.request_id),foreign={...own,el:{},ts:99};
+    stale.ctx.CU.nodes.set('message:'+request.request_id,foreign);stale.ctx.cuPaint=()=>{};
+    stale.ofMessageMerge([api]);assert.equal(foreign.ts,99,'only exact owned row elements may receive metadata');
+  }
+  // Execute the actual send handler with a fake response; preserve its local send
+  // time even when a later server receipt/poll records a different creation time.
+  const h=ownerTimestampHarness(code),ctx=h.ctx,local=created+10,posts=[];
+  Object.assign(ctx,{connected:true,locked:false,Date:{now:()=>local*1000},crypto:{randomUUID:()=>request.request_id},
+    ofIn:{value:request.question},cuSendReason:()=>'',cuDraftSave(){},ofContextPaint(){},
+    post:async(path,body)=>{posts.push({path,body});return {ok:true,json:async()=>({...api,state:'queued'})}}});
+  ctx.CU.busy=new Set();const send=vm.runInContext(directCode+';cuSend',ctx);await send();
+  const localRecord=h.OFM.records.get(request.request_id);assert.equal(posts.length,1);assert.equal(posts[0].path,'/agent-message');
+  assert.equal(localRecord.created,local,'valid direct-send browser time is immutable');assert.equal(ctx.CU.nodes.get('message:'+request.request_id).ts,local);
+  h.ofMessageMerge([api]);assert.equal(localRecord.created,local);assert.equal(ctx.CU.nodes.get('message:'+request.request_id).ts,local);
+}
+(async()=>{
+  await ownerTimestampChecks();
+  const hydration="if(!(typeof r.created==='number'&&Number.isFinite(r.created)&&r.created>0)&&typeof v.created==='number'&&Number.isFinite(v.created)&&v.created>0)r.created=v.created;",
+    rowTime="ownedRow.ts=typeof r.created==='number'&&Number.isFinite(r.created)&&r.created>0?r.created:0;";
+  for(const [label,from,to] of [
+    ['lost cached time hydration',hydration,''],['lost owned CU row time',rowTime,'void 0;'],
+    ['stale CU ownership',"if(ownedRow?.el===r.el)",'if(ownedRow)'],
+    ['overwritten direct local time',"!(typeof r.created==='number'&&Number.isFinite(r.created)&&r.created>0)",'true'],
+  ]){assert(messageCode.includes(from));await assert.rejects(()=>ownerTimestampChecks(messageCode.replace(from,to)),label+' must fail actual reload/card/paint/order checks')}
+  console.log('ok owner reply timestamps: actual cache reload/GET merge/cuCard/paint ordering in Classic+Workspace, exact identity/element ownership, immutable local send time and four causal mutations');
+})().catch(error=>{console.error(error);process.exitCode=1});

@@ -2,6 +2,7 @@
 """No live sends: mocked CLI, temporary transcripts and an ephemeral HTTP server."""
 import concurrent.futures
 import http.client
+import inspect
 import json
 import os
 import subprocess
@@ -16,6 +17,37 @@ from unittest.mock import patch, Mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import officer_messaging as m
 import server
+
+
+class PublicTimestampTests(unittest.TestCase):
+    def test_only_valid_stored_creation_time_is_added_to_public_allowlist(self):
+        row = dict(request_id='fictional-request', agent='x:fictional-agent', name='Aster',
+                   question='Fictional question', state='answered', reply='Fictional reply', error='',
+                   path='/fictional/private', cursor=123, envelope='private transport metadata')
+        expected = {key: row[key] for key in ('request_id', 'agent', 'name', 'question', 'state', 'reply', 'error')}
+        self.assertEqual(m.public(row), expected)
+        for created in (1800000000, 1800000000.125):
+            with self.subTest(created=created):
+                self.assertEqual(m.public(dict(row, created=created)), dict(expected, created=created))
+        for created in (True, False, '1800000000', None, 0, -1, float('nan'), float('inf'),
+                        -float('inf'), 10 ** 400):
+            with self.subTest(kind=type(created).__name__):
+                value = m.public(dict(row, created=created))
+                self.assertEqual(value, expected)
+                json.dumps(value, allow_nan=False)
+        self.assertEqual(m.public(dict(row, created=1800000000, delivery_warning='Fictional warning')),
+                         dict(expected, created=1800000000, delivery_warning='Fictional warning'))
+
+    def test_public_created_removal_mutant_is_rejected(self):
+        source = inspect.getsource(m.public)
+        field = "result['created'] = created"
+        self.assertIn(field, source)
+        namespace = {'math': m.math}
+        exec(compile(source.replace(field, 'pass', 1), '<fictional public timestamp mutant>', 'exec'), namespace)
+        result = unittest.TestResult()
+        with patch.object(m, 'public', namespace['public']):
+            PublicTimestampTests('test_only_valid_stored_creation_time_is_added_to_public_allowlist').run(result)
+        self.assertFalse(result.wasSuccessful(), 'Removing the public field must break the serializer contract test')
 
 
 @unittest.skipIf(os.name == "nt", "POSIX-private Codex messaging storage; Windows startup leaves it unavailable")
@@ -532,12 +564,17 @@ class MessagingTests(unittest.TestCase):
             self.assertEqual(request('GET', '/agent-messages', dict(auth, Host='evil.test'))[0], 403)
             payload = {'agent': self.agent, 'question': self.question, 'request_id': self.rid}
             self.assertEqual(request('POST', '/agent-message', body=payload)[0], 403)
-            self.assertEqual(request('POST', '/agent-message', auth, payload)[0], 200)
+            sent_status, sent_body = request('POST', '/agent-message', auth, payload)
+            self.assertEqual(sent_status, 200)
+            created = json.loads(sent_body)['created']
+            self.assertGreater(created, 0)
+            self.assertEqual(created, self.store._rows()[0]['created'])
             self.assertEqual(request('POST', '/agent-message', auth, payload)[0], 200)
             self.assertEqual(request('POST', '/agent-message', auth, dict(payload, question='changed'))[0], 409)
             status, body = request('GET', '/agent-messages', auth)
             self.assertEqual(status, 200)
             self.assertEqual(len(json.loads(body)['requests']), 1)
+            self.assertEqual(json.loads(body)['requests'][0]['created'], created)
         finally:
             httpd.shutdown(); httpd.server_close(); thread.join()
             server.KEY, server.MESSAGING, server.PORT = old_key, old_store, old_port

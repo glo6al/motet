@@ -93,6 +93,13 @@ def outgoing_message(row):
 
 def public(row):
     result = {k: row.get(k, '') for k in ('request_id', 'agent', 'name', 'question', 'state', 'reply', 'error')}
+    created = row.get('created')
+    if type(created) in (int, float) and created > 0:
+        try:
+            if math.isfinite(created):
+                result['created'] = created
+        except OverflowError:
+            pass
     if isinstance(row.get('delivery_warning'), str) and row['delivery_warning']:
         result['delivery_warning'] = row['delivery_warning']
     return result

@@ -5598,6 +5598,7 @@ function ofMessagePaint(r,reconcile=false){
   const delivery=fulfilled?(originalLabels[r.state]||originalLabels.unknown):state;
   const replyMarkup=r.state==='answered'?ofParas(String(r.reply||'')):'';
   const deskPresentation=typeof WORKSPACE!=='undefined'&&WORKSPACE&&!!focus&&OFUI.docked;
+  const ownedRow=CU.nodes.get('message:'+r.request_id);if(ownedRow?.el===r.el)ownedRow.ts=typeof r.created==='number'&&Number.isFinite(r.created)&&r.created>0?r.created:0;
   if(typeof WORKSPACE!=='undefined'&&WORKSPACE){const row=CU.nodes.get('message:'+r.request_id);if(row?.el===r.el){row.workspaceMessageId=r.request_id;row.workspaceMessagePresentation=!!deskPresentation}}
   const markup=deskPresentation?`${fulfilled?'<p class="k" role="status">Pause completed by a later interrupt</p>':''}<div class="draft">${esc(r.question)}</div><div class="workspace-message-meta">Message to ${esc(r.name||r.agent)} · ${r.created?clock(r.created):'time not recorded'}</div><div class="k message-id">${esc(r.agent)} · ${r.created?clock(r.created):'time not recorded'}</div><div class="workspace-message-outcome" data-state="${r.state==='unknown'?'unknown':'other'}"><p class="k" role="status">${esc(delivery)}${r.error?' · '+esc(r.error):''}</p>${r.state==='unknown'?'<button type="button" class="message-check">Check status</button>':''}</div>${r.delivery_warning?`<p class="k">${esc(r.delivery_warning)}</p>`:''}${r.state==='answered'?`<div class="workspace-message-reply"><b>Reply from ${esc(r.name||r.agent)}</b>${replyMarkup}</div>`:''}`:`${fulfilled?'<p class="k" role="status">Pause completed by a later interrupt</p>':''}<b>Message to ${esc(r.name||r.agent)}</b><div class="k message-id">${esc(r.agent)} · ${r.created?clock(r.created):'time not recorded'}</div><div class="draft">${esc(r.question)}</div><p class="k" role="status">${esc(delivery)}${r.error?' · '+esc(r.error):''}</p>${r.delivery_warning?`<p class="k">${esc(r.delivery_warning)}</p>`:''}${r.state==='answered'?`<b>Reply from ${esc(r.name||r.agent)}</b>${replyMarkup}`:''}${r.state==='unknown'?'<div class="cites"><button type="button" class="message-check">Check status</button></div>':''}`;
   if(r.painted!==markup){r.el.innerHTML=markup; r.painted=markup}
@@ -5609,6 +5610,7 @@ function ofMessageMerge(rows,{restored=false}={}){
     let r=OFM.records.get(v.request_id);
     if(!r){r={request_id:v.request_id,agent:v.agent,name:String(v.name||v.agent),question:v.question,created:typeof v.created==='number'&&Number.isFinite(v.created)&&v.created>0?v.created:0}; OFM.records.set(v.request_id,r)}
     if(r.agent!==v.agent||r.question!==v.question)continue;
+    if(!(typeof r.created==='number'&&Number.isFinite(r.created)&&r.created>0)&&typeof v.created==='number'&&Number.isFinite(v.created)&&v.created>0)r.created=v.created;
     if(restored&&v.notice_dismissed===true)r.noticeDismissed=true;
     Object.assign(r,{state:v.state,reply:v.reply,error:v.error,delivery_warning:typeof v.delivery_warning==='string'?v.delivery_warning:'',fulfillment:ofMessageFulfillment(v.fulfillment)}); ofMessagePaint(r);
   }
