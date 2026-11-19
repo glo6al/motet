@@ -205,7 +205,7 @@ Current version is [v0.1.0](CHANGELOG.md).
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Two rules keep the project honest:
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Open pull requests against the `dev` branch, not `main`, because changes are checked together on `dev` before a release. Two rules keep the project honest:
 
 - **Label the source.** Recorded is not inferred, running is not finished, failed is not blocked, absent is not zero, and unknown is not success.
 - **Review before trust.** Changes that touch the key, permission prompts or previews get an independent review before they are relied on.
