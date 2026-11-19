@@ -5,7 +5,9 @@
     not_installed: 'Dictation is not set up on this computer yet. Turn it on in Settings.',
     not_running: 'Dictation is not running. Start it, then press the microphone again.',
     loading: 'Dictation is loading on this computer. Try again in a moment.',
-    busy: 'Dictation is already running. Stop it, then try again.',
+    busy: 'Dictation is busy on this computer. Wait a moment, then try again.',
+    control_unconfirmed: 'The microphone is off, but the local dictation take could not be confirmed closed. Your visible draft has been kept. Wait a moment before dictating again.',
+    finalize_unconfirmed: 'Dictation stopped here, but its final words could not be confirmed. Your visible words are kept.',
     microphone_blocked: 'Motet cannot use the microphone. Allow it for this page in your browser’s settings, then press the microphone again.',
     microphone_missing: 'No microphone was found. Connect one and try again.',
     insecure_context: 'The microphone needs a secure connection. Open Motet using localhost or a trusted HTTPS connection.',
@@ -52,7 +54,21 @@
     const maximum = () => Number.isInteger(options.maxLength) && options.maxLength > 0 ? options.maxLength
       : textarea.maxLength > 0 ? textarea.maxLength : 64000;
     let state = 'idle', detail = {}, take = null, operation = 0, destroyed = false, composing = false;
+    let feedbackVersion = 0, statusVersion = 0;
     let cleanup = Promise.resolve(), applying = false, pendingInput = null, compositionSelection = null;
+    const TERMINAL_BUDGET_MS = 20000, BUSY_RETRY_MS = 100;
+    const now = scope.performance && typeof scope.performance.now === 'function' ? scope.performance.now.bind(scope.performance) : null;
+    function terminalDeadline(current) {
+      if (current.terminalDeadline === undefined) current.terminalDeadline = now() + TERMINAL_BUDGET_MS;
+      return current.terminalDeadline;
+    }
+    function withinDeadline(promise, deadline) {
+      const remaining = deadline - now();
+      if (remaining <= 0) return Promise.reject(problem('control_unconfirmed'));
+      let timer;
+      const expired = new Promise((resolve, reject) => { timer = setTimeout(() => reject(problem('control_unconfirmed')), remaining); });
+      return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+    }
     const demo = () => !!(options.demo && options.demo());
     const canUse = () => !destroyed && !demo() && (!options.canUse || !!options.canUse());
     const target = () => options.target ? options.target() : '';
@@ -95,6 +111,7 @@
       }));
     }
     function setState(next, value = {}) {
+      statusVersion++;
       state = next; detail = Object.assign({ code: next, notice: take ? take.notice : '' }, value); render();
     }
     function patchText(patch, announce = true, source = 'engine') {
@@ -122,10 +139,17 @@
       }
       return true;
     }
-    async function request(path, value, extra = {}, current = null, polling = false) {
+    async function request(path, value, extra = {}, current = null, polling = false, deadline = null) {
+      const timeout = deadline === null ? 12000 : Math.min(12000, deadline - now());
+      if (timeout <= 0) throw problem('control_unconfirmed');
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000);
+      const timer = setTimeout(() => controller.abort(), timeout);
       if (polling && current) current.pollAbort = controller;
+      if (path === 'stop' && current) current.stopAbort = controller;
+      let onAbort;
+      const aborted = new Promise((resolve, reject) => {
+        onAbort = () => reject(problem('timeout')); controller.signal.addEventListener('abort', onAbort, { once: true });
+      });
       try {
         let config = { method: value === undefined ? 'GET' : 'POST', signal: controller.signal,
           cache: 'no-store', credentials: 'same-origin' };
@@ -133,7 +157,7 @@
           headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value)
         });
         config = Object.assign(config, extra);
-        const response = await options.api('/api/dictation/' + path, config);
+        const response = await Promise.race([Promise.resolve().then(() => options.api('/api/dictation/' + path, config)), aborted]);
         if (!response || typeof response !== 'object' || Array.isArray(response)) throw problem('failed');
         if (response.error) throw problem(response.error.code || 'failed');
         return response;
@@ -142,7 +166,9 @@
         throw problem(error && error.name === 'AbortError' ? 'timeout' : error && error.name === 'TypeError' ? 'not_running' : 'failed');
       } finally {
         clearTimeout(timer);
+        controller.signal.removeEventListener('abort', onAbort);
         if (polling && current && current.pollAbort === controller) current.pollAbort = null;
+        if (current && current.stopAbort === controller) current.stopAbort = null;
       }
     }
     function releaseCapture(current) {
@@ -160,13 +186,49 @@
       try { if (current.analyser) current.analyser.disconnect(); } catch (_) {}
       if (current.context && current.context.state !== 'closed') current.context.close().catch(() => {});
     }
+    async function terminalRequest(current, action, deadline) {
+      while (now() < deadline) {
+        if (action === 'stop' && (!valid(current) || current.backendEnded)) return;
+        try {
+          const result = await request(action, { sessionId: current.sessionId }, action === 'cancel' ? { keepalive: true } : {},
+            action === 'stop' ? current : null, false, deadline);
+          if (result.sessionId !== current.sessionId || result.ended !== true) throw problem('control_unconfirmed');
+          return result;
+        } catch (error) {
+          if (action === 'stop' && (!valid(current) || current.backendEnded)) return;
+          if (action === 'cancel' && error && ['ended','unknown_session'].includes(error.code)) return;
+          if (action === 'stop' && error && error.code === 'ended') return; // Let the event poll drain final words.
+          if (action === 'stop' && error && error.code === 'unknown_session') throw problem('finalize_unconfirmed');
+          if (!error || error.code !== 'busy') throw error;
+          if (action === 'stop' && (!valid(current) || current.backendEnded)) return;
+          const remaining = deadline - now();
+          if (remaining <= 0) break;
+          await withinDeadline(new Promise(resolve => setTimeout(resolve, Math.min(BUSY_RETRY_MS, remaining))), deadline);
+        }
+      }
+      throw problem('control_unconfirmed');
+    }
+    function rememberCleanup(current) {
+      if (current && current.cancelScheduled) current.cleanupFeedback = {
+        operation, target: target(), text: textarea.value, feedback: feedbackVersion, status: statusVersion
+      };
+    }
+    function cleanupWarning(current) {
+      const stamp = current.cleanupFeedback;
+      if (destroyed || take || composing || !stamp || operation !== stamp.operation || target() !== stamp.target
+          || current.target !== stamp.target || textarea.value !== stamp.text || feedbackVersion !== stamp.feedback
+          || statusVersion !== stamp.status || detail.message === COPY.control_unconfirmed) return;
+      setState('idle', { code: 'control_unconfirmed', reason: 'cleanup_unconfirmed',
+        message: COPY.control_unconfirmed, announcement: COPY.control_unconfirmed });
+    }
     function scheduleCancel(current) {
       if (!current || current.cancelScheduled || (!current.sessionId && !current.startPromise)) return;
       current.cancelScheduled = true;
-      const prior = cleanup;
-      cleanup = Promise.allSettled([prior, current.queue, current.startPromise]).then(() => {
-        if (current.sessionId && !current.backendEnded) return request('cancel', { sessionId: current.sessionId }, { keepalive: true });
-      }).catch(() => {});
+      const prior = cleanup, deadline = terminalDeadline(current);
+      cleanup = withinDeadline(Promise.allSettled([prior, current.queue, current.startPromise]), deadline).then(() => {
+        if (current.sessionId && !current.backendEnded) return terminalRequest(current, 'cancel', deadline);
+        if (!current.sessionId && current.startUnconfirmed) throw problem('control_unconfirmed');
+      }).catch(() => cleanupWarning(current));
     }
     function retire(current) {
       if (!current) return;
@@ -174,6 +236,7 @@
       clearTimeout(current.finishTimer); clearTimeout(current.pollTimer);
       if (current.pollResolve) current.pollResolve();
       if (current.pollAbort) current.pollAbort.abort();
+      if (current.stopAbort) current.stopAbort.abort();
       if (current.flushResolver) current.flushResolver();
       for (const cancel of current.prepareWaiters || []) cancel();
       closeGraph(current); scheduleCancel(current);
@@ -186,6 +249,7 @@
       model.reset(textarea.value);
       const shown = message === undefined ? COPY[next] || '' : message;
       setState(next, Object.assign({ message: shown, reason: next, announcement: shown }, ending));
+      rememberCleanup(current);
     }
     function endForContext(current, reason) {
       const code = Object.prototype.hasOwnProperty.call(END_REASON, reason) ? reason : 'recipient';
@@ -280,6 +344,7 @@
     function finish(current) {
       if (!valid(current)) return;
       current.backendEnded = true; current.transportClosed = true; current.acceptFrames = false;
+      if (current.stopAbort) current.stopAbort.abort();
       clearTimeout(current.finishTimer); closeGraph(current);
       if (composing) { current.deferredEnd = true; setState('finishing', { message: 'Finishing the last words…' }); return; }
       current.closed = true; current.acceptEvents = false;
@@ -325,8 +390,23 @@
       });
       return pending.finally(() => { clearTimeout(timer); current.prepareWaiters.delete(cancel); });
     }
+    function startRequest(current) {
+      return request('start', { intervalSeconds: .25 }).then(result => {
+        if (typeof result.sessionId !== 'string' || !/^[a-zA-Z0-9_-]{16,128}$/.test(result.sessionId)) {
+          current.startUnconfirmed = true; throw problem('control_unconfirmed');
+        }
+        current.sessionId = result.sessionId; return result;
+      }).catch(error => {
+        // An ambiguous Start cannot be cancelled safely without its session ID.
+        const refused = error && ['busy','loading','not_configured','not_installed','dependency_missing',
+          'runtime_version','model_missing_or_invalid','demo'].includes(error.code);
+        if (!refused) current.startUnconfirmed = true;
+        throw error;
+      });
+    }
     async function start() {
       if (!canUse() || take) return;
+      if (!now) { setState('unsupported', { message: COPY.unsupported }); return; }
       if (journal.text !== textarea.value) journal.reset(textarea.value);
       journal.barrier();
       const token = ++operation;
@@ -344,9 +424,7 @@
         if (availability.state === 'failed') {
           // This explicit gesture can ask the helper to reload a failed worker.
           // Preparation must finish before a later gesture can request a mic.
-          current.startPromise = request('start', { intervalSeconds: .25 }).then(result => {
-            current.sessionId = result.sessionId; return result;
-          });
+          current.startPromise = startRequest(current);
           await current.startPromise;
           // A competing client may have made the helper ready between status
           // and start. Retire any returned session without capturing audio.
@@ -373,9 +451,7 @@
         if (!await prepare(current, () => current.context.resume(), 'audio_start_failed')) return;
         if (current.context.state !== 'running') throw problem('audio_start_failed');
         if (!still(current) || token !== operation) return;
-        current.startPromise = request('start', { intervalSeconds: .25 }).then(result => {
-          current.sessionId = result.sessionId; return result;
-        });
+        current.startPromise = startRequest(current);
         const result = await current.startPromise;
         if (!still(current) || token !== operation) { scheduleCancel(current); return; }
         if (typeof result.sessionId !== 'string' || !/^[a-zA-Z0-9_-]{16,128}$/.test(result.sessionId)
@@ -416,10 +492,12 @@
       if (!current) return;
       journal.barrier();
       if (state === 'finishing') return current.done;
+      const deadline = terminalDeadline(current);
       current.stopRequested = true;
       if (state !== 'listening') { abandon(current, 'idle', '', { reason: 'stop', announcement: 'Dictation stopped' }); return; }
       setState('finishing', { message: 'Finishing the last words…' });
       releaseCapture(current);
+      current.finishTimer = setTimeout(() => fail(current, problem('control_unconfirmed')), Math.max(0, deadline - now()));
       try {
         await new Promise((resolve, reject) => {
           const timer = setTimeout(() => { current.flushResolver = null; reject(problem('failed')); }, 750);
@@ -428,14 +506,14 @@
         });
         current.acceptFrames = false; closeGraph(current);
         if (!still(current)) return;
-        await queue(current, () => request('stop', { sessionId: current.sessionId }));
-        if (valid(current)) current.finishTimer = setTimeout(() => fail(current, problem('failed')), 8000);
+        await withinDeadline(queue(current, () => terminalRequest(current, 'stop', deadline)), deadline);
       } catch (error) { fail(current, error); }
       return current.done;
     }
     function cancel() {
       const current = take;
       if (!current) return;
+      terminalDeadline(current);
       if (!composing && textarea.value !== model.text) { journal.reset(textarea.value); endForContext(current, 'draft_changed'); return; }
       model.userEdit(textarea.value);
       const patches = model.cancelTake();
@@ -444,8 +522,10 @@
       model.reset(textarea.value); setState('idle', { reason: 'cancel', announcement: 'Dictation cancelled' });
       journal.barrier();
       if (patches.some(Boolean)) changed();
+      rememberCleanup(current);
     }
     function beforeSend() {
+      feedbackVersion++;
       const visible = textarea.value;
       journal.barrier();
       if (take) abandon(take, 'idle', '', { reason: 'send', announcement: 'Dictation stopped' });
@@ -454,6 +534,7 @@
     }
     function applyHistory(direction) {
       if (destroyed || composing || textarea.readOnly || textarea.disabled || !journal.enabled) return false;
+      feedbackVersion++;
       if (journal.text !== textarea.value) {
         journal.reset(textarea.value);
         if (take) endForContext(take, 'draft_changed'); else model.reset(textarea.value);
@@ -506,6 +587,7 @@
     }
     function onEdit(event = {}) {
       if (applying) return;
+      feedbackVersion++;
       if (!composing) {
         const type = event.inputType || pendingInput && pendingInput.type || 'manual';
         if ((!journal.enabled || pendingInput && pendingInput.nativeHistory) && ['historyUndo', 'historyRedo'].includes(type)) {
@@ -520,6 +602,7 @@
       render();
     }
     function contextChanged(reason = 'recipient') {
+      feedbackVersion++;
       if (take) endForContext(take, reason);
       model.reset(textarea.value); journal.reset(textarea.value); pendingInput = null; render();
     }
@@ -553,6 +636,7 @@
     // synchronously refresh this controller's draft-ownership fence.
     bind(textarea, 'input', onEdit, true);
     bind(textarea, 'compositionstart', () => {
+      feedbackVersion++;
       if (journal.text !== textarea.value) journal.reset(textarea.value);
       compositionSelection = selection(); pendingInput = null; journal.barrier();
       composing = true; render();

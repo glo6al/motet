@@ -168,6 +168,10 @@ sequence zero and serialize packets and controls. The helper rejects concurrent
 audio commands rather than accumulating a queue. The client should bound its
 own capture queue and stop on a growing backlog.
 
+Command admission waits at most 100 ms for the helper's command lock. This
+short wait is not a deadline for recognition or finalization. A `busy` refusal
+does not end the take and does not mean the browser microphone is still open.
+
 Line events contain `id`, `type`, `epoch`, `lineId`, `text` and `complete`, with
 timing fields when available. An active line can be revised as a whole; a dark
 prefix or grey tail in the later editor cannot imply word-level finality.
@@ -282,6 +286,27 @@ scrolling. Selection, composition and forced-color mode use the native text
 display. Editing an active phrase resets recognition; speech at that boundary
 may need correction. Dictation is currently for the local desktop connection;
 phone capture needs its separately reviewed secure connection setup.
+
+Stop and Cancel release microphone capture immediately. Stop keeps the visible
+words and waits for final events; Cancel immediately removes untouched dictated
+phrases and keeps manual edits. For a known session, the page retries only an
+explicit `busy` refusal for the same Stop or cleanup Cancel. It never replays
+audio, Reset or Start, and does not retry an ambiguous timeout or network error.
+The action has one 20-second budget, including queued work, retry pauses and
+final-event waiting. Each request is limited to the remaining budget or twelve
+seconds, whichever is shorter. Cleanup after a failed Stop shares its original
+budget. A completed event stream can finish Stop before its HTTP reply arrives.
+
+If closure cannot be confirmed, the page says that the microphone is off and
+the visible draft has been kept. A late cleanup warning does not replace a
+newer status or alter a subsequently edited draft. The next take waits for
+cleanup and checks readiness before asking for the microphone. This is a
+bounded recovery attempt, not a guarantee that the helper is idle at the
+deadline: already admitted native work can outlive an HTTP request. A lost
+Start reply can also leave the page without a session ID to cancel. Readiness
+checks prevent another take while the helper reports occupied; the helper's
+existing inactivity expiry provides recovery after requests stop. An
+unconfirmed Stop may lose final words that were not yet visible.
 
 Use Cmd+Z or Ctrl+Z to undo manual corrections, and Cmd+Shift+Z, Ctrl+Shift+Z or
 Ctrl+Y to redo them. Recognition updates do not become manual Undo entries, so
