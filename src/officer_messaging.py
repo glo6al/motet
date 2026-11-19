@@ -3,6 +3,7 @@
 Queue acceptance is not delivery. Only the exact outgoing user envelope followed
 by a matching completed turn can produce an answer. Uncertain sends are never retried.
 """
+import copy
 import hmac
 import json
 import math
@@ -1182,7 +1183,35 @@ class MessagingStore:
             # The live tracker validates the saved successor pin. A bounded
             # read in the original rollout cannot prove the consumed interval.
             return None
-        path, source, st, header = codex_transcript.open_pinned(self.sessions_dir, row['path'], row['agent'][2:])
+        try:
+            path, source, st, header = codex_transcript.open_pinned(self.sessions_dir, row['path'], row['agent'][2:])
+        except codex_transcript.TemporaryUnavailable:
+            raise
+        except codex_transcript.Unavailable as error:
+            # The native pointer may already name a single-hop successor the
+            # previous worker has not followed. Require the same bounded chain
+            # proof as live tracking before checking the original consumed tail.
+            try:
+                probe = copy.deepcopy(row)
+                continuation = codex_transcript.tracking_source(self.sessions_dir, probe, MAX_READ)
+            except OSError:
+                raise error
+            if probe.get('codex_continuation'):
+                row['codex_continuation'] = probe['codex_continuation']
+            if continuation is None:
+                raise BlockingIOError('Codex continuation proof is still being read.')
+            continuation[0].close()
+            if not probe.get('codex_continuation'):
+                raise error
+            # Only prefix progress is retained here. The normal live tracker
+            # switches segments after the original tail proof also succeeds.
+            path = row['path']
+            source, st = codex_transcript.open_regular(self.sessions_dir, path)
+            try:
+                header = codex_transcript.header(source, row['agent'][2:])
+            except BaseException:
+                source.close()
+                raise
         with source:
             if (st.st_dev, st.st_ino) != (row['device'], row['inode']) or st.st_size < cursor:
                 raise ValueError()

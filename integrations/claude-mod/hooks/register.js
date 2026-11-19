@@ -146,8 +146,9 @@ async function flush($, state, retryRequest = null) {
         const value = request.events[index], receipt = canonicalReceipt(value);
         let hash = Object.keys(request.rejections || {}).length ? await fingerprint(receipt) : null;
         const rejection = request.rejections?.[hash];
-        if (retryRequest ? rejection?.count !== MAX_RECEIPT_REJECTIONS :
-            rejection && (rejection.count >= MAX_RECEIPT_REJECTIONS || await $.clock.now() < rejection.retry_at)) {
+        const held = rejection?.count >= MAX_RECEIPT_REJECTIONS;
+        const retryAt = Math.max(rejection?.retry_at ?? 0, state.transientReceiptRetries.get(value) ?? 0);
+        if (retryRequest ? !held : held || (retryAt && await $.clock.now() < retryAt)) {
           index += 1;
           continue;
         }
@@ -166,7 +167,15 @@ async function flush($, state, retryRequest = null) {
         try {
           await post($, state, 'event', {...receipt,...identityBody(state)});
         } catch (error) {
-          if (!['receipt_rejected','invalid_request',''].includes(error.code) || ![400,409].includes(error.status)) throw error;
+          const requestError = [400,409].includes(error.status);
+          if (error.status === 503 || (requestError && error.code === '')) {
+            // Older bridges used untyped 400 even for storage faults. Defer
+            // this event without charging its durable rejection budget.
+            state.transientReceiptRetries.set(value, (await $.clock.now()) + REJECTED_RECEIPT_RETRY_MS);
+            index += 1;
+            continue;
+          }
+          if (!requestError || !['receipt_rejected','invalid_request'].includes(error.code)) throw error;
           if (state.data !== data || state.epoch !== epoch) return;
           const retry_at = (await $.clock.now()) + REJECTED_RECEIPT_RETRY_MS;
           hash ??= await fingerprint(receipt);
@@ -281,15 +290,17 @@ async function recoverReceipts($, state) {
       if (data.acknowledged[hash]) continue;
       // Old clients acknowledged the original property order.
       if (value.kind === 'completed' && content !== JSON.stringify(value) && data.acknowledged[await fingerprint(value)]) continue;
+      const alreadyRetained = current.events.some(item => JSON.stringify(canonicalReceipt(item)) === content);
+      if (!alreadyRetained) {
+        if ((current.execution_completed || current.completed) && !['answered','completed','dropped'].includes(value.kind)) continue;
+        current.events.push(copy(receipt));
+      }
       const rejection = record.rejections?.[hash], previous = current.rejections?.[hash];
       if (rejection && (!previous || rejection.count > previous.count ||
           rejection.count === previous.count && rejection.retry_at > previous.retry_at)) {
         current.rejections ??= {};
         current.rejections[hash] = copy(rejection);
       }
-      if (current.events.some(item => JSON.stringify(canonicalReceipt(item)) === content)) continue;
-      if ((current.execution_completed || current.completed) && !['answered','completed','dropped'].includes(value.kind)) continue;
-      current.events.push(copy(receipt));
     }
     if (!current.execution_completed && !current.completed && current !== state.flight && !['dropped','unknown'].includes(record.phase)) {
       const value = {request_id:id,attempt_id:record.attempt_id,kind:'unknown'};
@@ -297,6 +308,15 @@ async function recoverReceipts($, state) {
       if (!data.acknowledged[hash] && !current.events.some(item => item.kind === 'unknown')) current.events.push(value);
     }
   }
+  for (const request of Object.values(data.requests)) {
+    if (!request.rejections || conflicts.has(request.request_id)) continue;
+    const retained = new Set(await Promise.all(request.events.map(value=>fingerprint(canonicalReceipt(value)))));
+    for (const hash of Object.keys(request.rejections)) {
+      if (!retained.has(hash)) delete request.rejections[hash];
+    }
+    if (!Object.keys(request.rejections).length) delete request.rejections;
+  }
+  if (state.data !== data) return;
   await save($, state);
 }
 
@@ -705,7 +725,7 @@ export function register(on) {
   const state = {clientId:crypto.randomUUID(),sequence:-1,data:null,key:null,config:null,generation:null,connected:false,epoch:0,eligibilityEpoch:0,desktopBinding:null,disconnecting:0,
     timer:null,peerProtocol:0,lifecycleProtocol:0,bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
-    observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),recovering:false,
+    observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
     rejectedGrant:'',rejectedIdentity:'',startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);

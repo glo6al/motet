@@ -629,7 +629,7 @@ class ClaudePeerBackendTests(unittest.TestCase):
                 raise sqlite3.OperationalError('Fictional persistence fault')
             return put(row)
         with patch.object(self.store.mods,'put',side_effect=fail_attempt):
-            self.assertEqual(self.global_poll(self.body['client_id'])[0],400)
+            self.assertEqual(self.global_poll(self.body['client_id'])[0],503)
         self.assertIsNone(self.store.db.execute('SELECT launched FROM shared_bridge_requests').fetchone()[0])
         row=self.peer_row(sent['request_id']);self.assertFalse(row['launched']);self.assertNotIn('mod_attempt_id',row)
         self.assertEqual(self.global_poll(self.body['client_id'])[1]['claim']['request_id'],row['request_id'])

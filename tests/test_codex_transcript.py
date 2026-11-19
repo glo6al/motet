@@ -543,6 +543,89 @@ class TranscriptTests(unittest.TestCase):
         self.retain_previous_worker_binding(prefix=[('response_item', image)])
         self.assert_held_reply_tracks_to_exact_end(self.old)
 
+    def test_previous_worker_unfollowed_successor_tracks_to_exact_end(self):
+        self.retain_previous_worker_binding()
+        self.successor()
+        with patch.object(m.subprocess, 'Popen') as launch:
+            for _ in range(4):
+                self.store.tick()
+            saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+            self.assertFalse(saved.get('tracking_stopped'))
+            self.assertEqual(saved['codex_tracking']['path'], str(self.new))
+            self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+            self.append(self.new, 'event_msg', dict(type='task_complete', turn_id='other'))
+            self.store.tick()
+            self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+            self.append(self.new, 'event_msg', dict(type='task_complete', turn_id='bound',
+                        last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional verified successor answer.'))
+            self.store.tick()
+            launch.assert_not_called()
+        result = self.public_result(2)
+        self.assertEqual((result['state'], result['reply']), ('answered', 'Fictional verified successor answer.'))
+        self.assertIsNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+
+    def test_previous_worker_unfollowed_successor_proof_survives_restart(self):
+        self.retain_previous_worker_binding(prefix=[('event_msg', {'type': 'agent_reasoning', 'text': 'x' * 2_500})])
+        self.successor()
+        self.append(self.new, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional withheld answer.'))
+        with patch.object(m, 'MAX_READ', 512), patch.object(m.subprocess, 'Popen') as launch:
+            self.store.tick()
+            saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+            self.assertFalse(saved.get('tracking_stopped'))
+            self.assertEqual(saved['codex_continuation']['offset'], 512)
+            self.assertNotIn('codex_tracking', saved)
+            self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+            self.store.close()
+            self.store = m.MessagingStore(str(self.root / 'watch'), str(self.sessions))
+            for _ in range(24):
+                self.store.tick()
+            launch.assert_not_called()
+        self.assert_durable_peer_end(gap=True)
+
+    def test_previous_worker_successor_does_not_skip_unfinished_original_proof(self):
+        self.retain_previous_worker_binding()
+        self.successor()
+        # First tick records a bounded prefix; the next can prove the chain.
+        self.store.tick()
+        with patch.object(self.store, '_previous_codex_envelope', side_effect=BlockingIOError()):
+            self.store.tick()
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertNotIn('codex_tracking', saved)
+        self.assert_previous_proof_waiting()
+        with patch.object(self.store, '_previous_codex_envelope', side_effect=ValueError()) as original:
+            self.store.tick()
+            original.assert_called_once()
+        self.assert_previous_proof_held()
+
+    def test_previous_worker_unfollowed_successor_waits_for_original_to_return(self):
+        self.retain_previous_worker_binding()
+        self.successor()
+        hidden = self.root / 'temporarily-hidden-predecessor'
+        self.old.rename(hidden)
+        self.store.tick()
+        self.assert_previous_proof_waiting()
+        hidden.rename(self.old)
+        self.append(self.new, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional restored successor answer.'))
+        with patch.object(m.subprocess, 'Popen') as launch:
+            for _ in range(6):
+                self.store.tick()
+            launch.assert_not_called()
+        result = self.public_result(2)
+        self.assertEqual((result['state'], result['reply']), ('answered', 'Fictional restored successor answer.'))
+        self.assertIsNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+
+    def test_previous_worker_unfollowed_successor_rejects_wrong_boundary(self):
+        self.retain_previous_worker_binding()
+        self.successor(end_ordinal_exclusive=999)
+        self.append(self.new, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional unproven answer.'))
+        for _ in range(4):
+            self.store.tick()
+        self.assert_previous_proof_held()
+        self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+
     def test_previous_worker_successor_tracks_to_exact_end(self):
         self.retain_previous_worker_binding()
         self.successor()

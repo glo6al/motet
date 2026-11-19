@@ -25,6 +25,7 @@ const mac=(key,lines)=>createHmac('sha256',key).update(lines.join('\n')).digest(
 const equal=(a,b)=>typeof a==='string'&&HEX.test(a)&&timingSafeEqual(Buffer.from(a,'hex'),Buffer.from(b,'hex'));
 export const MAX_MESSAGE_CHARACTERS=16000;
 const MAX_RPC_BYTES=262144;
+const RPC_DEADLINE_MS=10000, STARTUP_DISCOVERY_DEADLINE_MS=1500;
 class MessageLengthError extends Error {}
 const fail=()=>new Error('Peer operation could not be confirmed. No request was retried.');
 class PeerReplyError extends Error{
@@ -58,27 +59,32 @@ export async function readCredential(file){
 }
 export class PeerClient{
   constructor(credential,inboxCredential=null){this.credential=credential;this.inboxCredential=inboxCredential}
-  async call(method,params){
+  async call(method,params,deadlineMs=RPC_DEADLINE_MS){
     const receiver=receiverMethods.has(method),inbox=this.inboxCredential;
     if(receiver&&!inbox)throw fail();
     const d=this.credential,key=Buffer.from(d.secret,'hex'),nonce=randomBytes(32).toString('hex');
     // Agent is deliberately single-use: it must never reconnect after server proof.
     const agent=new http.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1});
+    const controller=new AbortController();
     let provenSocket=null,closed=false;
-    const timer=setTimeout(()=>{closed=true;agent.destroy()},10000);
+    const timer=setTimeout(()=>{
+      closed=true;
+      controller.abort();
+      agent.destroy();
+    },deadlineMs);
     const request=(route,body,headers={},rpc=false)=>new Promise((resolve,reject)=>{
-      if(rpc&&(!provenSocket||closed||provenSocket.destroyed))return reject(fail());
-      const req=http.request({host:'127.0.0.1',port:d.port,path:route,method:'POST',agent,headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body),...headers}},res=>{
+      if(closed||(rpc&&(!provenSocket||provenSocket.destroyed)))return reject(fail());
+      const req=http.request({host:'127.0.0.1',port:d.port,path:route,method:'POST',agent,signal:controller.signal,headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body),...headers}},res=>{
         const chunks=[];let size=0;
         res.on('data',chunk=>{size+=chunk.length;if(size>65536){res.destroy();reject(fail())}else chunks.push(chunk)});
         res.on('error',()=>reject(fail()));res.on('aborted',()=>reject(fail()));
         res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body:Buffer.concat(chunks)}));
       });
       req.on('socket',socket=>{
-        if(rpc&&socket!==provenSocket){req.destroy(fail());return}
+        if(closed||socket.destroyed||(rpc&&socket!==provenSocket)){req.destroy(fail());return}
         if(!rpc){provenSocket=socket;socket.once('close',()=>{closed=true})}
         // Writing is delayed until the exact authenticated socket is assigned.
-        if(!rpc||(!closed&&!socket.destroyed))req.end(body);else req.destroy(fail());
+        req.end(body);
       });
       req.on('error',()=>reject(fail()));
     });
@@ -179,7 +185,7 @@ export const nativeInstructions=instructions.split('\n').filter(line=>!line.star
   .replace('Optional shared pull inboxes also accept requests for Antigravity; they never send to or wake a native Antigravity chat.','These native tools never send to or wake a native Antigravity chat.')
   .replace('do not call send_message or send_inbox_message;','do not call send_message;');
 export async function discoverInboxes(client){
-  try{return (await client.call('list_inboxes',{})).inboxes;}catch{return [];}
+  try{return (await client.call('list_inboxes',{},STARTUP_DISCOVERY_DEADLINE_MS)).inboxes;}catch{return [];}
 }
 export async function main(){
   if(![4,6].includes(process.argv.length)||process.argv[2]!=='--credential'||(process.argv.length===6&&process.argv[4]!=='--inbox-credential'))throw fail();

@@ -241,7 +241,10 @@ def tracking_source(sessions, row, budget):
     """
     current = segment(row)
     ident = row['agent'][2:]
-    source, st = open_regular(sessions, current['path'])
+    try:
+        source, st = open_regular(sessions, current['path'])
+    except OSError as error:
+        raise TemporaryUnavailable('The pinned Codex predecessor is temporarily unavailable.') from error
     successor = None
     try:
         meta = header(source, ident)
@@ -302,7 +305,10 @@ def tracking_source(sessions, row, budget):
         check = index(os.path.dirname(sessions), ident)
         if check is None or selected(check.get(ident)) != path:
             raise Unavailable('Codex native pointer changed during continuation proof.')
-        again, check_stat = open_regular(sessions, current['path'])
+        try:
+            again, check_stat = open_regular(sessions, current['path'])
+        except OSError as error:
+            raise TemporaryUnavailable('The pinned Codex predecessor cannot be rechecked yet.') from error
         again.close()
         if (check_stat.st_dev, check_stat.st_ino, check_stat.st_size) != (st.st_dev, st.st_ino, st.st_size):
             raise Unavailable('Codex predecessor changed before the tracking switch.')

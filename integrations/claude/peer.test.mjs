@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import {once} from 'node:events';
 import {Readable} from 'node:stream';
 import {randomUUID,createHash,createHmac} from 'node:crypto';
 import {spawn} from 'node:child_process';
@@ -45,6 +46,7 @@ async function fixture(){
   }
   assert.equal(req.url,'/bridge/v2/rpc');const p=JSON.parse(raw),n=req.headers['x-watch-nonce'];
   assert.equal(req.headers['x-watch-bridge'],credential.credential_id);assert.equal(req.headers['x-watch-run'],run);assert.equal(req.headers['x-watch-signature'],hmac(credential.secret,['watch-bridge-request-v2',String(credential.port),'POST','/bridge/v2/rpc',req.headers['x-watch-time'],n,run,hash(raw)]));
+  if(mode==='hang-rpc')return;
   if(mode==='loss'){req.socket.destroy();return}
   const record={origin:'peer',request_id:mode==='mismatched'?randomUUID():p.params.request_id,agent_id:p.params.agent_id||agent,state:'queued',reply:'<untrusted>',error:'',created_at:Date.now()/1000,target:{...target,agent_id:p.params.agent_id||agent},duplicate:false,text_preview:'Please inspect',secret:'SHOULD NOT DISPLAY'};
   const result=p.method==='list_inboxes'?{inboxes:[]}:p.method==='list_agents'?{agents:[{...target,native_id:native,capability:'unavailable',reason:'No transport',last_seen:Date.now()/1000,supported_transport:'codex_queue',secret:'SHOULD NOT DISPLAY'}],next_cursor:null,directory:{complete:false,reasons:['Scan bounded'],refreshed_at:Date.now()/1000}}:p.method==='list_requests'?{requests:[{...record,request_id:randomUUID()}],next_cursor:null}:record;
@@ -148,6 +150,31 @@ test('adapter sensitivity: server proof and signed response protections are requ
 
 test('peer HTTP has a total ten-second deadline without a redispatch',{timeout:12000},async()=>{
  const f=await fixture();try{f.setMode('hang');const started=Date.now();await assert.rejects(new PeerClient(f.credential).call('list_requests',{}),/No request was retried/);assert.ok(Date.now()-started>=9500);assert.ok(Date.now()-started<11500);assert.equal(f.seen.length,1);assert.equal(f.seen[0].path,'/bridge/v2/challenge');}finally{await f.close()}
+});
+test('silent startup discovery closes its socket promptly and leaves exactly four native tools',{timeout:25000},async t=>{
+ for(const [mode,expected] of [['hang',['/bridge/v2/challenge']],['hang-rpc',['/bridge/v2/challenge','/bridge/v2/rpc']]]){
+  await t.test(mode,async()=>{
+   const f=await fixture(),client=new Client({name:'silent discovery fixture',version:'1'});
+   try{
+    f.setMode(mode);
+    const started=performance.now();
+    await client.connect(new StdioClientTransport({command:process.execPath,args:[script,'--credential',f.file],cwd:here,stderr:'pipe'}));
+    const elapsed=performance.now()-started;
+    assert.ok(elapsed<3000,`startup took ${Math.round(elapsed)}ms`);
+    assert.deepEqual(f.seen.map(request=>request.path),expected,'one discovery attempt without a retry');
+    if(mode==='hang-rpc')assert.deepEqual(JSON.parse(f.seen[1].raw),{method:'list_inboxes',params:{}});
+    const socket=f.seen[0].socket;
+    assert.ok(f.seen.every(request=>request.socket===socket));
+    if(!socket.destroyed)await once(socket,'close',{signal:AbortSignal.timeout(1000)});
+    assert.ok(socket.destroyed,'startup canceled its actual HTTP socket');
+    assert.equal(client.getInstructions(),nativeInstructions);
+    assert.deepEqual((await client.listTools()).tools.map(tool=>tool.name),['list_agents','send_message','get_reply','list_requests']);
+    assert.deepEqual(f.seen.map(request=>request.path),expected,'listing tools did not retry discovery');
+    f.setMode('normal');
+    assert.equal((await client.callTool({name:'list_agents',arguments:{}})).isError,undefined);
+   }finally{await client.close();await f.close()}
+  });
+ }
 });
 test('signed bounded server rejections are distinct from uncertain transport failures',async()=>{
  const f=await fixture(),client=new Client({name:'signed rejection host',version:'1'});let connected=false;try{

@@ -80,13 +80,16 @@ test('inbox tool guidance distinguishes previews, confirmed claims and native fi
 
 test('actual stdio receiver advertises scoped tools and prepares a token before any HTTP mutation',async()=>{
  const root=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'motet-inbox-mcp-'));
- const c=config(),credential={version:2,credential_id:randomUUID(),secret:'b'.repeat(64)},run=randomUUID(),r=base(c),calls=[];
+ const c=config(),credential={version:2,credential_id:randomUUID(),secret:'b'.repeat(64)},run=randomUUID(),r=base(c),calls=[],paths=[];
+ const senderNames=['list_agents','send_message','get_reply','list_requests',...publicTools.map(tool=>tool.name)];
+ const advertised={inbox_id:c.inbox_id,inbox_revision:inboxRevision(c),label:c.label,availability:'shared pull inbox configured'};
  const hash=x=>createHash('sha256').update(x).digest('hex');
  const mac=(key,parts)=>createHmac('sha256',key).update(parts.join('\n')).digest('hex');
- let server,client,inboxMode='configured';
+ let server,client,discovered=advertised,inboxMode='configured';
  try{
   await fs.chmod(root,0o700);const state=path.join(root,'state'),dir=path.join(state,'bridge-credentials');await fs.mkdir(dir,{recursive:true,mode:0o700});await fs.chmod(state,0o700);
   server=http.createServer(async(req,res)=>{
+   paths.push(req.url);
    const chunks=[];for await(const b of req)chunks.push(b);const body=Buffer.concat(chunks),value=JSON.parse(body.toString());
    if(req.url==='/bridge/v2/challenge'){
     const proof={run_id:run,proof:mac(Buffer.from(credential.secret,'hex'),['watch-bridge-server-v2',String(credential.port),credential.credential_id,value.nonce,run])};
@@ -101,16 +104,16 @@ test('actual stdio receiver advertises scoped tools and prepares a token before 
     assert.equal(p.receiver_proof,expected);
     assert.equal(p.inbox_id,c.inbox_id);assert.equal(p.inbox_revision,inboxRevision(c));
    }
-   const result=value.method==='list_inboxes'?(inboxMode==='configured'?{inboxes:[{inbox_id:c.inbox_id,inbox_revision:inboxRevision(c),label:c.label,availability:'shared pull inbox configured'}]}:inboxMode==='malformed'?{wrong:true}:{inboxes:[]}):value.method==='list_agents'?{agents:[],next_cursor:null,directory:{complete:true,reasons:[],refreshed_at:Date.now()/1000}}:value.method==='check_inbox'?{requests:[r],next_cursor:null}:{...r,state:'claimed',request_id:p.request_id,text:'Fictional work request.',claimed_at:2000};
+   const result=value.method==='list_inboxes'?(inboxMode==='configured'?{inboxes:[discovered]}:inboxMode==='malformed'?{wrong:true}:{inboxes:[]}):value.method==='list_agents'?{agents:[],next_cursor:null,directory:{complete:true,reasons:[],refreshed_at:Date.now()/1000}}:value.method==='check_inbox'?{requests:[r],next_cursor:null}:{...r,state:'claimed',request_id:p.request_id,text:'Fictional work request.',claimed_at:2000};
    const response=JSON.stringify({result});res.setHeader('X-Watch-Signature',mac(Buffer.from(credential.secret,'hex'),['watch-bridge-response-v2',String(credential.port),run,nonce,'200',hash(response)]));
    if(receiving)res.setHeader('X-Watch-Inbox-Signature',mac(Buffer.from(c.receiver_key,'hex'),['watch-inbox-response-v1',String(credential.port),credential.credential_id,run,nonce,c.inbox_id,inboxRevision(c),'200',hash(response)]));
    res.end(response);
   });await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));credential.port=server.address().port;
   const credentialFile=path.join(dir,'shared.json'),inboxFile=path.join(state,'inbox.json');await fs.writeFile(credentialFile,JSON.stringify(credential),{mode:0o600});await fs.writeFile(inboxFile,JSON.stringify(c),{mode:0o600});
-  const script=new URL('./peer.mjs',import.meta.url).pathname;
+  const script=process.env.WATCH_PEER_TEST_SCRIPT||new URL('./peer.mjs',import.meta.url).pathname;
   client=new Client({name:'fictional-inbox-receiver',version:'1'});
   await client.connect(new StdioClientTransport({command:process.execPath,args:[script,'--credential',credentialFile,'--inbox-credential',inboxFile],stderr:'pipe'}));
-  const tools=(await client.listTools()).tools.map(t=>t.name);for(const t of receiverTools)assert.ok(tools.includes(t.name));
+  assert.deepEqual((await client.listTools()).tools.map(tool=>tool.name),[...senderNames,...receiverTools.map(tool=>tool.name)]);
   const startupReads=calls.length;const prepared=JSON.parse((await client.callTool({name:'prepare_inbox_claim',arguments:{}})).content[0].text);
   assert.match(prepared.claim_token,/^[0-9a-f]{64}$/);assert.equal(calls.length,startupReads,'token preparation must not mutate server state');
   const checked=await client.callTool({name:'check_inbox',arguments:{}});assert.equal(checked.isError,undefined);assert.equal(calls.length,startupReads+1);
@@ -118,6 +121,20 @@ test('actual stdio receiver advertises scoped tools and prepares a token before 
   assert.equal(claimed.isError,undefined);assert.equal(calls.length,startupReads+2);assert.ok(!JSON.stringify(claimed).includes(prepared.claim_token));
   assert.equal(JSON.parse(claimed.content[0].text).untrusted_peer_data.state,'claimed');
   await client.close();client=null;
+  for(const mismatch of [{inbox_id:randomUUID()},{inbox_revision:'d'.repeat(64)}]){
+   discovered={...advertised,...mismatch};
+   client=new Client({name:'fictional-mismatched-receiver-test',version:'1'});
+   await client.connect(new StdioClientTransport({command:process.execPath,args:[script,'--credential',credentialFile,'--inbox-credential',inboxFile],stderr:'pipe'}));
+   assert.deepEqual((await client.listTools()).tools.map(tool=>tool.name),senderNames,`mismatched ${Object.keys(mismatch)[0]}`);
+   const before=paths.length,claimArgs={request_id:r.request_id,claim_token:prepared.claim_token};
+   for(const [name,args] of [['prepare_inbox_claim',{}],['check_inbox',{}],['claim_inbox_message',claimArgs],['answer_inbox_message',{...claimArgs,answer:'Fictional answer'}]]){
+    assert.equal((await client.callTool({name,arguments:args})).isError,true,name);
+   }
+   assert.equal(paths.length,before,'hidden receiver calls never challenge or send RPC');
+   assert.equal((await client.callTool({name:'list_inboxes',arguments:{}})).isError,undefined);
+   await client.close();client=null;
+  }
+  discovered=advertised;
   for(const invalid of ['missing','malformed','nonprivate','deep','utf16','fraction_version','special_mode']){
    const optional=path.join(state,'optional-'+invalid+'.json');
    if(invalid!=='missing'){

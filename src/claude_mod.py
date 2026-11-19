@@ -830,14 +830,20 @@ def handle_http(handler, store, agents):
                 or handler.headers.get('Origin') is not None or handler.headers.get('Transfer-Encoding') is not None
                 or len(handler.headers.get_all('Content-Length') or []) != 1):
             raise ModError(403, 'Invalid Claude mod service request.')
-        size = int(handler.headers.get('Content-Length', ''))
+        try:
+            size = int(handler.headers.get('Content-Length', ''))
+        except ValueError:
+            raise ModError(400, 'Invalid Claude mod request size.') from None
         # JSON escaping can take up to six bytes per allowed reply codepoint.
         if size < 2 or size > (100000 if method == 'event' else 16384):
             raise ModError(400, 'Invalid Claude mod request size.')
         raw = handler.rfile.read(size)
         if len(raw) != size:
             raise ModError(400, 'Incomplete Claude mod request.')
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except (ValueError, RecursionError):
+            raise ModError(400, 'Invalid Claude mod request JSON.') from None
         if not isinstance(data, dict):
             raise ModError(400, 'Invalid Claude mod request.')
         auth = handler.headers.get_all('Authorization') or []
@@ -850,6 +856,6 @@ def handle_http(handler, store, agents):
     except ModError as error:
         status, result = error.status, {'error': str(error), 'error_code': error.code}
     except Exception:
-        status, result = 400, {'error': 'Claude mod request could not be accepted.'}
+        status, result = 503, {'error': 'Claude mod service is temporarily unavailable. Retry the same request later.'}
     handler.close_connection = True
     return handler.send(status, json.dumps(result).encode(), 'application/json')

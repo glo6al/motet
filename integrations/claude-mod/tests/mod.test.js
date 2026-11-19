@@ -1254,11 +1254,10 @@ test('permanent receipt rejection preserves evidence and lets a later completion
   assert.equal(h.submissions.length,1);
 });
 
-for(const typed of [true,false])test(`${typed?'typed':'untyped'} rejections hold exact receipt after two tries across reload and allow owner-only retry`,async()=>{
+for(const code of ['receipt_rejected','invalid_request'])test(`typed ${code} rejections hold exact receipt across reload and allow owner-only retry`,async()=>{
   const storage=new Map([[GLOBAL_KEY,CONFIG]]);
   const h=await lifecycleHarness({storage,fetch:(url,body)=>{
-    if(url.endsWith('/event')&&body.kind==='started')return typed?responseJSON({error_code:'receipt_rejected'},409):
-      {ok:false,status:409,headers:{},text:'Fictional rejection'};
+    if(url.endsWith('/event')&&body.kind==='started')return responseJSON({error_code:code},409);
   }});
   await h.tick();await h.waitSubmission();
   await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'held-receipt-turn'});
@@ -1294,6 +1293,72 @@ for(const typed of [true,false])test(`${typed?'typed':'untyped'} rejections hold
   assert.equal((await status(reload)).receipt_recovery,null);
   assert.equal(reload.submissions.length,0);
   assert.deepEqual(storage.get(originalKey),original);
+});
+
+for(const transientStatus of [400,409,503])test(`receipt recovers automatically after two untyped HTTP ${transientStatus} responses`,async()=>{
+  let failures=0;
+  const h=await lifecycleHarness({fetch:(url,body)=>{
+    if(url.endsWith('/event')&&body.kind==='completed'&&failures<2){
+      failures+=1;
+      return transientStatus===409?{ok:false,status:409,headers:{},text:'Fictional temporary response'}:
+        responseJSON({error:'Fictional temporary response'},transientStatus);
+    }
+  }});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'temporary-receipt-turn'});
+  await h.waitAck('started');
+  const before=h.calls.length;
+  await h.call('turn.complete',{turnId:'temporary-receipt-turn',answer:ANSWER,isAborted:false,reason:'answer'});
+  await h.waitCall('/event',(b,c)=>b.kind==='completed'&&c.response?.status===transientStatus,{settled:true});
+  await h.drive(()=>h.calls.slice(before).some(c=>c.url.endsWith('/poll')),'heartbeat after first temporary failure');
+  assert.equal(h.events().filter(e=>e.kind==='completed').length,1);
+  const afterFirstFailure=h.calls.length;
+  h.setNow(130000);
+  await h.drive(()=>failures===2&&h.calls.slice(afterFirstFailure).some(c=>c.url.endsWith('/poll')),
+    'heartbeat after the second temporary failure');
+  assert.equal((await status(h)).receipt_recovery,null);
+  assert(h.ownData().requests[REQUEST].events.some(e=>e.kind==='completed'));
+  h.setNow(160000);
+  await h.drive(()=>h.calls.some(c=>c.body.kind==='completed'&&c.response?.ok),'automatic exact receipt retry');
+  const stored=await h.waitAck('completed',{count:3});
+  assert.equal(stored.completed,true);
+  const completions=h.events().filter(e=>e.kind==='completed');
+  assert.equal(completions.length,3);
+  assert(completions.every(e=>e.event_id===completions[0].event_id&&e.answer===ANSWER));
+  assert.equal((await status(h)).receipt_recovery,null);
+  assert.equal(h.submissions.length,1);
+});
+
+test('superseded foreign rejections do not hold completed history or clear real held evidence',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await lifecycleHarness({storage});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'known-completed-turn'});
+  await h.waitAck('started');
+  await h.call('turn.complete',{turnId:'known-completed-turn',answer:ANSWER,isAborted:false,reason:'answer'});
+  await h.waitAck('completed');
+  const [key,complete]=runtimeRows(storage)[0], foreign=copy(complete);
+  const expired={request_id:REQUEST,attempt_id:ATTEMPT,kind:'started',turn_id:'known-completed-turn'};
+  const hold=event=>({[createHash('sha256').update(JSON.stringify(event)).digest('hex')]:{count:2,retry_at:130000}});
+  foreign.requests[REQUEST]={...foreign.requests[REQUEST],phase:'started',completed:false,execution_completed:false,
+    events:[expired],rejections:hold(expired)};
+  const other='77777777-7777-4777-8777-777777777777';
+  const terminal={request_id:other,attempt_id:ATTEMPT,kind:'completed',turn_id:'another-retained-turn',
+    outcome:'withheld',answer:'',event_id:other,occurred_at:100000};
+  foreign.requests[other]={...complete.requests[REQUEST],request_id:other,turn_id:terminal.turn_id,
+    completed:false,capture:'withheld',events:[terminal],rejections:hold(terminal)};
+  const foreignKey='watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT;
+  storage.set(foreignKey,foreign);
+  const reload=await lifecycleHarness({storage,claimed:false});
+  const visible=await status(reload);
+  assert.deepEqual(visible.receipt_recovery?.held,[other]);
+  assert.deepEqual(reload.ownData().requests[REQUEST].events,[]);
+  assert.equal(Object.keys(reload.ownData().requests[REQUEST].rejections || {}).length,0);
+  assert.deepEqual(reload.ownData().requests[other].events,[terminal]);
+  assert.deepEqual(reload.ownData().requests[other].rejections,hold(terminal));
+  assert.deepEqual(reload.events(),[]);
+  assert.deepEqual(storage.get(key),complete);
+  assert.deepEqual(storage.get(foreignKey),foreign);
 });
 
 test('replacing setup while disconnected abandons only the old volatile turn binding',async()=>{
