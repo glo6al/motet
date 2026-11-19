@@ -163,6 +163,33 @@ function modelCssProof(source=html){const css=source.split('/* Stage model choic
   assert(!source.includes('#workspaceOfficerHeader>#ofModelPicker{position:relative'),'The model has no obsolete header placement');
 }
 modelCssProof();for(const target of ['order:3!important','align-self:flex-end!important',':not(.dictation-active) #ofRow:has(>#ofModelPicker:not([hidden]))>.dictation-mic{margin-left:0!important}','flex:0 0 100%!important','order:-1!important','flex-wrap:wrap;row-gap:6px'])assert.throws(()=>modelCssProof(html.replace(target,'')),assert.AssertionError);
+// These selectors cross two stylesheet files. Pin their scope and the absence
+// of the higher-specificity order:2 override that defeated the words-first row.
+const dictationCss=fs.readFileSync(path.join(__dirname,'../src/web/dictation.css'),'utf8');
+function attachmentCssProof(source=dictationCss){
+  const rules=[...source.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(match=>({selector:match[1].trim(),body:match[2]}));
+  for(const [control,order] of [['workspace-attachments-plus','0'],['workspace-attachments-files','1']]){
+    const matches=rules.filter(rule=>rule.selector.includes('.dictation-mounted')&&rule.selector.endsWith('#ofRow>.'+control)&&/\border\s*:/.test(rule.body));
+    assert.equal(matches.length,1,control+' has one idle dictation-order rule');
+    assert(matches[0].selector.includes('body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer].dictation-mounted'),control+' order is confined to the stage');
+    assert(new RegExp('\\border\\s*:\\s*'+order+'\\s*!important').test(matches[0].body));
+  }
+  assert(!rules.some(rule=>rule.selector.includes('#ofCompose')&&/\border\s*:\s*2\s*!important/.test(rule.body)),'Dictation cannot override the stage words-first order with order:2');
+}
+attachmentCssProof();
+for(const control of ['workspace-attachments-plus','workspace-attachments-files']){
+  const scoped='body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer].dictation-mounted #ofRow>.'+control;
+  assert(dictationCss.includes(scoped));
+  assert.throws(()=>attachmentCssProof(dictationCss.replace(scoped,'#officer.dictation-mounted #ofRow>.'+control)),assert.AssertionError,control+' desk-leaking selector mutation caught');
+}
+assert.throws(()=>attachmentCssProof(dictationCss+'\n#officer[data-workspace-composer].dictation-mounted #ofRow>#ofCompose{order:2!important}'),assert.AssertionError,'Words-first cascade regression caught');
+function narrowArrowCssProof(source=html){
+  const selector='html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer=narrow] #workspaceOfficerHeader:not(:has(>#ofSuggestions:not([hidden]))) #workspaceOfficerNarrowHistoryToggle';
+  const rule=[...source.matchAll(/([^{}]+)\{([^{}]*)\}/g)].find(match=>match[1].trim()===selector);
+  assert(rule,'The narrow arrow owns the trailing space when Suggestions is absent or hidden');
+  assert(/\bmargin-left\s*:\s*auto\b/.test(rule[2]));
+}
+narrowArrowCssProof();assert.throws(()=>narrowArrowCssProof(html.replace('#workspaceOfficerHeader:not(:has(>#ofSuggestions:not([hidden]))) #workspaceOfficerNarrowHistoryToggle{margin-left:auto}','#workspaceOfficerHeader:not(:has(>#ofSuggestions:not([hidden]))) #workspaceOfficerNarrowHistoryToggle{margin-left:0}')),assert.AssertionError,'Hidden-Suggestions arrow alignment mutation caught');
 console.log('ok stage message box: wide/narrow real-node ownership, accessible bulb and one arrow, full-width words/control rows, bottom model/menu, responsive/Settings restoration; fifteen behavior and six CSS guard mutations');
 
 async function motionProof(mutate=x=>x){

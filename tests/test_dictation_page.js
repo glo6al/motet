@@ -146,6 +146,15 @@ function environment(configuration = {}) {
     Float32Array, Float64Array, Date, Promise, Map, Set });
   vm.createContext(browser); vm.runInContext(env.mutateDraft ? env.mutateDraft(draftSource) : draftSource, browser);
   vm.runInContext(env.mutateController ? env.mutateController(source) : source, browser);
+  if (env.withView) {
+    vm.runInContext(env.mutateView ? env.mutateView(viewSource) : viewSource, browser);
+    for (const name of ['textarea','mic','cancel','send','wave','status','settings']) elements[name].remove();
+    const row = new Element(document), compose = new Element(document);
+    elements.host.append(row); row.append(compose, elements.send); compose.append(elements.textarea);
+    const view = browser.MotetDictationView.attach({ textarea: elements.textarea, row, compose, host: elements.host, send: elements.send });
+    env.view = view;
+    for (const name of ['mic','cancel','send','wave','status','settings']) elements[name] = view[name];
+  }
   env.browser = browser; env.newStream = newStream;
   const endpoint = async (url, config) => {
     const route = url.replace('/api/dictation/', '');
@@ -171,6 +180,7 @@ function environment(configuration = {}) {
       return { epoch: ++env.epoch };
     }
     if (route === 'stop') {
+      if (env.stopDeferred) return env.stopDeferred.promise;
       const result = { epoch: env.epoch, ended: true };
       queueMicrotask(() => env.emit([
         ...(env.stopText ? [env.line(env.stopText, true)] : []),
@@ -202,9 +212,13 @@ function environment(configuration = {}) {
     prepareTimeoutMs: env.prepareTimeoutMs, captureNotice: () => env.captureNotice || '',
     canCancelEscape: () => !env.foreground,
     onDraftChange: () => { env.patches++; env.drafts.set(env.target, elements.textarea.value); elements.textarea.dispatch('input'); },
-    onState: (state, detail) => env.stateChanges.push({ state, detail })
+    onState: (state, detail) => {
+      env.stateChanges.push({ state, detail });
+      if (env.view) env.view.render(state === 'checking' ? 'preparing' : state,
+        Object.assign({}, detail, { message: state === 'listening' ? '' : detail.message }));
+    }
   }));
-  env.close = async () => { env.controller.destroy(); await flush(); };
+  env.close = async () => { env.controller.destroy(); if (env.view) env.view.destroy(); await flush(); };
   return env;
 }
 
@@ -343,8 +357,8 @@ function announcerProof(mutateView) {
 }
 
 async function contextReasonProof(mutateController) {
-  for (const reason of ['recipient', 'scope', 'locked', 'keychanged', 'unavailable']) {
-    const env = environment({ mutateController });
+  for (const reason of ['recipient', 'scope', 'desk', 'locked', 'keychanged', 'unavailable']) {
+    const env = environment({ mutateController, withView: reason === 'desk' });
     try {
       await env.controller.start(); await flush(); env.emit([env.line('Keep these words')]); await flush();
       env.controller.contextChanged(reason);
@@ -353,6 +367,10 @@ async function contextReasonProof(mutateController) {
       const detail = env.stateChanges.at(-1).detail;
       assert.equal(detail.reason, reason); assert.match(detail.message, /Dictation stopped/);
       assert(detail.message.length > 25); assert.equal(detail.announcement, detail.message);
+      if (reason === 'desk') {
+        assert.equal(detail.announcement, 'Dictation stopped when you changed desks.');
+        assert.equal(env.view.announcer.textContent, detail.announcement, 'The attached live region announces the desk reason');
+      }
     } finally { await env.close(); }
   }
 }
@@ -397,7 +415,7 @@ async function publicEscapeProof(mutateController) {
     assert.equal(env.controller.escape(event()), false, 'Idle Escape belongs to the surrounding application');
     env.elements.textarea.value = 'Typed prefix'; env.elements.mic.focus();
     env.elements.mic.dispatch('click'); await flush(); env.emit([env.line('spoken words')]); await flush();
-    for (const blocked of [event({ isComposing: true }), event({ defaultPrevented: true }), event({ key: 'Enter' })]) {
+    for (const blocked of [event({ isComposing: true }), event({ keyCode: 229 }), event({ defaultPrevented: true }), event({ key: 'Enter' })]) {
       assert.equal(env.controller.escape(blocked), false); assert(env.controller.active);
       assert.equal(blocked.immediate, undefined);
     }
@@ -414,6 +432,51 @@ async function publicEscapeProof(mutateController) {
     assert.equal(env.controller.escape(event()), false, 'Host fallback cannot cancel the same take twice');
     await flush(); assert.equal(env.calls.filter(call => call.route === 'cancel').length, 1);
   } finally { await env.close(); }
+}
+
+async function finishingEscapeProof(mutateController) {
+  const stopped = deferred(), env = environment({ mutateController, withView: true, stopDeferred: stopped });
+  try {
+    env.elements.textarea.value = 'Typed.';await env.controller.start();await flush();
+    env.emit([env.line('these words were kept by Stop')]);await flush();
+    const visible = env.elements.textarea.value, pending = env.controller.stop();await flush();
+    assert.equal(env.controller.state, 'finishing');assert(env.controller.active);assert.equal(env.elements.cancel.hidden, true);
+    assert(env.tracks.every(track => track.stopped));
+    const event = () => ({ key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopImmediatePropagation() { this.stopped = true; } });
+    const direct = event();assert.equal(env.controller.escape(direct), false, 'Stop completion cannot be changed into Cancel');
+    const local = event();env.elements.host.dispatch('keydown', local);
+    for (const ignored of [direct, local]) { assert.equal(ignored.defaultPrevented, false);assert.equal(ignored.stopped, undefined); }
+    assert.equal(env.elements.textarea.value, visible);assert.equal(env.controller.state, 'finishing');
+    assert.equal(env.calls.filter(call => call.route === 'cancel').length, 0);
+    stopped.resolve({ epoch: env.epoch, ended: true });
+    env.emit([env.line('these words were kept by Stop and finalized', true), { id: ++env.nextId, type: 'ended', epoch: env.epoch }], true);
+    await pending;await flush();
+    assert.equal(env.elements.textarea.value, 'Typed. these words were kept by Stop and finalized');
+    assert.equal(env.controller.active, false);assert.equal(env.stateChanges.at(-1).detail.reason, 'stop');
+  } finally { stopped.resolve({ epoch: env.epoch, ended: true });await env.close(); }
+}
+
+async function sendNoticeProof(mutateController, mutateView) {
+  const notice = 'This desk cannot receive a message. You can dictate a draft, but cannot send it here.';
+  for (const withView of [false, true]) {
+    const env = environment({ captureNotice: notice, mutateController, mutateView, withView });
+    try {
+      env.elements.send.disabled = true;await env.controller.start();await flush();
+      assert.equal(env.noticeBeforeMicrophone, notice);assert.equal(env.controller.state, 'listening');
+      const check = () => {
+        assert.equal(env.elements.status.textContent, notice);assert.equal(env.elements.status.hidden, false, 'The notice span itself remains visible');
+        if (withView) { assert.equal(env.elements.status.parent.hidden, false);assert(env.view.announcer.textContent.includes(notice)); }
+      };
+      check();
+      env.emit([env.line('A draft only')]);await flush();check();
+      env.controller.refresh();check();
+      if (withView) {
+        // Rendering a message must also recover a span hidden by an earlier writer.
+        env.elements.status.hidden = true;env.view.render('listening', { notice });check();
+      }
+      assert.equal(env.elements.textarea.value, 'A draft only');assert(!env.calls.some(call => ['ask','send'].includes(call.route)));
+    } finally { await env.close(); }
+  }
 }
 
 function viewEndProof(mutateView) {
@@ -467,6 +530,7 @@ async function main() {
   await test('Escape cancels dictation and preserves the pre-existing draft', () => escapeProof());
   await test('composer capture cancels Escape with the microphone, Cancel or Send focused', () => focusedEscapeProof());
   await test('window Escape interception preserves IME and foreground-popup precedence', () => publicEscapeProof());
+  await test('Escape during Stop completion keeps visible and finalized words without consuming dismissal', () => finishingEscapeProof());
   await test('stage and desk controls return on Stop, Cancel, Send and every interruption', () => viewEndProof());
   await test('Motet and all synthetic agent desk identities cannot share late dictated words', () => deskIdentityProof());
   await test('a cancelled pending resume settles and releases capture', async () => {
@@ -487,23 +551,7 @@ async function main() {
       assert.equal(env.contexts[0].state, 'closed');
     } finally { await env.close(); }
   });
-  await test('an unavailable-Send notice exists before capture and remains while listening', async () => {
-    const notice = 'This desk cannot receive a message. You can dictate a draft, but cannot send it here.';
-    const env = environment({ captureNotice: notice });
-    try {
-      env.elements.send.disabled = true; await env.controller.start(); await flush();
-      assert.equal(env.noticeBeforeMicrophone, notice); assert.equal(env.stateChanges.at(-1).detail.notice, notice);
-      assert.equal(env.controller.state, 'listening');
-      const { view } = viewFixture();
-      try {
-        view.render('listening', { notice }); assert.equal(view.status.textContent, notice);
-        assert(view.announcer.textContent.includes(notice));
-      } finally { view.destroy(); }
-      env.emit([env.line('A draft only')]); await flush();
-      assert.equal(env.elements.textarea.value, 'A draft only');
-      assert(!env.calls.some(call => ['ask', 'send'].includes(call.route)));
-    } finally { await env.close(); }
-  });
+  await test('an unavailable-Send notice remains visibly rendered by the real controller and attached view', () => sendNoticeProof());
   await test('ordinary refresh and view changes leave a take listening', async () => {
     const env = environment();
     try {
@@ -943,6 +991,10 @@ async function main() {
     await caught('Escape is Cancel', value => value.replace('cancel(); return true;', 'stop(); return true;'), escapeProof);
     await caught('Escape composer capture binding', value => value.replace("bind(escapeBoundary, 'keydown', onComposerEscape, true);", ''), focusedEscapeProof);
     await caught('Escape foreground precedence', value => value.replace('(options.canCancelEscape && !options.canCancelEscape())', 'false'), publicEscapeProof);
+    await caught('Stop finishing cannot become Cancel', value => value.replace("state === 'finishing' || take.stopRequested || ", ''), finishingEscapeProof);
+    await caught('legacy IME Escape guard', value => value.replace(' || event.keyCode === 229', ''), publicEscapeProof);
+    await caught('controller keeps unavailable-Send notice visible', value => value.replace("['checking','preparing','listening'].includes(state) && notice ? notice : detail.message || ''", "detail.message || ''"), sendNoticeProof);
+    await caught('view owns notice span visibility', value => value.replace('status.hidden = !message;', ''), mutate => sendNoticeProof(undefined, mutate), viewSource);
     await caught('finishing returns desk controls', value => value.replace("active = ['preparing','listening'].includes(state);", "active = ['preparing','listening','finishing'].includes(state);"), viewEndProof, viewSource);
     await caught('actual desk identity guard', value => value.replace('!canUse() || target() !== current.target', '!canUse() || false'), deskIdentityProof);
   });

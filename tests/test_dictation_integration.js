@@ -19,7 +19,7 @@ function harness({demo=false,key='fictional-owner',workspace=true,modules=true,m
     append(...children){for(const child of children){child.remove();this.children.push(child);child.parentNode=this}}appendChild(child){this.append(child);return child}
     insertBefore(child,next){if(child===next)return;calls.push(['move',child]);if(child.contains(doc.activeElement))doc.activeElement=null;child.remove();child.parentNode=this;const at=next?this.children.indexOf(next):-1;if(at<0)this.children.push(child);else this.children.splice(at,0,child)}
     querySelector(selector){return this.children.flatMap(child=>[child,...child.descendants()]).find(child=>child.className===selector.slice(1))||null}descendants(){return this.children.flatMap(child=>[child,...child.descendants()])}
-    classList={values:new Set(),contains(name){return this.values.has(name)},add(name){this.values.add(name)},remove(name){this.values.delete(name)},toggle(name,on){if(on)this.add(name);else this.remove(name)}};
+    classList={values:new Set(),contains:name=>this.classList.values.has(name)||String(this.className||'').split(/\s+/).includes(name),add(name){this.values.add(name)},remove(name){this.values.delete(name)},toggle(name,on){if(on)this.add(name);else this.remove(name)}};
     addEventListener(type,fn,capture){(this.handlers[type]||=[]).push({fn,capture})}
     dispatchEvent(event){calls.push(['input event',event.type,event.bubbles]);for(const listener of this.handlers[event.type]||[])listener.fn(event);return true}
     focus(){doc.activeElement=this}closest(){return null}
@@ -66,16 +66,16 @@ function initProof(mutate=x=>x){
 }
 initProof();
 function orderProof(mutate=x=>x){
-  const h=harness({mutate}),row=h.node('#ofRow'),compose=h.node('#ofCompose'),plus=h.node('plus'),files=h.node('files');
+  const h=harness({mutate}),row=h.node('#ofRow'),compose=h.node('#ofCompose'),recipient=h.node('#workspaceStationToolbar'),plus=h.node('plus'),files=h.node('files');
   plus.className='workspace-attachments-plus';files.className='workspace-attachments-files';
-  compose.append(h.input);h.host.append(row);row.append(compose,plus,files,h.controls.cancel,h.controls.wave,h.controls.mic,h.controls.send);
+  compose.append(h.input);h.host.append(row);row.append(compose,plus,files,recipient,h.controls.cancel,h.controls.wave,h.controls.mic,h.controls.send);
   const sequence=()=>row.children.map(node=>node.name);
   h.input.focus();h.ctx.workspaceDictationOrderControls();
-  assert.deepEqual(sequence(),['plus','files','#ofCompose','cancel','wave','mic','#ofSend']);
+  assert.deepEqual(sequence(),['#ofCompose','plus','#workspaceStationToolbar','files','cancel','wave','mic','#ofSend']);
   assert.equal(h.doc.activeElement,h.input);assert.equal(h.input.parentNode,compose);
   const originalText=h.input.value;h.input.selectionStart=3;h.input.selectionEnd=7;h.input.scrollTop=18;
   h.host.classList.add('dictation-active');files.focus();h.ctx.workspaceDictationOrderControls();
-  assert.deepEqual(sequence(),['#ofCompose','plus','files','cancel','wave','mic','#ofSend']);
+  assert.deepEqual(sequence(),['#ofCompose','#workspaceStationToolbar','plus','files','cancel','wave','mic','#ofSend']);
   assert.equal(h.doc.activeElement,files,'Moving Files retains keyboard focus');
   h.host.classList.remove('dictation-active');plus.focus();h.ctx.workspaceDictationOrderControls();
   assert.equal(h.doc.activeElement,plus,'Returning plus to idle retains keyboard focus');
@@ -112,8 +112,8 @@ function stageOrderProof(mutate=x=>x){
   for(const excluded of ['docked','stepped','workspace-officer-desk']){
     const h=harness({mutate}),row=h.node('#ofRow'),compose=h.node('#ofCompose'),plus=h.node('plus'),files=h.node('files');h.host.dataset.workspaceComposer='desktop';
     if(excluded==='docked')h.host.classList.add(excluded);else h.doc.body.classList.add(excluded);
-    plus.className='workspace-attachments-plus';files.className='workspace-attachments-files';row.append(compose,plus,files,h.controls.mic,h.controls.send);
-    h.ctx.workspaceDictationOrderControls();assert.deepEqual(row.children.slice(0,3).map(node=>node.name),['plus','files','#ofCompose'],excluded+' retains existing desk order despite a stale stage marker');
+    plus.className='workspace-attachments-plus';files.className='workspace-attachments-files';const recipient=h.node('#workspaceStationToolbar');row.append(compose,plus,files,recipient,h.controls.mic,h.controls.send);
+    h.ctx.workspaceDictationOrderControls();assert.deepEqual(row.children.slice(0,4).map(node=>node.name),['#ofCompose','plus','#workspaceStationToolbar','files'],excluded+' retains canonical desk order despite a stale stage marker');
   }
 }
 function liveStagePlacementProof(mutate=x=>x){
@@ -142,9 +142,9 @@ function identityProof(mutate=x=>x){
   const before=h.options.target();h.ctx.KEY='another-fictional-owner';assert.notEqual(h.options.target(),before);
 }
 function windowEscapeProof(mutate=x=>x){
-  for(const route of ['desk','global'])for(const location of ['mic','outside','ime','popup','model','recipient',...(route==='global'?['attachments','suggestions']:[])]){
+  for(const route of ['desk','global'])for(const location of ['mic','outside','ime','popup','model','recipient','attachments',...(route==='desk'?['drawer']:['suggestions'])]){
     const h=harness({mutate}),ctx=h.ctx;h.controller.active=true;const background=[];
-    Object.assign(ctx,{focus:'fictional-agent',DESK:{drawer:null,open:true},workspaceForeground:()=>location==='popup',agDialogForeground:()=>false,deckForeground:()=>false,
+    Object.assign(ctx,{focus:'fictional-agent',DESK:{drawer:location==='drawer'?'agents':null,open:true},workspaceForeground:()=>location==='popup',agDialogForeground:()=>false,deckForeground:()=>false,
       officerModelEscape:()=>location==='model',workspaceOfficerEscape:()=>location==='recipient',workspaceAttachmentsEscape:()=>location==='attachments',
       workspaceOfficerDeskActive:()=>false,workspaceOfficerUnifiedMenu:()=>false,workspaceOfficerInlineSuggestions:()=>false,
       deskEscapeLayer:(drawer,work)=>drawer?'drawer':work?'work':'room',deskCloseWork:()=>background.push('work'),deskCloseDrawer:()=>background.push('drawer'),render:()=>{},
@@ -156,7 +156,7 @@ function windowEscapeProof(mutate=x=>x){
       preventDefault(){this.defaultPrevented=true},stopImmediatePropagation(){this.stopped=true}};
     handler(event);
     if(location==='mic'||location==='outside'){assert.equal(h.controller.active,false,route+' '+location+' Escape cancels the active take');assert(event.defaultPrevented);assert(event.stopped);assert.deepEqual(background,[],'Cancel precedes nonmodal panel/navigation');}
-    else {assert.equal(h.controller.active,true,route+' '+location+' keeps the take');assert(!h.calls.some(call=>call[0]==='escape attempt'));assert.deepEqual(background,[]);}
+    else {assert.equal(h.controller.active,true,route+' '+location+' keeps the take');assert(!h.calls.some(call=>call[0]==='escape attempt'));assert.deepEqual(background,location==='drawer'?['drawer']:[]);}
   }
 }
 function hiddenPopupProof(mutate=x=>x){
@@ -194,10 +194,10 @@ function openContextProof(mutate=x=>x){
     {recipient:'watch',scope:'station',target:'fictional-a',next:{scope:'station',agent:'fictional-b'},changed:true}
   ]){
     const calls=[],ctx={OFUI:{recipient:scenario.recipient,scope:scenario.scope,epoch:4},focus:scenario.target,A:{'fictional-a':{},'fictional-b':{}},cuTarget:()=>scenario.target,
-      workspaceDictationContextChanging:()=>calls.push('retire'),cuDraftSave:()=>calls.push('save'),cuDraftRestore:()=>calls.push('restore'),ofContextPaint:()=>{},ofToggle:()=>{},setFocus:()=>{}};
+      workspaceDictationContextChanging:reason=>calls.push(['retire',reason]),cuDraftSave:()=>calls.push('save'),cuDraftRestore:()=>calls.push('restore'),ofContextPaint:()=>{},ofToggle:()=>{},setFocus:()=>{}};
     const fn=vm.runInNewContext(mutate(functionBlock('ofOpenContext'))+';ofOpenContext',ctx);fn(scenario.next);
-    assert.equal(calls.includes('retire'),scenario.changed,'Opening the already displayed Motet context is only a presentation change');
-    if(scenario.changed)assert.equal(calls[0],'retire');
+    assert.equal(calls.some(call=>Array.isArray(call)&&call[0]==='retire'),scenario.changed,'Opening the already displayed Motet context is only a presentation change');
+    if(scenario.changed)assert.deepEqual(calls[0],['retire',scenario.recipient!=='watch'||scenario.next.scope==='station'&&scenario.target!==scenario.next.agent?'recipient':'scope']);
   }
 }
 async function apiProof(mutate=x=>x){
@@ -215,15 +215,24 @@ async function sendProof(mutate=x=>x){
     const fn=vm.runInNewContext(mutate('async '+functionBlock(name))+';'+name,ctx);await fn();assert.equal(calls[0],'voice',name+' stops capture before any send interceptor');assert.equal(calls[1],name==='ofSendOrdinary'?'history':'documents');
   }
 }
+async function rejectedKeyProof(mutate=x=>x){
+  const calls=[],ctx={DEMO:false,claiming:false,KEY:'fictional-owner',authN:0,APP_ICONS:{batch:null},
+    fetch:async()=>({ok:false}),localStorage:{removeItem:key=>calls.push(['remove',key])},
+    workspaceDictationContextChanging:reason=>calls.push(['retire',reason,ctx.KEY]),
+    lock:on=>calls.push(['lock',on,ctx.KEY]),setTimeout:()=>assert.fail('A rejected key does not retry')};
+  const start=vm.runInNewContext(mutate(functionBlock('start'))+';start',ctx);
+  start();await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(calls,[['remove','liveRoomKey'],['retire','keychanged','fictional-owner'],['lock',true,'']]);
+}
 function lifecycleProof(mutate=x=>x){
   let calls=[];const scope={scope:'room',recipient:'watch'},input={value:'old visible draft'},node={open:true};
-  const ctx={OFUI:scope,ofIn:input,$:()=>node,workspaceDictationContextChanging:()=>calls.push(['retire',input.value,scope.recipient,scope.scope]),cuDraftSave:()=>calls.push(['save',input.value,scope.recipient,scope.scope]),cuDraftRestore:()=>{input.value='new recipient draft';calls.push(['restore'])},ofContextPaint:()=>calls.push(['paint'])};
-  let fn=vm.runInNewContext(mutate(sourceLine('cuSelectRecipient'))+';cuSelectRecipient',ctx);fn('agent');assert.deepEqual(calls[0],['retire','old visible draft','watch','room']);assert.equal(calls[1][0],'save');assert.equal(input.value,'new recipient draft');
+  const ctx={OFUI:scope,ofIn:input,$:()=>node,workspaceDictationContextChanging:reason=>calls.push(['retire',input.value,scope.recipient,scope.scope,reason]),cuDraftSave:()=>calls.push(['save',input.value,scope.recipient,scope.scope]),cuDraftRestore:()=>{input.value='new recipient draft';calls.push(['restore'])},ofContextPaint:()=>calls.push(['paint'])};
+  let fn=vm.runInNewContext(mutate(sourceLine('cuSelectRecipient'))+';cuSelectRecipient',ctx);fn('agent');assert.deepEqual(calls[0],['retire','old visible draft','watch','room','recipient']);assert.equal(calls[1][0],'save');assert.equal(input.value,'new recipient draft');
   calls=[];scope.recipient='watch';scope.scope='room';input.value='scope draft';ctx.ofCurrent=()=>({context:{scope:'room'}});const button={disabled:false,dataset:{scope:'station'}};
-  vm.runInNewContext(mutate(html.split('\n').find(s=>s.startsWith("$('#ofScope').onclick="))),ctx);node.onclick({target:{closest:()=>button}});assert.deepEqual(calls[0],['retire','scope draft','watch','room']);assert.equal(calls[1][0],'save');assert.equal(scope.scope,'station');
+  vm.runInNewContext(mutate(html.split('\n').find(s=>s.startsWith("$('#ofScope').onclick="))),ctx);node.onclick({target:{closest:()=>button}});assert.deepEqual(calls[0],['retire','scope draft','watch','room','scope']);assert.equal(calls[1][0],'save');assert.equal(scope.scope,'station');
   calls=[];const nativeFactory=()=>nativeFactory.current;nativeFactory.current={retireIfChanged(){calls.push('native retire')},ownsInput:()=>true};const restoreContext={workspaceDictationRefresh:()=>calls.push('voice'),workspaceNativeAttachments:nativeFactory};fn=vm.runInNewContext(mutate(functionBlock('cuDraftRestore'))+';cuDraftRestore',restoreContext);fn();assert.deepEqual(calls,['voice','native retire'],'voice retires before draft controller ownership can change');
-  calls=[];const stop=new Error('stop after first unrelated hook'),focusContext={focus:null,A:{'fictional-agent':{}},workspaceDictationContextChanging:()=>calls.push('voice'),workspaceCancelDeskReturn:()=>{calls.push('desk');throw stop}};
-  fn=vm.runInNewContext(mutate(functionBlock('setFocus'))+';setFocus',focusContext);assert.throws(()=>fn('fictional-agent'),error=>error===stop);assert.deepEqual(calls,['voice','desk'],'voice retires before focus handoff begins');
+  calls=[];const stop=new Error('stop after first unrelated hook'),focusContext={focus:null,A:{'fictional-agent':{}},workspaceDictationContextChanging:reason=>calls.push(['voice',reason]),workspaceCancelDeskReturn:()=>{calls.push('desk');throw stop}};
+  fn=vm.runInNewContext(mutate(functionBlock('setFocus'))+';setFocus',focusContext);assert.throws(()=>fn('fictional-agent'),error=>error===stop);assert.deepEqual(calls,[['voice','desk'],'desk'],'voice retires with a desk reason before focus handoff begins');
   calls=[];const lockContext={workspaceDictationContextChanging:()=>{calls.push('voice');throw stop},workspaceAppIconsReset:()=>calls.push('lock')};
   fn=vm.runInNewContext(mutate(sourceLine('lock'))+';lock',lockContext);assert.throws(()=>fn(true),error=>error===stop);assert.deepEqual(calls,['lock','voice'],'app icon reset precedes dictation retirement on locking');
   for(const name of['workspaceOfficerRestore','workspaceStationRestore','workspaceOfficerDeskClose','workspaceOfficerDeskOpen'])assert(!sourceLine(name).includes('workspaceDictationContextChanging'),name+' is a visual move, not a destination fence');assert(!sourceLine('ofToggle').includes('workspaceDictationContextChanging'));
@@ -231,14 +240,14 @@ function lifecycleProof(mutate=x=>x){
 }
 lifecycleProof();
 async function main(){
-  await apiProof();await sendProof();orderProof();stageOrderProof();liveStagePlacementProof();identityProof();windowEscapeProof();hiddenPopupProof();openContextProof();
+  await apiProof();await sendProof();await rejectedKeyProof();orderProof();stageOrderProof();liveStagePlacementProof();identityProof();windowEscapeProof();hiddenPopupProof();openContextProof();
   for(const [name,mutate,proof]of[
     ['control ordering',s=>s.replace('for(const node of controls)row.insertBefore(node,anchor);',''),orderProof],
     ['stationary editor',s=>s.replace('for(const node of controls)row.insertBefore(node,anchor);','row.insertBefore(compose,anchor);for(const node of controls)row.insertBefore(node,anchor);'),orderProof],
     ['held control focus',s=>s.replace('held.focus({preventScroll:true});','void 0;'),orderProof],
     ['stage words precede controls',s=>s.replace("const stage=WORKSPACE&&(ofEl.dataset.workspaceComposer==='desktop'||ofEl.dataset.workspaceComposer==='narrow')&&!ofEl.classList.contains('docked')&&!document.body.classList.contains('stepped')&&!document.body.classList.contains('workspace-officer-desk');",'const stage=false;'),stageOrderProof],
     ['stage without mounted mic',s=>s.replace('if(!stage&&(!mic||mic.parentNode!==row))return;','if(!mic||mic.parentNode!==row)return;'),stageOrderProof],
-    ['lazy identity for inert layout',s=>s.replace('identity=heldControl?workspaceDictationTarget():null','identity=workspaceDictationTarget()'),stageOrderProof],
+    ['lazy identity for inert layout',s=>s.replaceAll('identity=heldControl?workspaceDictationTarget():null','identity=workspaceDictationTarget()'),stageOrderProof],
     ['Settings return anchor after Files',s=>s.replace('modelAnchor?.parentNode===row?modelAnchor:mic||send','mic||send'),stageOrderProof],
     ['Settings comment anchor idempotence',s=>s.replace('node.nextSibling===(controls[index+1]||anchor)','node.nextElementSibling===(controls[index+1]||anchor)'),stageOrderProof],
     ['stage marker cannot change desks',s=>s.replace("&&!document.body.classList.contains('workspace-officer-desk')",''),stageOrderProof],
@@ -254,8 +263,11 @@ async function main(){
   assert.throws(()=>initProof(s=>s.replace("if(DEMO){view.render('idle');return}","if(false){view.render('idle');return}")),assert.AssertionError,'demo construction bypass mutation caught');
   assert.throws(()=>initProof(s=>s.replace("if(state==='listening')shown.message='';",'')),assert.AssertionError,'listening status words mutation caught');
   await assert.rejects(()=>sendProof(s=>s.replace("if(typeof workspaceDictationBeforeSend==='function')workspaceDictationBeforeSend();",'')),assert.AssertionError,'missing pre-send retirement mutation caught');
-  assert.throws(()=>lifecycleProof(s=>s.replace("if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging();",'')),assert.AssertionError,'missing pre-context retirement mutation caught');
+  assert.throws(()=>lifecycleProof(s=>s.replace("workspaceDictationContextChanging('recipient');",'void 0;')),assert.AssertionError,'missing pre-context retirement mutation caught');
+  for(const [reason,proof] of [['desk',lifecycleProof],['scope',lifecycleProof],['scope',openContextProof]])assert.throws(()=>proof(s=>s.replaceAll("'"+reason+"'","'recipient'")),assert.AssertionError,reason+' stop reason mutation caught');
+  await assert.rejects(()=>rejectedKeyProof(s=>s.replace("workspaceDictationContextChanging('keychanged')","workspaceDictationContextChanging('recipient')")),assert.AssertionError,'Rejected-key reason mutation caught');
+  for(const target of ["if(e.key==='Escape'&&typeof workspaceAttachmentsEscape==='function'&&workspaceAttachmentsEscape(e))return;","if(e.key==='Escape'&&DESK.drawer){e.preventDefault();e.stopImmediatePropagation();deskCloseDrawer();render();return}"])assert.throws(()=>windowEscapeProof(s=>s.replace(target,'')),assert.AssertionError,'Foreground Escape precedence mutation caught');
   assert(wiring.includes("help.href='/dictation-help'"));assert(wiring.includes("help.rel='noopener noreferrer'"));assert(!/X-Dictation-Key|127\.0\.0\.1:[0-9]|\.live-room|localStorage/.test(wiring),'page wiring contains no helper capability, private path or extra persistence');
-  console.log('ok dictation page wiring: inert demo/classic/load, Send/draft fences, stage words before controls with no-view/live-paint/real-Settings-comment/desk boundaries, stationary editor focus, real Escape/popup precedence, private adapter and twenty-one causal mutations');
+  console.log('ok dictation page wiring: inert demo/classic/load, Send/draft fences, stage words before controls with no-view/live-paint/real-Settings-comment/desk boundaries, stationary editor focus, real Escape/popup precedence, private adapter, desk attachment ordering, exact stop reasons and causal mutation checks');
 }
 main().catch(error=>{console.error(error);process.exitCode=1});

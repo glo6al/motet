@@ -23,6 +23,7 @@
   };
   const END_REASON = {
     recipient: 'Dictation stopped when you changed the recipient.',
+    desk: 'Dictation stopped when you changed desks.',
     scope: 'Dictation stopped when you changed the scope.',
     hidden: 'Dictation stopped when you left this tab.',
     locked: 'Dictation stopped when you locked the stage.',
@@ -83,8 +84,10 @@
       if (options.cancel) options.cancel.hidden = !on;
       if (options.wave) options.wave.hidden = !on;
       if (options.status) {
-        options.status.textContent = detail.message || '';
-        options.status.hidden = !detail.message;
+        const notice = typeof detail.notice === 'string' ? detail.notice : '';
+        const message = ['checking','preparing','listening'].includes(state) && notice ? notice : detail.message || '';
+        options.status.textContent = message;
+        options.status.hidden = !message;
       }
       if (options.settings) options.settings.hidden = state !== 'not_installed';
       if (options.onState) options.onState(state, Object.assign({}, detail, {
@@ -483,7 +486,7 @@
       pendingInput = { type: event.inputType || 'manual', selection: selection() };
     }
     function onComposerEscape(event) {
-      if (!event || destroyed || !take || event.key !== 'Escape' || event.defaultPrevented || composing || event.isComposing
+      if (!event || destroyed || !take || state === 'finishing' || take.stopRequested || event.key !== 'Escape' || event.defaultPrevented || composing || event.isComposing || event.keyCode === 229
           || (options.canCancelEscape && !options.canCancelEscape())) return false;
       event.preventDefault();
       if (event.stopImmediatePropagation) event.stopImmediatePropagation();

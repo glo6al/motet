@@ -2905,6 +2905,7 @@ html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-wor
 html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer=narrow] #workspaceOfficerNarrowHistoryToggle[aria-expanded=true] svg{transform:rotate(180deg)}
 html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer=narrow] :is(#workspaceOfficerNarrowHistoryToggle,#ofSuggestions summary):hover{background:#f4f3ef}
 html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer=narrow] :is(#workspaceOfficerNarrowHistoryToggle,#ofSuggestions summary):focus-visible{outline:2px solid #1c1b19;outline-offset:2px}
+html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer=narrow] #workspaceOfficerHeader:not(:has(>#ofSuggestions:not([hidden]))) #workspaceOfficerNarrowHistoryToggle{margin-left:auto}
 /* End narrow stage arrow and Suggestions icon. */
 </style>
 </head>
@@ -4482,9 +4483,10 @@ new ResizeObserver(()=>{if(focus){deskSize();A[focus].dirty=true;render()}}).obs
 $('#compactDesk').addEventListener('wheel',e=>{if(!e.ctrlKey||!DESK.open||deskView!=='seeing'||!e.target.closest('#compactMonitor')||!focus)return;e.preventDefault();const a=A[focus];a.zm=Math.max(1,Math.min(5,(a.zm||1)*Math.exp(-e.deltaY*.012)));a.$.split.style.setProperty('--zm',a.zm.toFixed(3))},{passive:false});
 function deskKeydown(e){
   if(e.isComposing||e.keyCode===229)return;
-  if(typeof workspaceForeground==='function'&&workspaceForeground())return;if(typeof agDialogForeground==='function'&&agDialogForeground())return;if(typeof deckForeground==='function'&&deckForeground())return;if(typeof officerModelEscape==='function'&&e.key==='Escape'&&officerModelEscape(e))return;
+  if(typeof workspaceForeground==='function'&&workspaceForeground())return;if(typeof agDialogForeground==='function'&&agDialogForeground())return;if(typeof deckForeground==='function'&&deckForeground())return;if(e.key==='Escape'&&typeof workspaceAttachmentsEscape==='function'&&workspaceAttachmentsEscape(e))return;if(typeof officerModelEscape==='function'&&e.key==='Escape'&&officerModelEscape(e))return;
   if(!focus)return;
   if(e.key==='Escape'&&typeof workspaceOfficerEscape==='function'&&workspaceOfficerEscape(e))return;
+  if(e.key==='Escape'&&DESK.drawer){e.preventDefault();e.stopImmediatePropagation();deskCloseDrawer();render();return}
   if(typeof workspaceDictationEscape==='function'&&workspaceDictationEscape(e))return;
   if(e.key==='Escape'){const layer=deskEscapeLayer(DESK.drawer,DESK.open);if(layer==='drawer'||layer==='work'){e.preventDefault();e.stopImmediatePropagation();if(layer==='drawer')deskCloseDrawer();else deskCloseWork();render();return}}
   if(e.key==='Tab'&&DESK.drawer){const pane=DESK.drawer==='agents'?$('#deskAgents'):$('#deskFacts'),items=[...pane.querySelectorAll('button,[href],input,textarea,[tabindex]')].filter(x=>!x.disabled&&x.tabIndex>=0&&deskVisible(x));if(!items.length)return;const first=items[0],last=items.at(-1);if(e.shiftKey&&(document.activeElement===first||!pane.contains(document.activeElement))){e.preventDefault();last.focus()}else if(!e.shiftKey&&(document.activeElement===last||!pane.contains(document.activeElement))){e.preventDefault();first.focus()}}
@@ -4653,7 +4655,7 @@ function leaveDesk() {
 
 function setFocus(id){
   if(id&&!A[id]) return;
-  if(focus!==id&&typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging();
+  if(focus!==id&&typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('desk');
   if(typeof workspaceCancelDeskReturn==='function')workspaceCancelDeskReturn();
   const workspaceEntry=typeof workspaceDeskEntry==='function'&&WORKSPACE&&focus!==id?workspaceDeskEntry(id):null;
   if(id&&typeof workspaceOfficerDeskClose==='function')workspaceOfficerDeskClose(false);
@@ -5164,7 +5166,7 @@ function start(){
   if(APP_ICONS.batch&&APP_ICONS.batch.key!==k)workspaceAppIconsReset();
   fetch('/check?k='+encodeURIComponent(k)).then(r=>{
     if(n!==authN||k!==KEY) return;
-    if(r.ok){lock(false);connect();if(typeof workspaceAppIconsLoad==='function')workspaceAppIconsLoad()}else{try{localStorage.removeItem('liveRoomKey')}catch(err){} if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging();KEY=''; lock(true)}
+    if(r.ok){lock(false);connect();if(typeof workspaceAppIconsLoad==='function')workspaceAppIconsLoad()}else{try{localStorage.removeItem('liveRoomKey')}catch(err){} if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');KEY=''; lock(true)}
   }).catch(()=>{if(n===authN) setTimeout(start,3000)});
 }
 /* tell the server a visible room window exists; permission prompts are only held while one does */
@@ -5400,7 +5402,7 @@ function cuRevealEvent(id,n){if(focus!==id)setFocus(id);if(!A[id])return;cuSelec
 function cuCard(r,kind){const id=kind+':'+r.request_id;let row=CU.nodes.get(id);if(!row){const el=ofAdd('of '+kind,'',{id,context:{scope:'station',agent:r.agent,name:r.name},ts:r.created||0,kind});row=CU.nodes.get(id);row.el=el}return row.el}
 function ofCurrent(){return ofSnapshot(OFUI.scope,cuTarget(),A,OFUI.epoch)}
 function ofOpenContext(context){
-  if((OFUI.recipient!=='watch'||OFUI.scope!==context.scope||context.scope==='station'&&cuTarget()!==context.agent)&&typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('recipient');cuDraftSave();if(context.scope==='station'&&focus!==context.agent){if(A[context.agent])setFocus(context.agent);else{if(focus)setFocus(null);OFUI.target=context.agent;OFUI.targetName=context.name||context.agent}}
+  if((OFUI.recipient!=='watch'||OFUI.scope!==context.scope||context.scope==='station'&&cuTarget()!==context.agent)&&typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging(OFUI.recipient!=='watch'||context.scope==='station'&&cuTarget()!==context.agent?'recipient':'scope');cuDraftSave();if(context.scope==='station'&&focus!==context.agent){if(A[context.agent])setFocus(context.agent);else{if(focus)setFocus(null);OFUI.target=context.agent;OFUI.targetName=context.name||context.agent}}
   OFUI.recipient='watch';OFUI.scope=context.scope;OFUI.epoch++;cuDraftRestore();ofContextPaint();ofToggle(true);
 }
 function ofReplyNotice(request){
@@ -5476,7 +5478,7 @@ function ofInit(){if(typeof officerModelEnsure==='function')officerModelEnsure()
 function ofPlace(){if(typeof workspaceOfficerDeskActive==='function'&&workspaceOfficerDeskActive())return;if(focus&&typeof workspaceOfficerRestore==='function')workspaceOfficerRestore();if(!focus&&typeof workspaceStationRestore==='function')workspaceStationRestore();const docked=!!focus;if(docked!==OFUI.docked){OFUI.docked=docked;if(docked){$('#officerSlot').appendChild(ofEl);ofEl.classList.add('docked');ofEl.classList.remove('fold');ofInit()}else{$('#officerHome').after(ofEl);ofEl.classList.remove('docked');ofEl.classList.add('fold');$('#ofB').setAttribute('aria-expanded','false')}}ofTab(OFUI.tab,false);ofContextPaint();if(typeof workspaceOfficerLayout==='function')workspaceOfficerLayout();if(typeof workspaceStationLayout==='function')workspaceStationLayout();if(typeof workspaceAttachmentsSync==='function')workspaceAttachmentsSync()}
 function ofReveal(){cuSelectRecipient('watch');if(focus){deskReveal('conversation');ofTab('officer');if(STATION.compact)$('#deskR').scrollIntoView({block:'start'})}ofToggle(true)}
 function ofOwnsFocus(request){return request.epoch===OFUI.epoch&&(OFUI.recipient==='watch')&&!ofEl.classList.contains('fold')&&(document.activeElement===ofIn||document.activeElement===$('#ofSend'))}
-$('#ofScope').onclick=e=>{const b=e.target.closest('button[data-scope]');if(!b||b.disabled||b.dataset.scope===ofCurrent().context.scope)return;if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging();$('#ofSuggestions').open=false;cuDraftSave();OFUI.scope=b.dataset.scope;OFUI.epoch++;cuDraftRestore();ofContextPaint()};
+$('#ofScope').onclick=e=>{const b=e.target.closest('button[data-scope]');if(!b||b.disabled||b.dataset.scope===ofCurrent().context.scope)return;if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('scope');$('#ofSuggestions').open=false;cuDraftSave();OFUI.scope=b.dataset.scope;OFUI.epoch++;cuDraftRestore();ofContextPaint()};
 $('#ofScope').onkeydown=e=>e.stopPropagation();
 $('#claudeConnect').onclick=cuClaudeConnect;$('#claudeRevoke').onclick=cuClaudeRevoke;
 $('#recipient').onclick=e=>{const b=e.target.closest('[data-recipient]');if(!b||b.hidden)return;if(b.dataset.recipient==='agent'&&!focus){cuChooserOpen();return}cuSelectRecipient(b.dataset.recipient)};
@@ -9722,6 +9724,15 @@ function workspaceDictationOrderControls(){
   if(!stage&&(!mic||mic.parentNode!==row))return;
   const compose=$('#ofCompose'),active=ofEl.classList.contains('dictation-active');
   const controls=['.workspace-attachments-plus','.workspace-attachments-files'].map(selector=>row.querySelector(selector)).filter(node=>node&&node.parentNode===row);
+  if(!stage&&!active){
+    const recipient=[$('#workspaceStationToolbar'),$('#ofAddress')].find(node=>node?.parentNode===row),plus=controls[0]?.classList.contains('workspace-attachments-plus')?controls[0]:null,files=controls.find(node=>node.classList.contains('workspace-attachments-files'));
+    if(!recipient||((!plus||plus.nextSibling===recipient)&&(!files||recipient.nextSibling===files)))return;
+    const held=document.activeElement,heldControl=controls.includes(held),identity=heldControl?workspaceDictationTarget():null;
+    if(plus&&plus.nextSibling!==recipient)row.insertBefore(plus,recipient);
+    if(files&&recipient.nextSibling!==files)row.insertBefore(files,recipient.nextSibling);
+    if(heldControl&&held.isConnected&&identity===workspaceDictationTarget()&&document.activeElement!==held)held.focus({preventScroll:true});
+    return;
+  }
   const model=$('#ofModelPicker');
   const modelAnchor=stage&&!active&&model.parentNode!==row&&typeof workspaceOfficerDesktopModelAnchor==='function'?workspaceOfficerDesktopModelAnchor():null;
   const anchor=active?(current?.view.cancel||mic||send):stage?(model.parentNode===row?model:modelAnchor?.parentNode===row?modelAnchor:mic||send):compose;

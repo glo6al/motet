@@ -75,7 +75,7 @@
       settings.hidden = !['not_installed','not_running','not_configured','dependency_missing','model_missing_or_invalid'].includes(value.code);
       const notice = typeof value.notice === 'string' ? value.notice : '';
       const message = ['preparing','listening'].includes(state) && notice ? notice : typeof value.message === 'string' ? value.message : '';
-      statusRow.hidden = !message; status.textContent = message;
+      statusRow.hidden = !message; status.textContent = message; status.hidden = !message;
       let announcement = typeof value.announcement === 'string' ? value.announcement : '';
       if (state === 'listening') announcement = 'Listening' + (notice ? '. ' + notice : '');
       else if (!announcement) announcement = message;

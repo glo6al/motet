@@ -27,9 +27,8 @@ html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>.dictatio
 html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>#ofSend{order:5!important}
 html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>.dictation-mic{margin-left:auto!important}
 html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>#ofSend{margin-left:0!important}
-html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>.workspace-attachments-plus{order:0!important;align-self:flex-end}
-html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>.workspace-attachments-files{order:1!important;align-self:flex-end}
-html.workspace.workspace-attachments #officer.dictation-mounted #ofRow>#ofCompose{order:2!important}
+html.workspace.workspace-attachments body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer].dictation-mounted #ofRow>.workspace-attachments-plus{order:0!important;align-self:flex-end}
+html.workspace.workspace-attachments body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer].dictation-mounted #ofRow>.workspace-attachments-files{order:1!important;align-self:flex-end}
 html.workspace.workspace-attachments #officer.dictation-active #ofRow>.dictation-cancel{order:2!important}
 html.workspace.workspace-attachments #officer.dictation-active #ofRow>.dictation-wave{order:3!important}
 html.workspace.workspace-attachments #officer.dictation-active #ofRow>#ofCompose{order:-1!important}
