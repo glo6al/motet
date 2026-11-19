@@ -227,20 +227,40 @@ class ServiceTests(unittest.TestCase):
         # Pin first: a 30-second policy mutant must fail before a real wait.
         self.assertEqual(COMMAND_WAIT_SECONDS, .1)
         for action in ('stop', 'cancel'):
-            with self.subTest(action=action):
-                ident = self.service.start(.25)['sessionId']
-                before = list(self.engine.calls)
-                # This is the unwrapped production lock. The holder cannot
-                # release before the refusal, so there is no success margin.
-                with self.service.command:
-                    with self.assertRaises(ServiceError) as error:
-                        self.service.control(ident, action)
-                    self.assertEqual((error.exception.status, error.exception.code), (409, 'busy'))
-                    self.assertEqual(self.engine.calls, before)
-                    self.assertFalse(self.service.sessions[ident]['ended'])
-                    self.assertEqual(self.service.status()['state'], 'listening')
-                self.assertTrue(self.service.control(ident, action)['ended'])
-                self.assertEqual(self.service.status()['state'], 'ready')
+            ident = self.service.start(.25)['sessionId']
+            before = list(self.engine.calls)
+            command = self.service.command
+            outcomes = []
+            def control():
+                try:
+                    outcomes.append(self.service.control(ident, action))
+                except BaseException as error:
+                    outcomes.append(error)
+            # Daemon is a last safety net, not permission to leak: cleanup below
+            # must join the worker after releasing the real, unwrapped lock.
+            worker = threading.Thread(target=control, name='held-lock-' + action, daemon=True)
+            self.assertTrue(command.acquire(blocking=False), 'Start left the command lock held')
+            try:
+                worker.start()
+                # This is a deadlock watchdog, not a 100 ms success margin.
+                # The holder cannot release before the refusal is observed.
+                worker.join(5)
+                self.assertFalse(worker.is_alive(),
+                                 action + ' did not refuse the real held lock; command acquire may be unbounded')
+                self.assertEqual(len(outcomes), 1)
+                error = outcomes[0]
+                self.assertIsInstance(error, ServiceError)
+                self.assertEqual((error.status, error.code), (409, 'busy'))
+                self.assertEqual(self.engine.calls, before)
+                self.assertFalse(self.service.sessions[ident]['ended'])
+                self.assertEqual(self.service.status()['state'], 'listening')
+            finally:
+                command.release()
+                if worker.ident is not None:
+                    worker.join(5)
+                self.assertFalse(worker.is_alive(), action + ' worker leaked after the held lock was released')
+            self.assertTrue(self.service.control(ident, action)['ended'])
+            self.assertEqual(self.service.status()['state'], 'ready')
 
     def test_concurrent_command_is_rejected_instead_of_queued(self):
         for action in ('stop', 'cancel'):

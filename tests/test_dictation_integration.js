@@ -68,6 +68,7 @@ function initProof(mutate=x=>x){
   const h=harness({mutate});assert.equal(h.calls.filter(c=>c[0]==='create').length,1);assert.equal(h.calls.filter(c=>c[0]==='fetch').length,0,'page load never probes or starts recognition');
   h.ctx.workspaceDictationInit();assert.equal(h.calls.filter(c=>c[0]==='attach').length,1,'shared composer binds once');
   assert.equal(h.options.workletUrl,'/dictation-worklet.js');assert.equal(h.options.canUse(),true);
+  assert.equal(h.options.isLocalRefusal,h.ctx.workspaceDictationIsLocalRefusal,'The controller receives the adapter-private identity predicate');
   for(const prop of['locked','claiming']){h.ctx[prop]=true;assert.equal(h.options.canUse(),false);h.ctx[prop]=false}
   for(const prop of['disabled','readOnly']){h.input[prop]=true;assert.equal(h.options.canUse(),false);h.input[prop]=false}
   h.ctx.KEY='';assert.equal(h.options.canUse(),false);h.ctx.KEY='fictional-owner';h.doc.hidden=true;assert.equal(h.options.canUse(),false);h.doc.hidden=false;
@@ -229,6 +230,27 @@ async function apiProof(mutate=x=>x){
   h.ctx.fetch=async()=>({ok:false,json:async()=>({error:{code:'not_installed'}})});await assert.rejects(()=>api('/api/dictation/start'),error=>error.code==='not_installed');
   h.ctx.fetch=async()=>{h.ctx.KEY='different-fictional-owner';return {ok:true,json:async()=>({state:'ready'})}};await assert.rejects(()=>api('/api/dictation/status'),error=>error.code==='unavailable','old response cannot publish across owner-key change');
 }
+async function adapterProvenanceProof(mutate=x=>x){
+  const h=harness({mutate}),api=h.ctx.workspaceDictationApi,isLocal=h.ctx.workspaceDictationIsLocalRefusal;
+  async function refused(local){let caught;try{await api('/api/dictation/cancel',{method:'POST',body:'{"sessionId":"fictional-session"}'})}catch(error){caught=error}assert(caught);assert.equal(isLocal(caught),local);return caught;}
+  for(const property of ['KEY','locked','claiming']){
+    const before=h.calls.filter(call=>call[0]==='fetch').length,old=h.ctx[property];h.ctx[property]=property==='KEY'?'':true;
+    const error=await refused(true);assert.equal(error.code,'unavailable');assert.equal(h.calls.filter(call=>call[0]==='fetch').length,before,'Local admission refusal cannot contact the server');
+    assert.equal(isLocal(JSON.parse(JSON.stringify(error))),false,'Provenance belongs to the thrown Error identity, never JSON');h.ctx[property]=old;
+  }
+  for(const code of ['unavailable','adapter_local_refusal']){
+    h.ctx.fetch=async()=>({ok:false,json:async()=>({localRefusal:true,error:{code,localRefusal:true,isLocalRefusal:true,marker:{}}})});
+    const error=await refused(false);assert.equal(error.code,code);assert.equal('localRefusal' in error,false);assert.equal('isLocalRefusal' in error,false);assert.equal('marker' in error,false,'Helper fields cannot manufacture adapter provenance');
+  }
+  for(const value of [null,[],42]){h.ctx.fetch=async()=>({ok:true,json:async()=>value});await refused(false);}
+  h.ctx.fetch=async()=>({ok:true,json:async()=>{throw Error('fictional JSON failure')}});await refused(false);
+  const before=h.calls.filter(call=>call[0]==='fetch').length;await assert.rejects(()=>api('/foreign-route'),error=>error.code==='unavailable'&&!isLocal(error));assert.equal(h.calls.filter(call=>call[0]==='fetch').length,before);
+  for(const phase of ['response','json']){
+    h.ctx.fetch=async()=>{if(phase==='response')h.ctx.locked=true;return {ok:true,json:async()=>{if(phase==='json')h.ctx.claiming=true;return {state:'ready'}}}};
+    await refused(true);h.ctx.locked=h.ctx.claiming=false;
+  }
+  h.ctx.fetch=async()=>{h.ctx.KEY='different-owner';return {ok:true,json:async()=>({state:'ready'})}};await refused(true);
+}
 async function sendProof(mutate=x=>x){
   for(const name of['cuSend','ofSend','ofSendOrdinary']){
     const calls=[],ctx={workspaceDictationBeforeSend:()=>calls.push('voice'),workspaceLiveDocumentsSend:()=>{calls.push('documents');return true},workspaceOfficerHistoryActive:()=>{calls.push('history');return true}};
@@ -260,7 +282,7 @@ function lifecycleProof(mutate=x=>x){
 }
 lifecycleProof();
 async function main(){
-  await apiProof();await sendProof();await rejectedKeyProof();orderProof();stageOrderProof();liveStagePlacementProof();identityProof();windowEscapeProof();hiddenPopupProof();openContextProof();
+  await apiProof();await adapterProvenanceProof();await sendProof();await rejectedKeyProof();orderProof();stageOrderProof();liveStagePlacementProof();identityProof();windowEscapeProof();hiddenPopupProof();openContextProof();
   for(const [name,mutate,proof]of[
     ['control ordering',s=>s.replace('for(const node of controls)row.insertBefore(node,anchor);',''),orderProof],
     ['stationary editor',s=>s.replace('for(const node of controls)row.insertBefore(node,anchor);','row.insertBefore(compose,anchor);for(const node of controls)row.insertBefore(node,anchor);'),orderProof],
@@ -282,6 +304,9 @@ async function main(){
   ])assert.throws(()=>proof(mutate),assert.AssertionError,name+' causal mutation caught');
   assert.throws(()=>initProof(s=>s.replace("if(DEMO){view.render('idle');return}","if(false){view.render('idle');return}")),assert.AssertionError,'demo construction bypass mutation caught');
   assert.throws(()=>initProof(s=>s.replace("if(state==='listening')shown.message='';",'')),assert.AssertionError,'listening status words mutation caught');
+  assert.throws(()=>initProof(s=>s.replace('isLocalRefusal:workspaceDictationIsLocalRefusal,','')),assert.AssertionError,'Controller provenance wiring is required');
+  await assert.rejects(()=>adapterProvenanceProof(s=>s.replace('WORKSPACE_DICTATION_LOCAL_REFUSALS.add(error);','')),assert.AssertionError,'Local provenance must attest the actual refusal Error');
+  await assert.rejects(()=>adapterProvenanceProof(s=>s.replace("error.code='unavailable';return error", "error.code='unavailable';WORKSPACE_DICTATION_LOCAL_REFUSALS.add(error);return error")),assert.AssertionError,'Generic helper/decode failures cannot acquire local provenance');
   await assert.rejects(()=>sendProof(s=>s.replace("if(typeof workspaceDictationBeforeSend==='function')workspaceDictationBeforeSend();",'')),assert.AssertionError,'missing pre-send retirement mutation caught');
   assert.throws(()=>lifecycleProof(s=>s.replace("workspaceDictationContextChanging('recipient');",'void 0;')),assert.AssertionError,'missing pre-context retirement mutation caught');
   for(const [reason,proof] of [['desk',lifecycleProof],['scope',lifecycleProof],['scope',openContextProof]])assert.throws(()=>proof(s=>s.replaceAll("'"+reason+"'","'recipient'")),assert.AssertionError,reason+' stop reason mutation caught');

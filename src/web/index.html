@@ -9796,17 +9796,21 @@ function workspaceDictationRefresh(){
   if(current.identity!==identity){current.controller?.contextChanged('recipient');current.identity=identity}
   current.controller?.refresh();current.view.refresh();
 }
+const WORKSPACE_DICTATION_LOCAL_REFUSALS=new WeakSet();
+function workspaceDictationIsLocalRefusal(error){return !!error&&typeof error==='object'&&WORKSPACE_DICTATION_LOCAL_REFUSALS.has(error)}
 async function workspaceDictationApi(path,config={}){
   const denied=()=>{const error=new Error('Local dictation is unavailable.');error.code='unavailable';return error};
-  if(!WORKSPACE||DEMO||!KEY||locked||claiming||!/^\/api\/dictation\/(?:status|start|audio|events|stop|cancel|reset)$/.test(path))throw denied();
+  const localDenied=()=>{const error=denied();WORKSPACE_DICTATION_LOCAL_REFUSALS.add(error);return error};
+  if(!WORKSPACE||DEMO||!/^\/api\/dictation\/(?:status|start|audio|events|stop|cancel|reset)$/.test(path))throw denied();
+  if(!KEY||locked||claiming)throw localDenied();
   const owner=KEY,abort=new AbortController(),cancel=()=>abort.abort(),timeout=setTimeout(cancel,12000);
   if(config.signal){if(config.signal.aborted)cancel();else config.signal.addEventListener('abort',cancel,{once:true})}
   try{
     const headers=new Headers(config.headers||{});headers.set('X-Live-Room-Key',owner);
     const response=await fetch(path,{...config,headers,signal:abort.signal,credentials:'same-origin',cache:'no-store',redirect:'error'});
-    if(owner!==KEY||locked||claiming)throw denied();
+    if(owner!==KEY||locked||claiming)throw localDenied();
     let value;try{value=await response.json()}catch(error){throw denied()}
-    if(owner!==KEY||locked||claiming)throw denied();
+    if(owner!==KEY||locked||claiming)throw localDenied();
     if(!value||typeof value!=='object'||Array.isArray(value))throw denied();
     if(!response.ok||value.error){const error=denied(),code=typeof value.error?.code==='string'?value.error.code:typeof value.error==='string'?value.error:'';if(/^[a-z_]{1,60}$/.test(code))error.code=code;throw error}
     return value;
@@ -9839,7 +9843,7 @@ function workspaceDictationInit(){
   workspaceDictationOrderControls();
   if(DEMO){view.render('idle');return}
   current.controller=MotetDictation.create({textarea:ofIn,mic:view.mic,cancel:view.cancel,send:view.send,wave:view.wave,status:view.status,settings:view.settings,
-    api:workspaceDictationApi,target:workspaceDictationTarget,demo:()=>DEMO,canUse:workspaceDictationCanUse,captureNotice:workspaceDictationSendNotice,host:ofEl,canCancelEscape:workspaceDictationEscapeAllowed,workletUrl:'/dictation-worklet.js',
+    api:workspaceDictationApi,isLocalRefusal:workspaceDictationIsLocalRefusal,target:workspaceDictationTarget,demo:()=>DEMO,canUse:workspaceDictationCanUse,captureNotice:workspaceDictationSendNotice,host:ofEl,canCancelEscape:workspaceDictationEscapeAllowed,workletUrl:'/dictation-worklet.js',
     onState:(state,detail={})=>{const shown={...detail,code:detail.code||state};if(state==='listening')shown.message='';view.render(state==='checking'?'preparing':state,shown);workspaceDictationCloseHiddenPopups();workspaceDictationOrderControls()},
     onDraftChange:()=>{ofIn.dispatchEvent(new Event('input',{bubbles:true}));view.refresh()}
   });

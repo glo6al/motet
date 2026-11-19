@@ -4,6 +4,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { spawnSync } = require('node:child_process');
+const { randomBytes } = require('node:crypto');
+// Only the parent proof substitutes a nonce into a compiled child copy.
+const PROOF_CHILD_TOKEN = null;
+const proofChild=PROOF_CHILD_TOKEN!==null;
+if(proofChild&&!process.argv.includes('--dictation-proof-child='+PROOF_CHILD_TOKEN))throw Error('Invalid dictation proof child invocation.');
 const { DraftModel, ManualJournal, textPatch } = require('../src/web/dictation_draft.js');
 const { PCMResampler } = require('../src/web/dictation_worklet.js');
 
@@ -238,8 +243,10 @@ function environment(configuration = {}) {
     const entry = env.pendingEvents.shift();
     assert(entry, 'Expected a pending event request');if (env.clock) env.clock.clearTimeout(entry.timer);entry.resolve({ events, ended, epoch: env.epoch });
   };
+  const localRefusals=new WeakSet();env.localRefusal=error=>{localRefusals.add(error);return error};env.isLocalRefusal=error=>localRefusals.has(error);
   env.controller = browser.MotetDictation.create(Object.assign({}, elements, {
     api: endpoint, demo: () => env.demo, canUse: () => env.allowed, target: () => env.target,
+    isLocalRefusal: env.isLocalRefusal,
     prepareTimeoutMs: env.prepareTimeoutMs, captureNotice: () => env.captureNotice || '',
     canCancelEscape: () => !env.foreground,
     onDraftChange: () => { env.patches++; env.drafts.set(env.target, elements.textarea.value); elements.textarea.dispatch('input'); },
@@ -641,7 +648,9 @@ async function terminalAckProof(mutateController) {
     const env=await speaking({mutateController,apiHook(route,data,config,current){
       if(route==='stop'){if(outcome==='unknown_session')throw apiError(outcome);return {sessionId:outcome==='mismatch'?'wrong-session':data.sessionId,epoch:current.epoch,ended:outcome!=='not-ended'};}
     }});
-    try{await env.controller.stop();await flush();assert.equal(env.elements.textarea.value,'Typed. kept words');assert.equal(env.calls.filter(call=>call.route==='stop').length,1);assert.equal(env.view.status.textContent,outcome==='unknown_session'?EXPECTED_COPY.final:EXPECTED_COPY.control);}finally{await env.close();}
+    try{await env.controller.stop();await flush();assert.equal(env.elements.textarea.value,'Typed. kept words');assert.equal(env.calls.filter(call=>call.route==='stop').length,1);assert.equal(env.view.status.textContent,outcome==='unknown_session'?EXPECTED_COPY.final:EXPECTED_COPY.control);
+      const cancels=env.calls.filter(call=>call.route==='cancel');assert.equal(cancels.length,1,'An unvalidated Stop reply must not suppress fallback Cancel');assert.equal(cancels[0].data.sessionId,env.sessionId);assert.equal(cancels[0].config.keepalive,true);
+    }finally{await env.close();}
   }
 }
 async function cleanupFeedbackProof(mutateController) {
@@ -665,6 +674,23 @@ async function cleanupFeedbackProof(mutateController) {
       else assert.notEqual(env.view.status.textContent,EXPECTED_COPY.control,'Late cleanup cannot overwrite another action or manual edit');
       assert.equal(env.patches,patches,'Cleanup feedback never writes the draft');assert.equal(env.elements.textarea.value,change==='context'?'Other draft':'Typed.');
     }finally{failed.resolve({sessionId:env.sessionId,epoch:1,ended:true});readiness.resolve({state:'ready'});if(change==='new-take')microphone.resolve(returnedStream||(returnedStream=env.newStream()));await env.close();}
+  }
+}
+async function cleanupOwnershipProof(mutateController) {
+  for(const scenario of ['destroyed','composing','silent-target','silent-value','detected-target']){
+    const failed=deferred();const env=await speaking({mutateController,apiHook(route){if(route==='cancel')return failed.promise;}});
+    try{
+      if(scenario==='detected-target'){env.target='other-owner';env.controller.refresh();}
+      else{if(scenario==='composing')env.elements.textarea.dispatch('compositionstart');env.controller.cancel();}
+      await flush();
+      if(scenario==='destroyed')env.controller.destroy();
+      if(scenario==='silent-target'){env.target='other-owner';env.controller.refresh();}
+      if(scenario==='silent-value'){env.elements.textarea.value='Other draft';env.controller.refresh();}
+      const text=env.elements.textarea.value,history=env.stateChanges.length,patches=env.patches;
+      failed.reject(apiError('failed'));await flush();
+      assert(!env.stateChanges.slice(history).some(row=>row.detail.reason==='cleanup_unconfirmed'),scenario+' must reject the old cleanup feedback');
+      assert.equal(env.elements.textarea.value,text);assert.equal(env.patches,patches);
+    }finally{failed.resolve({sessionId:env.sessionId,epoch:1,ended:true});if(env.controller.composing)env.elements.textarea.dispatch('compositionend');await env.close();}
   }
 }
 async function lateStopPollProof(mutateController) {
@@ -733,17 +759,27 @@ async function monotonicClockProof(mutateController) {
   finally{await env.close();}
 }
 async function lockedCleanupProof(mutateController) {
-  for(const scenario of ['locked-local-refusal','other-context','helper-failure']){
-    let refused=0,wire=0;
-    const env=await speaking({mutateController,apiHook(route,data,config,current){if(route==='cancel'){if(!current.allowed){refused++;throw apiError(scenario==='helper-failure'?'failed':'unavailable');}wire++;}}});
+  for(const scenario of ['locked-local-refusal','other-context','helper-failure','upstream-unavailable','unlock-still-unusable']){
+    let refused=0,wire=0,adapterLocked=false,lastFailure;
+    const packet=deferred();
+    const env=await speaking({mutateController,audioDeferred:scenario==='unlock-still-unusable'?packet:null,apiHook(route,data,config,current){if(route==='cancel'){
+      if(adapterLocked){refused++;lastFailure=current.localRefusal(apiError('unavailable'));throw lastFailure;}
+      wire++;lastFailure=apiError(scenario==='helper-failure'?'failed':'unavailable');lastFailure.localRefusal=true;throw lastFailure;
+    }}});
     try{
-      env.allowed=false;env.controller.contextChanged(scenario==='other-context'?'desk':'locked');await flush();
-      assert.equal(refused,1);assert.equal(wire,0,'No request bypasses the revoked adapter permission');
+      if(scenario==='unlock-still-unusable'){env.worklets[0].pcm();await flush();}
+      const local=['locked-local-refusal','other-context'].includes(scenario);
+      env.allowed=false;adapterLocked=true;env.controller.contextChanged(scenario==='other-context'?'desk':'locked');
+      if(!local){adapterLocked=false;env.elements.textarea.readOnly=true;}
+      if(scenario==='unlock-still-unusable'){assert.equal(adapterLocked,false);packet.resolve({acceptedSequence:0,epoch:1});}
+      await flush();
+      assert.equal(refused,local?1:0);assert.equal(wire,local?0:1,'Only an unlocked adapter can send cleanup, even when the composer stays unusable');
+      assert.equal(env.isLocalRefusal(lastFailure),local,'Local refusals are branded; helper errors with spoofed fields are not');
       assert(env.tracks.every(track=>track.stopped));assert.equal(env.elements.textarea.value,'Typed. kept words');
       if(scenario==='locked-local-refusal'){assert.equal(env.view.status.textContent,'Dictation stopped when you locked the stage.');assert.equal(env.stateChanges.at(-1).detail.reason,'locked');}
       else assert.equal(env.view.status.textContent,EXPECTED_COPY.control,'Unexpected cleanup failures still warn');
-      const count=env.calls.length;await env.controller.start();assert.equal(env.calls.length,count);assert.equal(env.mediaCalls,1,'A locked stage cannot request another microphone');
-    }finally{await env.close();}
+      const count=env.calls.length;await env.controller.start();assert.equal(env.calls.length,count);assert.equal(env.mediaCalls,1,'An unusable composer cannot request another microphone');
+    }finally{packet.resolve({acceptedSequence:0,epoch:1});await env.close();}
   }
 }
 async function acknowledgedDrainTimerProof(mutateController) {
@@ -773,13 +809,18 @@ async function retireStopAbortProof(mutateController) {
   }finally{held.resolve({sessionId:env.sessionId,epoch:1,ended:true});await env.close();}
 }
 function incompleteRunProof() {
+  if(proofChild)throw Error('A proof child cannot invoke the parent subprocess proof.');
   const filename=__filename,test=fs.readFileSync(filename,'utf8');
-  function child(controller) {
-    const content=test.replace("const source = fs.readFileSync(path.join(__dirname, '../src/web/dictation.js'), 'utf8');",'const source = '+JSON.stringify(controller)+';');
+  function child(controller,argument='matching') {
+    const token=randomBytes(16).toString('hex');
+    const content=test.replace("const source = fs.readFileSync(path.join(__dirname, '../src/web/dictation.js'), 'utf8');",'const source = '+JSON.stringify(controller)+';')
+      .replace('const PROOF_CHILD_TOKEN = null;','const PROOF_CHILD_TOKEN = '+JSON.stringify(token)+';');
     const bootstrap="const Module=require('node:module'),path=require('node:path');const m=new Module("+JSON.stringify(filename)+",module);m.filename="+JSON.stringify(filename)+";m.paths=Module._nodeModulePaths(path.dirname(m.filename));m._compile("+JSON.stringify(content)+",m.filename);";
-    return spawnSync(process.execPath,['-'],{input:bootstrap,encoding:'utf8',timeout:30000,maxBuffer:1024*1024,env:Object.assign({},process.env,{MOTET_DICTATION_CHILD:'1'})});
+    const args=['-'];if(argument!=='missing')args.push('--dictation-proof-child='+(argument==='matching'?token:'wrong-token'));
+    return spawnSync(process.execPath,args,{input:bootstrap,encoding:'utf8',timeout:30000,maxBuffer:1024*1024,env:process.env});
   }
   const normal=child(source);assert.equal(normal.error,undefined);assert.equal(normal.signal,null);assert.equal(normal.status,0,normal.stderr);assert(normal.stdout.includes('Dictation page checks passed.'));
+  for(const argument of ['missing','wrong']){const refused=child(source,argument);assert.equal(refused.error,undefined);assert.equal(refused.signal,null);assert.equal(refused.status,1);assert(refused.stderr.includes('Invalid dictation proof child invocation.'));assert(!refused.stdout.includes('PASS '),'A malformed compiled-child invocation must fail before it can recurse');}
   const mutants=[
     ['thirty-second budget',s=>s.replace('TERMINAL_BUDGET_MS = 20000','TERMINAL_BUDGET_MS = 30000')],
     ['twenty-one-second budget',s=>s.replace('TERMINAL_BUDGET_MS = 20000','TERMINAL_BUDGET_MS = 21000')],
@@ -797,6 +838,7 @@ async function main() {
   await test('Stop total budget includes pre-existing ordered audio',()=>queueBudgetProof());
   await test('terminal acknowledgements validate session and closure; ambiguous failures are not retried',()=>terminalAckProof());
   await test('late cleanup feedback never writes a draft or overrides typing, context, Send or a new take',()=>cleanupFeedbackProof());
+  await test('each independent late-feedback guard covers a reachable editor or owner lifecycle',()=>cleanupOwnershipProof());
   await test('final poll events immediately retire a pending Stop request including deferred IME',()=>lateStopPollProof());
   await test('both Start paths retain ambiguity without inventing a cleanup session',()=>ambiguousStartProof());
   await test('both Start paths preserve proven pre-execution refusals and setup guidance',()=>startRefusalProof());
@@ -805,7 +847,7 @@ async function main() {
   await test('locking preserves its reason only for the expected local adapter refusal',()=>lockedCleanupProof());
   await test('a Stop closure ACK without final events ends at exactly twenty seconds with final-words copy',()=>acknowledgedDrainTimerProof());
   await test('retirement immediately aborts Stop while cleanup keeps its same-session keepalive',()=>retireStopAbortProof());
-  if(process.env.MOTET_DICTATION_CHILD!=='1')await test('actual subprocesses reject incomplete budget, queue, unknown-session and hanging-promise runs',()=>incompleteRunProof());
+  if(!proofChild)await test('actual subprocesses reject incomplete budget, queue, unknown-session and hanging-promise runs',()=>incompleteRunProof());
   await test('recognition revisions preserve collapsed end and interior carets', () => caretProof());
   await test('native edits reconcile before older page autosize/paint refresh listeners', () => legacyInputProof());
   await test('history shortcuts follow Latin key meaning on German and Dvorak layouts', () => layoutKeyProof());
@@ -1268,6 +1310,7 @@ async function main() {
     await caught('terminal busy-only retry',value=>value.replace("if (!error || error.code !== 'busy') throw error;",'throw error;'),busyStopProof);
     await caught('retired same-session cleanup still runs',value=>value.replace('while (now() < deadline) {',"while (now() < deadline) { if (action === 'cancel' && !valid(current)) return;"),cleanupFenceProof);
     await caught('terminal ACK validates closure and session',value=>value.replace("if (result.sessionId !== current.sessionId || result.ended !== true) throw problem('control_unconfirmed');",''),terminalAckProof);
+    await caught('a Stop ACK is recorded only after validation',value=>value.replace("if (result.sessionId !== current.sessionId || result.ended !== true) throw problem('control_unconfirmed');\n          if (action === 'stop') current.stopAcknowledged = true;","if (action === 'stop') current.stopAcknowledged = true;\n          if (result.sessionId !== current.sessionId || result.ended !== true) throw problem('control_unconfirmed');"),terminalAckProof);
     await caught('HTTP attempt uses remaining budget',value=>value.replace('Math.min(12000, deadline - now())','12000'),terminalBudgetProof);
     await caught('Stop fallback retains the original deadline',value=>value.replace('if (current.terminalDeadline === undefined)','if (true)'),terminalBudgetProof);
     await caught('queue-inclusive Stop deadline',value=>value.replace("current.finishTimer = setTimeout(() => fail(current, problem('finalize_unconfirmed')), Math.max(0, deadline - now()));",'')
@@ -1279,11 +1322,16 @@ async function main() {
     await caught('both Start branches share ambiguity tracking',value=>value.replace('current.startPromise = startRequest(current);',"current.startPromise = request('start', { intervalSeconds: .25 }).then(result => { current.sessionId = result.sessionId; return result; });"),ambiguousStartProof);
     await caught('known Start refusals retain setup guidance',value=>value.replace('if (!refused) current.startUnconfirmed = true;','current.startUnconfirmed = true;'),startRefusalProof);
     await caught('monotonic clock is required before capture',value=>value.replace('scope.performance.now.bind(scope.performance) : null;','scope.performance.now.bind(scope.performance) : Date.now;'),monotonicClockProof);
-    await caught('routine lock keeps its context reason',value=>value.replace("if (detail.reason === 'locked' && error && error.code === 'unavailable' && !canUse()) return;",''),lockedCleanupProof);
+    await caught('routine lock requires verified local provenance',value=>value.replace('&& options.isLocalRefusal && options.isLocalRefusal(error) === true',''),lockedCleanupProof);
     await caught('ACK without final events still has a deadline',value=>value.replace("current.finishTimer = setTimeout(() => fail(current, problem('finalize_unconfirmed')), Math.max(0, deadline - now()));",''),acknowledgedDrainTimerProof);
     await caught('closure ACK remains distinct from the event drain',value=>value.replace("if (action === 'stop') current.stopAcknowledged = true;",''),acknowledgedDrainTimerProof);
     await caught('late cleanup preserves final-words feedback',value=>value.replace('[COPY.control_unconfirmed,COPY.finalize_unconfirmed].includes(detail.message)','detail.message === COPY.control_unconfirmed'),terminalBudgetProof);
-    await caught('new-take guards cannot be masked by readiness',value=>value.replace('destroyed || take || composing','destroyed || composing').replace('operation !== stamp.operation || ','').replace('statusVersion !== stamp.status || ',''),cleanupFeedbackProof);
+    await caught('new-take status ownership cannot be masked by readiness',value=>value.replace('statusVersion !== stamp.status || ',''),cleanupFeedbackProof);
+    await caught('destroyed editor rejects cleanup feedback',value=>value.replace('if (destroyed || composing || !stamp || target() !== stamp.target','if (composing || !stamp || target() !== stamp.target'),cleanupOwnershipProof);
+    await caught('composition begun before Cancel keeps its feedback boundary',value=>value.replace('if (destroyed || composing || !stamp || target() !== stamp.target','if (destroyed || !stamp || target() !== stamp.target'),cleanupOwnershipProof);
+    await caught('silent target change rejects cleanup feedback',value=>value.replace('target() !== stamp.target','false'),cleanupOwnershipProof);
+    await caught('refresh-detected owner change rejects old take feedback',value=>value.replace('current.target !== stamp.target','false'),cleanupOwnershipProof);
+    await caught('silent draft replacement rejects cleanup feedback',value=>value.replace('textarea.value !== stamp.text','false'),cleanupOwnershipProof);
     await caught('Start is never retried on busy',value=>value.replace('const refused = error &&',"if(error && error.code === 'busy' && !current.startRetried){current.startRetried=true;return startRequest(current);}const refused = error &&"),startRefusalProof);
     await caught('cleanup retains keepalive',value=>value.replace("action === 'cancel' ? { keepalive: true } : {}",'{}'),cleanupFenceProof);
     await caught('retirement aborts the pending Stop request',value=>value.replace('if (current.stopAbort) current.stopAbort.abort();',''),retireStopAbortProof);
