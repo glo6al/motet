@@ -58,7 +58,7 @@ When you want to look for yourself, every agent is in view.
 - **See the whole ensemble.** Your recent sessions on this Mac, grouped by project, each one showing what it is doing right now. Sub-agents sit under the agent that handed off to them.
 - **Hear the cue.** With the optional hooks installed, when a Claude Code agent stops to ask permission, it is marked, counted and put in the bell, with the exact command it wants to run. A question an agent asks is shown too, and one worked out from its last words is labelled as probable. Codex's own permission prompts are not visible to Motet.
 - **Read the score.** Open an agent's desk: the conversation on the left, its work on the right. The edits, the commands, the files and the pages it opened. Long runs of steps fold away until you want them.
-- **Bring a player in.** Message an agent from its desk, hand it a PDF or a picture, or start a fresh Codex chat in a project's folder.
+- **Bring a player in.** Message an agent from its desk, hand it a PDF or a picture, or start a fresh Codex chat in a project's folder, including a folder you add yourself.
 - **Catch the wrong note.** A command that looks like a deploy, a push, a delete or a send is flagged as it happens. You choose the words it listens for.
 
 <p align="center"><img src="docs/media/workspace-desk.png" width="1000" alt="Ada's desk in Workspace. The conversation is on the left: your request, a folded run of steps, Ada's update and a command still running. The Changes panel on the right shows two recorded edits to one file as short red and green excerpts, each noting that only the recorded change text is shown."></p>
@@ -130,12 +130,9 @@ A chat has to qualify before Motet will send to it. When something isn't availab
 - **No dictation.** You type your messages.
 - **Mac only,** and only coding sessions on this computer. Web chats are not brought in.
 
-**Being built now**
-
-- **Your own project folders in New chat.** You will be able to type in a folder Motet does not know yet and start its first chat there.
-
 **Designed, not built yet**
 
+- **Remove a project folder you added.** Today a folder you add to New chat stays saved; removing it from Motet, without touching the folder itself, comes next.
 - **Speak instead of type.** A microphone beside Send. Your words will appear as you talk, you will be able to fix them as you go, and nothing will be sent until you press Send. The plan is for the words to be worked out on your own computer.
 - **A roomier message box.** The quick questions will move out of the box, and one small arrow will open the conversation, so your words get the space.
 - **A live browser at the desk.** A real page you will open and operate yourself beside an agent's conversation, kept apart from the record of the pages its tools fetched.

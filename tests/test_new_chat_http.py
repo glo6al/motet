@@ -40,6 +40,10 @@ class Service:
         self.calls.append('context')
         return {'schemaVersion': 1, 'folders': []}
 
+    def register_folder(self, data):
+        self.calls.append(('register_folder', data))
+        return {'schemaVersion': 1}
+
     def prepare(self, data):
         self.calls.append(('prepare', data))
         return {'requestId': NATIVE}
@@ -74,7 +78,7 @@ class HttpTests(unittest.TestCase):
         class Unreadable:
             def read1(self, _):
                 raise AssertionError('Unauthenticated body was consumed')
-        for path in (PREFIX + 'context', PREFIX + 'attempts'):
+        for path in (PREFIX + 'context', PREFIX + 'attempts', PREFIX + 'folders'):
             h = self.post(path)
             h.headers.replace_header('X-Live-Room-Key', 'wrong')
             h.rfile = Unreadable()
@@ -88,14 +92,28 @@ class HttpTests(unittest.TestCase):
         h = Handler(headers=[('Origin', 'http://127.0.0.1:18801'), ('Origin', 'http://127.0.0.1:18801')])
         self.assertEqual(self.call(h, Service())[0], 403)
 
-    def test_all_six_routes_forward_only_authenticated_data(self):
+    def test_all_routes_forward_only_authenticated_data(self):
         s = Service()
         routes = [(Handler(), 200), (Handler(PREFIX + 'requests/' + NATIVE), 200), (Handler(PREFIX + 'attempts/' + NATIVE), 200),
                   (self.post(PREFIX + 'intents'), 201), (self.post(), 202),
+                  (self.post(PREFIX + 'folders', b'{"path":"/fictional/project"}'), 201),
                   (self.post(PREFIX + 'attempts/' + NATIVE + '/observe', b'{"action":"stop"}'), 200)]
         for h, status in routes:
             self.assertEqual(self.call(h, s)[0], status)
-        self.assertEqual(len(s.calls), 6)
+        self.assertEqual(len(s.calls), 7)
+        self.assertIn(('register_folder', {'path': '/fictional/project'}), s.calls)
+
+    def test_folder_registration_rejects_foreign_or_duplicate_auth_and_read_routes(self):
+        for extra in [('Host', '127.0.0.1:18801'), ('X-Live-Room-Key', 'fictional-key'),
+                      ('Origin', 'https://fictional.invalid')]:
+            service = Service()
+            handler = self.post(PREFIX + 'folders', b'{"path":"/fictional/project"}', headers=[extra])
+            self.assertEqual(self.call(handler, service)[0], 403)
+            self.assertEqual(service.calls, [])
+        for method in ('GET', 'DELETE'):
+            service = Service()
+            self.assertEqual(self.call(Handler(PREFIX + 'folders', method), service)[0], 404)
+            self.assertEqual(service.calls, [])
 
     def test_request_recovery_is_owner_only_get_and_never_launches(self):
         service = Service()

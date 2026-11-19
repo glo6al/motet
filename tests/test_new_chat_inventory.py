@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from new_chat_inventory import KnownFolderInventory, validate_folder
@@ -25,7 +26,8 @@ class InventoryTests(unittest.TestCase):
         st = self.source.stat()
         self.identity = VerifiedIdentity(NATIVE, str(self.folder), str(self.source), st.st_dev, st.st_ino, 'fixture-v1')
         self.rows = [self.identity]
-        self.inventory = KnownFolderInventory(lambda: self.rows, b'a' * 32)
+        self.inventory = KnownFolderInventory(lambda: self.rows, b'a' * 32, home=self.root,
+                                               state_root=self.root / 'private-state')
 
     def test_only_verified_identity_type_and_pinned_regular_source(self):
         self.rows = [{'cwd': str(self.folder)}, replace(self.identity, source_inode=1),
@@ -86,6 +88,136 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(self.inventory.refresh(), [])
         self.inventory.source = lambda: iter([self.identity, self.identity])
         self.assertEqual(self.inventory.refresh(), [])
+
+    def test_registration_accepts_only_service_home_relative_expansion(self):
+        literal = self.root / '$HOME'
+        literal.mkdir()
+        with patch('new_chat_inventory.os.path.expanduser', side_effect=AssertionError('Home was already injected.')) as home:
+            saved = self.inventory.register('~/fictional-project')
+            self.assertEqual(saved.path, str(self.folder))
+            self.assertEqual(self.inventory.register('~//fictional-project'), saved)
+            self.assertEqual(self.inventory.register('~/$HOME').path, str(literal))
+            for path in ('~', '~fictional/fictional-project', '$HOME/fictional-project',
+                         '${HOME}/fictional-project', '$(pwd)/fictional-project'):
+                with self.subTest(path=path), self.assertRaises(NewChatError) as caught:
+                    self.inventory.register(path)
+                self.assertEqual(caught.exception.code, 'invalid_folder')
+            home.assert_not_called()
+
+    def test_registration_reports_regular_file_without_exposing_filesystem_errors(self):
+        selected = self.root / 'fictional-file.txt'
+        selected.write_text('Fictional content that must not be returned.')
+        paths = [selected]
+        if os.name != 'nt':
+            alias = self.root / 'file-alias'
+            alias.symlink_to(selected)
+            paths.append(alias)
+        for path in paths:
+            with self.subTest(path=path), self.assertRaises(NewChatError) as caught:
+                self.inventory.register(str(path))
+            self.assertEqual((caught.exception.status, caught.exception.code, caught.exception.message),
+                             (400, 'invalid_folder', 'That is a file, not a folder.'))
+        for path in (str(self.root / 'missing'), '/' + 'x' * 4096, '/fictional\x7f', '/fictional\ud800'):
+            with self.subTest(path=path), self.assertRaises(NewChatError) as caught:
+                self.inventory.register(path)
+            self.assertEqual((caught.exception.status, caught.exception.code), (400, 'invalid_folder'))
+            self.assertNotIn(str(self.root), caught.exception.message)
+        with patch('new_chat_inventory.Path.resolve', side_effect=PermissionError('/fictional/private-detail')):
+            with self.assertRaises(NewChatError) as caught:
+                self.inventory.register(str(self.folder))
+        self.assertEqual(caught.exception.message,
+                         'Motet could not verify that folder. Check the path and try again.')
+
+    def test_registered_rows_survive_discovery_failure_but_not_directory_replacement(self):
+        saved = self.inventory.register(str(self.folder))
+        self.inventory.source = lambda: (_ for _ in ()).throw(OSError('Fictional discovery failure.'))
+        self.assertEqual(self.inventory.refresh([saved]), [saved])
+        self.assertEqual(self.inventory.get(saved.id, saved.revision, [saved]), saved)
+        self.folder.rename(self.root / 'old-project')
+        self.folder.mkdir()
+        self.assertEqual(self.inventory.refresh([saved]), [])
+        with self.assertRaises(NewChatError):
+            self.inventory.get(saved.id, saved.revision, [saved])
+
+    def test_private_roots_and_descendants_are_refused_without_a_temporary_directory_ban(self):
+        roots = [self.root / name for name in ('.live-room', '.codex', '.claude', 'private-state')]
+        for root in roots:
+            child = root / 'nested' / 'project'
+            child.mkdir(parents=True)
+            for path in (root, child):
+                with self.subTest(path=path), self.assertRaises(NewChatError) as caught:
+                    self.inventory.register(str(path))
+                self.assertEqual((caught.exception.code, caught.exception.message),
+                                 ('invalid_folder', 'Motet cannot use that folder.'))
+        for spelling in (str(self.root), '~/', '~/.codex/nested/project'):
+            with self.subTest(spelling=spelling), self.assertRaises(NewChatError) as caught:
+                self.inventory.register(spelling)
+            self.assertEqual(caught.exception.message, 'Motet cannot use that folder.')
+        for name in ('project', '.codex-project', '.claude-project', '.live-room-project', 'private-state-project'):
+            project = self.root / name
+            project.mkdir()
+            self.assertEqual(self.inventory.register(str(project)).path, str(project))
+        # This fixture itself is an explicit temporary project, outside private roots.
+        self.assertEqual(self.inventory.register(str(self.folder)).path, str(self.folder))
+
+    @unittest.skipIf(os.name == 'nt', 'Creating directory symlinks requires Windows privileges.')
+    def test_private_alias_retarget_and_replacement_cannot_keep_a_folder_eligible(self):
+        saved = self.inventory.refresh()[0]
+        private = self.root / '.codex'
+        private.symlink_to(self.folder, target_is_directory=True)
+        validate_folder(saved)  # The target's inode has not changed.
+        with self.assertRaises(NewChatError):
+            self.inventory.require_allowed(saved)
+        self.assertEqual(self.inventory.refresh([saved]), [])
+        with self.assertRaises(NewChatError):
+            self.inventory.get(saved.id, saved.revision, [saved])
+        alias = self.root / 'private-alias'
+        alias.symlink_to(private, target_is_directory=True)
+        with self.assertRaises(NewChatError):
+            self.inventory.register(str(alias))
+        private.unlink()
+        state = self.root / 'private-state'
+        state.mkdir()
+        state.rename(self.root / 'former-state')
+        state.mkdir()
+        with self.assertRaises(NewChatError):
+            self.inventory.register(str(state))
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Physical directory spelling is a macOS capability.')
+    def test_private_anchor_uses_physical_case(self):
+        private = self.root / '.Claude'
+        private.mkdir()
+        if not (self.root / '.claude').exists():
+            self.skipTest('This volume is case-sensitive.')
+        with self.assertRaises(NewChatError) as caught:
+            self.inventory.register(str(private))
+        self.assertEqual(caught.exception.message, 'Motet cannot use that folder.')
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Physical directory spelling is a macOS capability.')
+    def test_private_case_alias_discovery_and_get_are_refused(self):
+        private = self.root / '.claude'
+        private.mkdir()
+        alias = self.root / '.CLAUDE'
+        if not alias.exists():
+            self.skipTest('This volume is case-sensitive.')
+        self.rows = [replace(self.identity, cwd=str(alias))]
+        folder = self.inventory._folder(str(alias), alias.stat())
+        self.assertEqual(self.inventory.refresh([folder]), [])
+        with self.assertRaises(NewChatError):
+            self.inventory.get(folder.id, folder.revision, [folder])
+
+    def test_private_metadata_provenance_does_not_exclude_a_public_project(self):
+        private = self.root / '.codex'
+        private.mkdir()
+        source = private / 'fictional-native.jsonl'
+        self.source.rename(source)
+        self.rows = [replace(self.identity, source_path=str(source))]
+        self.assertEqual(self.inventory.refresh()[0].path, str(self.folder))
+
+    def test_non_directory_provider_anchor_does_not_exclude_an_unrelated_project(self):
+        for name in ('.codex', '.claude'):
+            (self.root / name).write_text('Fictional non-directory state anchor.')
+        self.assertEqual(self.inventory.register(str(self.folder)).path, str(self.folder))
 
 
 if __name__ == '__main__':

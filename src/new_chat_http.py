@@ -104,6 +104,8 @@ def handle_http(handler, service, owner_key, port):
                 raise ValueError()
         except (ValueError, UnicodeError, OSError, RecursionError):
             raise NewChatError('invalid_request', 'Invalid JSON request body.', 400) from None
+        if route == '/api/new-chat/folders':
+            return reply(201, service.register_folder(data))
         if route == '/api/new-chat/intents':
             return reply(201, service.prepare(data))
         if route == '/api/new-chat/attempts':

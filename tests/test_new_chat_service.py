@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from new_chat_service import NewChatService, RETENTION
@@ -107,7 +108,7 @@ class ServiceTests(unittest.TestCase):
             service.close()
 
     def service(self, **kwargs):
-        s = NewChatService(self.root, self.adapter, lambda: [self.seed],
+        s = NewChatService(self.root / 'private-state', self.adapter, lambda: [self.seed], home=self.root,
                            enabled=kwargs.pop('enabled', True), clock=lambda: self.clocks.mono,
                            wall=lambda: self.clocks.wall, **kwargs)
         self.services.append(s)
@@ -129,8 +130,325 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(s.context()['providers'][0]['available'])
             with self.assertRaises(NewChatError):
                 s.prepare({'provider': 'codex', 'folderId': 'fake', 'folderRevision': 'fake'})
+            with self.assertRaises(NewChatError) as refused:
+                s.register_folder({'path': str(self.folder)})
+            self.assertIn(refused.exception.code, ('disabled', 'demo_unavailable'))
             s.close()
         self.assertEqual((self.adapter.preflights, self.adapter.verifies, self.adapter.creates), (0, 0, 0))
+
+    def test_registered_folder_survives_restart_and_discovery_failure(self):
+        s = self.service()
+        new = self.root / 'first-project'
+        new.mkdir()
+        alias = self.root / 'alias'
+        alias.symlink_to(new, target_is_directory=True)
+        saved = s.register_folder({'path': str(alias)})['folder']
+        self.assertEqual(saved['displayPath'], str(new))
+        self.assertEqual(s.register_folder({'path': str(new)})['folder'], saved)
+        self.assertIn(saved, s.context()['folders'])
+        self.assertEqual(self.adapter.creates, 0)
+        s.close()
+
+        s = self.service()
+        def offline():
+            raise OSError('fixture discovery unavailable')
+        s.inventory.source = offline
+        self.assertEqual(s.context()['folders'], [saved])
+        selection = {'provider': 'codex', 'folderId': saved['id'], 'folderRevision': saved['revision']}
+        intent = s.prepare(selection)
+        new.rename(self.root / 'old-project')
+        new.mkdir()
+        self.assertEqual(s.context()['folders'], [])
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
+        with self.assertRaises(NewChatError) as failed:
+            s.open(dict(selection, requestId=intent['requestId']))
+        self.assertEqual(failed.exception.code, 'folder_changed')
+        self.assertEqual(self.adapter.creates, 0)
+        replaced = s.register_folder({'path': str(new)})['folder']
+        self.assertEqual(replaced['id'], saved['id'])
+        self.assertNotEqual(replaced['revision'], saved['revision'])
+        with self.assertRaises(NewChatError):
+            s.prepare(selection)
+
+    def test_registration_rejects_invalid_directory_selections(self):
+        s = self.service()
+        file = self.root / 'example.txt'
+        file.touch()
+        for value in (str(file), str(self.root / 'missing'), 'relative', '/', '/fixture\x00', None):
+            with self.subTest(value=value), self.assertRaises(NewChatError) as failed:
+                s.register_folder({'path': value})
+            self.assertEqual(failed.exception.code, 'invalid_folder')
+        self.assertEqual(len(s.context()['folders']), 1)
+
+    def test_registration_does_not_call_adapters_prepare_or_start_attempts(self):
+        s = self.service()
+        self.adapter.available = False
+        before = self.folder.stat().st_mode
+        with patch.object(self.adapter, 'preflight') as preflight, \
+                patch.object(self.adapter, 'create_once') as create, \
+                patch.object(self.adapter, 'open_existing') as open_native, \
+                patch.object(self.adapter, 'verify_existing') as verify, \
+                patch.object(s, 'prepare') as prepare, patch.object(s, 'open') as attempt, \
+                patch.object(s.inventory, 'source') as source:
+            saved = s.register_folder({'path': str(self.folder)})
+            for operation in (preflight, create, open_native, verify, prepare, attempt, source):
+                operation.assert_not_called()
+        self.assertEqual(saved['schemaVersion'], 1)
+        self.assertTrue(saved['folder']['registered'])
+        self.assertEqual(self.folder.stat().st_mode, before)
+        self.assertEqual((s.root.stat().st_mode & 0o777, (s.root / 'journal.sqlite').stat().st_mode & 0o777),
+                         (0o700, 0o600))
+        self.assertEqual(s.db.execute('SELECT count(*) FROM intents').fetchone()[0], 0)
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+        self.assertEqual(s.jobs, {})
+        context = s.context()
+        self.assertTrue(context['canRegisterFolders'])
+        self.assertIn(saved['folder'], context['folders'])
+        self.assertFalse(context['providers'][0]['available'])
+        self.assertEqual((self.adapter.creates, self.adapter.opens, self.adapter.verifies), (0, 0, 0))
+        self.assertEqual(s.db.execute('SELECT count(*) FROM intents').fetchone()[0], 0)
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+
+    def test_registration_requires_one_path_and_does_not_probe_invalid_shapes(self):
+        s = self.service()
+        with patch.object(s.inventory, 'register') as register:
+            for data in (None, [], str(self.folder), {}, {'path': str(self.folder), 'launch': True},
+                         {'folder': str(self.folder)}):
+                with self.subTest(data=data), self.assertRaises(NewChatError) as caught:
+                    s.register_folder(data)
+                self.assertEqual((caught.exception.status, caught.exception.code), (400, 'invalid_request'))
+            register.assert_not_called()
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 0)
+
+    def test_saved_capacity_is_256_and_duplicate_is_allowed_at_limit(self):
+        s = self.service()
+        self.assertEqual(s.inventory.maximum, 256)
+        saved = None
+        for index in range(256):
+            folder = self.root / ('registered-%03d' % index)
+            folder.mkdir()
+            saved = s.register_folder({'path': str(folder)})['folder']
+        self.assertEqual(s.register_folder({'path': saved['displayPath']})['folder'], saved)
+        extra = self.root / 'overflow-project'
+        extra.mkdir()
+        with self.assertRaises(NewChatError) as caught:
+            s.register_folder({'path': str(extra)})
+        self.assertEqual((caught.exception.status, caught.exception.code), (429, 'capacity'))
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 256)
+        # Native discovery has its own separate bound and remains available.
+        self.assertEqual(len(s.context()['folders']), 257)
+        self.assertEqual(self.adapter.creates, 0)
+
+    def test_replacement_during_registration_does_not_save_stale_authority(self):
+        s = self.service()
+        register = s.inventory.register
+
+        def replace_after_check(path):
+            folder = register(path)
+            self.folder.rename(self.root / 'old-project')
+            self.folder.mkdir()
+            return folder
+
+        with patch.object(s.inventory, 'register', side_effect=replace_after_check):
+            with self.assertRaises(NewChatError) as caught:
+                s.register_folder({'path': str(self.folder)})
+        self.assertEqual(caught.exception.code, 'folder_changed')
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 0)
+        self.assertEqual(self.adapter.creates, 0)
+
+    def test_bad_saved_rows_do_not_poison_healthy_rows_or_repair_the_registry(self):
+        s = self.service()
+        healthy = s.register_folder({'path': str(self.folder)})['folder']
+        other = self.root / 'other-project'
+        other.mkdir()
+        damaged = s.register_folder({'path': str(other)})['folder']
+        original = json.loads(s.db.execute('SELECT data FROM registered_folders WHERE id=?', (damaged['id'],)).fetchone()[0])
+        bad = ['{', 'null', '[]', '"fictional"', '[' * 2000 + ']' * 2000, b'not-text', ' ' * 65537 + '{}']
+        for changes in ({'id': []}, {'revision': '0' * 64}, {'path': 'relative'}, {'device': True},
+                        {'inode': -1}, {'label': 7}, {'label': ''}, {'extra': 'unknown'}, {'path': '/fictional\ud800'}):
+            bad.append(json.dumps(dict(original, **changes)))
+        missing = dict(original)
+        missing.pop('inode')
+        bad.append(json.dumps(missing))
+        bad.append(json.dumps(original)[:-1] + ',"id":' + json.dumps(original['id']) + '}')
+        for index, raw in enumerate(bad):
+            with self.subTest(index=index):
+                with s.db:
+                    s.db.execute('UPDATE registered_folders SET data=? WHERE id=?', (raw, damaged['id']))
+                before = s.db.execute('SELECT id,data FROM registered_folders ORDER BY id').fetchall()
+                self.assertEqual(s.context()['folders'], [healthy])
+                self.assertEqual(s.db.execute('SELECT id,data FROM registered_folders ORDER BY id').fetchall(), before)
+        with s.db:
+            s.db.execute('UPDATE registered_folders SET id=?,data=? WHERE id=?',
+                         ('f' * 64, json.dumps(original), damaged['id']))
+        self.assertEqual(s.context()['folders'], [healthy])
+        forged = dict(original, id='f' * 64)
+        with s.db:
+            s.db.execute('UPDATE registered_folders SET data=? WHERE id=?', (json.dumps(forged), 'f' * 64))
+            s.db.execute('INSERT INTO registered_folders VALUES (?,?)', ('0' * 64, '{'))
+        self.assertEqual(s.context()['folders'], [healthy])
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 3)
+        self.assertEqual(self.adapter.creates, 0)
+
+    def test_saved_loader_is_filesystem_free_and_query_failure_is_not_hidden(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        with patch('new_chat_inventory.os.stat', side_effect=AssertionError('No filesystem reads in loader.')), \
+                patch('new_chat_inventory._physical_path', side_effect=AssertionError('No policy I/O in loader.')):
+            loaded = s._registered_folders()
+        self.assertEqual([folder.id for folder in loaded], [saved['id']])
+        with s.db:
+            s.db.execute('DROP TABLE registered_folders')
+        with self.assertRaises(sqlite3.Error):
+            s.context()
+
+    def test_corrupt_saved_revision_cannot_override_independent_discovery(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        raw = json.loads(s.db.execute('SELECT data FROM registered_folders').fetchone()[0])
+        raw['revision'] = '0' * 64
+        with s.db:
+            s.db.execute('UPDATE registered_folders SET data=?', (json.dumps(raw),))
+        current = s.context()['folders'][0]
+        self.assertEqual(current['revision'], saved['revision'])
+        self.assertNotIn('registered', current)
+        with self.assertRaises(NewChatError):
+            s.prepare(dict(provider='codex', folderId=current['id'], folderRevision=raw['revision']))
+        self.assertEqual(self.adapter.creates, 0)
+
+    def test_private_discovery_and_saved_rows_are_unavailable_without_deletion(self):
+        s = self.service()
+        private = self.root / '.claude'
+        private.mkdir()
+        proof = self.adapter.make_identity(private)
+        s.inventory.source = lambda: [proof]
+        folder = s.inventory._folder(str(private), private.stat())
+        with s.db:
+            s.db.execute('INSERT INTO registered_folders VALUES (?,?)',
+                         (folder.id, json.dumps(vars(folder))))
+        self.assertEqual(s.context()['folders'], [])
+        with self.assertRaises(NewChatError):
+            s.prepare(dict(provider='codex', folderId=folder.id, folderRevision=folder.revision))
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
+
+    def test_actual_state_root_is_injected_and_refused(self):
+        s = self.service()
+        for path in (s.root.parent, s.root):
+            with self.subTest(path=path), self.assertRaises(NewChatError) as caught:
+                s.register_folder({'path': str(path)})
+            self.assertEqual(caught.exception.message, 'Motet cannot use that folder.')
+        self.assertEqual(self.adapter.creates, 0)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Physical directory spelling is a macOS capability.')
+    def test_private_case_alias_cannot_prepare_through_discovery(self):
+        s = self.service()
+        private = self.root / '.claude'
+        private.mkdir()
+        alias = self.root / '.CLAUDE'
+        if not alias.exists():
+            self.skipTest('This volume is case-sensitive.')
+        proof = replace(self.adapter.make_identity(private), cwd=str(alias))
+        s.inventory.source = lambda: [proof]
+        folder = s.inventory._folder(str(alias), alias.stat())
+        self.assertEqual(s.context()['folders'], [])
+        with self.assertRaises(NewChatError):
+            s.prepare(dict(provider='codex', folderId=folder.id, folderRevision=folder.revision))
+        self.assertEqual(s.db.execute('SELECT count(*) FROM intents').fetchone()[0], 0)
+        self.assertEqual(self.adapter.creates, 0)
+
+    def test_concurrent_registration_keeps_private_refusals_and_duplicate_capacity(self):
+        s = self.service()
+        private = self.root / '.codex'
+        private.mkdir()
+        results, errors = [], []
+
+        def register(index):
+            try:
+                results.append(s.register_folder({'path': str(private if index % 2 else self.folder)}))
+            except BaseException as error:
+                errors.append(error)
+
+        callers = [threading.Thread(target=register, args=(index,)) for index in range(40)]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(10)
+        self.assertTrue(all(not caller.is_alive() for caller in callers))
+        self.assertEqual(len(results), 20)
+        self.assertTrue(all(result == results[0] for result in results))
+        self.assertEqual(len(errors), 20)
+        self.assertTrue(all(isinstance(error, NewChatError) and error.message == 'Motet cannot use that folder.' for error in errors))
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+        self.assertEqual(self.adapter.creates, 0)
+
+    def test_private_anchor_retarget_between_verification_and_save_is_refused(self):
+        s = self.service()
+        register = s.inventory.register
+
+        def retarget(path):
+            folder = register(path)
+            (self.root / '.codex').symlink_to(self.folder, target_is_directory=True)
+            return folder
+
+        with patch.object(s.inventory, 'register', side_effect=retarget):
+            with self.assertRaises(NewChatError) as caught:
+                s.register_folder({'path': str(self.folder)})
+        self.assertEqual(caught.exception.message, 'Motet cannot use that folder.')
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 0)
+
+    def test_private_anchor_retarget_before_worker_creation_has_no_native_effect(self):
+        s = self.service()
+        request = self.request(s)
+        get = s.inventory.get
+
+        def retarget(*args):
+            folder = get(*args)
+            (self.root / '.codex').symlink_to(self.folder, target_is_directory=True)
+            return folder
+
+        with patch.object(s.inventory, 'get', side_effect=retarget):
+            _, attempt = s.open(request)
+        self.settle(s)
+        final = s.status(attempt['attemptId'])
+        self.assertEqual(final['creation']['outcome'], 'not_attempted')
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
+
+    def test_normal_identity_proof_still_works_then_private_retarget_prevents_open_and_admission(self):
+        s = self.service()
+        _, attempt = s.open(self.request(s))
+        self.settle(s)
+        with s.lock:
+            row = s._load(attempt['attemptId'])
+        identity = self.adapter.identities[row['native_id']]
+        self.assertEqual(s._checked_identity(identity, row), identity)
+        (self.root / '.codex').symlink_to(self.folder, target_is_directory=True)
+        with self.assertRaises(NewChatError):
+            s._checked_identity(identity, row)
+        admissions = []
+        verifies = self.adapter.verifies
+        s.process_admissions(lambda *args: admissions.append(args))
+        self.assertEqual(admissions, [])
+        self.assertEqual(self.adapter.verifies, verifies)
+
+    def test_private_anchor_retarget_after_creation_prevents_ui_open(self):
+        s = self.service()
+        self.adapter.after_receipt = lambda _: (self.root / '.codex').symlink_to(self.folder, target_is_directory=True)
+        _, attempt = s.open(self.request(s))
+        self.settle(s)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (1, 0))
+        self.assertIsNone(s.status(attempt['attemptId'])['session'])
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Physical directory spelling is a macOS capability.')
+    def test_registration_uses_physical_case_for_the_launch_path(self):
+        s = self.service()
+        alternate = self.folder.with_name(self.folder.name.upper())
+        if not alternate.exists():
+            self.skipTest('This volume is case-sensitive.')
+        actual = s.register_folder({'path': str(self.folder)})['folder']
+        self.assertEqual(s.register_folder({'path': str(alternate)})['folder'], actual)
+        self.assertEqual(actual['displayPath'], str(self.folder))
 
     def test_async_one_creation_and_duplicate_click_replay(self):
         s = self.service()
@@ -582,6 +900,19 @@ class WorkingServiceTests(unittest.TestCase):
     def settled(self, service, attempt_id):
         wait_for(lambda: attempt_id not in service.jobs)
         return service.status(attempt_id)
+
+    def test_private_anchor_retarget_before_instruction_claim_prevents_submission(self):
+        service, request = self.working()
+        self.adapter.submit_release.clear()
+        try:
+            _, attempt = service.open(request)
+            self.assertTrue(self.adapter.submit_entered.wait(3))
+            (self.root / '.codex').symlink_to(self.folder, target_is_directory=True)
+        finally:
+            self.adapter.submit_release.set()
+        final = self.settled(service, attempt['attemptId'])
+        self.assertEqual(final['execution']['attempts'], 0)
+        self.assertEqual(self.adapter.submissions, 0)
 
     def test_explicit_mode_instruction_validation_and_backwards_compatible_blank(self):
         service, request = self.working()

@@ -100,8 +100,8 @@ class ManagedServiceTests(unittest.TestCase):
     def service(self, *, enabled=True, demo=False):
         if not hasattr(self, 'managed'):
             self.managed = ManagedAdapter(self.root, self.folder)
-        service = NewChatService(self.root, {'codex': self.adapter, 'claude_code': self.managed},
-            lambda: [self.seed], enabled=enabled, demo=demo,
+        service = NewChatService(self.root / 'private-state', {'codex': self.adapter, 'claude_code': self.managed},
+            lambda: [self.seed], home=self.root, enabled=enabled, demo=demo,
             clock=lambda: self.clocks.mono, wall=lambda: self.clocks.wall)
         self.services.append(service)
         return service

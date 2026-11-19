@@ -77,7 +77,7 @@ def _text(value, maximum):
 class NewChatService:
     def __init__(self, state_dir, adapter, inventory_source, *, enabled=False, demo=False,
                  clock=time.monotonic, wall=time.time, host_id='local', host_label='This computer',
-                 max_intents=128, max_active=32, max_attempts=1024, intent_rate=10):
+                 max_intents=128, max_active=32, max_attempts=1024, intent_rate=10, home=None):
         self.adapters = dict(adapter) if isinstance(adapter, dict) else {'codex': adapter}
         if any(provider not in PROVIDERS for provider in self.adapters):
             raise ValueError('Unknown New chat adapter provider.')
@@ -104,7 +104,7 @@ class NewChatService:
                 self.key = bytes.fromhex(row[0])
                 if len(self.key) != 32:
                     raise ValueError()
-            self.inventory = KnownFolderInventory(inventory_source, self.key)
+            self.inventory = KnownFolderInventory(inventory_source, self.key, state_root=self.root.parent, home=home)
             self._recover()
         except Exception:
             self._dispose()
@@ -142,6 +142,7 @@ class NewChatService:
               id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL,
               created REAL NOT NULL, expires REAL NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS registered_folders (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS intent_issues (id TEXT PRIMARY KEY, issued REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS native_receipts (
               native_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE);
@@ -199,8 +200,49 @@ class NewChatService:
         except Exception:
             return Capability(False, 'adapter_unavailable', MESSAGES['adapter_unavailable'])
 
-    def _inventory(self):
-        rows = self.inventory.refresh()
+    def _registered_folders(self):
+        def unique(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError('Duplicate saved folder field.')
+                result[key] = value
+            return result
+
+        folders = []
+        with self.lock:
+            # API writes already cap the row count. Bound individual transfers
+            # too, so a damaged row cannot force an unbounded JSON allocation.
+            rows = self.db.execute("SELECT CASE WHEN typeof(id)='text' AND length(id)=64 THEN id END,"
+                                   'substr(data,1,65537) FROM registered_folders ORDER BY id')
+            for ident, raw in rows:
+                try:
+                    if type(raw) is not str or len(raw) > 65536:
+                        continue
+                    value = json.loads(raw, object_pairs_hook=unique)
+                    folders.append(self.inventory.restore_registered(ident, value))
+                except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+                    continue
+        return folders
+
+    def register_folder(self, data):
+        self._guard()
+        if type(data) is not dict or set(data) != {'path'}:
+            _error('invalid_request', 'Choose one project folder to add.', 400)
+        folder = self.inventory.register(data['path'])
+        with self.lock, self.db:
+            self._guard()
+            validate_folder(folder)
+            self.inventory.require_allowed(folder)
+            if (self.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0] >= self.inventory.maximum
+                    and not self.db.execute('SELECT 1 FROM registered_folders WHERE id=?', (folder.id,)).fetchone()):
+                _error('capacity', 'The saved project folder limit has been reached.', 429)
+            self.db.execute('INSERT OR REPLACE INTO registered_folders VALUES (?, ?)',
+                            (folder.id, json.dumps(asdict(folder), ensure_ascii=True)))
+        return {'schemaVersion': 1, 'folder': dict(public_folder(folder), registered=True)}
+
+    def _inventory(self, registered):
+        rows = self.inventory.refresh(registered)
         with self.lock, self.db:
             self.db.execute('DELETE FROM folders')
             self.db.executemany('INSERT INTO folders VALUES (?, ?)',
@@ -211,7 +253,10 @@ class NewChatService:
         with self.lock, self.db:
             self._gc(self._now()[0])
         # Disabled/demo context has no native reads, even through inventory.
-        folders = self._inventory() if self.enabled and not self.demo and not self.closing else []
+        can_register = self.enabled and not self.demo and not self.closing
+        registered = self._registered_folders() if can_register else []
+        registered_revisions = {folder.id: folder.revision for folder in registered}
+        folders = self._inventory(registered) if can_register else []
         providers = []
         for provider in PROVIDERS:
             cap = self._capability(provider)
@@ -224,7 +269,9 @@ class NewChatService:
                               'supportsBlank': available and cap.supports_blank, 'supportsWork': available and cap.supports_work,
                               'unavailableReason': None if available else _reason(code)})
         return {'schemaVersion': 1, 'fixture': False, 'host': dict(self.host),
-                'folders': [public_folder(f) for f in folders], 'providers': providers,
+                'canRegisterFolders': can_register,
+                'folders': [dict(public_folder(f), registered=True) if registered_revisions.get(f.id) == f.revision else public_folder(f)
+                            for f in folders], 'providers': providers,
                 'limits': {'observationWindowMs': WINDOW * 1000,
                            'managedPermissionTimeoutSeconds': MANAGED_PERMISSION_TIMEOUT_SECONDS}}
 
@@ -287,7 +334,7 @@ class NewChatService:
             _error('work_unavailable', MESSAGES['work_unavailable'], 503)
         if data.get('mode', 'blank') == 'blank' and not cap.supports_blank:
             _error('blank_unavailable', 'Blank chat is unavailable for this provider.', 503)
-        folder = self.inventory.get(data['folderId'], data['folderRevision'])
+        folder = self.inventory.get(data['folderId'], data['folderRevision'], self._registered_folders())
         now, _ = self._now()
         ident = str(uuid.uuid4())
         frozen = {'provider': data['provider'], 'mode': data.get('mode', 'blank'), 'folder': asdict(folder),
@@ -409,7 +456,7 @@ class NewChatService:
             if any(r['provider'] == data['provider'] and r['folder']['id'] == folder.id for r in active):
                 _error('folder_busy', 'A New chat request for this folder is already active.', 409)
             # All preflight/selection checks precede the one durable claim.
-            self.inventory.get(folder.id, folder.revision)
+            self.inventory.get(folder.id, folder.revision, self._registered_folders())
             cap = self._capability(frozen['provider'])
             available = (cap.available and cap.version == frozen['adapter_version']
                          and cap.ownership == frozen.get('ownership', 'desktop')
@@ -488,9 +535,9 @@ class NewChatService:
             _error('folder_mismatch' if cwd != row['folder']['path'] else 'service_closed',
                    MESSAGES['folder_mismatch'] if cwd != row['folder']['path'] else 'New chat is shutting down.')
 
-    @staticmethod
-    def _checked_identity(value, row):
+    def _checked_identity(self, value, row):
         folder = validate_folder(FrozenFolder(**row['folder']))
+        self.inventory.require_allowed(folder)
         if (not isinstance(value, VerifiedIdentity) or value.native_id != row['native_id']
                 or value.provider != row['provider']
                 or value.adapter_version != row['adapter_version']
@@ -509,9 +556,8 @@ class NewChatService:
             _error('identity_unavailable', MESSAGES['identity_unavailable'])
         return value
 
-    @classmethod
-    def _identity(cls, value, row):
-        value = cls._checked_identity(value, row)
+    def _identity(self, value, row):
+        value = self._checked_identity(value, row)
         if value.cwd != row['folder']['path']:
             _error('folder_mismatch', MESSAGES['folder_mismatch'])
         return value
@@ -537,6 +583,7 @@ class NewChatService:
                 row = self._load(ident, expired=True)
             adapter = self._adapter(row)
             folder = validate_folder(FrozenFolder(**row['folder']))
+            self.inventory.require_allowed(folder)
             with self.lock:
                 if self.closing:
                     return
@@ -700,7 +747,8 @@ class NewChatService:
                     or row.get('mode') != 'work' or row['execution']['attempts']
                     or not ready):
                 _error('execution_not_claimed', 'The instruction was not submitted.', 409)
-            validate_folder(FrozenFolder(**row['folder']))
+            folder = validate_folder(FrozenFolder(**row['folder']))
+            self.inventory.require_allowed(folder)
             row['execution'].update(attempts=1, outcome='unknown', reason=_reason('execution_unknown'))
             self._save(row)
         # The commit is complete before this callback returns to the adapter.
@@ -871,6 +919,7 @@ class NewChatService:
                 continue
             try:
                 folder = validate_folder(FrozenFolder(**row['folder']))
+                self.inventory.require_allowed(folder)
                 value = self._adapter(row).verify_existing(row['native_id'], folder)
                 identity = self._checked_identity(value, row)
             except Exception:
