@@ -11,6 +11,7 @@ from new_chat_http import handle_http
 from new_chat_types import NewChatError
 
 NATIVE = '11111111-1111-4111-8111-111111111111'
+EPOCH = '22222222-2222-4222-8222-222222222222'
 PREFIX = '/api/new-chat/'
 
 
@@ -44,8 +45,8 @@ class Service:
         self.calls.append(('register_folder', data))
         return {'schemaVersion': 1}
 
-    def begin_folder_choice(self, data, connection):
-        self.calls.append(('begin_folder_choice', data, connection))
+    def begin_folder_choice(self, data, connection, forwarded=False):
+        self.calls.append(('begin_folder_choice', data, connection, forwarded))
         return {'schemaVersion': 1, 'requestId': NATIVE, 'state': 'pending'}
 
     def folder_choice_status(self, ident):
@@ -105,25 +106,56 @@ class HttpTests(unittest.TestCase):
         class Explosive:
             def __getattr__(self, name):
                 raise AssertionError('Unauthenticated chooser reached the service')
+        class Unreadable:
+            def read1(self, _):
+                raise AssertionError('Unauthenticated chooser consumed its body')
         for suffix, method in (('folders/choose', 'POST'),
                                ('folders/choose/' + NATIVE, 'GET'),
                                ('folders/choose/' + NATIVE + '/cancel', 'POST'),
                                ('folders/choose/' + NATIVE + '/accept', 'POST')):
             h = self.post(PREFIX + suffix) if method == 'POST' else Handler(PREFIX + suffix)
             h.headers.replace_header('X-Live-Room-Key', 'wrong')
+            h.headers['Forwarded'] = ''
+            h.rfile = Unreadable()
+            def forbidden_header_scan():
+                raise AssertionError('Unauthenticated chooser inspected forwarding headers')
+            h.headers.keys = forbidden_header_scan
             self.assertEqual(self.call(h, Explosive())[0], 403)
 
     def test_chooser_routes_pass_real_accepted_connection_only_to_begin(self):
         service = Service()
-        h = self.post(PREFIX + 'folders/choose', b'{"requestId":"' + NATIVE.encode() + b'"}')
+        data = {'requestId': NATIVE, 'epoch': EPOCH, 'gesture': {'trusted': True}}
+        h = self.post(PREFIX + 'folders/choose', json.dumps(data).encode())
         self.assertEqual(self.call(h, service)[0], 202)
-        self.assertIs(service.calls[-1][2], h.connection)
+        self.assertEqual(service.calls, [('begin_folder_choice', data, h.connection, False)])
+        self.assertIs(service.calls[0][2], h.connection)
         base = PREFIX + 'folders/choose/' + NATIVE
-        for handler in (Handler(base), self.post(base + '/cancel'),
+        for handler in (Handler(base), self.post(base + '/cancel', json.dumps({'epoch': EPOCH}).encode()),
                         self.post(base + '/accept', b'{"selectionToken":"' + NATIVE.encode() + b'"}')):
             self.assertEqual(self.call(handler, service)[0], 200)
         self.assertEqual([row[0] for row in service.calls], ['begin_folder_choice', 'folder_choice_status',
                          'cancel_folder_choice', 'accept_folder_choice'])
+        self.assertEqual(service.calls[2], ('cancel_folder_choice', NATIVE, {'epoch': EPOCH}))
+        self.assertEqual(service.calls[3], ('accept_folder_choice', NATIVE, {'selectionToken': NATIVE}))
+
+    def test_chooser_marks_forwarding_header_presence_without_trusting_values(self):
+        data = {'requestId': NATIVE, 'epoch': EPOCH, 'gesture': {'trusted': True}}
+        raw = json.dumps(data).encode()
+        names = ('Forwarded', 'X-Forwarded-For', 'x-FoRwArDeD-Fictional', 'X-Real-IP', 'Via',
+                 'CF-Connecting-IP', 'True-Client-IP', 'X-Original-Forwarded-For',
+                 'X-Cluster-Client-IP', 'Fastly-Client-IP')
+        for name in names:
+            for value in ('', '127.0.0.1'):
+                with self.subTest(header=name, empty=not value):
+                    service = Service()
+                    handler = self.post(PREFIX + 'folders/choose', raw, [(name, value)])
+                    self.assertEqual(self.call(handler, service)[0], 202)
+                    self.assertEqual(service.calls, [('begin_folder_choice', data, handler.connection, True)])
+                    self.assertIs(service.calls[0][2], handler.connection)
+        service = Service()
+        handler = self.post(PREFIX + 'folders/choose', raw, [('X-Fictional', 'present')])
+        self.assertEqual(self.call(handler, service)[0], 202)
+        self.assertIs(service.calls[0][3], False)
 
     def test_chooser_rejects_cross_origin_duplicate_auth_and_read_side_effect_routes(self):
         for suffix in ('folders/choose', 'folders/choose/' + NATIVE + '/cancel',
@@ -148,23 +180,23 @@ class HttpTests(unittest.TestCase):
         s = Service()
         routes = [(Handler(), 200), (Handler(PREFIX + 'requests/' + NATIVE), 200), (Handler(PREFIX + 'attempts/' + NATIVE), 200),
                   (self.post(PREFIX + 'intents'), 201), (self.post(), 202),
-                  (self.post(PREFIX + 'folders', b'{"path":"/fictional/project"}'), 201),
                   (self.post(PREFIX + 'attempts/' + NATIVE + '/observe', b'{"action":"stop"}'), 200)]
         for h, status in routes:
             self.assertEqual(self.call(h, s)[0], status)
-        self.assertEqual(len(s.calls), 7)
-        self.assertIn(('register_folder', {'path': '/fictional/project'}), s.calls)
+        self.assertEqual(len(s.calls), 6)
 
-    def test_folder_registration_rejects_foreign_or_duplicate_auth_and_read_routes(self):
+    def test_retired_folder_registration_still_authenticates_and_never_registers(self):
         for extra in [('Host', '127.0.0.1:18801'), ('X-Live-Room-Key', 'fictional-key'),
                       ('Origin', 'https://fictional.invalid')]:
             service = Service()
             handler = self.post(PREFIX + 'folders', b'{"path":"/fictional/project"}', headers=[extra])
             self.assertEqual(self.call(handler, service)[0], 403)
             self.assertEqual(service.calls, [])
-        for method in ('GET', 'DELETE'):
+        for method in ('GET', 'POST', 'PUT', 'DELETE', 'PATCH'):
             service = Service()
-            self.assertEqual(self.call(Handler(PREFIX + 'folders', method), service)[0], 404)
+            handler = (self.post(PREFIX + 'folders', b'{"path":"/fictional/project"}') if method == 'POST'
+                       else Handler(PREFIX + 'folders', method))
+            self.assertEqual(self.call(handler, service)[0], 404)
             self.assertEqual(service.calls, [])
 
     def test_request_recovery_is_owner_only_get_and_never_launches(self):

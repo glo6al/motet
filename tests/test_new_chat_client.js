@@ -6,6 +6,7 @@ const html=fs.readFileSync(path.join(__dirname,'../src/web/index.html'),'utf8');
 const source=html.slice(html.indexOf('function createNewChatClient('),html.indexOf('/* end New chat HTTP client */'));
 const create=vm.runInNewContext(source+';createNewChatClient');
 const requestId='11111111-1111-4111-8111-111111111111',attemptId='22222222-2222-4222-8222-222222222222';
+const choiceEpoch='44444444-4444-4444-8444-444444444444';
 const folder={id:'opaque-folder',revision:'r7',label:'Orchard',displayPath:'/fictional/projects/orchard'};
 const context=()=>({schemaVersion:1,fixture:false,folders:[folder],host:{id:'opaque-host',label:'This computer'},providers:[{id:'codex',available:true,supportsWork:true,supportsBlank:true},{id:'claude_code',available:false,unavailableReason:{message:'Claude active handoff is unavailable.'}}],limits:{observationWindowMs:120000}});
 const receipt=(extra={})=>({schemaVersion:1,fixture:false,requestId,attemptId,provider:'codex',mode:'work',folder,state:'waiting',creation:{outcome:'verified'},uiOpen:{attempts:1,outcome:'rejected'},execution:{attempts:1,outcome:'running'},observation:'active',capabilities:{keepWaiting:false,stopWaiting:true},reason:{message:'The native session exists, but its window did not open.'},...extra});
@@ -57,17 +58,17 @@ async function checkProductionTimerWiring(){
 }
 async function folderChecks(factory=create){
   const registered={...folder,registered:true};
-  const inventory=()=>({...context(),canRegisterFolders:true,folders:[registered]});
+  const inventory=()=>({...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch,folders:[registered]});
   let fail=false,malformed=false,revision='r7';
   let h=harness({create:factory,route:route=>{assert.equal(route,'context');if(fail)throw Error('Fictional unavailable inventory');const c=inventory();c.folders=[{...registered,revision}];if(malformed)c.providers=[null];return c}});
-  await h.boot();assert.equal(h.client.canRegisterFolders(),true);assert.equal(h.client.registeredFolders().length,1);assert.equal(h.client.folderRevision(folder.displayPath),'r7');
+  await h.boot();assert.equal(h.client.canChooseFolders(),true);assert.equal(h.client.registeredFolders().length,1);assert.equal(h.client.folderRevision(folder.displayPath),'r7');
   fail=true;assert.equal(await h.client.retryContext(),false);assert.equal(h.client.inventoryFresh,false);
   assert.equal(h.client.hasFolder(folder.displayPath),true,'failed refresh retains the owner-visible cached path');assert.equal(h.client.registeredFolders().length,1,'failed refresh retains registered sidebar data');
   await assert.rejects(h.client.launch(work),/unavailable/);assert.equal(h.requests.filter(r=>r.body).length,0,'stale display is not launch authority');
   fail=false;malformed=true;assert.equal(await h.client.retryContext(),false);assert.equal(h.client.folderRevision(folder.displayPath),'r7','malformed read cannot overwrite cached display');
   malformed=false;revision='r8';assert.equal(await h.client.retryContext(),true);assert.equal(h.client.inventoryFresh,true);assert.equal(h.client.folderRevision(folder.displayPath),'r8');
   await assert.rejects(h.client.launch({...work,folderRevision:'r7'}),/unavailable/);assert.equal(h.requests.filter(r=>r.body).length,0,'stale explicit revision never creates an intent');
-  h.setKey('');h.client.sync();assert.equal(h.client.registeredFolders().length,0,'owner reset clears cached folders');assert.equal(h.client.canRegisterFolders(),false);
+  h.setKey('');h.client.sync();assert.equal(h.client.registeredFolders().length,0,'owner reset clears cached folders');assert.equal(h.client.canChooseFolders(),false);
 }
 async function knownHostReasonCheck(factory=create){
  let failure={httpError:503,code:'unavailable',message:'New chat is unavailable on this host.'};const h=harness({create:factory,route:()=>failure});await h.boot();assert.equal(h.client.inventoryReason,'New chat is unavailable on this host.');assert.equal(h.client.apps.codex.reason,h.client.inventoryReason);assert.equal(h.client.inventoryFresh,false);
@@ -81,56 +82,50 @@ async function descriptiveProviderCheck(factory=create){
   await assert.rejects(h.client.launch({...work,app:'claude'}),/unavailable/);assert.equal(h.requests.filter(r=>r.body).length,0,'cached provider descriptions never restore launch authority');
 }
 async function serverFailureReceiptCheck(factory=create){
-  const h=harness({create:factory,route:route=>route==='context'?{...context(),canRegisterFolders:true}:{httpError:503,message:'Fictional server response lost after committing registration.'}});
-  await h.boot();await assert.rejects(h.client.registerFolder(folder.displayPath),error=>error.status===503&&error.registrationUnknown===true,'server errors without validated receipts stay unknown');
-  assert.equal(h.requests.filter(r=>r.route==='folders').length,1);assert.equal(h.requests.filter(r=>r.route==='context').length,1,'unknown 503 offers explicit read-only refresh rather than automatic retry');
+  const h=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch}:{httpError:503,message:'Fictional saved receipt unavailable.'}});
+  await h.boot();await assert.rejects(h.client.acceptFolderChoice(requestId,attemptId,choiceEpoch),error=>error.status===503,'a failed accept receipt stays an error for read-only recovery by the page');
+  assert.equal(h.requests.filter(r=>r.route.endsWith('/accept')).length,1);assert.equal(h.requests.filter(r=>r.route==='context').length,1,'no automatic save or read is invented by the failed client response');
 }
 async function registrationChecks(){
-  const registered={...folder,registered:true},inventory=()=>({...context(),canRegisterFolders:true});
-  let saved=false;let h=harness({route:route=>{if(route==='context')return {...inventory(),folders:saved?[registered]:[]};assert.equal(route,'folders');saved=true;return {schemaVersion:1,folder:registered}}});
-  await h.boot();const r=await h.client.registerFolder('~/Projects/Orchard');assert.equal(r.availabilityChecked,true);assert.equal(r.revision,'r7');assert.equal(h.client.isRegistered(folder.displayPath),true);assert.deepEqual(h.requests.filter(r=>r.body).map(r=>r.body),[{path:'~/Projects/Orchard'}]);assert(!h.requests.some(r=>['intents','attempts'].includes(r.route)),'registration and refresh never launch');
-  h=harness({route:route=>route==='context'?inventory():{httpError:400,message:'That is a file, not a folder.'}});await h.boot();await assert.rejects(h.client.registerFolder('/fictional/file'),error=>error.status===400&&!error.registrationUnknown&&/file, not a folder/.test(error.message));
-  for(const broken of [()=>Promise.reject(Error('lost receipt')),()=>({schemaVersion:1,folder:{...registered,revision:''}}),()=>({schemaVersion:99,folder:registered})]){
-    h=harness({route:route=>route==='context'?inventory():broken()});await h.boot();await assert.rejects(h.client.registerFolder(folder.displayPath),error=>error.registrationUnknown===true);assert.equal(h.requests.filter(r=>r.route==='folders').length,1,'unknown receipt is never automatically retried');assert.equal(h.requests.filter(r=>r.route==='context').length,1,'an unknown receipt does not pretend registration succeeded');
-  }
-  let contexts=0;h=harness({route:route=>route==='folders'?{schemaVersion:1,folder:registered}:++contexts===1?{...inventory(),folders:[]}:Promise.reject(Error('lost inventory'))});await h.boot();const savedReceipt=await h.client.registerFolder(folder.displayPath);assert.equal(savedReceipt.availabilityChecked,false);assert.equal(h.client.inventoryFresh,false);assert.equal(h.client.registeredFolders()[0].displayPath,folder.displayPath,'validated saved receipt remains display data when later GET fails');assert.equal(h.requests.filter(r=>r.route==='folders').length,1);
-  let finish;h=harness({route:route=>route==='context'?inventory():new Promise(resolve=>finish=resolve)});await h.boot();const pending=h.client.registerFolder(folder.displayPath);await tick();await assert.rejects(h.client.registerFolder(folder.displayPath),/already/);h.setKey('new-owner');h.client.sync();finish({schemaVersion:1,folder:registered});await assert.rejects(pending,/authentication/);await tick();assert.equal(h.client.registeredFolders().length,0,'late old-owner registration receipt cannot appear for a new owner');
+  const inventory=()=>({...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch});let h;
   const recovery=new Map([['watch-new-chat:digest-fictional-owner',requestId]]);h=harness({store:recovery,route:route=>route.startsWith('requests/')?{schemaVersion:1,requestId,status:'prepared',mode:'work',provider:'codex',folder}:Promise.reject(Error('inventory unavailable'))});await h.boot();assert.equal(h.requests.filter(r=>r.route.startsWith('requests/')).length,1,'pending launch recovery does not require fresh inventory');await h.client.retryContext();await h.client.retryContext();assert.equal(h.requests.filter(r=>r.route.startsWith('requests/')).length,1,'refresh never repeats pending launch recovery');assert.equal(h.requests.filter(r=>r.body).length,0);
   let release;let reads=0;h=harness({route:route=>{assert.equal(route,'context');return ++reads===1?inventory():new Promise(resolve=>release=resolve)}});await h.boot();const a=h.client.retryContext(),b=h.client.retryContext();assert.equal(a,b,'concurrent refresh shares a promise');await tick();assert.equal(reads,2);release(inventory());assert.equal(await a,true);
   const baseline=h.requests.length;h.client.projectsChanged('initial');h.client.projectsChanged('new-root');h.client.projectsChanged('newer-root');assert.equal(h.jobs.filter(j=>j.ms===500).length,1,'observed project changes use one bounded refresh');const refreshJob=h.jobs.find(j=>j.ms===500);const running=refreshJob.f();await tick();release(inventory());await running;assert.equal(h.requests.length,baseline+1);assert.equal(h.requests.filter(r=>r.body).length,0);
-  console.log('ok Add project folder client: cached display freshness, revision rejection, validated receipts, unknown no-repeat, saved-GET failure, auth isolation, refresh ordering, one-time recovery and bounded project refresh');
+  console.log('ok New chat refresh/recovery: one-time recovery, cached metadata freshness and bounded project refresh');
 }
 async function chooserChecks(factory=create){
-  const token='33333333-3333-4333-8333-333333333333',saved={...folder,registered:true},data={requestId,gesture:{visible:true,focused:true,trusted:true}};
+  const token='33333333-3333-4333-8333-333333333333',saved={...folder,registered:true},data={requestId,epoch:choiceEpoch,gesture:{trusted:true}};
   let accepted=false,reads=0;
   const h=harness({create:factory,route:(route,body)=>{
-    if(route==='context'){reads++;return {...context(),canChooseFolders:true,folders:accepted?[saved]:[]}}
+    if(route==='context'){reads++;return {...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch,folders:accepted?[saved]:[]}}
     if(route==='folders/choose'){assert.deepEqual(body,data);return {schemaVersion:1,requestId,state:'pending'}}
     if(route==='folders/choose/'+requestId)return {schemaVersion:1,requestId,state:'selected',selectionToken:token};
     if(route.endsWith('/accept')){assert.deepEqual(body,{selectionToken:token});accepted=true;return {schemaVersion:1,requestId,state:'saved',folder:saved}}
     if(route.endsWith('/cancel'))return {schemaVersion:1,requestId,state:'saved',folder:saved};
     throw Error('Unexpected route');
   }});await h.boot();assert.equal(h.client.canChooseFolders(),true);
+  const initialPosts=h.requests.filter(r=>r.body).length;await assert.rejects(h.client.beginFolderChoice({...data,epoch:attemptId}),/context changed/);assert.equal(h.requests.filter(r=>r.body).length,initialPosts,'old coordinator epoch cannot open a chooser');
   assert.equal((await h.client.beginFolderChoice(data)).state,'pending');assert.equal((await h.client.folderChoiceStatus(requestId)).selectionToken,token);assert.equal(accepted,false,'status cannot save a choice');
   const receipt=await h.client.acceptFolderChoice(requestId,token);assert.equal(receipt.folder.availabilityChecked,true);assert.equal(h.client.isRegistered(folder.displayPath),true);assert.equal(reads,2);
-  assert.equal((await h.client.cancelFolderChoice(requestId)).state,'saved','cancel cannot claim to undo a completed save');assert.equal(h.requests.filter(r=>r.route.endsWith('/accept')).length,1);assert.equal(h.store.size,0,'chooser IDs and selected paths are not stored in the browser');assert.equal(h.requests.filter(r=>['intents','attempts'].includes(r.route)).length,0);
+  assert.equal((await h.client.cancelFolderChoice(requestId,choiceEpoch)).state,'saved','cancel cannot claim to undo a completed save');assert.equal(h.requests.at(-1).opts.keepalive,true,'page-exit cancellation may finish after the page goes away');assert.deepEqual(h.requests.at(-1).body,{epoch:choiceEpoch});assert(!h.requests.at(-1).route.includes('fictional-owner'));assert.equal(h.requests.filter(r=>r.route.endsWith('/accept')).length,1);assert.equal(h.store.size,0,'chooser IDs and selected paths are not stored in the browser');assert.equal(h.requests.filter(r=>['intents','attempts'].includes(r.route)).length,0);
   await assert.rejects(h.client.folderChoiceStatus('not-an-id'));await assert.rejects(h.client.acceptFolderChoice(requestId,'not-a-token'));
   for(const bad of [{requestId:attemptId,state:'pending'},{requestId,state:'selected',selectionToken:'not-a-token'},{requestId,state:'saved',folder:{...saved,registered:false}},{requestId,state:'invented'}]){
-    const b=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true}:{schemaVersion:1,...bad}});await b.boot();await assert.rejects(b.client.beginFolderChoice(data),'a mismatched or malformed chooser receipt is not authority');await assert.rejects(b.client.folderChoiceStatus(requestId));
+    const b=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch}:{schemaVersion:1,...bad}});await b.boot();await assert.rejects(b.client.beginFolderChoice(data),'a mismatched or malformed chooser receipt is not authority');await assert.rejects(b.client.folderChoiceStatus(requestId));
   }
-  let response;const l=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true}:new Promise(resolve=>response=resolve)});await l.boot();const pending=l.client.beginFolderChoice(data);await tick();l.setKey('changed-owner');l.client.sync();response({schemaVersion:1,requestId,state:'selected',selectionToken:token});await assert.rejects(pending,/authentication/);
-  let recoveredReads=0;const recovered=harness({create:factory,route:route=>route==='context'?(recoveredReads++,{...context(),canChooseFolders:true,folders:recoveredReads===1?[]:[saved]}):{schemaVersion:1,requestId,state:'saved',folder:saved}});await recovered.boot();const recoveredReceipt=await recovered.client.folderChoiceStatus(requestId);assert.equal(recoveredReceipt.folder.availabilityChecked,true,'a saved GET receipt refreshes availability just as the accept reply does');assert.equal(recovered.client.isRegistered(folder.displayPath),true);assert.equal(recovered.requests.filter(r=>r.body).length,0);
-  let posts=0;const u=harness({create:factory,route:(route,body)=>{if(route==='context')return {...context(),canChooseFolders:true};if(body){posts++;throw Error('lost response')}return {schemaVersion:1,requestId,state:'pending'}}});await u.boot();await assert.rejects(u.client.beginFolderChoice(data));await u.client.folderChoiceStatus(requestId);assert.equal(posts,1,'unknown begin is never automatically repeated');
+  let response;const l=harness({create:factory,route:route=>route==='context'?{...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch}:new Promise(resolve=>response=resolve)});await l.boot();const pending=l.client.beginFolderChoice(data);await tick();l.setKey('changed-owner');l.client.sync();response({schemaVersion:1,requestId,state:'selected',selectionToken:token});await assert.rejects(pending,/authentication/);
+  let recoveredReads=0;const recovered=harness({create:factory,route:route=>route==='context'?(recoveredReads++,{...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch,folders:recoveredReads===1?[]:[saved]}):{schemaVersion:1,requestId,state:'saved',folder:saved}});await recovered.boot();const recoveredReceipt=await recovered.client.folderChoiceStatus(requestId);assert.equal(recoveredReceipt.folder.availabilityChecked,true,'a saved GET receipt refreshes availability just as the accept reply does');assert.equal(recovered.client.isRegistered(folder.displayPath),true);assert.equal(recovered.requests.filter(r=>r.body).length,0);
+  let posts=0;const u=harness({create:factory,route:(route,body)=>{if(route==='context')return {...context(),canChooseFolders:true,folderChoiceEpoch:choiceEpoch};if(body){posts++;throw Error('lost response')}return {schemaVersion:1,requestId,state:'pending'}}});await u.boot();await assert.rejects(u.client.beginFolderChoice(data));await u.client.folderChoiceStatus(requestId);assert.equal(posts,1,'unknown begin is never automatically repeated');
 }
 (async()=>{
   await checkProductionTimerWiring();
   await chooserChecks();
-  {const marker="return savedChoice(await choiceRequest(id,'',undefined),e,k)";assert(source.includes(marker));await assert.rejects(chooserChecks(vm.runInNewContext(source.replace(marker,"return choiceRequest(id,'',undefined)")+';createNewChatClient')),'unrefreshed saved GET receipt mutation must fail')}
+  assert.equal(typeof harness().client.registerFolder,'undefined','typed registration has no client surface');
+  {const marker="return savedChoice(await choiceRequest(id,'',undefined,choiceEpoch),e,k)";assert(source.includes(marker));await assert.rejects(chooserChecks(vm.runInNewContext(source.replace(marker,"return choiceRequest(id,'',undefined)")+';createNewChatClient')),'unrefreshed saved GET receipt mutation must fail')}
   {const marker="value.state==='selected'&&!uuid.test(value.selectionToken||'')";assert(source.includes(marker));await assert.rejects(chooserChecks(vm.runInNewContext(source.replaceAll(marker,'false')+';createNewChatClient')),'unchecked selection token mutation must fail')}
   await folderChecks();await registrationChecks();await serverFailureReceiptCheck();await descriptiveProviderCheck();await knownHostReasonCheck();
   {const from="error.status===503&&error.code==='unavailable'&&error.message==='New chat is unavailable on this host.'";assert(source.includes(from));await assert.rejects(knownHostReasonCheck(vm.runInNewContext(source.replace(from,'false')+';createNewChatClient')),'known host explanation mutation must fail')}
   {const from='...api.apps.claude,';assert(source.includes(from));await assert.rejects(descriptiveProviderCheck(vm.runInNewContext(source.replace(from,'')+';createNewChatClient')),'dropped cached managed-provider description mutation must fail')}
-  {const from='||error.status>=500';assert(source.includes(from));await assert.rejects(serverFailureReceiptCheck(vm.runInNewContext(source.replace(from,'')+';createNewChatClient')),'HTTP503-as-definite-refusal mutation must fail')}
+
   for(const [from,to] of [[";api.inventoryFresh=false;changed()};",";context=null;api.inventoryFresh=false;changed()};"],["req.folderRevision!==undefined&&req.folderRevision!==f.revision||",""]]){
     assert(source.includes(from),'causal client mutation is present');const mutant=vm.runInNewContext(source.replace(from,to)+';createNewChatClient');await assert.rejects(folderChecks(mutant),'freshness/revision mutation must fail');
   }

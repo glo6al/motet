@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import server
-from new_chat_types import Capability, ExecutionResult, FrozenFolder, OpenResult, VerifiedIdentity
+from new_chat_types import Capability, ExecutionResult, FrozenFolder, NewChatError, OpenResult, VerifiedIdentity
 
 
 @unittest.skipIf(os.name == 'nt', 'Pinned native metadata requires POSIX')
@@ -202,13 +202,16 @@ class AdmissionTests(unittest.TestCase):
                 _, context = request('GET', '/api/new-chat/context')
                 if register:
                     self.assertEqual(context['folders'], [])
-                    self.assertTrue(context['canRegisterFolders'])
-                    code, rejected = request('POST', '/api/new-chat/folders', {'path': str(self.path)})
-                    self.assertEqual(code, 400)
-                    self.assertEqual(rejected['error'],
-                                     {'code': 'invalid_folder', 'message': 'That is a file, not a folder.'})
-                    code, saved = request('POST', '/api/new-chat/folders', {'path': '~/fictional-project'})
-                    self.assertEqual(code, 201)
+                    self.assertNotIn('canRegisterFolders', context)
+                    self.assertFalse(context['canChooseFolders'])
+                    self.assertIsNone(context['folderChoiceEpoch'])
+                    # Seed through the same internal registration engine as a
+                    # chooser acceptance; the typed-path HTTP action is retired.
+                    with self.assertRaises(NewChatError) as refused:
+                        store.register_folder({'path': str(self.path)})
+                    self.assertEqual((refused.exception.code, refused.exception.message),
+                                     ('invalid_folder', 'Motet cannot use that folder.'))
+                    saved = store.register_folder({'path': self.frozen.path})
                     self.assertTrue(saved['folder']['registered'])
                     self.assertEqual(set(saved['folder']), {'id', 'revision', 'label', 'displayPath', 'registered'})
                     self.assertEqual(saved['folder']['displayPath'], self.frozen.path)

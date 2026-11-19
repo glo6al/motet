@@ -129,7 +129,7 @@ class KnownFolderInventory:
                 # The exception is a genuine directory below the Codex root,
                 # never a symlink laundering sessions or the entire private root.
                 worktree_identity = _directory_identity(worktrees)
-                if worktree_identity is None:
+                if worktree_identity is None or ancestry[0][1] == worktree_identity:
                     raise ValueError()
                 worktree_ancestry = _ancestry(worktrees)
                 codex_identity = _directory_identity(current_codex)
@@ -160,12 +160,12 @@ class KnownFolderInventory:
             # This is path handling, never shell or environment interpolation.
             path = self.home + path[1:]
         if not _valid_path(path):
-            raise NewChatError('invalid_folder', 'Enter a full folder path on the computer running Motet.', 400)
+            raise NewChatError('invalid_folder', 'Motet cannot use that folder.', 400)
         try:
             resolved = str(Path(path).resolve(strict=True))
             directory = os.stat(resolved, follow_symlinks=False)
             if stat.S_ISREG(directory.st_mode):
-                raise NewChatError('invalid_folder', 'That is a file, not a folder.', 400)
+                raise NewChatError('invalid_folder', 'Motet cannot use that folder.', 400)
             if sys.platform == 'darwin':
                 # Follow macOS's physical spelling, including case-insensitive volumes.
                 import fcntl
@@ -182,9 +182,9 @@ class KnownFolderInventory:
         except NewChatError as error:
             if error.code == 'invalid_folder':
                 raise
-            raise NewChatError('invalid_folder', 'Motet could not verify that folder. Check the path and try again.', 400) from None
+            raise NewChatError('invalid_folder', 'Motet cannot use that folder.', 400) from None
         except (OSError, RuntimeError, ValueError):
-            raise NewChatError('invalid_folder', 'Motet could not verify that folder. Check the path and try again.', 400) from None
+            raise NewChatError('invalid_folder', 'Motet cannot use that folder.', 400) from None
 
     def refresh(self, registered=()):
         entries, provenance = {}, {}

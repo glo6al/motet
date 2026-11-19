@@ -105,7 +105,7 @@ class InventoryTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 'invalid_folder')
             home.assert_not_called()
 
-    def test_registration_reports_regular_file_without_exposing_filesystem_errors(self):
+    def test_registration_refuses_invalid_selections_without_typed_path_instructions(self):
         selected = self.root / 'fictional-file.txt'
         selected.write_text('Fictional content that must not be returned.')
         paths = [selected]
@@ -117,17 +117,18 @@ class InventoryTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(NewChatError) as caught:
                 self.inventory.register(str(path))
             self.assertEqual((caught.exception.status, caught.exception.code, caught.exception.message),
-                             (400, 'invalid_folder', 'That is a file, not a folder.'))
-        for path in (str(self.root / 'missing'), '/' + 'x' * 4096, '/fictional\x7f', '/fictional\ud800'):
+                             (400, 'invalid_folder', 'Motet cannot use that folder.'))
+        for path in (None, 'relative', str(self.root / 'missing'), '/', '/' + 'x' * 4096, '/fictional\x7f', '/fictional\ud800'):
             with self.subTest(path=path), self.assertRaises(NewChatError) as caught:
                 self.inventory.register(path)
-            self.assertEqual((caught.exception.status, caught.exception.code), (400, 'invalid_folder'))
+            self.assertEqual((caught.exception.status, caught.exception.code, caught.exception.message),
+                             (400, 'invalid_folder', 'Motet cannot use that folder.'))
             self.assertNotIn(str(self.root), caught.exception.message)
         with patch('new_chat_inventory.Path.resolve', side_effect=PermissionError('/fictional/private-detail')):
             with self.assertRaises(NewChatError) as caught:
                 self.inventory.register(str(self.folder))
         self.assertEqual(caught.exception.message,
-                         'Motet could not verify that folder. Check the path and try again.')
+                         'Motet cannot use that folder.')
 
     def test_registered_rows_survive_discovery_failure_but_not_directory_replacement(self):
         saved = self.inventory.register(str(self.folder))
@@ -220,12 +221,13 @@ class InventoryTests(unittest.TestCase):
             (self.root / name).write_text('Fictional non-directory state anchor.')
         self.assertEqual(self.inventory.register(str(self.folder)).path, str(self.folder))
 
-    def test_genuine_codex_worktrees_root_and_projects_are_available(self):
+    def test_genuine_codex_worktree_descendants_are_available_but_root_is_refused(self):
         worktrees = self.root / '.codex' / 'worktrees'
         project = worktrees / 'orchard'
         project.mkdir(parents=True)
         saved = self.inventory.register(str(project))
-        self.assertEqual(self.inventory.register(str(worktrees)).path, str(worktrees))
+        with self.assertRaises(NewChatError):
+            self.inventory.register(str(worktrees))
         self.rows = [replace(self.identity, cwd=str(project))]
         self.assertEqual(self.inventory.refresh([saved]), [saved])
         self.assertEqual(self.inventory.get(saved.id, saved.revision, [saved]), saved)
@@ -234,6 +236,36 @@ class InventoryTests(unittest.TestCase):
             private.mkdir()
             with self.subTest(name=name), self.assertRaises(NewChatError):
                 self.inventory.register(str(private))
+
+    def test_worktrees_root_cannot_reenter_through_discovery_saved_rows_or_parent_spelling(self):
+        worktrees = self.root / '.codex' / 'worktrees'
+        child = worktrees / 'orchard'
+        child.mkdir(parents=True)
+        frozen = self.inventory._folder(str(worktrees), worktrees.stat())
+        self.rows = [replace(self.identity, cwd=str(worktrees))]
+        for spelling in (str(worktrees), str(child / '..')):
+            with self.subTest(spelling=spelling), self.assertRaises(NewChatError) as caught:
+                self.inventory.register(spelling)
+            self.assertEqual(caught.exception.message, 'Motet cannot use that folder.')
+        self.assertEqual(self.inventory.refresh([frozen]), [])
+        with self.assertRaises(NewChatError):
+            self.inventory.get(frozen.id, frozen.revision, [frozen])
+
+    @unittest.skipIf(os.name == 'nt', 'Creating directory symlinks requires Windows privileges.')
+    def test_worktrees_root_aliases_and_case_are_refused(self):
+        worktrees = self.root / '.codex' / 'worktrees'
+        worktrees.mkdir(parents=True)
+        alias = self.root / 'worktrees-alias'
+        alias.symlink_to(worktrees, target_is_directory=True)
+        spellings = [alias]
+        case_alias = self.root / '.CODEX' / 'WORKTREES'
+        if case_alias.exists():
+            spellings.append(case_alias)
+        for spelling in spellings:
+            with self.subTest(spelling=spelling), self.assertRaises(NewChatError):
+                self.inventory.register(str(spelling))
+            self.rows = [replace(self.identity, cwd=str(spelling))]
+            self.assertEqual(self.inventory.refresh(), [])
 
     @unittest.skipIf(os.name == 'nt', 'Creating directory symlinks requires Windows privileges.')
     def test_worktree_aliases_allow_projects_but_cannot_launder_private_roots(self):

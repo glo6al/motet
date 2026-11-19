@@ -108,14 +108,16 @@ def handle_http(handler, service, owner_key, port):
         except (ValueError, UnicodeError, OSError, RecursionError):
             raise NewChatError('invalid_request', 'Invalid JSON request body.', 400) from None
         if route == '/api/new-chat/folders/choose':
-            return reply(202, service.begin_folder_choice(data, handler.connection))
+            forwarded = any(name.lower().startswith('x-forwarded-') or name.lower() in
+                            ('forwarded', 'x-real-ip', 'via', 'cf-connecting-ip', 'true-client-ip',
+                             'x-original-forwarded-for', 'x-cluster-client-ip', 'fastly-client-ip')
+                            for name in handler.headers.keys())
+            return reply(202, service.begin_folder_choice(data, handler.connection, forwarded=forwarded))
         match = re.fullmatch(r'/api/new-chat/folders/choose/([0-9a-f-]{36})/(cancel|accept)', route)
         if match:
             if match[2] == 'cancel':
                 return reply(200, service.cancel_folder_choice(match[1], data))
             return reply(200, service.accept_folder_choice(match[1], data))
-        if route == '/api/new-chat/folders':
-            return reply(201, service.register_folder(data))
         if route == '/api/new-chat/intents':
             return reply(201, service.prepare(data))
         if route == '/api/new-chat/attempts':

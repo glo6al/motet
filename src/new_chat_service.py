@@ -253,17 +253,15 @@ class NewChatService:
             _error('chooser_unavailable', 'The folder window is unavailable on this host.', 503)
         return self.folder_chooser
 
-    def begin_folder_choice(self, data, connection):
-        return self._chooser().begin(data, connection, self._guard)
+    def begin_folder_choice(self, data, connection, forwarded=False):
+        return self._chooser().begin(data, connection, self._guard, forwarded=forwarded)
 
     def folder_choice_status(self, ident):
         return self._chooser().status(ident)
 
     def cancel_folder_choice(self, ident, data):
         chooser = self._chooser()
-        if type(data) is not dict or data:
-            _error('invalid_request', 'Invalid folder window cancellation.', 400)
-        return chooser.cancel(ident)
+        return chooser.cancel(ident, data)
 
     def accept_folder_choice(self, ident, data):
         return self._chooser().accept(ident, data, self.register_folder, self._guard)
@@ -296,8 +294,8 @@ class NewChatService:
                               'supportsBlank': available and cap.supports_blank, 'supportsWork': available and cap.supports_work,
                               'unavailableReason': None if available else _reason(code)})
         return {'schemaVersion': 1, 'fixture': False, 'host': dict(self.host),
-                'canRegisterFolders': can_register,
                 'canChooseFolders': can_register and self.folder_chooser is not None,
+                'folderChoiceEpoch': self.folder_chooser.epoch if can_register and self.folder_chooser is not None else None,
                 'folders': [dict(public_folder(f), registered=True) if registered_revisions.get(f.id) == f.revision else public_folder(f)
                             for f in folders], 'providers': providers,
                 'limits': {'observationWindowMs': WINDOW * 1000,

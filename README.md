@@ -118,7 +118,7 @@ We would rather name the gaps than let you find them.
 | Steer or stop a running turn | Not yet | On a verified app version | Not yet | Not yet |
 | Message another company's agent | With the optional bridge | With the optional bridge | Not yet | Not yet |
 
-A chat has to qualify before Motet will send to it. When something isn't available, the button is off and says why. Steering is verified on one build of the Codex app; New chat and sending files on another. With one installed you get one group. Sending files also needs SQLite 3.45 or newer in the Python that runs Motet. The conditions are in [What works with what](docs/PROVIDER_SUPPORT.md). Use **Add project folder** on the Mac running Motet to choose a folder in the Mac’s own folder window; adding one never starts a chat.
+A chat has to qualify before Motet will send to it. When something isn't available, the button is off and says why. Steering is verified on one build of the Codex app; New chat and sending files on another. With one installed you get one group. Sending files also needs SQLite 3.45 or newer in the Python that runs Motet. The conditions are in [What works with what](docs/PROVIDER_SUPPORT.md). Use **Add project folder** on the Mac running Motet to choose a folder in the Mac's own folder window; adding one never starts a chat.
 
 **Not yet**
 

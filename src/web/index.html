@@ -864,7 +864,7 @@ svg.workspace-nc-working circle{stroke:#2459d6;stroke-width:2;stroke-dasharray:2
 #workspaceAddFolderDialog .workspace-nc-folder-reserve{visibility:hidden}
 .workspace-nc-disabled-reason{margin:10px 0 0;font-size:13.5px;line-height:1.5;color:var(--ws-mute)}
 #workspaceAddFolderDialog footer{display:flex;justify-content:flex-end;margin-top:4px}
-#workspaceAddFolderDialog [data-action]{border:1px solid var(--ws-line);background:#fff;color:var(--ws-ink);border-radius:10px;padding:10px 18px;font-weight:600}
+#workspaceAddFolderDialog [data-action]{border:1px solid #c9c6be;background:#fff;color:var(--ws-ink);border-radius:10px;padding:10px 18px;font-weight:600}
 #workspaceAddFolderDialog [data-action][data-primary=true]{background:var(--ws-ink);border-color:var(--ws-ink);color:#fff}
 #workspaceAddFolderDialog button:focus-visible,.workspace-nc-recover:focus-visible,.workspace-nc-empty button:focus-visible,#workspaceNewChatSettings button:focus-visible{outline:2px solid var(--ws-ink);outline-offset:2px}
 #workspaceNewChatSettings{margin-top:18px}
@@ -7064,12 +7064,12 @@ function createNewChatClient(o){
   const changed=()=>o.changed&&o.changed();
   const unavailable=reason=>{api.inventoryReason=reason;api.managedPermissionTimeoutSeconds=null;api.apps={codex:{...api.apps.codex,status:'unavailable',reason},claude:{...api.apps.claude,status:'unavailable',reason}};api.inventoryFresh=false;changed()};
   const err=(message,status=0)=>Object.assign(Error(message),{status});
-  async function request(path,body,e=epoch,k=owner,root=base){
+  async function request(path,body,e=epoch,k=owner,root=base,keepalive=false){
     if(!valid(e,k))throw err('Owner authentication changed.');
     let timeout;const control=o.controller?.();
     const timedOut=new Promise((_,reject)=>{timeout=o.setTimeout(()=>{control?.abort();reject(err('The New chat response timed out. Check the request outcome before starting another.'))},15000)});
     const operation=(async()=>{
-      const response=await o.fetch(root+path,{method:body===undefined?'GET':'POST',credentials:'same-origin',cache:'no-store',...(control?{signal:control.signal}:{}),headers:{'X-Live-Room-Key':k,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
+      const response=await o.fetch(root+path,{method:body===undefined?'GET':'POST',...(keepalive?{keepalive:true}:{}),credentials:'same-origin',cache:'no-store',...(control?{signal:control.signal}:{}),headers:{'X-Live-Room-Key':k,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});
       if(!valid(e,k))throw err('Owner authentication changed.');
       let value;try{value=await response.json()}catch(_){throw err('The New chat response could not be read.')}
       if(!valid(e,k))throw err('Owner authentication changed.');
@@ -7081,15 +7081,15 @@ function createNewChatClient(o){
   }
   function clearStored(){if(scope)try{o.storage.removeItem(scope)}catch(_){}}
   function halt(){o.clearTimeout(timer);timer=0;}
-  function reset(){epoch++;launchEpoch++;halt();if(refreshTimer!==null)o.clearTimeout(refreshTimer);refreshTimer=null;projects=null;clearStored();active=null;context=null;scope='';busy=false;loading=null;recovered=false;owner='';api.apps={};api.host=null;api.inventoryFresh=false;api.inventoryReason='';registering=null;api.managedPermissionTimeoutSeconds=null;if(o.authChanged)o.authChanged();}
+  function reset(){epoch++;launchEpoch++;halt();if(refreshTimer!==null)o.clearTimeout(refreshTimer);refreshTimer=null;projects=null;clearStored();active=null;context=null;scope='';busy=false;loading=null;recovered=false;owner='';api.apps={};api.host=null;api.inventoryFresh=false;api.inventoryReason='';api.managedPermissionTimeoutSeconds=null;if(o.authChanged)o.authChanged();}
   function folder(path){const matches=context?.folders.filter(f=>f.displayPath===path)||[];return matches.length===1?matches[0]:null;}
   const validFolder=f=>f&&typeof f.id==='string'&&!!f.id&&typeof f.revision==='string'&&!!f.revision&&typeof f.displayPath==='string'&&!!f.displayPath&&typeof f.label==='string'&&!!f.label&&(f.registered===undefined||typeof f.registered==='boolean');
   api.hasFolder=path=>!!folder(path);
   api.folderRevision=path=>folder(path)?.revision||'';
   api.isRegistered=path=>folder(path)?.registered===true;
   api.registeredFolders=()=>context?.folders.filter(f=>f.registered===true)||[];
-  api.canRegisterFolders=()=>context?.canRegisterFolders===true;
-  api.canChooseFolders=()=>context?.canChooseFolders===true;
+  api.folderChoiceEpoch=()=>uuid.test(context?.folderChoiceEpoch||'')?context.folderChoiceEpoch:'';
+  api.canChooseFolders=()=>context?.canChooseFolders===true&&!!api.folderChoiceEpoch();
   api.pending=()=>!!active||busy;
   api.sync=()=>{const key=o.auth()||'';if(key===owner)return;if(owner)reset();owner=key;if(!key){unavailable('Unlock Motet to start a new chat.');return}load();};
   function load(){
@@ -7102,7 +7102,7 @@ function createNewChatClient(o){
       if(!scope){const tag=await o.scope(k);if(!valid(e,k))return false;scope='watch-new-chat:'+tag;}
       if(!recovered){recovered=true;let saved='';try{saved=o.storage.getItem(scope)||''}catch(_){}if(!active&&uuid.test(saved)){active={id:saved,ui:saved,attempt:null,polls:0,seq:0};await recover(e,k)}}
       const c=await request('context',undefined,e,k);if(!valid(e,k))return false;
-      if(!Array.isArray(c.folders)||!Array.isArray(c.providers)||!c.host||typeof c.host.label!=='string'||!c.folders.every(validFolder)||c.providers.some(p=>!p||typeof p.id!=='string')||c.canRegisterFolders!==undefined&&typeof c.canRegisterFolders!=='boolean'||c.canChooseFolders!==undefined&&typeof c.canChooseFolders!=='boolean'||new Set(c.folders.map(f=>f.id)).size!==c.folders.length||new Set(c.folders.map(f=>f.displayPath)).size!==c.folders.length)throw err('Motet could not load the list of apps and folders. Try again.');
+      if(!Array.isArray(c.folders)||!Array.isArray(c.providers)||!c.host||typeof c.host.label!=='string'||!c.folders.every(validFolder)||c.providers.some(p=>!p||typeof p.id!=='string')||c.folderChoiceEpoch!==undefined&&c.folderChoiceEpoch!==null&&!uuid.test(c.folderChoiceEpoch)||c.canChooseFolders!==undefined&&typeof c.canChooseFolders!=='boolean'||new Set(c.folders.map(f=>f.id)).size!==c.folders.length||new Set(c.folders.map(f=>f.displayPath)).size!==c.folders.length)throw err('Motet could not load the list of apps and folders. Try again.');
       context=c;api.inventoryFresh=true;api.inventoryReason='';api.host=c.host;api.waitMs=Math.max(5000,Math.min(600000,Number(c.limits?.observationWindowMs)||120000));
       api.managedPermissionTimeoutSeconds=Number.isInteger(c.limits?.managedPermissionTimeoutSeconds)&&c.limits.managedPermissionTimeoutSeconds>0?c.limits.managedPermissionTimeoutSeconds:null;
       api.apps={};for(const [app,id] of [['codex','codex'],['claude','claude_code']]){const p=c.providers.find(p=>p.id===id);api.apps[app]={provider:id,status:p?.available===true&&(p.supportsWork===true||p.supportsBlank===true)?'ready':'unavailable',supportsWork:p?.supportsWork===true,supportsBlank:p?.supportsBlank===true,ownership:p?.ownership,reason:p?.available===true?'':p?.unavailableReason?.message||'New chats are unavailable.'};}
@@ -7165,41 +7165,26 @@ function createNewChatClient(o){
       if(valid(e,k))await load();
     },500);
   };
-  let registering=null;
-  api.registerFolder=async path=>{
-    const e=epoch,k=owner;
-    if(registering)throw err('A folder addition is already being checked.');
-    if(!api.canRegisterFolders())throw err('Motet cannot add folders right now. Refresh availability in Settings, Connections and try again.');
-    const registration={};registering=registration;
-    try{
-      let receipt;
-      try{receipt=await request('folders',{path},e,k)}catch(error){if(!error.status||error.status>=500)error.registrationUnknown=true;throw error}
-      if(!validFolder(receipt.folder)||receipt.folder.registered!==true||typeof receipt.folder.label!=='string'||!receipt.folder.label){throw Object.assign(err('Motet could not confirm whether the folder was added. Refresh availability to check before adding it again.'),{registrationUnknown:true})}
-      if(loading)await loading;
-      if(!valid(e,k))throw err('Owner authentication changed.');
-      context={...context,folders:[...(context?.folders||[]).filter(f=>f.id!==receipt.folder.id&&f.displayPath!==receipt.folder.displayPath),receipt.folder]};
-      const refreshed=await load();
-      if(!valid(e,k))throw err('Owner authentication changed.');
-      return {...receipt.folder,availabilityChecked:refreshed===true};
-    }finally{if(registering===registration)registering=null}
-  };
-
   const choiceStates=new Set(['pending','selected','saved','cancelled','not_local','busy','failed','refused','unknown']);
-  async function choiceRequest(id,suffix,body){
+  async function choiceRequest(id,suffix,body,expectedEpoch=api.folderChoiceEpoch()){
     if(!uuid.test(id))throw err('The folder window request could not be checked.');
-    const value=await request('folders/choose/'+id+suffix,body);
+    if(!expectedEpoch||expectedEpoch!==api.folderChoiceEpoch())throw err('The folder window context changed.');
+    const value=await request('folders/choose/'+id+suffix,body,epoch,owner,base,suffix==='/cancel');
+    if(expectedEpoch!==api.folderChoiceEpoch())throw err('The folder window context changed.');
     if(value.requestId!==id||!choiceStates.has(value.state)||value.state==='selected'&&!uuid.test(value.selectionToken||'')||value.state==='saved'&&(!validFolder(value.folder)||value.folder.registered!==true))throw err('The folder window response could not be checked.');
     return value;
   }
   api.beginFolderChoice=async data=>{
     if(!api.canChooseFolders())throw err('Adding folders is unavailable on this computer.');
+    if(data?.epoch!==api.folderChoiceEpoch())throw err('The folder window context changed.');
     if(!uuid.test(data?.requestId||''))throw err('The folder window request could not be checked.');
     const value=await request('folders/choose',data);
+    if(data.epoch!==api.folderChoiceEpoch())throw err('The folder window context changed.');
     if(value.requestId!==data.requestId||!choiceStates.has(value.state)||value.state==='selected'&&!uuid.test(value.selectionToken||'')||value.state==='saved'&&(!validFolder(value.folder)||value.folder.registered!==true))throw err('The folder window response could not be checked.');
     return value;
   };
-  api.folderChoiceStatus=async id=>{const e=epoch,k=owner;return savedChoice(await choiceRequest(id,'',undefined),e,k)};
-  api.cancelFolderChoice=id=>choiceRequest(id,'/cancel',{});
+  api.folderChoiceStatus=async(id,choiceEpoch=api.folderChoiceEpoch())=>{const e=epoch,k=owner;return savedChoice(await choiceRequest(id,'',undefined,choiceEpoch),e,k)};
+  api.cancelFolderChoice=(id,choiceEpoch)=>choiceRequest(id,'/cancel',{epoch:choiceEpoch},choiceEpoch);
   async function savedChoice(value,e,k){
     if(value.state!=='saved')return value;
     if(loading)await loading;
@@ -7209,10 +7194,10 @@ function createNewChatClient(o){
     if(!valid(e,k))throw err('Owner authentication changed.');
     return {...value,folder:{...value.folder,availabilityChecked:refreshed===true}};
   }
-  api.acceptFolderChoice=async(id,token)=>{
+  api.acceptFolderChoice=async(id,token,choiceEpoch=api.folderChoiceEpoch())=>{
     if(!uuid.test(token||''))throw err('The folder selection could not be checked.');
     const e=epoch,k=owner;
-    return savedChoice(await choiceRequest(id,'/accept',{selectionToken:token}),e,k);
+    return savedChoice(await choiceRequest(id,'/accept',{selectionToken:token},choiceEpoch),e,k);
   };
 
 
@@ -7550,12 +7535,12 @@ function workspaceNewChatEmptyEntry(){
 }
 function workspaceNewChatAddFolderClose(restore=true){
   const d=WNC.addFolder;if(!d)return;const opening=d._opening;d._opening=null;
-  if(opening){clearTimeout(opening.timer);if(opening.requestId)Promise.resolve(opening.adapter.cancelFolderChoice(opening.requestId)).catch(()=>{})}
+  if(opening){clearTimeout(opening.timer);if(opening.requestId)Promise.resolve(opening.adapter.cancelFolderChoice(opening.requestId,opening.epoch)).catch(()=>{})}
   if(d.open)d.close();
   if(restore&&opening&&workspaceNewChatReady()){if(opening.recovery&&WNC.form===opening.recovery&&WNC.dialog?.open)(opening.trigger?.isConnected?opening.trigger:WNC.dialog.querySelector('.workspace-nc-recover')||WNC.dialog.querySelector('[data-close]'))?.focus();else workspaceNewChatFocusHome(opening.trigger)}
 }
 function workspaceNewChatAddFolder(trigger,recovery=null,event=null){
-  if(!workspaceNewChatCanAdd())return;workspaceNewChatRememberDraft();
+  if(!workspaceNewChatCanAdd()||event?.isTrusted!==true)return;workspaceNewChatRememberDraft();
   if(!WNC.addFolder){
     const d=wncEl('dialog','workspace-dialog');d.id='workspaceAddFolderDialog';d.setAttribute('aria-labelledby','workspaceAddFolderTitle');d.setAttribute('aria-describedby','workspaceAddFolderStatus workspaceAddFolderTrust');
     d.innerHTML='<header><h2 id="workspaceAddFolderTitle">Add project folder</h2><button type="button" data-close aria-label="Close Add project folder">×</button></header><form><div class="workspace-nc-folder-message"><span class="workspace-nc-folder-reserve" aria-hidden="true">Choose the folder in the window that opened on this Mac.</span><span id="workspaceAddFolderStatus" role="status"></span></div><small id="workspaceAddFolderTrust" class="workspace-nc-folder-hint">Add only folders you trust. A chat started there uses that folder\'s own settings and hooks.</small><button type="button" data-refresh hidden>Refresh availability</button><footer><button type="button" data-action>Cancel</button></footer></form>';
@@ -7572,7 +7557,7 @@ function workspaceNewChatAddFolder(trigger,recovery=null,event=null){
       if(opening.recovery){const f=opening.recovery;if(WNC.form!==f||!WNC.dialog?.open)return false;f.folder=folder.displayPath;f.oldFolder=folder.displayPath;f.folderRevision=folder.revision;f.missing=false;f.added=folder.label;workspaceNewChatAddFolderClose(false);workspaceNewChatFormRefresh();WNC.dialog.querySelector('#workspaceNewChatDraft')?.focus()}
       else{workspaceNewChatAddFolderClose(false);workspaceNewChatOpen(key,opening.trigger,{folder:folder.displayPath,folderRevision:folder.revision,added:folder.label})}return true;
     };
-    const retry=(opening,text,error=false)=>{message(text,error);opening.retry=true;action.hidden=false;action.disabled=false;action.dataset.primary='true';action.textContent=error?'Choose another folder':'Try again'};
+    const retry=(opening,text,error=false,warning=error)=>{message(text,warning);opening.retry=true;action.hidden=false;action.disabled=false;action.dataset.primary='true';action.textContent=error?'Choose another folder':'Try again'};
     const unknown=opening=>{opening.unknown=true;message(opening.accepted?'Motet could not confirm whether the folder was added. Refresh availability to check before adding it again.':'Motet could not check the folder window. Close this dialog before trying again.');action.hidden=true;if(opening.accepted)revealRefresh(opening)};
     const follow=async(opening,value)=>{
       if(!current(opening))return;
@@ -7580,29 +7565,35 @@ function workspaceNewChatAddFolder(trigger,recovery=null,event=null){
       if(value.requestId!==opening.requestId){unknown(opening);return}
       if(value.state==='selected'){
         if(opening.accepted){await follow(opening,{...value,state:'unknown'});return}opening.accepted=true;
-        try{const saved=await opening.adapter.acceptFolderChoice(opening.requestId,value.selectionToken);if(!current(opening))return;await follow(opening,saved)}catch(_){if(current(opening))await read(opening)}return;
+        try{const saved=await opening.adapter.acceptFolderChoice(opening.requestId,value.selectionToken,opening.epoch);if(!current(opening))return;await follow(opening,saved)}catch(_){if(current(opening))await read(opening)}return;
       }
       if(value.state==='saved'){finish(opening,value.folder);return}
       if(value.state==='cancelled'){workspaceNewChatAddFolderClose();return}
       if(value.state==='not_local'){message('Adding a folder needs the computer that runs Motet. Open Motet there and choose the folder.');action.hidden=true;return}
       if(value.state==='busy'){retry(opening,'A folder window is already open on this Mac. Close it, then try again.');return}
       if(value.state==='refused'){if(value.reasonCode==='capacity'){message('The saved project folder limit has been reached.',true);action.hidden=true}else retry(opening,'Motet cannot use that folder.',true);return}
-      if(value.state==='failed'){retry(opening,'Motet could not open the folder window on this Mac. Try again.');return}
+      if(value.state==='failed'){retry(opening,'Motet could not open the folder window on this Mac. Try again.',false,true);return}
       if(value.state==='unknown'){opening.unknown=true;message('Motet could not confirm whether the folder was added. Refresh availability to check before adding it again.');action.hidden=true;revealRefresh(opening);return}
       if(value.state!=='pending'){unknown(opening);return}
-      if(Date.now()-opening.started>150000){Promise.resolve(opening.adapter.cancelFolderChoice(opening.requestId)).catch(()=>{});retry(opening,'Motet could not open the folder window on this Mac. Try again.');return}
+      if(Date.now()-opening.started>150000){Promise.resolve(opening.adapter.cancelFolderChoice(opening.requestId,opening.epoch)).catch(()=>{});retry(opening,'Motet could not open the folder window on this Mac. Try again.',false,true);return}
+      message(value.windowStarted===true?'Choose the folder in the window that opened on this Mac.':'Opening the folder window…');
       opening.timer=setTimeout(()=>read(opening),500);
     };
-    const read=async opening=>{if(!current(opening))return;if(document.visibilityState!=='visible'){opening.resume=()=>read(opening);return}try{const value=await opening.adapter.folderChoiceStatus(opening.requestId);if(!current(opening))return;await follow(opening,value)}catch(_){if(current(opening))unknown(opening)}};
+    const read=async opening=>{if(!current(opening))return;if(document.visibilityState!=='visible'){opening.resume=()=>read(opening);return}try{const value=await opening.adapter.folderChoiceStatus(opening.requestId,opening.epoch);if(!current(opening))return;await follow(opening,value)}catch(_){if(current(opening))unknown(opening)}};
     d._start=async(opening,click)=>{
-      if(!current(opening))return;clearTimeout(opening.timer);opening.retry=false;opening.unknown=false;opening.accepted=false;opening.started=Date.now();opening.submissionFocus=document.activeElement;
-      opening.requestId=crypto.randomUUID();message('Choose the folder in the window that opened on this Mac.');action.hidden=false;action.disabled=false;action.dataset.primary='false';action.textContent='Cancel';refresh.hidden=true;
-      const data={requestId:opening.requestId,gesture:{visible:document.visibilityState==='visible',focused:document.hasFocus(),trusted:click?.isTrusted===true}};const hint=opening.recovery?.oldFolder||opening.recovery?.folder;if(hint)data.initialPath=hint;
+      if(!current(opening)||click?.isTrusted!==true)return;clearTimeout(opening.timer);if(opening.requestId)Promise.resolve(opening.adapter.cancelFolderChoice(opening.requestId,opening.epoch)).catch(()=>{});opening.requestId=null;opening.epoch=null;opening.retry=false;opening.unknown=false;opening.accepted=false;opening.started=Date.now();opening.submissionFocus=document.activeElement;
+      message('Opening the folder window…');action.hidden=false;action.disabled=false;action.dataset.primary='false';action.textContent='Cancel';refresh.hidden=true;
+      const refreshed=await opening.adapter.retryContext();if(!current(opening))return;
+      if(!refreshed||!opening.adapter.canChooseFolders()){retry(opening,'Motet could not open the folder window on this Mac. Try again.',false,true);return}
+      if(document.visibilityState!=='visible'){opening.retry=true;message('The folder window was not opened. Try again when this page is visible.');action.dataset.primary='true';action.textContent='Try again';return}
+      opening.requestId=crypto.randomUUID();opening.epoch=opening.adapter.folderChoiceEpoch();
+      const data={requestId:opening.requestId,epoch:opening.epoch,gesture:{trusted:true}};const hint=opening.recovery?.oldFolder||opening.recovery?.folder;if(hint)data.initialPath=hint;
       try{const value=await opening.adapter.beginFolderChoice(data);if(!current(opening))return;await follow(opening,value)}catch(_){if(current(opening))await read(opening)}
     };
     d.querySelector('[data-close]').onclick=()=>workspaceNewChatAddFolderClose();
     d.addEventListener('cancel',e=>{e.preventDefault();workspaceNewChatAddFolderClose()});
     d.addEventListener('close',()=>{if(!d.open&&d._opening)workspaceNewChatAddFolderClose()});
+    addEventListener('pagehide',()=>workspaceNewChatAddFolderClose(false));
     document.addEventListener('visibilitychange',()=>{const opening=d._opening;if(document.visibilityState==='visible'&&opening?.resume&&current(opening)){const resume=opening.resume;opening.resume=null;resume()}});
     d.querySelector('form').onsubmit=e=>e.preventDefault();
     action.onclick=click=>{const opening=d._opening;if(!opening||action.disabled)return;if(opening.retry)return d._start(opening,click);workspaceNewChatAddFolderClose()};

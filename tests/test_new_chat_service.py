@@ -202,7 +202,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
         self.assertEqual(s.jobs, {})
         context = s.context()
-        self.assertTrue(context['canRegisterFolders'])
+        self.assertNotIn('canRegisterFolders', context)
+        self.assertFalse(context['canChooseFolders'])
         self.assertIn(saved['folder'], context['folders'])
         self.assertFalse(context['providers'][0]['available'])
         self.assertEqual((self.adapter.creates, self.adapter.opens, self.adapter.verifies), (0, 0, 0))
@@ -341,6 +342,26 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual((self.adapter.creates, self.adapter.opens), (1, 1))
         s.process_admissions(lambda identity, folder, permit: 'x:' + identity.native_id if permit() else None)
         self.assertEqual(s.status(attempt['attemptId'])['state'], 'added')
+
+    def test_old_saved_worktrees_root_stays_stored_but_cannot_prepare_a_chat(self):
+        s = self.service()
+        worktrees = self.root / '.codex' / 'worktrees'
+        worktrees.mkdir(parents=True)
+        frozen = s.inventory._folder(str(worktrees), worktrees.stat())
+        with s.db:
+            s.db.execute('INSERT INTO registered_folders VALUES (?,?)',
+                         (frozen.id, json.dumps(vars(frozen), ensure_ascii=True)))
+        self.seed = self.adapter.make_identity(worktrees)
+        before = s.db.execute('SELECT id,data FROM registered_folders').fetchall()
+        self.assertEqual([folder.id for folder in s._registered_folders()], [frozen.id])
+        self.assertEqual(s.context()['folders'], [])
+        with self.assertRaises(NewChatError):
+            s.prepare(dict(provider='codex', folderId=frozen.id, folderRevision=frozen.revision))
+        with self.assertRaises(NewChatError):
+            s.register_folder({'path': str(worktrees)})
+        self.assertEqual(s.db.execute('SELECT id,data FROM registered_folders').fetchall(), before)
+        self.assertEqual(s.db.execute('SELECT count(*) FROM intents').fetchone()[0], 0)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
 
     def test_corrupt_saved_revision_cannot_override_independent_discovery(self):
         s = self.service()
