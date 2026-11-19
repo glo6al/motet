@@ -524,14 +524,17 @@ test('late former-owner answer is recovered from its isolated shard once after h
   assert.equal(storage.get(oldKey).requests[REQUEST].events[0].answer,ANSWER,'new runtime never rewrites old shard');
 });
 
-test('conflicting attempt digest in recovered shard stops claims without rewriting foreign data',async()=>{
+test('conflicting attempt digest holds that request without disconnecting or rewriting foreign data',async()=>{
   const storage=new Map([[GLOBAL_KEY,CONFIG]]);
   const h=await harness({storage,fetch:globalFetch});await h.tick();await h.tick();await h.waitSubmission();await h.waitAck('submitted');
   const [key,data]=runtimeRows(storage)[0];
   const foreign=copy(data);foreign.requests[REQUEST].envelope_digest='0'.repeat(64);
   const foreignKey='watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT;storage.set(foreignKey,foreign);
-  h.setNow(110000);await h.drive(async()=>!JSON.parse((await h.command('watch-status')).text).connected,'conflicting shard recovery');
-  assert.equal(JSON.parse((await h.command('watch-status')).text).connected,false);
+  h.setNow(110000);await h.drive(async()=>(await status(h)).receipt_recovery?.conflicts.includes(REQUEST),'conflicting shard recovery');
+  const visible=await status(h);
+  assert.equal(visible.connected,true);
+  assert.deepEqual(visible.receipt_recovery.conflicts,[REQUEST]);
+  assert.match(visible.receipt_recovery.next_step,/watch_bridge_clear.py --port 8793 --transport-id/);
   assert.deepEqual(storage.get(foreignKey),foreign);assert.equal(h.submissions.length,1);
   assert.equal(runtimeRows(storage).find(([row])=>row===key)[1].requests[REQUEST].envelope_digest,data.requests[REQUEST].envelope_digest);
 });
@@ -947,7 +950,8 @@ test('submitted ACK digest delay requires a genuinely eligible recovery tick bef
     const [key,data]=runtimeRows(h.storage)[0],foreign=copy(data);foreign.requests[REQUEST].envelope_digest='0'.repeat(64);
     const foreignKey='watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT;h.storage.set(foreignKey,foreign);h.setNow(110000);
     await h.tick();assert.equal((await status(h)).connected,true,'held ACK keeps the recovery callback gated');
-    release();await h.waitAck('submitted');await h.drive(async()=>!(await status(h)).connected,'conflict after ACK');
+    release();await h.waitAck('submitted');await h.drive(async()=>(await status(h)).receipt_recovery?.conflicts.includes(REQUEST),'conflict after ACK');
+    assert.equal((await status(h)).connected,true);
     assert.deepEqual(h.storage.get(foreignKey),foreign);assert.equal(h.storage.get(key).requests[REQUEST].envelope_digest,data.requests[REQUEST].envelope_digest);assert.equal(h.submissions.length,1);
   });
 });
@@ -1208,6 +1212,325 @@ test('v2 terminal execution releases local admission without publishing malforme
     assert.equal(h.events().filter(e=>e.kind==='completed').length,1);
     await h.tick();assert.equal(h.calls.filter(c=>c.url.endsWith('/poll')).at(-1).body.accept,true);
     assert(!JSON.stringify(receipt.journal).includes('Private owner instruction'));assert(receipt.journal.length<=16);
+  }
+});
+
+test('reply correlation agrees with the server on line boundaries and Unicode',()=>{
+  const marker='WATCH_REPLY '+REQUEST;
+  for(const separator of ['\n','\r\n','\r','\v','\f','\x1c','\x1d','\x1e','\x85','\u2028','\u2029'])
+    assert.equal(matchingAnswer('Fictional lead'+separator+marker+separator+'Fictional 😀 reply',REQUEST),true);
+  for(const suffix of ['', '\n \t\x1f\u00a0\u2009\u3000', '\nMentions WATCH_REPLY in prose.','\n '+marker,'\nWATCH_REPLY','\n\x00','\n\ud800'])
+    assert.equal(matchingAnswer(marker+suffix,REQUEST),false);
+  assert.equal(matchingAnswer(marker+'\n\ufeff',REQUEST),true);
+});
+
+test('v2 releases an exact completion whose marker has no reply body',async()=>{
+  for(const suffix of ['', '\n \t\x1f\u00a0\u2009\u3000']){
+    const h=await lifecycleHarness();
+    await h.tick();await h.waitSubmission();
+    await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'empty-candidate'});
+    await h.call('turn.complete',{turnId:'empty-candidate',answer:'WATCH_REPLY '+REQUEST+suffix,isAborted:false,reason:'answer'});
+    const event=await h.waitForEvent('completed');
+    assert.equal(event.outcome,'unusable');assert.equal(event.answer,'');
+  }
+});
+
+test('permanent receipt rejection preserves evidence and lets a later completion and heartbeat proceed',async()=>{
+  let reject=true;
+  const h=await lifecycleHarness({fetch:(url,body)=>reject&&url.endsWith('/event')&&body.kind==='started'?
+    responseJSON({error_code:'receipt_rejected'},409):null});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'receipt-conflict'});
+  await h.waitCall('/event',(b,c)=>b.kind==='started'&&c.response?.status===409,{settled:true});
+  const afterRejection=h.calls.length;
+  await h.call('turn.complete',{turnId:'receipt-conflict',answer:ANSWER,isAborted:false,reason:'answer'});
+  await h.drive(()=>h.ownData().requests[REQUEST].execution_completed &&
+    !h.ownData().requests[REQUEST].events.some(e=>e.kind==='completed') &&
+    h.calls.slice(afterRejection).some(c=>c.url.endsWith('/poll')),'completion and heartbeat after rejection');
+  assert.deepEqual(h.ownData().requests[REQUEST].events.map(e=>e.kind),['started']);
+  assert.equal(h.events().filter(e=>e.kind==='started').length,1);
+  reject=false;h.setNow(130000);
+  await h.tick();await h.waitAck('started',{since:afterRejection});
+  assert.equal(h.submissions.length,1);
+});
+
+for(const typed of [true,false])test(`${typed?'typed':'untyped'} rejections hold exact receipt after two tries across reload and allow owner-only retry`,async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await lifecycleHarness({storage,fetch:(url,body)=>{
+    if(url.endsWith('/event')&&body.kind==='started')return typed?responseJSON({error_code:'receipt_rejected'},409):
+      {ok:false,status:409,headers:{},text:'Fictional rejection'};
+  }});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'held-receipt-turn'});
+  await h.waitCall('/event',(b,c)=>b.kind==='started'&&c.response?.status===409,{settled:true});
+  await h.drive(()=>h.calls.filter(c=>c.url.endsWith('/poll')).length>=2,'heartbeat after receipt rejection');
+  assert.equal((await status(h)).connected,true);
+  h.setNow(130000);
+  await h.drive(async()=>(await status(h)).receipt_recovery?.held_count===1,'second receipt rejection holds the proof');
+  assert.equal(h.events().filter(e=>e.kind==='started').length,2);
+  const [originalKey,original]=runtimeRows(storage)[0];
+  const retained=original.requests[REQUEST].events.find(e=>e.kind==='started');
+  const reload=await lifecycleHarness({storage,claimed:false});
+  reload.setNow(250000);
+  await reload.tick();
+  const visible=await status(reload);
+  assert.equal(visible.connected,true);
+  assert.deepEqual(visible.receipt_recovery.held,[REQUEST]);
+  assert.match(visible.receipt_recovery.next_step,/watch-retry-receipts/);
+  assert(!reload.events().some(e=>e.kind==='started'));
+  for(const origin of [{kind:'plugin',name:'fictional'},{kind:'peer'}]){
+    assert.equal(JSON.parse((await reload.command('watch-status','',origin)).text).receipt_recovery,null);
+    assert.match((await reload.command('watch-retry-receipts',REQUEST,origin)).text,/direct owner/);
+    assert(!reload.events().some(e=>e.kind==='started'));
+  }
+  reload.setCwd('/fictional/unrelated-project');
+  assert.match((await reload.command('watch-retry-receipts',REQUEST)).text,/original Motet conversation/);
+  assert(!reload.events().some(e=>e.kind==='started'));
+  reload.setCwd('/fictional/project');
+  await reload.command('watch-retry-receipts',REQUEST);
+  await reload.waitAck('started');
+  const replay=reload.events().find(e=>e.kind==='started');
+  for(const [field,value] of Object.entries(retained))assert.deepEqual(replay[field],value);
+  assert.equal((await status(reload)).receipt_recovery,null);
+  assert.equal(reload.submissions.length,0);
+  assert.deepEqual(storage.get(originalKey),original);
+});
+
+test('replacing setup while disconnected abandons only the old volatile turn binding',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const nextGrant={...CONFIG,grant_id:ATTEMPT,grant:'c'.repeat(64)};
+  let stale=false;
+  const h=await lifecycleHarness({storage,fetch:(url,body)=>{
+    if(url.endsWith('/setup'))return responseJSON(nextGrant);
+    if(url.endsWith('/poll')&&stale)return responseJSON({error_code:'stale_connection'},409);
+    if(url.endsWith('/register')&&storage.get(GLOBAL_KEY).grant_id===nextGrant.grant_id)
+      return responseJSON(registered(body,{grant_id:nextGrant.grant_id,enrollment_id:REQUEST,token:'d'.repeat(64),
+        peer_protocol:1,supported_lifecycle_protocol:2,lifecycle_protocol:body.lifecycle_protocol??0}));
+  }});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'old-enrollment-turn'});
+  await h.waitAck('started');
+  const [oldKey,oldShard]=runtimeRows(storage)[0];
+  stale=true;
+  await h.drive(async()=>!(await status(h)).connected,'disconnect with an original turn still bound');
+  assert.equal((await status(h)).pending,REQUEST);
+  await h.command('watch-setup','8793:fictional_setup_code_1234');
+  assert.equal((await status(h)).pending,null);
+  await h.call('turn.complete',{turnId:'old-enrollment-turn',answer:ANSWER,isAborted:false,reason:'answer'});
+  stale=false;
+  await h.drive(async()=>(await status(h)).connected,'register replacement setup');
+  await h.tick();
+  assert(!h.events().some(e=>e.kind==='completed'||e.kind==='answered'));
+  assert.deepEqual(storage.get(oldKey),oldShard);
+  const next=runtimeRows(storage).find(([key])=>key!==oldKey)[1];
+  assert.equal(next.enrollment_id,REQUEST);
+  assert.deepEqual(next.requests,{});
+  assert.equal(h.submissions.length,1);
+});
+
+test('stale authentication stops the connection and retains the original receipt',async()=>{
+  let stale=true;
+  const h=await lifecycleHarness({fetch:(url,body)=>stale&&url.endsWith('/event')&&body.kind==='completed'?
+    responseJSON({error_code:'stale_connection'},409):null});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'stale-completion'});
+  await h.waitAck('started');
+  await h.call('turn.complete',{turnId:'stale-completion',answer:ANSWER,isAborted:false,reason:'answer'});
+  const rejected=await h.waitCall('/event',(b,c)=>b.kind==='completed'&&c.response?.status===409,{settled:true});
+  await h.drive(async()=>!JSON.parse((await h.command('watch-status')).text).connected,'stale connection stops');
+  assert.equal(h.ownData().requests[REQUEST].events.find(e=>e.kind==='completed').event_id,rejected.body.event_id);
+  stale=false;h.setNow(102000);
+  await h.drive(()=>h.calls.some(c=>c.body.kind==='completed'&&c.response?.ok),'completion replays after reconnect');
+  const receipt=await h.waitAck('completed',{since:h.calls.indexOf(rejected)+1});
+  assert.equal(receipt.completed,true);assert.equal(h.submissions.length,1);
+  assert(h.events().filter(e=>e.kind==='completed').every(e=>e.event_id===rejected.body.event_id));
+});
+
+test('full reload observes only the original proven main turn and withholds its answer',async()=>{
+  for(const variant of ['exact','too-early','foreign-generation','foreign-attempt','foreign-turn','foreign-project','ambiguous','no-proof']){
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const h=await lifecycleHarness({storage});
+    await h.tick();await h.waitSubmission();
+    await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'bound-before-reload'});
+    await h.waitAck('started');
+    const proof={request_id:REQUEST,attempt_id:ATTEMPT,generation:GENERATION,turn_id:'bound-before-reload'};
+    if(variant==='foreign-generation')proof.generation=ENROLLMENT;
+    if(variant==='foreign-attempt')proof.attempt_id=ENROLLMENT;
+    if(variant==='foreign-turn')proof.turn_id='different-turn';
+    const reload=await lifecycleHarness({storage,claimed:false,fetch:(url,body)=>{
+      if(url.endsWith('/poll'))return responseJSON({version:1,native_id:NATIVE,generation:GENERATION,claim:null,
+        recoverable_turns:variant==='no-proof'?[]:variant==='ambiguous'?[proof,proof]:[proof]});
+    }});
+    const completion={turnId:'bound-before-reload',answer:ANSWER,isAborted:false,reason:'answer'};
+    if(variant==='too-early')await reload.call('turn.complete',completion);
+    await reload.tick();
+    await reload.call('turn.complete',{...completion,agentId:'child'});
+    await reload.call('turn.complete',{...completion,turnId:'different-turn'});
+    if(variant!=='too-early')assert(!reload.events().some(e=>e.kind==='completed'));
+    if(variant==='foreign-project')reload.setCwd('/fictional/other-project');
+    if(variant!=='too-early')await reload.call('turn.complete',completion);
+    if(variant==='exact'||variant==='too-early'){
+      const event=await reload.waitForEvent('completed');
+      assert.equal(event.turn_id,proof.turn_id);assert.equal(event.outcome,'withheld');assert.equal(event.answer,'');
+      await reload.waitAck('completed');
+      await reload.call('turn.complete',completion);
+      assert.equal(reload.events().filter(e=>e.kind==='completed').length,1);
+    }else{
+      await reload.tick();
+      assert(!reload.events().some(e=>e.kind==='completed'));
+    }
+    assert.equal(reload.submissions.length,0);
+  }
+});
+
+test('full reload rejects conflicting original turns before merging any historical shard',async()=>{
+  for(const reversed of [false,true]){
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const original=await lifecycleHarness({storage});
+    await original.tick();await original.waitSubmission();
+    await original.call('turn.start',{text:PEER_ENVELOPE,turnId:'original-turn'});
+    await original.waitAck('started');
+    const [key,receipt]=runtimeRows(storage)[0];
+    const foreign=copy(receipt);
+    foreign.requests[REQUEST].turn_id='different-turn';
+    const foreignKey='watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT;
+    if(reversed)storage.delete(key);
+    storage.set(foreignKey,foreign);
+    if(reversed)storage.set(key,receipt);
+    const proof={request_id:REQUEST,attempt_id:ATTEMPT,generation:GENERATION,turn_id:'original-turn'};
+    const reload=await lifecycleHarness({storage,claimed:false,fetch:url=>{
+      if(url.endsWith('/poll'))return responseJSON({version:1,native_id:NATIVE,generation:GENERATION,claim:null,
+        recoverable_turns:[proof]});
+    }});
+    await reload.tick();
+    await reload.call('turn.complete',{turnId:proof.turn_id,answer:ANSWER,isAborted:false,reason:'answer'});
+    const status=JSON.parse((await reload.command('watch-status')).text);
+    assert.equal(status.connected,true);
+    assert.deepEqual(status.receipt_recovery.conflicts,[REQUEST]);
+    assert.equal(reload.ownData().requests[REQUEST],undefined);
+    assert.deepEqual(reload.events(),[]);
+    assert.equal(reload.submissions.length,0);
+    assert.deepEqual(storage.get(key),receipt);
+    assert.deepEqual(storage.get(foreignKey),foreign);
+  }
+});
+
+test('reload reconciles modern completion receipts before posting either shard',async()=>{
+  for(const variant of ['conflicting-body','conflicting-time','identical','unusable','withheld']){
+    for(const reversed of [false,true]){
+      const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+      const original=await lifecycleHarness({storage,fetch:(url,body)=>url.endsWith('/event')&&body.kind==='completed'?
+        responseJSON({},503):null});
+      await original.tick();await original.waitSubmission();
+      await original.call('turn.start',{text:PEER_ENVELOPE,turnId:'retained-completion'});
+      await original.waitAck('started');
+      await original.call('turn.complete',{turnId:'retained-completion',answer:ANSWER,isAborted:false,reason:'answer'});
+      await original.waitCall('/event',(b,c)=>b.kind==='completed'&&c.response?.status===503,{settled:true});
+      const [key,receipt]=runtimeRows(storage)[0];
+      const foreign=copy(receipt);
+      const event=foreign.requests[REQUEST].events[0];
+      if(variant==='conflicting-body')event.answer='WATCH_REPLY '+REQUEST+'\nDifferent fictional reply.';
+      if(variant==='conflicting-time')event.occurred_at+=1;
+      if(variant==='identical')foreign.requests[REQUEST].events[0]=Object.fromEntries(Object.entries(event).reverse());
+      const supplementalAnswer=['unusable','withheld'].includes(variant);
+      if(supplementalAnswer){
+        Object.assign(event,{event_id:ATTEMPT,outcome:variant,answer:'',occurred_at:event.occurred_at-1});
+        Object.assign(foreign.requests[REQUEST],{capture:variant,completed:false});
+      }
+      const foreignKey='watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT;
+      if(reversed)storage.delete(key);
+      storage.set(foreignKey,foreign);
+      if(reversed)storage.set(key,receipt);
+
+      let rejectWithheld=variant==='withheld';
+      const reload=await lifecycleHarness({storage,claimed:false,fetch:(url,body)=>
+        rejectWithheld&&url.endsWith('/event')&&body.outcome==='withheld'?responseJSON({error_code:'receipt_rejected'},409):null});
+      if(variant.startsWith('conflicting')){
+        assert.deepEqual(reload.events(),[]);
+        const visible=await status(reload);
+        assert.equal(visible.connected,true);
+        assert.deepEqual(visible.receipt_recovery.conflicts,[REQUEST]);
+        assert.equal(reload.ownData().requests[REQUEST],undefined);
+      }else{
+        if(rejectWithheld){
+          await reload.tick();
+          assert.deepEqual(reload.events().map(e=>e.outcome),['withheld']);
+          assert(reload.calls.some(c=>c.url.endsWith('/poll')));
+          rejectWithheld=false;reload.setNow(130000);
+        }
+        const expected=variant==='identical'?['answered']:variant==='unusable'?['unusable','answered']:['withheld','withheld','answered'];
+        if(supplementalAnswer)await reload.drive(()=>reload.events().length===expected.length,'answer after terminal disposition');
+        await reload.waitAck('completed',{count:expected.length});
+        reload.setNow(140000);
+        await reload.tick();
+        assert.deepEqual(reload.events().map(e=>e.outcome),expected);
+      }
+      assert.deepEqual(storage.get(key),receipt);
+      assert.deepEqual(storage.get(foreignKey),foreign);
+      assert.equal(reload.submissions.length,0);
+    }
+  }
+});
+
+test('reused completion ID quarantines both attempts while unrelated receipt and heartbeat proceed',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await lifecycleHarness({storage,fetch:(url,body)=>url.endsWith('/event')&&body.kind==='completed'?
+    responseJSON({},503):null});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'retained-turn'});
+  await h.waitAck('started');
+  await h.call('turn.complete',{turnId:'retained-turn',answer:ANSWER,isAborted:false,reason:'answer'});
+  await h.waitCall('/event',(b,c)=>b.kind==='completed'&&c.response?.status===503,{settled:true});
+  const [key,original]=runtimeRows(storage)[0], foreign=copy(original);
+  const implicated='66666666-6666-4666-8666-666666666666', unrelated='77777777-7777-4777-8777-777777777777';
+  const template=original.requests[REQUEST];
+  const withIdentity=(id,event_id)=>{
+    const record=copy(template);
+    record.request_id=id;
+    Object.assign(record.events[0],{request_id:id,event_id,answer:'WATCH_REPLY '+id+'\nFictional reply.'});
+    return record;
+  };
+  foreign.requests={
+    [implicated]:withIdentity(implicated,template.events[0].event_id),
+    [unrelated]:withIdentity(unrelated,unrelated)
+  };
+  const foreignKey='watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT;
+  storage.set(foreignKey,foreign);
+  const reload=await lifecycleHarness({storage,claimed:false});
+  await reload.waitAck('completed');
+  await reload.tick();
+  const visible=await status(reload);
+  assert.equal(visible.connected,true);
+  assert.deepEqual(visible.receipt_recovery.conflicts.sort(),[REQUEST,implicated].sort());
+  assert.deepEqual(reload.events().map(e=>e.request_id),[unrelated]);
+  assert(reload.calls.some(c=>c.url.endsWith('/poll')));
+  assert.match((await reload.command('watch-retry-receipts',REQUEST)).text,/original receipts conflict/);
+  assert.equal(reload.submissions.length,0);
+  assert.deepEqual(storage.get(key),original);
+  assert.deepEqual(storage.get(foreignKey),foreign);
+});
+
+test('replay retains an older invalid candidate and a verified drop across reloads',async()=>{
+  for(const terminal of ['completed','dropped']){
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const h=await lifecycleHarness({storage,fetch:(url,body)=>url.endsWith('/event')&&body.kind===terminal?responseJSON({},503):null,
+      submit:terminal==='dropped'?async()=>({drop:'fictional pre-start drop'}):undefined});
+    await h.tick();await h.waitSubmission();
+    if(terminal==='completed'){
+      await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'old-candidate'});
+      await h.waitAck('started');
+      await h.call('turn.complete',{turnId:'old-candidate',answer:ANSWER,isAborted:false,reason:'answer'});
+    }
+    await h.waitCall('/event',(b,c)=>b.kind===terminal&&c.response?.status===503,{settled:true});
+    const [key,shard]=runtimeRows(storage)[0];
+    const retained=shard.requests[REQUEST].events.find(e=>e.kind===terminal);
+    if(terminal==='completed')retained.answer+='\nThis sentence mentions WATCH_REPLY.';
+    storage.set(key,shard);
+    const reload=await lifecycleHarness({storage,claimed:false});
+    await reload.waitAck(terminal);
+    const replay=reload.events().find(e=>e.kind===terminal);
+    for(const [field,value] of Object.entries(retained))assert.deepEqual(replay[field],value);
+    assert.equal(reload.submissions.length,0);
   }
 });
 

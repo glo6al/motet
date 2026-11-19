@@ -26,6 +26,15 @@ class ModError(Exception):
         super().__init__(message)
 
 
+class ReceiptError(ModError):
+    def __init__(self, status, message):
+        super().__init__(status, message, 'receipt_rejected')
+
+
+class EmptyReplyError(ReceiptError):
+    pass
+
+
 def ident(value):
     try:
         return isinstance(value, str) and str(uuid.UUID(value)) == value
@@ -35,6 +44,25 @@ def ident(value):
 
 def digest(value):
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def turn_id(value):
+    return (isinstance(value, str) and 1 <= len(value) <= 128
+            and not any(ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF for c in value))
+
+
+def reply_text(answer, request_id):
+    if (not isinstance(answer, str) or len(answer) > 16000 or '\x00' in answer
+            or any(0xD800 <= ord(c) <= 0xDFFF for c in answer)):
+        raise ReceiptError(400, 'Invalid Claude reply.')
+    lines = answer.splitlines()
+    marker = 'WATCH_REPLY ' + request_id
+    if [line for line in lines if 'WATCH_REPLY' in line] != [marker]:
+        raise ReceiptError(409, 'Claude reply has missing or ambiguous correlation markers.')
+    reply = '\n'.join(line for line in lines if line != marker).strip()
+    if not reply:
+        raise EmptyReplyError(409, 'Claude reply has no answer body.')
+    return reply
 
 
 def schema(data, required):
@@ -312,7 +340,7 @@ class ClaudeMod:
         if data.get('native_id') != entry['agent'][2:]:
             raise ModError(409, 'The enrolled Claude conversation does not match.')
         if connected and (not entry['generation'] or data.get('generation') != entry['generation']):
-            raise ModError(409, 'Reconnect the Claude mod before receiving more messages.')
+            raise ModError(409, 'Reconnect the Claude mod before receiving more messages.', 'stale_connection')
         if entry['grant_id'] and data.get('client_id') != entry['client_id']:
             raise ModError(409, 'Another Claude runtime owns this connection.', 'host_conflict')
 
@@ -382,6 +410,32 @@ class ClaudeMod:
         notices = self.store.reply_delivery.statuses(entry) if hasattr(self.store, 'reply_delivery') and entry['reply_notice_protocol'] == 1 else []
         return notices + [dict(request_id=r['request_id'], attempt_id=r['mod_attempt_id'], state=r['state'], turn_id=r.get('mod_turn', ''), error=r.get('error', ''))
                 for r in sorted(self.rows(), key=lambda r: r['created']) if r.get('mod_enrollment') == entry['id'] and r.get('mod_attempt_id')][-32:]
+
+    def recoverable_turns(self, entry):
+        # No message content. A post-reload observer must also match its own
+        # retained receipt to this authenticated original turn.
+        if entry['lifecycle_protocol'] != 2 or not entry['grant_id']:
+            return []
+        project_digest = digest(entry['project'])
+        turns = []
+        for request_id, execution, created in peer_lifecycle.blockers(self.db, entry['agent']):
+            if execution not in ('uncertain', 'running'):
+                continue
+            admission = peer_lifecycle.exact_admission(self.db, request_id)
+            if (not admission or admission[:2] != (entry['agent'], created)
+                    or admission[2] is None or admission[3] != 2):
+                continue
+            evidence = peer_lifecycle.get(self.db, request_id)['evidence']
+            if (evidence.get('launched') is not True or evidence.get('lifecycle_protocol') != 2
+                    or evidence.get('project_digest') != project_digest or evidence.get('mod_enrollment') != entry['id']
+                    or not ident(evidence.get('mod_attempt_id')) or not ident(evidence.get('mod_generation'))
+                    or not turn_id(evidence.get('mod_turn'))):
+                continue
+            turns.append(dict(request_id=request_id, attempt_id=evidence['mod_attempt_id'],
+                              generation=evidence['mod_generation'], turn_id=evidence['mod_turn']))
+            if len(turns) == 32:
+                break
+        return turns
 
     def validate_poll(self, entry, data):
         schema(data, self.fields(entry, ('generation', 'native_id', 'project', 'accept')))
@@ -552,11 +606,11 @@ class ClaudeMod:
                 if row.get('origin') == 'peer':
                     claim['origin'] = 'peer'
                 break
-        return dict(version=1, native_id=entry['agent'][2:], generation=entry['generation'], peer_protocol=entry['peer_protocol'], reply_notice_protocol=entry['reply_notice_protocol'], lifecycle_protocol=entry['lifecycle_protocol'], supported_lifecycle_protocol=2, peer_envelope_limit=entry['peer_envelope_limit'], supported_peer_envelope_limit=100000, claim=claim, requests=self.statuses(entry))
+        return dict(version=1, native_id=entry['agent'][2:], generation=entry['generation'], peer_protocol=entry['peer_protocol'], reply_notice_protocol=entry['reply_notice_protocol'], lifecycle_protocol=entry['lifecycle_protocol'], supported_lifecycle_protocol=2, peer_envelope_limit=entry['peer_envelope_limit'], supported_peer_envelope_limit=100000, claim=claim, requests=self.statuses(entry), recoverable_turns=self.recoverable_turns(entry))
 
     def event(self, entry, data):
+        self.native(entry, data)
         if hasattr(self.store, 'reply_delivery'):
-            self.native(entry, data)
             try:
                 result = self.store.reply_delivery.event_in_transaction(entry, data)
             except peer_bridge.PeerError as error:
@@ -567,18 +621,18 @@ class ClaudeMod:
         extras = {'submitted': (), 'started': ('turn_id',), 'answered': ('turn_id', 'answer'), 'dropped': (), 'unknown': (),
                   'completed': ('turn_id', 'outcome', 'answer', 'event_id', 'occurred_at')}
         if kind not in extras:
-            raise ModError(400, 'Invalid Claude request event.')
-        schema(data, self.fields(entry, ('generation', 'native_id', 'request_id', 'attempt_id', 'kind') + extras[kind]))
-        self.native(entry, data)
+            raise ReceiptError(400, 'Invalid Claude request event.')
+        if set(data) != set(self.fields(entry, ('generation', 'native_id', 'request_id', 'attempt_id', 'kind') + extras[kind])):
+            raise ReceiptError(400, 'Invalid Claude event fields.')
         if self.store._attachment_reserved(data['request_id']):
-            raise ModError(409, 'Claude request does not match its original claim.')
+            raise ReceiptError(409, 'Claude request does not match its original claim.')
         lifecycle = peer_lifecycle.get(self.db, data['request_id'])
         row = next((r for r in self.rows() if r['request_id'] == data['request_id']), None)
         payload_expired = row is None
         if lifecycle and (payload_expired or lifecycle['execution'] in ('retired', 'dropped')):
             evidence = lifecycle['evidence']
             if evidence.get('project_digest') != digest(entry['project']):
-                raise ModError(409, 'Original Claude project evidence is unavailable.')
+                raise ReceiptError(409, 'Original Claude project evidence is unavailable.')
             row = dict(request_id=data['request_id'], agent=lifecycle['agent'], created=lifecycle['created'],
                        runtime='claude', transport=TRANSPORT, origin='peer', bridge_version=2,
                        mod_project=entry['project'], target_project=entry['project'], launched=bool(evidence.get('launched')),
@@ -586,25 +640,26 @@ class ClaudeMod:
         if (not row or row.get('mod_enrollment') != entry['id'] or row.get('mod_project') != entry['project']
                 or row.get('mod_attempt_id') != data['attempt_id'] or not ident(data['attempt_id'])
                 or row['agent'] != entry['agent'] or not row.get('launched')):
-            raise ModError(409, 'Claude request does not match its original claim.')
+            raise ReceiptError(409, 'Claude request does not match its original claim.')
         if self.peer_row(row):
             launched = self.db.execute('SELECT launched FROM shared_bridge_requests WHERE transport_id=?',
                                        (row['request_id'],)).fetchone()
             if not launched or launched[0] is None or not ident(row.get('mod_generation')):
-                raise ModError(409, 'Claude peer claim has no original launch receipt.')
+                raise ReceiptError(409, 'Claude peer claim has no original launch receipt.')
         if kind == 'completed':
             if entry['lifecycle_protocol'] != 2 or row.get('lifecycle_protocol') != 2:
                 raise ModError(409, 'Claude lifecycle completion requires its original negotiated protocol.')
             if (data['outcome'] not in ('answered', 'unusable', 'aborted', 'withheld') or not ident(data['event_id'])
                     or type(data['occurred_at']) is not int or not 0 <= data['occurred_at'] <= 9007199254740991
                     or not isinstance(data['answer'], str) or data['outcome'] != 'answered' and data['answer'] != ''):
-                raise ModError(400, 'Invalid Claude completion outcome.')
+                raise ReceiptError(400, 'Invalid Claude completion outcome.')
         turn = data.get('turn_id')
         if kind in ('started', 'answered', 'completed'):
-            if not isinstance(turn, str) or not 1 <= len(turn) <= 128 or any(ord(c)<32 for c in turn):
-                raise ModError(400, 'Invalid Claude turn identifier.')
-            if row.get('mod_turn') and row['mod_turn'] != turn:
-                raise ModError(409, 'Claude request is already bound to another turn.')
+            if not turn_id(turn):
+                raise ReceiptError(400, 'Invalid Claude turn identifier.')
+            durable_turn = lifecycle['evidence'].get('mod_turn') if lifecycle else None
+            if (row.get('mod_turn') and row['mod_turn'] != turn) or (durable_turn and durable_turn != turn):
+                raise ReceiptError(409, 'Claude request is already bound to another turn.')
         if lifecycle and lifecycle['execution'] == 'retired':
             # Original identity, claim, protocol and turn checks above still apply.
             # Retirement is not a provider completion; never retain the late answer
@@ -615,7 +670,7 @@ class ClaudeMod:
                         retired=True, message=peer_lifecycle.RETIRE_MESSAGE)
         if lifecycle and lifecycle['execution'] == 'dropped':
             if kind in ('started', 'answered', 'completed'):
-                raise ModError(409, 'Claude execution contradicts a verified dropped submission.')
+                raise ReceiptError(409, 'Claude execution contradicts a verified dropped submission.')
             # The row above is an authentication view of immutable receipts,
             # not a replacement payload. Late ACKs must neither erase a retained
             # envelope nor recreate one after pruning.
@@ -629,53 +684,58 @@ class ClaudeMod:
                     or row.get('execution_outcome') == 'completed' or row.get('state') in ('awaiting_reply', 'answered')
                     or evidence.get('mod_turn') or evidence.get('bound_turn')
                     or lifecycle and lifecycle['execution'] in ('running', 'completed')):
-                raise ModError(409, 'Claude input already has execution evidence; a pre-start drop is contradictory.')
-        answered = kind == 'answered' or kind == 'completed' and data['outcome'] == 'answered'
+                raise ReceiptError(409, 'Claude input already has execution evidence; a pre-start drop is contradictory.')
+        outcome = data.get('outcome', kind)
+        answered = outcome == 'answered'
         reply = None
         if answered:
-            answer, marker = data['answer'], 'WATCH_REPLY ' + row['request_id']
-            if not isinstance(answer, str) or len(answer) > 16000 or '\x00' in answer:
-                raise ModError(400, 'Invalid Claude reply.')
-            if [line for line in answer.splitlines() if 'WATCH_REPLY' in line] != [marker]:
-                raise ModError(409, 'Claude reply has missing or ambiguous correlation markers.')
-            reply = '\n'.join(line for line in answer.splitlines() if line != marker).strip()
-            if row['state'] == 'answered' and row.get('reply') != reply:
-                raise ModError(409, 'A different Claude reply was already recorded.')
-        if answered and lifecycle and lifecycle['evidence'].get('answer_digest') not in (None, digest(reply)):
-            raise ModError(409, 'A different Claude reply was already recorded.')
+            try:
+                reply = reply_text(data['answer'], row['request_id'])
+            except ReceiptError as error:
+                # Legacy senders emitted a marker-only answer for an already
+                # bound turn. Acknowledge that exact terminal receipt as unusable.
+                if kind != 'completed' and not (isinstance(error, EmptyReplyError) and
+                                                (row.get('mod_turn') or durable_turn)):
+                    raise
+                # A valid terminal receipt already proves execution. Its answer
+                # candidate can fail capture independently of that evidence.
+                outcome, answered = 'unusable', False
+        if answered and (row['state'] == 'answered' and row.get('reply') != reply
+                         or lifecycle and lifecycle['evidence'].get('answer_digest') not in (None, digest(reply))):
+            raise ReceiptError(409, 'A different Claude reply was already recorded.')
         before = lifecycle['execution'] if lifecycle else row.get('execution_outcome', row['state'])
         terminal = row.get('settled') or lifecycle and lifecycle['execution'] in peer_lifecycle.TERMINAL
         withheld = row.get('capture_disposition') == 'withheld' or lifecycle and lifecycle['capture'] == 'withheld'
         fingerprint = ''
-        if (answered or kind == 'completed') and (row.get('execution_outcome') == 'dropped'
+        if kind in ('answered', 'completed') and (row.get('execution_outcome') == 'dropped'
                 or lifecycle and lifecycle['execution'] == 'dropped'):
-            raise ModError(409, 'Claude completion contradicts a verified dropped submission.')
+            raise ReceiptError(409, 'Claude completion contradicts a verified dropped submission.')
         if kind == 'completed':
             # Connection generation is not event identity: retained events replay
             # on the current authenticated connection without resubmitting input.
             fingerprint = digest(json.dumps({k:data[k] for k in ('request_id','attempt_id','turn_id','outcome','answer','event_id','occurred_at')}, sort_keys=True))
             prior = self.db.execute('SELECT request_id,fingerprint FROM peer_execution_events WHERE event_id=?', (data['event_id'],)).fetchone()
             if prior and (prior[0] != row['request_id'] or prior[1] != fingerprint):
-                raise ModError(409, 'Claude completion event conflicts with its original receipt.')
+                raise ReceiptError(409, 'Claude completion event conflicts with its original receipt.')
             evidence = lifecycle['evidence'] if lifecycle else row
             for prefix in ('completion', 'answer'):
                 if evidence.get(prefix+'_event_id') == data['event_id'] and evidence.get(prefix+'_fingerprint') != fingerprint:
-                    raise ModError(409, 'Claude completion event conflicts with its retained acknowledgment.')
+                    raise ReceiptError(409, 'Claude completion event conflicts with its retained acknowledgment.')
             if not evidence.get('completion_event_id'):
                 row.update(completion_event_id=data['event_id'], completion_fingerprint=fingerprint)
             elif evidence['completion_event_id'] != data['event_id'] and not answered:
-                raise ModError(409, 'This attempt already has its terminal completion receipt.')
+                raise ReceiptError(409, 'This attempt already has its terminal completion receipt.')
             if answered:
                 if evidence.get('answer_event_id') not in (None, data['event_id']):
-                    raise ModError(409, 'This attempt already has its answer completion receipt.')
+                    raise ReceiptError(409, 'This attempt already has its answer completion receipt.')
                 row.update(answer_event_id=data['event_id'], answer_fingerprint=fingerprint)
         if answered and not withheld and not payload_expired:
             row.update(state='answered', reply=reply, error='', mod_turn=turn,
                        execution_outcome='completed', settled=True, capture_disposition='captured')
-        elif kind == 'completed' or answered:
+        elif kind in ('answered', 'completed'):
             row.update(execution_outcome='completed', settled=True, mod_turn=turn)
             if row['state'] != 'answered':
-                disposition = 'withheld' if withheld or data.get('outcome') == 'withheld' else 'unusable'
+                disposition = 'withheld' if withheld or outcome == 'withheld' else 'unusable'
                 row.update(state='unknown', reply='', capture_disposition=disposition,
                            error=('The turn completed; its reply was withheld because conversation isolation could not be verified.'
                                   if disposition == 'withheld' else
@@ -696,7 +756,7 @@ class ClaudeMod:
         else:
             self.put(row)
         after = peer_lifecycle.get(self.db, row['request_id'])
-        peer_lifecycle.record_event(self.db, row['request_id'], kind, data.get('outcome', kind), before,
+        peer_lifecycle.record_event(self.db, row['request_id'], kind, outcome, before,
                                     after['execution'] if after else row.get('execution_outcome', row['state']),
                                     event_id=data.get('event_id'), occurred=data.get('occurred_at'), fingerprint=fingerprint)
         return dict(request_id=row['request_id'], state=row['state'], turn_id=row.get('mod_turn', ''))
@@ -771,7 +831,8 @@ def handle_http(handler, store, agents):
                 or len(handler.headers.get_all('Content-Length') or []) != 1):
             raise ModError(403, 'Invalid Claude mod service request.')
         size = int(handler.headers.get('Content-Length', ''))
-        if size < 2 or size > (80000 if method == 'event' else 16384):
+        # JSON escaping can take up to six bytes per allowed reply codepoint.
+        if size < 2 or size > (100000 if method == 'event' else 16384):
             raise ModError(400, 'Invalid Claude mod request size.')
         raw = handler.rfile.read(size)
         if len(raw) != size:

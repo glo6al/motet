@@ -3,6 +3,7 @@
 Queue acceptance is not delivery. Only the exact outgoing user envelope followed
 by a matching completed turn can produce an answer. Uncertain sends are never retried.
 """
+import hmac
 import json
 import math
 from contextlib import nullcontext
@@ -23,6 +24,7 @@ from attachments_owner_marker import CLEAR, UNCERTAIN
 import claude_channel
 import claude_mod
 import peer_bridge
+import peer_inbox
 import peer_lifecycle
 import codex_transcript
 
@@ -30,6 +32,8 @@ CLI = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
 ACTIVE = ('sending', 'queued', 'awaiting_reply', 'unknown', 'expired')
 MAX_RECORDS, MAX_PENDING, MAX_LINE, MAX_READ = 256, 8, 1_000_000, 2_000_000
 TTL, RETENTION = 900, 86400
+CODEX_REPLY_EXPIRED = 'No matching reply yet. The question may still be queued; Motet will not resend.'
+CODEX_PREVIOUS_SOURCE_UNAVAILABLE = 'The original Codex transcript is temporarily unavailable. Motet will check it again.'
 CLAUDE_OWNER_UNAVAILABLE = ("Exact named-chat delivery requires the official Motet plugin connected in this Claude chat. "
                            "Connect it before sending. Nothing was sent.")
 
@@ -108,6 +112,7 @@ def public(row):
 class MessagingStore:
     def __init__(self, state_dir, sessions_dir, cli=CLI, channel_root=None, managed=None):
         self.managed = managed  # Independent owner ledger; never fed to legacy/peer workers.
+        self.state_dir = os.path.abspath(state_dir)
         self.sessions_dir, self.cli = os.path.realpath(sessions_dir), cli
         self.channel_root = channel_root or os.path.join(state_dir, "claude-channels")
         self.codex_available, self.worker_failed = None, False
@@ -153,6 +158,7 @@ class MessagingStore:
                         self.db = sqlite3.connect(path, check_same_thread=False, timeout=peer_bridge.DB_TIMEOUT)
                 finally:
                     os.close(fd)
+            self.db.execute('PRAGMA secure_delete = ON')
             if fence is None and self.db.execute("SELECT 1 FROM main.sqlite_schema WHERE name='owner_attachment_namespace_identity'").fetchone():
                 raise OwnerGuardError('The retained owner namespace witness is unavailable.')
             self._attachment_guard = OwnerAttachmentGuard.probe(self.db, lock=self.lock)
@@ -165,6 +171,10 @@ class MessagingStore:
                     self._attachment_guard.require_schema()
                     self._attachment_guard.check_startup()
                 peer_bridge.shared_schema(self.db, peer_payload_readable=self._peer_payload_readable_at_startup)
+                peer_inbox.schema(self.db)
+                startup_now = peer_inbox.now_ms()
+                while peer_inbox.cleanup(self.db, startup_now) == peer_inbox.CLEANUP_ROWS:
+                    pass
             self.db.execute('CREATE TABLE IF NOT EXISTS controls (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
             self.db.execute('CREATE TABLE IF NOT EXISTS expired_controls (id TEXT PRIMARY KEY)')
             self.db.execute('CREATE TABLE IF NOT EXISTS request_fulfillments (request_id TEXT PRIMARY KEY, control_request_id TEXT NOT NULL, confirmed_at REAL NOT NULL)')
@@ -1124,6 +1134,170 @@ class MessagingStore:
         if row['state'] in ('queued', 'awaiting_reply') and time.time() - row['created'] > TTL:
             row.update(state='expired', error='No matching reply yet. Motet will keep checking without resending.')
 
+    def _previous_codex_envelope(self, row, path, st, project):
+        """Authenticate the retained envelope and original pin against admission."""
+        import peer_recovery
+
+        if not isinstance(project, str) or not os.path.isabs(project):
+            raise ValueError()
+        project = os.path.realpath(project)
+        tid = row['request_id']
+        with self.lock:
+            meta = peer_lifecycle.exact_admission(self.db, tid)
+            record = peer_lifecycle.get(self.db, tid)
+            if (not valid_uuid(tid) or not meta or not record or not self._timestamp(meta[2])
+                    or not peer_lifecycle.valid_payload(tid, row, meta) or meta[2] < meta[1]
+                    or (record['agent'], record['created']) != meta[:2]
+                    or record['evidence'].get('bound_turn') != row['bound_turn']):
+                raise ValueError()
+            envelope = row['envelope']
+            if meta[3] == 2:
+                client_id, = self.db.execute('SELECT client_id FROM shared_bridge_requests WHERE transport_id=?', (tid,)).fetchone()
+                key, = self.db.execute('SELECT ledger_key FROM shared_bridge_service WHERE singleton=1').fetchone()
+                ledger = peer_recovery.load_ledger(self.db, client_id, allow_retained=True)
+                if not peer_recovery.original_identity(ledger, path, st, project):
+                    raise ValueError()
+                return peer_recovery.envelope_proof(ledger, key, envelope)
+            sender_id, target_id, digest = self.db.execute(
+                'SELECT sender,target,payload_hash FROM peer_requests WHERE transport_id=?', (tid,)).fetchone()
+            sender = peer_bridge.principal(self.db, sender_id, active=False)
+            target = peer_bridge.principal(self.db, target_id, active=False)
+            question = row['question']
+            expected = peer_bridge.mac(sender['secret'], 'watch-peer-dedupe-v1', json.dumps([target_id, question], ensure_ascii=True))
+            if (target['identity'] != dict(path=path, device=st.st_dev, inode=st.st_ino)
+                    or target['project'] != project
+                    or not hmac.compare_digest(digest, expected)
+                    or envelope != peer_bridge.envelope(tid, sender['label'], question, 'codex')):
+                raise ValueError()
+            return envelope
+
+    def _previous_codex_terminal(self, row):
+        """Return an abort verdict for the consumed suffix, or None if incomplete."""
+        import peer_recovery
+
+        cursor, bound = row['cursor'], row['bound_turn']
+        if type(cursor) is not int or cursor <= 0:
+            raise ValueError()
+        if row.get('codex_tracking'):
+            # The live tracker validates the saved successor pin. A bounded
+            # read in the original rollout cannot prove the consumed interval.
+            return None
+        path, source, st, header = codex_transcript.open_pinned(self.sessions_dir, row['path'], row['agent'][2:])
+        with source:
+            if (st.st_dev, st.st_ino) != (row['device'], row['inode']) or st.st_size < cursor:
+                raise ValueError()
+            envelope = self._previous_codex_envelope(row, path, st, header.get('cwd'))
+            if row.get('codex_discard_record'):
+                if tuple(row['codex_discard_record']) != codex_transcript.segment_key(row):
+                    raise ValueError()
+                return None
+            start = max(0, cursor - MAX_READ)
+            source.seek(start)
+            raw = source.read(cursor - start)
+            expected = peer_recovery.fingerprint(st)
+            current = peer_recovery.fingerprint(os.stat(path, follow_symlinks=False))
+            if current[:2] != expected[:2]:
+                raise ValueError()
+            if current != expected or peer_recovery.fingerprint(os.fstat(source.fileno())) != expected:
+                # A live write to the same pinned file calls for a fresh proof.
+                raise BlockingIOError()
+            if len(raw) != cursor - start or not raw.endswith(b'\n'):
+                raise ValueError()
+
+        # The server-generated transport ID was minted after the admission
+        # cursor. An authenticated exact envelope anchors this suffix even
+        # though older rows no longer retain the initial cursor.
+        seen, aborted, incomplete, current_turn = False, False, False, None
+        # The first line of a clipped window may start inside a record.
+        for line in raw.split(b'\n')[1 if start else 0:-1]:
+            try:
+                event = peer_recovery.strict_json(line) if len(line) <= MAX_LINE else None
+            except (ValueError, RecursionError):
+                event = None
+            if not isinstance(event, dict):
+                incomplete, current_turn = True, None
+                continue
+            typ = event.get('type')
+            if typ in ('session_meta', 'world_state', 'token_usage_record', 'inter_agent_communication_metadata'):
+                continue
+            if typ not in ('event_msg', 'response_item', 'turn_context'):
+                incomplete |= seen
+                current_turn = None
+                continue
+            payload = event.get('payload')
+            if not isinstance(payload, dict):
+                incomplete, current_turn = True, None
+                continue
+            kind = payload.get('type')
+            context = typ == 'turn_context' or typ == 'event_msg' and kind == 'task_started'
+            user_message = typ == 'response_item' and kind == 'message' and payload.get('role') == 'user'
+            terminal = typ == 'event_msg' and kind in ('turn_aborted', 'task_aborted', 'task_complete')
+            if user_message:
+                text = codex_transcript.pure_text(payload.get('content'), 'user')
+                if text not in (envelope, envelope + '\n'):
+                    incomplete |= text is None and seen
+                    continue
+                if seen:
+                    raise ValueError()
+                seen = True
+            elif not context and not terminal:
+                continue
+            try:
+                turn = peer_recovery.codex_turn(payload)
+            except ValueError:
+                incomplete, current_turn = True, None
+                continue
+            if context:
+                current_turn = turn
+                incomplete |= seen and typ == 'event_msg' and current_turn == bound
+            elif user_message:
+                if turn and turn != bound:
+                    raise ValueError()
+                incomplete |= (turn or current_turn) != bound
+            elif not turn or payload.get('turn_id') != turn:
+                incomplete = True
+            elif turn == bound:
+                if kind == 'task_complete':
+                    raise ValueError()
+                incomplete |= not seen or aborted
+                aborted = True
+        return None if incomplete or not seen else aborted
+
+    def _check_previous_codex_terminal(self, row):
+        try:
+            aborted = self._previous_codex_terminal(row)
+        except (peer_bridge.PeerError, OSError, ValueError, TypeError, KeyError, RecursionError) as error:
+            if isinstance(error, (OSError, codex_transcript.TemporaryUnavailable)):
+                if row['state'] in ('queued', 'awaiting_reply') and time.time() - row['created'] > TTL:
+                    row.update(state='expired', error=CODEX_REPLY_EXPIRED)
+                elif not row.get('error'):
+                    row['error'] = CODEX_PREVIOUS_SOURCE_UNAVAILABLE
+                return False
+            row.update(state='unknown', capture_disposition='withheld', tracking_stopped=True,
+                       reply='', candidate_reply='', final='', final_turn='',
+                       error='Earlier Codex transcript records could not be verified. Reply withheld and recipient recovery is required.')
+        else:
+            if aborted is True:
+                self._withhold_codex_peer_end(row, interrupted=True)
+            elif aborted is None:
+                # A historical gap can hide an already-consumed abort. Wait
+                # for a new exact terminal and keep any reply text private.
+                row.update(codex_gap_seen=True, capture_disposition='withheld',
+                           reply='', candidate_reply='', final='', final_turn='',
+                           error='Earlier Codex transcript records are incomplete. Motet will keep checking for the original turn to end.')
+            elif row.get('error') == CODEX_PREVIOUS_SOURCE_UNAVAILABLE:
+                row['error'] = ''
+        return not row.get('tracking_stopped')
+
+    @staticmethod
+    def _withhold_codex_peer_end(row, *, interrupted=False):
+        gap_seen = row.get('codex_gap_seen') is True or row.get('codex_gap_needs_envelope') is True
+        if interrupted:
+            row['codex_abort_seen'] = True
+        row.update(settled=True, state='unknown', capture_disposition='withheld', tracking_stopped=True,
+                   reply='', candidate_reply='', final='', final_turn='',
+                   error=peer_lifecycle.withheld_message(gap=gap_seen, interrupted=interrupted))
+
     def _consume(self, row, data):
         p = data.get('payload')
         if not isinstance(p, dict):
@@ -1131,17 +1305,18 @@ class MessagingStore:
                 self._codex_gap(row)
             return
         typ = data.get('type')
-        if (row.get('origin') == 'peer' and row.get('codex_gap_needs_envelope')
+        kind = p.get('type')
+        gap_seen = row.get('codex_gap_seen') is True or row.get('codex_gap_needs_envelope') is True
+        if (row.get('origin') == 'peer' and typ == 'event_msg'
+                and kind in ('task_complete', 'turn_aborted', 'task_aborted')
+                and (gap_seen or kind != 'task_complete')
                 and isinstance(row.get('bound_turn'), str) and row['bound_turn']
-                and typ == 'event_msg' and p.get('type') in ('task_complete', 'turn_aborted', 'task_aborted')
                 and p.get('turn_id') == row['bound_turn']):
-            # The exact immutable turn ended. The gap still prevents capture;
-            # neither terminal answer text nor a correlation marker is needed.
-            row.update(settled=True, state='unknown', capture_disposition='withheld', tracking_stopped=True,
-                       reply='', candidate_reply='', final='', final_turn='',
-                       error='The identified turn ended, but transcript gaps prevent a trustworthy reply; reply content is withheld.')
+            # The exact immutable turn ended. A gap or abort leaves no safe
+            # reply to capture, even if this event includes answer text.
+            self._withhold_codex_peer_end(row, interrupted=kind != 'task_complete')
             return
-        if typ == 'event_msg' and p.get('type') == 'task_started':
+        if typ == 'event_msg' and kind == 'task_started':
             row['current_turn'] = p.get('turn_id') if isinstance(p.get('turn_id'), str) else ''
             if row.get('codex_gap_needs_envelope'):
                 row['codex_post_gap_start'] = row['current_turn']
@@ -1153,7 +1328,7 @@ class MessagingStore:
                     starts[:] = starts[-127:] + [row['current_turn']]
         elif typ == 'turn_context' and isinstance(p.get('turn_id'), str):
             row['current_turn'] = p['turn_id']
-        elif typ == 'response_item' and p.get('type') == 'message':
+        elif typ == 'response_item' and kind == 'message':
             content = p.get('content', [])
             if row.get('origin') == 'peer':
                 text = codex_transcript.pure_text(content, p.get('role'))
@@ -1211,6 +1386,7 @@ class MessagingStore:
                 if row.get('codex_gap_needs_envelope'):
                     if not explicit and row.get('codex_post_gap_start') != turn:
                         return
+                    row['codex_gap_seen'] = True  # Also upgrade held rows from earlier versions.
                     row['codex_gap_needs_envelope'] = False
                 if row.get('origin') == 'peer':
                     if (turn not in row.get('peer_turn_starts', []) or turn in row.get('peer_foreign_turns', [])
@@ -1222,7 +1398,7 @@ class MessagingStore:
                 row['state'] = 'awaiting_reply'
             elif p.get('role') == 'assistant' and p.get('phase') == 'final_answer' and turn and turn == row['bound_turn']:
                 row['final'], row['final_turn'] = text[:16000], turn
-        elif typ == 'event_msg' and p.get('type') == 'task_complete' and p.get('turn_id') and p['turn_id'] == row['bound_turn']:
+        elif typ == 'event_msg' and kind == 'task_complete' and p.get('turn_id') and p['turn_id'] == row['bound_turn']:
             if row.get('codex_gap_needs_envelope'):
                 return
             answer = p.get('last_agent_message') or (row['final'] if row.get('final_turn') == row['bound_turn'] else '')
@@ -1242,7 +1418,7 @@ class MessagingStore:
 
     @staticmethod
     def _codex_gap(row):
-        row.update(peer_mixed_input=True, capture_disposition='withheld',
+        row.update(peer_mixed_input=True, capture_disposition='withheld', codex_gap_seen=True,
                    codex_gap_needs_envelope=True, codex_post_gap_start='', current_turn='', state='unknown',
                    error='An unreadable transcript record was skipped; reply content will be withheld.')
 
@@ -1251,6 +1427,12 @@ class MessagingStore:
             return
         if row.get('runtime') == 'claude':
             return self._poll_claude(row)
+        peer = row.get('origin') == 'peer' and row.get('runtime') == 'codex'
+        if peer and row.get('bound_turn') and not row.get('settled'):
+            current = codex_transcript.segment(row)
+            checkpoint = [current.get(key) for key in ('device', 'inode', 'cursor')]
+            if row.get('codex_peer_terminal_checked') != checkpoint and not self._check_previous_codex_terminal(row):
+                return
         try:
             opened = codex_transcript.tracking_source(self.sessions_dir, row, MAX_READ)
             if opened is None:
@@ -1302,8 +1484,12 @@ class MessagingStore:
             row.update(state='unknown', error=str(error))
         except (OSError, MessagingError):
             row['error'] = 'The transcript is unavailable; Motet will keep checking for a reply.'
+        finally:
+            if peer and row.get('bound_turn'):
+                current = codex_transcript.segment(row)
+                row['codex_peer_terminal_checked'] = [current.get(key) for key in ('device', 'inode', 'cursor')]
         if row['state'] in ('queued', 'awaiting_reply') and time.time() - row['created'] > TTL:
-            row.update(state='expired', error='No matching reply yet. The question may still be queued; Motet will not resend.')
+            row.update(state='expired', error=CODEX_REPLY_EXPIRED)
 
     def _worker_current(self, row):
         # A detached worker selection is never sufficient to launch a protected
@@ -1333,6 +1519,7 @@ class MessagingStore:
             try:
                 with self.db:
                     self.mods.maintain()
+                    peer_inbox.cleanup(self.db)
                 rows = self._prune(self._rows(), time.time())
             except (sqlite3.OperationalError, OwnerGuardError):
                 self.db.rollback()

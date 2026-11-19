@@ -12,7 +12,9 @@ from unittest.mock import patch, Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import codex_transcript as c
 import officer_messaging as m
+import peer_bridge
 import peer_lifecycle
+from peer_recovery import directory_hash
 
 
 class FilenameTests(unittest.TestCase):
@@ -29,6 +31,24 @@ class FilenameTests(unittest.TestCase):
         self.assertEqual(c.pure_text([dict(type='input_text', text='Fictional instruction.')], 'developer'), 'Fictional instruction.')
         self.assertIsNone(c.pure_text([dict(part, image_url='fictional')], 'assistant'))
         self.assertIsNone(c.pure_text([dict(part, annotations='malformed')], 'assistant'))
+
+
+class IndexErrorTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(sqlite3, 'SQLITE_LOCKED'), 'SQLite exception codes require Python 3.11')
+    def test_index_lock_codes_take_precedence_over_messages(self):
+        error = sqlite3.OperationalError('Fictional SQLite diagnostic')
+        for code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED | 0x100):
+            error.sqlite_errorcode = code
+            self.assertTrue(c._sqlite_index_locked(error))
+        error = sqlite3.OperationalError('database is locked')
+        error.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+        self.assertFalse(c._sqlite_index_locked(error))
+
+    def test_index_lock_diagnostics_on_older_python_are_exact(self):
+        self.assertTrue(c._sqlite_index_locked(sqlite3.OperationalError('database is locked')))
+        self.assertTrue(c._sqlite_index_locked(sqlite3.OperationalError('database table is locked: threads')))
+        self.assertFalse(c._sqlite_index_locked(sqlite3.OperationalError('Fictional database is locked label')))
+        self.assertFalse(c._sqlite_index_locked(sqlite3.DatabaseError('database is locked')))
 
 
 @unittest.skipIf(os.name == 'nt', 'POSIX native metadata and private messaging storage')
@@ -342,6 +362,365 @@ class TranscriptTests(unittest.TestCase):
 
     def test_native_bound_gap_task_abort_releases_capacity(self):
         self.native_bound_gap_abort('task_aborted')
+
+    def assert_durable_peer_end(self, *, gap, version=2):
+        self.row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assert_withheld_completion()
+        record = peer_lifecycle.get(self.store.db, self.rid)
+        self.assertEqual((record['execution'], record['capture']), ('completed', 'withheld'))
+        self.assertEqual(record['evidence']['bound_turn'], 'bound')
+        self.assertIs(record['evidence'].get('codex_gap_seen', False), gap)
+        self.assertIsNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+        result = self.public_result(version)
+        self.assertEqual((result['state'], result['reply']), ('unknown', ''))
+        self.assertEqual('transcript gaps' in result['error'], gap)
+
+    def test_native_gap_then_exact_binding_and_turn_abort_in_one_tick(self):
+        self.admit()
+        self.oversized(self.old, 900)
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.append(self.old, 'response_item', dict(type='message', role='user', content=[dict(text=self.row['envelope'])]))
+        self.append(self.old, 'event_msg', dict(type='turn_aborted', turn_id='bound'))
+        terminal_offset = self.old.stat().st_size
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional late answer.'))
+        with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 2000):
+            with patch.object(m.subprocess, 'Popen') as launch:
+                self.store.tick(); self.store.tick()
+                launch.assert_not_called()
+        row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(c.segment(row)['cursor'], terminal_offset)
+        self.assert_durable_peer_end(gap=True)
+
+    def test_native_gap_then_exact_binding_and_task_abort_after_restart(self):
+        self.admit()
+        self.oversized(self.old, 900)
+        with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 1600):
+            with patch.object(m.subprocess, 'Popen') as launch:
+                self.store.tick(); self.store.close()
+                self.store = m.MessagingStore(str(self.root / 'watch'), str(self.sessions))
+                self.message(self.old, 'bound', self.row['envelope'])
+                self.store.tick()
+                self.assertEqual(self.public_result(2)['state'], 'awaiting_reply')
+                self.append(self.old, 'event_msg', dict(type='task_aborted', turn_id='bound'))
+                self.store.tick()
+                launch.assert_not_called()
+        self.assert_durable_peer_end(gap=True)
+
+    def test_native_clean_abort_requires_exact_original_binding(self):
+        self.admit(version=1)
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.append(self.old, 'event_msg', dict(type='task_aborted', turn_id='bound'))
+        self.store.tick()
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'submitted')
+        self.message(self.old, 'bound', self.row['envelope'])
+        for fields in ({}, {'turn_id': ''}, {'turn_id': 'other'}, {'turn_id': ['bound']}):
+            self.append(self.old, 'event_msg', dict(type='turn_aborted', **fields))
+        self.store.tick()
+        self.assertEqual(self.public_result(1)['state'], 'awaiting_reply')
+        self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+        self.append(self.old, 'event_msg', dict(type='turn_aborted', turn_id='bound'))
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False, version=1)
+        self.assertIn('was interrupted', self.public_result(1)['error'])
+
+    def test_native_gap_then_exact_binding_and_completion_persists_gap_in_one_tick(self):
+        self.admit()
+        self.oversized(self.old, 900)
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional withheld answer.'))
+        with patch.object(m, 'MAX_LINE', 300), patch.object(m, 'MAX_READ', 1600):
+            self.store.tick()
+        self.assert_durable_peer_end(gap=True)
+
+    def retain_previous_worker_binding(self, terminal=None, *, version=2, prefix=()):
+        self.client_id, self.sender_id = str(uuid.uuid4()), str(uuid.uuid4())
+        identity = {key: self.row[key] for key in ('path', 'device', 'inode')}
+        project, name, question = str(self.root), 'Fictional recipient', 'Fictional request'
+        if version == 2:
+            credential = peer_bridge.initialize_service(self.store.db, {'history_days': 'all'})
+            revision = directory_hash(['codex', self.ident, project, name, identity])
+            snapshot = dict(agent_id=self.row['agent'], name=name, provider='codex',
+                            project_id=directory_hash(['watch-project-v1', project]), identity_revision=revision)
+            digest = self.store.shared._hash(self.row['agent'], revision, question, None)
+            self.row.update(bridge_version=2, envelope=peer_bridge.shared_envelope(self.rid, None, question, 'codex'))
+            self.store.db.execute('INSERT INTO shared_bridge_requests VALUES (?,?,?,?,?,?,?,?,?)',
+                (self.client_id, self.row['agent'], json.dumps(snapshot), digest, self.rid, credential['credential_id'],
+                 self.row['created'], self.row['created'], question))
+        else:
+            sender = peer_bridge.enroll(self.store.db, 'Fictional sender', 'codex', str(uuid.uuid4()), project, identity)
+            target = peer_bridge.enroll(self.store.db, name, 'codex', self.ident, project, identity)
+            self.sender_id = sender['endpoint_id']
+            digest = peer_bridge.mac(sender['secret'], 'watch-peer-dedupe-v1', json.dumps([target['endpoint_id'], question]))
+            self.row.update(envelope=peer_bridge.envelope(self.rid, 'Fictional sender', question, 'codex'))
+            self.store.db.execute('INSERT INTO peer_requests VALUES (?,?,?,?,?,?,?)',
+                (self.sender_id, self.client_id, target['endpoint_id'], digest, self.rid,
+                 self.row['created'], self.row['created']))
+        self.row['question'] = question
+        self.store._save(self.row)
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        for kind, payload in prefix:
+            self.append(self.old, kind, payload)
+        if terminal:
+            self.append(self.old, 'event_msg', terminal)
+
+        consume, poll = self.store._consume, self.store._poll
+        def previous_consume(row, event):
+            if not terminal or event.get('payload') != terminal:
+                consume(row, event)
+
+        def previous_worker(row):
+            with patch.object(self.store, '_consume', previous_consume):
+                poll(row)
+            row.pop('codex_peer_terminal_checked', None)
+
+        with patch.object(self.store, '_poll', previous_worker), patch.object(self.store, '_check_previous_codex_terminal', return_value=True):
+            for _ in range(8):
+                self.store.tick()
+                self.row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+                if c.segment(self.row)['cursor'] == self.old.stat().st_size:
+                    break
+        self.assertEqual(c.segment(self.row)['cursor'], self.old.stat().st_size)
+        self.assertEqual(self.row['bound_turn'], 'bound')
+        self.assertIn(peer_lifecycle.get(self.store.db, self.rid)['execution'], ('running', 'uncertain'))
+        self.store.close()
+        self.store = m.MessagingStore(str(self.root / 'watch'), str(self.sessions))
+
+    def test_previous_worker_abort_settles_before_late_completion(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False)
+        self.assertIn('was interrupted', self.public_result(2)['error'])
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional late answer.'))
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False)
+        self.assertIn('was interrupted', self.public_result(2)['error'])
+
+    def test_previous_worker_abort_accepts_symlinked_project(self):
+        alias = self.root / 'project-link'
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.old.write_bytes(b'')
+        self.append(self.old, 'session_meta', dict(self.meta, cwd=str(alias)))
+        self.row['cursor'] = self.old.stat().st_size
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        self.pointer(self.old, cwd=str(alias))
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False)
+
+    def assert_held_reply_tracks_to_exact_end(self, path):
+        self.store.tick()
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertFalse(saved.get('tracking_stopped'))
+        self.assertFalse(saved.get('settled'))
+        self.assertTrue(saved.get('codex_gap_seen'))
+        self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+        self.assertEqual(self.public_result(2)['reply'], '')
+        self.append(path, 'event_msg', dict(type='task_complete', turn_id='other'))
+        self.store.tick()
+        self.assertIsNotNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+        self.append(path, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional withheld answer.'))
+        with patch.object(m.subprocess, 'Popen') as launch:
+            self.store.tick()
+            launch.assert_not_called()
+        self.assert_durable_peer_end(gap=True)
+        self.assertNotIn('was interrupted', self.public_result(2)['error'])
+
+    def test_previous_worker_compacted_prefix_tracks_to_exact_end(self):
+        self.retain_previous_worker_binding(prefix=[('compacted', {'message': 'Fictional compaction'})])
+        self.assert_held_reply_tracks_to_exact_end(self.old)
+
+    def test_previous_worker_envelope_outside_window_tracks_to_exact_end(self):
+        self.retain_previous_worker_binding(prefix=[('event_msg', {'type': 'agent_reasoning', 'text': 'x' * 900_000})] * 3)
+        self.assertGreater(self.row['cursor'], m.MAX_READ)
+        self.assert_held_reply_tracks_to_exact_end(self.old)
+
+    def test_previous_worker_consumed_image_tracks_to_exact_end(self):
+        image = dict(type='message', role='user', content=[dict(type='input_image', image_url='fixture')])
+        self.retain_previous_worker_binding(prefix=[('response_item', image)])
+        self.assert_held_reply_tracks_to_exact_end(self.old)
+
+    def test_previous_worker_successor_tracks_to_exact_end(self):
+        self.retain_previous_worker_binding()
+        self.successor()
+        with patch.object(self.store, '_check_previous_codex_terminal', return_value=True):
+            self.store.tick()
+            self.store.tick()
+        self.row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(self.row['codex_tracking']['path'], str(self.new))
+        self.row.pop('codex_peer_terminal_checked')
+        self.store._save(self.row)
+        self.assert_held_reply_tracks_to_exact_end(self.new)
+
+    def test_previous_worker_partial_discard_tracks_to_exact_end(self):
+        self.retain_previous_worker_binding()
+        with self.old.open('ab') as source:
+            source.write(b'{"type":"compacted","payload":{"message":"' + b'x' * 2_000)
+        with patch.object(m, 'MAX_LINE', 400), patch.object(m, 'MAX_READ', 800):
+            with patch.object(self.store, '_check_previous_codex_terminal', return_value=True):
+                self.store.tick()
+            self.row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+            self.assertTrue(self.row.get('codex_discard_record'))
+            self.row.pop('codex_peer_terminal_checked')
+            self.store._save(self.row)
+        with self.old.open('ab') as source:
+            source.write(b'"}}\n')
+        self.assert_held_reply_tracks_to_exact_end(self.old)
+
+    def assert_previous_proof_waiting(self):
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(saved['cursor'], self.row['cursor'])
+        self.assertFalse(saved.get('tracking_stopped'))
+        self.assertNotIn('codex_peer_terminal_checked', saved)
+        self.assertEqual(self.public_result(2)['reply'], '')
+
+    def test_previous_worker_abort_recovers_when_original_transcript_returns(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        original = self.root / 'temporarily-moved'
+        self.old.rename(original)
+        with patch.object(m.subprocess, 'Popen') as launch:
+            self.store.tick()
+            self.assert_previous_proof_waiting()
+            self.store.close()
+            self.store = m.MessagingStore(str(self.root / 'watch'), str(self.sessions))
+            self.append(original, 'event_msg', dict(type='task_complete', turn_id='bound',
+                        last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional late answer.'))
+            original.rename(self.old)
+            self.store.tick()
+            launch.assert_not_called()
+        self.assert_durable_peer_end(gap=False)
+
+    def test_previous_worker_retries_when_pinned_transcript_grows_during_proof(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        stat = os.stat
+
+        def append_before_stat(path, *args, **kwargs):
+            if path == str(self.old) and kwargs.get('follow_symlinks') is False:
+                self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                            last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional late answer.'))
+            return stat(path, *args, **kwargs)
+
+        with patch.object(m.os, 'stat', append_before_stat):
+            self.store.tick()
+        self.assert_previous_proof_waiting()
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False)
+
+    def test_previous_worker_retries_when_native_index_is_locked(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        self.pointer(self.old)
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional late answer.'))
+        with patch.object(m.subprocess, 'Popen') as launch:
+            lock = sqlite3.connect(self.root / 'state_5.sqlite')
+            try:
+                lock.execute('BEGIN EXCLUSIVE')
+                self.store.tick()
+                self.assert_previous_proof_waiting()
+            finally:
+                lock.close()
+            self.store.tick()
+            launch.assert_not_called()
+        self.assert_durable_peer_end(gap=False)
+
+    def test_previous_worker_retries_when_native_index_changes_during_validation(self):
+        self.retain_previous_worker_binding(dict(type='task_aborted', turn_id='bound'))
+        self.pointer(self.old)
+        before = c.index(str(self.root), self.ident)
+        with patch.object(c, 'index', side_effect=[before, None]):
+            self.store.tick()
+        self.assert_previous_proof_waiting()
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False)
+
+    def assert_previous_proof_held(self):
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertTrue(saved.get('tracking_stopped'))
+        self.assertEqual(saved['cursor'], self.row['cursor'])
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'uncertain')
+        result = self.public_result(2)
+        self.assertEqual((result['state'], result['reply']), ('unknown', ''))
+
+    def test_previous_worker_holds_when_native_index_is_corrupt(self):
+        self.retain_previous_worker_binding(dict(type='task_aborted', turn_id='bound'))
+        (self.root / 'state_5.sqlite').write_bytes(b'Fictional invalid SQLite header')
+        self.store.tick()
+        self.assert_previous_proof_held()
+
+    def test_previous_worker_holds_when_native_index_selects_another_transcript(self):
+        self.retain_previous_worker_binding(dict(type='task_aborted', turn_id='bound'))
+        self.pointer(self.new)
+        self.store.tick()
+        self.assert_previous_proof_held()
+
+    def test_previous_worker_holds_when_prefix_has_exact_completion(self):
+        self.retain_previous_worker_binding(dict(type='task_complete', turn_id='bound'))
+        self.store.tick()
+        self.assert_previous_proof_held()
+
+    def test_previous_worker_holds_when_prefix_has_duplicate_envelope(self):
+        self.retain_previous_worker_binding()
+        self.message(self.old, 'bound', self.row['envelope'])
+        with patch.object(self.store, '_check_previous_codex_terminal', return_value=True):
+            self.store._poll(self.row)
+        self.row.pop('codex_peer_terminal_checked')
+        self.store._save(self.row)
+        self.store.tick()
+        self.assert_previous_proof_held()
+
+    def test_previous_worker_legacy_abort_settles_with_legacy_admission(self):
+        self.retain_previous_worker_binding(dict(type='task_aborted', turn_id='bound'), version=1)
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False, version=1)
+
+    def test_previous_worker_ambiguous_abort_cannot_publish_late_reply(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted'))
+        self.assert_held_reply_tracks_to_exact_end(self.old)
+
+    def test_previous_worker_bounded_recovery_requires_original_envelope(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        with patch.object(m, 'MAX_READ', 100):
+            self.store.tick()
+        self.assert_held_reply_tracks_to_exact_end(self.old)
+
+    def test_previous_worker_abort_requires_authentic_admission_envelope(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        self.store.db.execute('UPDATE shared_bridge_requests SET payload_hash=? WHERE transport_id=?', ('f' * 64, self.rid))
+        self.store.db.commit()
+        self.store.tick()
+        result = self.public_result(2)
+        self.assertEqual((result['state'], result['reply']), ('unknown', ''))
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'uncertain')
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertTrue(saved['tracking_stopped'])
+
+    def test_previous_worker_abort_rejects_transcript_replacement(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        replacement = self.root / 'replacement'
+        replacement.write_bytes(self.old.read_bytes())
+        os.replace(replacement, self.old)
+        self.store.tick()
+        result = self.public_result(2)
+        self.assertEqual((result['state'], result['reply']), ('unknown', ''))
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'uncertain')
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertTrue(saved['tracking_stopped'])
+
+    def test_previous_worker_unrelated_abort_allows_original_reply(self):
+        self.retain_previous_worker_binding(dict(type='task_aborted', turn_id='other'))
+        self.store.tick()
+        self.store.close()
+        self.store = m.MessagingStore(str(self.root / 'watch'), str(self.sessions))
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional actual answer.'))
+        with patch.object(self.store, '_check_previous_codex_terminal') as recheck:
+            self.store.tick()
+            recheck.assert_not_called()
+        result = self.public_result(2)
+        self.assertEqual((result['state'], result['reply']), ('answered', 'Fictional actual answer.'))
 
     def test_gap_end_requires_exact_nonempty_binding(self):
         baseline = dict(self.row)

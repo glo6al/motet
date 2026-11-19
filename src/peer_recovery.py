@@ -19,6 +19,7 @@ import stat
 from datetime import datetime
 from urllib.parse import quote
 
+import claude_mod
 import codex_transcript
 import peer_bridge
 import peer_lifecycle
@@ -211,9 +212,9 @@ def records(source):
     fail('Native transcript exceeds the record bound.')
 
 
-def compact_envelope(tid, sender, text, *, ensure_ascii=False, legacy_brand=False):
+def compact_envelope(tid, sender, text, *, ensure_ascii=False, legacy_brand=False, legacy_sending_rule=False):
     return peer_bridge.shared_envelope(tid, sender, text, 'codex', ensure_ascii=ensure_ascii,
-                                       legacy_brand=legacy_brand)
+                                       legacy_brand=legacy_brand, legacy_sending_rule=legacy_sending_rule)
 
 
 def legacy_envelope(tid, sender, text):
@@ -265,8 +266,9 @@ def envelope_proof(ledger, key, envelope, *, trailing_lf=False):
                 # below still binds the intended sender, target, identity and message.
                 if make is compact_envelope:
                     variants = [make(ledger['transport_id'], sender, text, ensure_ascii=ascii_only,
-                                     legacy_brand=legacy_brand)
-                                for legacy_brand in (False, True) for ascii_only in (False, True)]
+                                     legacy_brand=legacy_brand, legacy_sending_rule=old_rule)
+                                for legacy_brand in (False, True) for ascii_only in (False, True)
+                                for old_rule in (False, True)]
                 else:
                     variants = [make(ledger['transport_id'], sender, text)]
                 if original not in variants:
@@ -428,6 +430,14 @@ def claude_candidates(root, native):
         fail('Claude transcript inventory is unavailable.')
 
 
+def claude_answer(answer, transport_id):
+    try:
+        claude_mod.reply_text(answer, transport_id)
+    except claude_mod.ReceiptError:
+        return False
+    return True
+
+
 def claude_proof(db, ledger, key, root, store_path, sources):
     if not root or not store_path:
         fail('Claude projects root and exact plugin store file are required.')
@@ -440,9 +450,11 @@ def claude_proof(db, ledger, key, root, store_path, sources):
     if not isinstance(store, dict) or len(store) > 4096:
         fail('Claude receipt store is invalid or exceeds its bound.')
     found = []
-    prefix = 'watch-owner-runtime-v2:' + ledger['target'][2:] + ':'
+    prefixes = {f'watch-owner-runtime-v{version}:' + ledger['target'][2:] + ':': version
+                for version in (2, 3)}
     for namespace, shard in store.items():
-        if not namespace.startswith(prefix):
+        prefix = next((prefix for prefix in prefixes if namespace.startswith(prefix)), None)
+        if prefix is None:
             continue
         if not uuid(namespace[len(prefix):]):
             fail('Claude receipt namespace is invalid.')
@@ -451,29 +463,47 @@ def claude_proof(db, ledger, key, root, store_path, sources):
         rc = shard['requests'].get(ledger['transport_id'])
         if rc is None:
             continue
-        if (shard.get('version') != 2 or shard.get('mode') != 'derived' or not uuid(shard.get('grant_id'))
+        current = prefixes[prefix] == 3 and isinstance(rc, dict) and rc.get('lifecycle_protocol') == 2
+        valid_turn = claude_mod.turn_id if current else uuid
+        if (shard.get('version') != prefixes[prefix] or shard.get('mode') != 'derived' or not uuid(shard.get('grant_id'))
                 or type(shard.get('active')) is not bool or not isinstance(shard.get('acknowledged'), dict)
                 or any(not HEX.fullmatch(k) or v is not True for k,v in shard['acknowledged'].items())
                 or not isinstance(rc, dict) or rc.get('request_id') != ledger['transport_id']
-                or rc.get('phase') != 'answered' or rc.get('completed') is not True or rc.get('attempted') is not True
+                or rc.get('phase') != ('completed' if current else 'answered')
+                or rc.get('completed') is not True or rc.get('attempted') is not True
                 or not isinstance(rc.get('events'), list) or len(rc['events']) > 8
                 or type(rc.get('expires_at')) not in (int,float) or not math.isfinite(rc['expires_at']) or rc['expires_at'] <= ledger['launched']
                 or shard.get('native_id') != ledger['target'][2:]
-                or not all(uuid(v) for v in (shard.get('enrollment_id'), rc.get('attempt_id'), rc.get('generation'), rc.get('turn_id')))
+                or not all(uuid(v) for v in (shard.get('enrollment_id'), rc.get('attempt_id'), rc.get('generation')))
+                or not valid_turn(rc.get('turn_id'))
                 or not isinstance(rc.get('envelope_digest'), str) or not HEX.fullmatch(rc['envelope_digest'])):
             fail('Claude requires an exact retained completed receipt; unknown receipts are excluded.')
+        if current and (rc.get('origin') != 'peer' or rc.get('execution_completed') is not True
+                        or rc.get('capture') != 'answered'):
+            fail('Claude requires an exact retained answered completion.')
+        completed = False
         for event in rc['events']:
+            if current and isinstance(event, dict) and event.get('kind') == 'completed':
+                if (completed or set(event) != {'request_id', 'attempt_id', 'kind', 'turn_id', 'outcome', 'answer',
+                                                'event_id', 'occurred_at'}
+                        or event['request_id'] != rc['request_id'] or event['attempt_id'] != rc['attempt_id']
+                        or event['turn_id'] != rc['turn_id'] or event['outcome'] != 'answered'
+                        or not uuid(event['event_id']) or type(event['occurred_at']) is not int
+                        or not 0 <= event['occurred_at'] <= 9007199254740991
+                        or not claude_answer(event['answer'], ledger['transport_id'])):
+                    fail('Claude lifecycle event contradicts its original completion.')
+                completed = True
+                continue
             if not isinstance(event, dict) or event.get('kind') not in ('submitted','started','answered','unknown','dropped'):
                 fail('Claude receipt contains an unsupported event.')
             kind = event['kind']
             fields = {'request_id','attempt_id','kind'} | ({'turn_id'} if kind in ('started','answered') else set()) | ({'answer'} if kind == 'answered' else set())
             if (set(event) != fields or event['request_id'] != rc['request_id'] or event['attempt_id'] != rc['attempt_id']
-                    or kind in ('started','answered') and event['turn_id'] != rc['turn_id'] or kind == 'dropped'):
+                    or kind in ('started','answered') and event['turn_id'] != rc['turn_id']
+                    or kind == 'dropped' or current and kind == 'answered'):
                 fail('Claude receipt event contradicts its original completion.')
             if kind == 'answered':
-                answer = event['answer']
-                if (not isinstance(answer,str) or len(answer)>16000
-                        or [line for line in answer.splitlines() if 'WATCH_REPLY' in line] != ['WATCH_REPLY '+ledger['transport_id']]):
+                if not claude_answer(event['answer'], ledger['transport_id']):
                     fail('Claude receipt answer has invalid correlation.')
         enrollment = db.execute('SELECT agent,project,token_hash,grant_id FROM claude_mod_enrollments WHERE id=?', (shard['enrollment_id'],)).fetchone()
         token = shard.get('token')
@@ -516,9 +546,7 @@ def claude_proof(db, ledger, key, root, store_path, sources):
                 if isinstance(blocks, list):
                     texts = [b.get('text') for b in blocks if isinstance(b, dict) and b.get('type') == 'text']
                     if any(isinstance(t, str) and 'WATCH_REPLY ' + ledger['transport_id'] in t for t in texts):
-                        marker = 'WATCH_REPLY ' + ledger['transport_id']
-                        if (len(texts) != 1 or not isinstance(texts[0], str) or len(texts[0]) > 16000
-                                or [line for line in texts[0].splitlines() if 'WATCH_REPLY' in line] != [marker]
+                        if (len(texts) != 1 or not claude_answer(texts[0], ledger['transport_id'])
                                 or node['session'] != ledger['target'][2:] or node['sidechain'] is not False):
                             fail('Claude final response has ambiguous correlation or native identity.')
                         answers[ident] = {'uuid': ident, 'record_hash': record_hash, 'time': stamp(data.get('timestamp'))}

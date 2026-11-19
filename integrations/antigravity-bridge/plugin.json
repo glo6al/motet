@@ -1,0 +1,4 @@
+{
+  "name": "motet-bridge",
+  "description": "Exchange owner-authorized requests with Codex and Claude, with an optional shared pull inbox for Antigravity."
+}

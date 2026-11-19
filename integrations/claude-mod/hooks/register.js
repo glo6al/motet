@@ -1,4 +1,4 @@
-import {UUID, LIMITATION, TRANSITIONS, pairing, sessionResponse, validClaim, matchingPrompt, matchingAnswer, publicStatus, globalConfiguration, receiptRecord, surfaceRoster, validNoticeClaim, noticeReceipt, lifecycleReceipt} from './protocol.js';
+import {UUID, LIMITATION, TRANSITIONS, MAX_RECEIPT_REJECTIONS, pairing, sessionResponse, validClaim, matchingPrompt, matchingAnswer, turnIdentifier, publicStatus, globalConfiguration, receiptRecord, surfaceRoster, validNoticeClaim, noticeReceipt, lifecycleReceipt} from './protocol.js';
 
 const GLOBAL_KEY = 'watch-owner-global-v1';
 const legacyKey = id => 'watch-owner-v1:' + id;
@@ -7,14 +7,21 @@ const legacyShardPrefix = id => 'watch-owner-runtime-v2:' + id + ':';
 const shardPrefix = id => 'watch-owner-runtime-v3:' + id + ':';
 const noticePrefix = id => 'watch-reply-notice-runtime-v1:' + id + ':';
 const MAX_DATA = 4 * 1024 * 1024;
+const REJECTED_RECEIPT_RETRY_MS = 30000;
 const copy = value => JSON.parse(JSON.stringify(value));
 const configurationId = value => value ? JSON.stringify([value.grant_id,value.grant,value.port]) : '';
+const validConflictIds = value => value === undefined ||
+  Array.isArray(value) && value.every(id => typeof id === 'string' && UUID.test(id));
 
 function trimHistory(state, data) {
-  let excess = Object.keys(data.requests).length - 32;
-  for (const request of Object.values(data.requests)) {
+  const requests = Object.values(data.requests);
+  // Held proof keeps its own space within the byte cap, independently of history.
+  const held = request => Object.values(request.rejections || {}).some(result => result.count >= MAX_RECEIPT_REJECTIONS) ||
+    data.conflict_ids?.includes(request.request_id);
+  let excess = requests.filter(request => !held(request)).length - 32;
+  for (const request of requests) {
     if (excess <= 0) break;
-    if (request !== state.flight && !request.events.length && (request.execution_completed || ['answered','dropped'].includes(request.phase))) {
+    if (!held(request) && request !== state.flight && !request.events.length && (request.execution_completed || ['answered','dropped'].includes(request.phase))) {
       delete data.requests[request.request_id]; excess -= 1;
     }
   }
@@ -46,15 +53,17 @@ async function post($, state, path, body, options = {}) {
     try {
       const response = await $.http.fetch('http://127.0.0.1:' + port + '/claude-mod/' + path,
         {method:'POST',headers,body:JSON.stringify(body)});
-      if (typeof response.text !== 'string' || response.text.length > 650000) throw Error('Invalid Motet response.');
-      const value = JSON.parse(response.text);
       if (!response.ok) {
         const error = Error('Motet service unavailable.');
+        let value;
+        try {if (typeof response.text === 'string' && response.text.length <= 650000) value = JSON.parse(response.text);}
+        catch { /* The HTTP status still distinguishes a request rejection. */ }
         error.code = typeof value?.error_code === 'string' ? value.error_code : '';
         error.status = response.status;
         throw error;
       }
-      return value;
+      if (typeof response.text !== 'string' || response.text.length > 650000) throw Error('Invalid Motet response.');
+      return JSON.parse(response.text);
     } finally {state.networkBusy = false;}
   });
   state.network = operation.catch(() => {});
@@ -70,6 +79,7 @@ function stop(state) {
   state.peerProtocol = 0;
   state.noticeProtocol = 0;
   state.lifecycleProtocol = 0;
+  state.recoverableTurns = [];
   state.epoch += 1;
 }
 
@@ -93,6 +103,16 @@ async function fingerprint(value) {
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2,'0')).join('');
 }
 
+function canonicalReceipt(value) {
+  if (value.kind !== 'completed') return value;
+  const {request_id, attempt_id, kind, turn_id, outcome, answer, event_id, occurred_at} = value;
+  return {request_id, attempt_id, kind, turn_id, outcome, answer, event_id, occurred_at};
+}
+
+function isUsableCompletion(value) {
+  return value.kind === 'completed' && value.outcome === 'answered' && matchingAnswer(value.answer, value.request_id);
+}
+
 async function event($, state, request, kind, extras = {}, reason = '') {
   const data = state.data, at = await $.clock.now();
   if (state.data !== data || data.requests[request.request_id] !== request) throw Error('Motet receipt identity changed.');
@@ -113,30 +133,111 @@ async function event($, state, request, kind, extras = {}, reason = '') {
   if (state.data === data) flush($, state).catch(() => {state.error = 'Motet event delivery interrupted; retained receipts will be retried without resubmitting.';});
 }
 
-async function flush($, state) {
-  if (state.flushing || !state.connected) return;
+async function flush($, state, retryRequest = null) {
+  if (state.flushing || state.recovering || !state.connected) return;
   const data = state.data, epoch = state.epoch;
   state.flushing = true;
   try {
-    for (const request of Object.values(data.requests)) {
-      while (request.events.length && state.connected && state.data === data && state.epoch === epoch) {
-        const value = request.events[0];
-        if (value.kind === 'completed' && state.lifecycleProtocol !== 2) throw Error('Motet lifecycle recovery requires a compatible bridge.');
-        await post($, state, 'event', {...value,...identityBody(state)});
+    for (const request of retryRequest ? [retryRequest] : Object.values(data.requests)) {
+      if (data.conflict_ids?.includes(request.request_id)) continue;
+      let index = 0;
+      while (index < request.events.length) {
+        if (state.recovering || !state.connected || state.data !== data || state.epoch !== epoch) return;
+        const value = request.events[index], receipt = canonicalReceipt(value);
+        let hash = Object.keys(request.rejections || {}).length ? await fingerprint(receipt) : null;
+        const rejection = request.rejections?.[hash];
+        if (retryRequest ? rejection?.count !== MAX_RECEIPT_REJECTIONS :
+            rejection && (rejection.count >= MAX_RECEIPT_REJECTIONS || await $.clock.now() < rejection.retry_at)) {
+          index += 1;
+          continue;
+        }
+        if (state.recovering || !state.connected || state.data !== data || state.epoch !== epoch) return;
+        if (value.kind === 'completed' && state.lifecycleProtocol !== 2) {
+          state.error = 'Motet lifecycle recovery requires a compatible bridge.';
+          index += 1;
+          continue;
+        }
+        // Establish an earlier terminal disposition before a supplemental answer.
+        // In particular, a withheld disposition must survive a reordered shard or retry.
+        if (isUsableCompletion(receipt) && request.events.some(item => item.kind === 'completed' && !isUsableCompletion(item))) {
+          index += 1;
+          continue;
+        }
+        try {
+          await post($, state, 'event', {...receipt,...identityBody(state)});
+        } catch (error) {
+          if (!['receipt_rejected','invalid_request',''].includes(error.code) || ![400,409].includes(error.status)) throw error;
+          if (state.data !== data || state.epoch !== epoch) return;
+          const retry_at = (await $.clock.now()) + REJECTED_RECEIPT_RETRY_MS;
+          hash ??= await fingerprint(receipt);
+          if (state.data !== data || state.epoch !== epoch) return;
+          await save($, state, () => {
+            request.rejections ??= {};
+            request.rejections[hash] = {count:Math.min((rejection?.count || 0) + 1, MAX_RECEIPT_REJECTIONS), retry_at};
+          });
+          index += 1;
+          continue;
+        }
         if (state.data !== data || state.epoch !== epoch) return;
-        const hash = data.mode === 'derived' ? await fingerprint(value) : null;
+        if (data.mode === 'derived') hash ??= await fingerprint(receipt);
+        if (state.data !== data || state.epoch !== epoch) return;
         await save($, state, () => {
-          if (hash) data.acknowledged[hash] = true;
-          if (request.events[0] === value) request.events.shift();
+          if (data.mode === 'derived') data.acknowledged[hash] = true;
+          if (request.rejections) delete request.rejections[hash];
+          if (request.events[index] === value) request.events.splice(index, 1);
         });
       }
     }
   } finally {state.flushing = false;}
 }
 
+function validateReceiptIdentity(identities, id, record) {
+  const prior = identities.get(id);
+  const {attempt_id, envelope_digest, generation} = record;
+  const turns = [record.turn_id, ...record.events.map(value => value.turn_id)].filter(value => value !== undefined);
+  const turn = turns[0];
+  if (turns.some(value => !turnIdentifier(value) || value !== turn) ||
+      generation !== undefined && (typeof generation !== 'string' || !UUID.test(generation)) ||
+      prior && (prior.attempt_id !== attempt_id || prior.envelope_digest !== envelope_digest ||
+        prior.generation && generation && prior.generation !== generation ||
+        prior.turn && turn && prior.turn !== turn)) throw Error('Conflicting Motet receipt identity.');
+  const answer = record.completed ? record.events.find(value => value.kind === 'answered') : undefined;
+  if (prior?.answer && answer && JSON.stringify(prior.answer) !== JSON.stringify(answer)) throw Error('Conflicting Motet answer.');
+  const completionIds = prior?.completionIds ?? {};
+  for (const value of record.events) {
+    if (value.kind !== 'completed') continue;
+    const role = isUsableCompletion(value) ? 'answer' : 'terminal';
+    if (completionIds[role] && completionIds[role] !== value.event_id) throw Error('Conflicting Motet completion receipt.');
+    completionIds[role] = value.event_id;
+  }
+  identities.set(id, {attempt_id, envelope_digest, generation:generation ?? prior?.generation,
+    turn:turn ?? prior?.turn, answer:answer ?? prior?.answer, completionIds});
+}
+
+function checkReceiptIdentity(identities, completions, conflicts, id, record) {
+  try {validateReceiptIdentity(identities, id, record);}
+  catch {conflicts.add(id);}
+  for (const value of record.events) {
+    if (value.kind !== 'completed') continue;
+    const content = JSON.stringify(canonicalReceipt(value));
+    const prior = completions.get(value.event_id);
+    if (prior && prior.content !== content) {
+      conflicts.add(id);
+      conflicts.add(prior.id);
+    }
+    if (!prior) completions.set(value.event_id, {id,content});
+  }
+}
+
 async function recover($, state) {
+  if (state.data.mode !== 'derived') return;
+  state.recovering = true;
+  try {await recoverReceipts($, state);}
+  finally {state.recovering = false;}
+}
+
+async function recoverReceipts($, state) {
   const data = state.data;
-  if (data.mode !== 'derived') return;
   const keys = await $.store.keys();
   if (!Array.isArray(keys) || keys.length > 4096) throw Error('Motet recovery data limit.');
   let total = JSON.stringify(data).length;
@@ -151,33 +252,44 @@ async function recover($, state) {
     if (total > MAX_DATA) throw Error('Motet recovery data limit.');
     if (!shard || shard.mode !== 'derived' || shard.native_id !== data.native_id ||
         shard.project !== data.project || shard.grant_id !== data.grant_id || shard.enrollment_id !== data.enrollment_id) continue;
-    if (!shard.requests || typeof shard.requests !== 'object' || Array.isArray(shard.requests)) throw Error('Invalid Motet receipt data.');
+    if (!shard.requests || typeof shard.requests !== 'object' || Array.isArray(shard.requests) ||
+        !validConflictIds(shard.conflict_ids)) throw Error('Invalid Motet receipt data.');
     shards.push({...shard, legacy:prefix===legacyShardPrefix(data.native_id)});
   }
   // Validate before writing; foreign runtime keys are read-only, even after lease takeover.
+  const identities = new Map(), completions = new Map(), conflicts = new Set(data.conflict_ids);
+  for (const shard of shards) for (const id of shard.conflict_ids || []) conflicts.add(id);
+  for (const [id,record] of Object.entries(data.requests)) checkReceiptIdentity(identities, completions, conflicts, id, record);
   for (const shard of shards) for (const [id,record] of Object.entries(shard.requests)) {
     if (!(shard.legacy?receiptRecord(record,id):lifecycleReceipt(record,id))) throw Error('Invalid Motet receipt data.');
-    const current = data.requests[id];
-    if (current && (current.attempt_id !== record.attempt_id || current.envelope_digest !== record.envelope_digest)) throw Error('Conflicting Motet receipt identity.');
-    if (current?.completed && record.completed) {
-      const own = current.events.find(value => value.kind === 'answered');
-      const incoming = record.events.find(value => value.kind === 'answered');
-      if (own && incoming && JSON.stringify(own) !== JSON.stringify(incoming)) throw Error('Conflicting Motet answer.');
-    }
+    checkReceiptIdentity(identities, completions, conflicts, id, record);
   }
+  data.conflict_ids = [...conflicts];
   for (const shard of shards) for (const [id,record] of Object.entries(shard.requests)) {
+    if (conflicts.has(id)) continue;
     let current = data.requests[id];
     if (!current) {
-      current = {...copy(record),events:[],phase:record.execution_completed?'completed':record.completed?'answered':'unknown'};
+      current = {...copy(record),events:[],rejections:{},phase:record.execution_completed?'completed':record.completed?'answered':'unknown'};
       data.requests[id] = current;
     }
+    if (!current.turn_id && record.turn_id) current.turn_id = record.turn_id;
     if (record.execution_completed && !current.execution_completed) {current.execution_completed=true; current.capture=record.capture; current.phase='completed';}
     if (record.completed && current.capture!=='withheld') {current.completed = true; current.phase = record.lifecycle_protocol===2?'completed':'answered';}
     for (const value of record.events) {
-      const hash = await fingerprint(value);
-      if (data.acknowledged[hash] || current.events.some(item => JSON.stringify(item) === JSON.stringify(value))) continue;
-      if ((current.execution_completed || current.completed) && !['answered','completed'].includes(value.kind)) continue;
-      current.events.push(copy(value));
+      const receipt = canonicalReceipt(value), content = JSON.stringify(receipt);
+      const hash = await fingerprint(receipt);
+      if (data.acknowledged[hash]) continue;
+      // Old clients acknowledged the original property order.
+      if (value.kind === 'completed' && content !== JSON.stringify(value) && data.acknowledged[await fingerprint(value)]) continue;
+      const rejection = record.rejections?.[hash], previous = current.rejections?.[hash];
+      if (rejection && (!previous || rejection.count > previous.count ||
+          rejection.count === previous.count && rejection.retry_at > previous.retry_at)) {
+        current.rejections ??= {};
+        current.rejections[hash] = copy(rejection);
+      }
+      if (current.events.some(item => JSON.stringify(canonicalReceipt(item)) === content)) continue;
+      if ((current.execution_completed || current.completed) && !['answered','completed','dropped'].includes(value.kind)) continue;
+      current.events.push(copy(receipt));
     }
     if (!current.execution_completed && !current.completed && current !== state.flight && !['dropped','unknown'].includes(record.phase)) {
       const value = {request_id:id,attempt_id:record.attempt_id,kind:'unknown'};
@@ -291,6 +403,10 @@ async function poll($, state) {
   const epoch = state.epoch;
   const response = await post($,state,'poll',{...identityBody(state),project:state.data.project,accept:!state.flight && !state.submitting});
   if (!sessionResponse({...response,heartbeat_interval_ms:2000,lease_seconds:12},state.data.native_id) || response.generation !== state.generation) throw Error('Invalid Motet poll identity.');
+  if (!state.connected || state.epoch !== epoch) return;
+  const turns = response.recoverable_turns;
+  state.recoverableTurns = Array.isArray(turns) && turns.length <= 32 ? turns : [];
+  await completeRecoveredTurns($, state);
   if (!state.connected || state.epoch !== epoch || !response.claim) return;
   const claim = response.claim;
   if(claim.kind!==undefined){
@@ -338,7 +454,8 @@ async function activate($, state, response, eligibilityEpoch) {
   if (state.data.mode === 'derived') await recover($,state);
   checkEligibility(state,eligibilityEpoch);
   for (const request of Object.values(state.data.requests)) {
-    if (request !== state.flight && !request.execution_completed && !['answered','dropped','unknown'].includes(request.phase)) await event($,state,request,'unknown',{},'reconnect');
+    if (!state.data.conflict_ids?.includes(request.request_id) && request !== state.flight &&
+        !request.execution_completed && !['answered','dropped','unknown'].includes(request.phase)) await event($,state,request,'unknown',{},'reconnect');
   }
   if (!state.submitting && state.flight && (state.flight.execution_completed || ['dropped','answered'].includes(state.flight.phase))) {state.flight = null; state.envelope = null;}
   state.recoverAt = (await $.clock.now()) + 10000;
@@ -366,28 +483,35 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
   if(response.supported_reply_notice_protocol===1 || response.supported_lifecycle_protocol===2 || response.supported_peer_envelope_limit===100000)response=await registration(response.supported_reply_notice_protocol===1,response.supported_lifecycle_protocol===2,response.supported_peer_envelope_limit===100000);
   if (await $.session.id() !== id || await $.session.cwd() !== project) throw Error('Native conversation changed.');
   checkEligibility(state,eligibilityEpoch);
-  const same = state.data?.mode === 'derived' && state.data.native_id === id && state.data.project === project && state.data.enrollment_id === response.enrollment_id;
+  const same = state.data?.mode === 'derived' && state.data.native_id === id && state.data.project === project &&
+    state.data.grant_id === config.grant_id && state.data.enrollment_id === response.enrollment_id;
   if (!same) {
     await state.writes;
-    const key = shardPrefix(id) + state.clientId;
+    const scope = JSON.stringify([id,project,config.grant_id,response.enrollment_id]);
+    let key = state.shardKeys.get(scope) ?? shardPrefix(id) + state.clientId;
     // Returning to A after visiting B reuses this runtime's A namespace. Read
     // its retained receipts before any activation write can replace that row.
     const stored = await $.store.get(key);
     checkEligibility(state,eligibilityEpoch);
-    let requests = {}, acknowledged = {};
+    let requests = {}, acknowledged = {}, conflict_ids = [];
     if (stored?.mode === 'derived' && stored.native_id === id && stored.project === project &&
         stored.grant_id === config.grant_id && stored.enrollment_id === response.enrollment_id) {
       if (JSON.stringify(stored).length > MAX_DATA || !stored.requests || typeof stored.requests !== 'object' || Array.isArray(stored.requests) ||
           !stored.acknowledged || typeof stored.acknowledged !== 'object' || Array.isArray(stored.acknowledged) ||
           !Object.entries(stored.requests).every(([requestId,record])=>lifecycleReceipt(record,requestId)) ||
-          !Object.entries(stored.acknowledged).every(([hash,value])=>/^[a-f0-9]{64}$/.test(hash) && value === true)) throw Error('Invalid Motet receipt data.');
-      requests = copy(stored.requests); acknowledged = copy(stored.acknowledged);
+          !Object.entries(stored.acknowledged).every(([hash,value])=>/^[a-f0-9]{64}$/.test(hash) && value === true) ||
+          !validConflictIds(stored.conflict_ids)) throw Error('Invalid Motet receipt data.');
+      requests = copy(stored.requests); acknowledged = copy(stored.acknowledged); conflict_ids = copy(stored.conflict_ids || []);
+    } else if (stored !== undefined && stored !== null) {
+      // A new grant or enrollment cannot replace evidence from the old one.
+      key = shardPrefix(id) + crypto.randomUUID();
     }
+    state.shardKeys.set(scope,key);
     state.key = key;
     state.data = {version:3,mode:'derived',native_id:id,project,port:config.port,grant_id:config.grant_id,
-      enrollment_id:response.enrollment_id,token:response.token,requests,acknowledged,active:true};
+      enrollment_id:response.enrollment_id,token:response.token,requests,acknowledged,conflict_ids,active:true};
     // Persisted receipts are recovery evidence, never a restored native flight.
-    state.flight = null; state.envelope = null;
+    state.flight = null; state.envelope = null; state.bound.clear();
   }
   state.config = config;
   await activate($,state,response,eligibilityEpoch);
@@ -396,6 +520,8 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
 // Desktop evidence belongs only to this loaded runtime's exact native identity.
 function invalidateEligibility(state) {
   state.desktopBinding = null;
+  state.observedCompletions.clear();
+  state.recoverableTurns = [];
   state.eligibilityEpoch += 1;
   return state.eligibilityEpoch;
 }
@@ -510,6 +636,31 @@ async function explicitDisconnect($, state) {
   } finally {state.disconnecting -= 1;}
 }
 
+async function retryHeldReceipts($, state, id) {
+  const data = state.data, epoch = state.epoch;
+  if (!UUID.test(id)) return {text:'Use /watch-retry-receipts with the full request ID from /watch-status.'};
+  if (!state.connected || state.connecting || state.supervising || state.networkBusy || state.flushing || state.recovering) {
+    return {text:'Wait for the original Motet connection to be ready, then use /watch-status before retrying receipts.'};
+  }
+  if (data.conflict_ids?.includes(id)) return {text:'The original receipts conflict. Inspect this request with the bridge recovery tools in /watch-status.'};
+  const request = data.requests[id];
+  if (!request?.events.length || !Object.values(request.rejections || {}).some(value=>value.count >= MAX_RECEIPT_REJECTIONS)) {
+    return {text:'This enrollment has no held receipt for that request ID. Check /watch-status.'};
+  }
+  state.connecting = true;
+  try {
+    if (await $.session.id() !== data.native_id || await $.session.cwd() !== data.project ||
+        state.data !== data || state.epoch !== epoch) return {text:'Open the original Motet conversation and check /watch-status.'};
+    if (data.mode === 'derived') await recover($,state);
+    if (state.data !== data || state.epoch !== epoch) return {text:'Open the original Motet conversation and check /watch-status.'};
+    if (data.conflict_ids?.includes(id)) return {text:'The original receipts conflict. Inspect this request with the bridge recovery tools in /watch-status.'};
+    await flush($,state,request);
+    return {text:'Receipt retry check finished. Use /watch-status to see any receipts still held.'};
+  } catch {
+    return {text:'The original connection could not confirm the receipt. Use /watch-status to check it.'};
+  } finally {state.connecting = false;}
+}
+
 async function observeInput($,state,e) {
   if (e.agentId !== undefined || !state.data || !state.bound.size) return;
   const id=state.data.native_id, project=state.data.project;
@@ -524,10 +675,37 @@ async function observeInput($,state,e) {
   }
 }
 
+async function completeRecoveredTurns($, state) {
+  const data = state.data;
+  if (state.lifecycleProtocol !== 2 || data?.mode !== 'derived' || !state.observedCompletions.size) return;
+  for (const proof of state.recoverableTurns) {
+    if (!proof || ![proof.request_id,proof.attempt_id,proof.generation].every(value => typeof value === 'string' && UUID.test(value)) ||
+        !turnIdentifier(proof.turn_id) ||
+        state.recoverableTurns.filter(item => item?.turn_id === proof.turn_id).length !== 1) continue;
+    const observed = state.observedCompletions.get(proof.turn_id);
+    const request = data.requests[proof.request_id];
+    if (!observed || observed.native_id !== data.native_id || observed.project !== data.project ||
+        data.conflict_ids?.includes(proof.request_id) ||
+        !request || request.execution_completed || request.completed || request.origin !== 'peer' ||
+        request.lifecycle_protocol !== 2 || request.attempted !== true ||
+        request.attempt_id !== proof.attempt_id || request.generation !== proof.generation ||
+        request.turn_id !== proof.turn_id || state.bound.has(proof.turn_id)) continue;
+    // The authenticated server and the original plugin receipt agree on the
+    // turn. Input isolation across an observation gap cannot be verified.
+    await event($, state, request, 'completed', {
+      turn_id:proof.turn_id, outcome:'withheld', answer:'',
+      event_id:crypto.randomUUID(), occurred_at:observed.occurred_at
+    });
+    if (state.data !== data) return;
+    state.observedCompletions.delete(proof.turn_id);
+  }
+}
+
 export function register(on) {
   const state = {clientId:crypto.randomUUID(),sequence:-1,data:null,key:null,config:null,generation:null,connected:false,epoch:0,eligibilityEpoch:0,desktopBinding:null,disconnecting:0,
     timer:null,peerProtocol:0,lifecycleProtocol:0,bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
+    observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),recovering:false,
     rejectedGrant:'',rejectedIdentity:'',startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
@@ -543,6 +721,7 @@ export function register(on) {
       await $.command.register({name:'watch-setup',description:'Authorize automatic Motet connections once for your local Claude chats.',argumentHint:'<port:setup-code>',immediate:true});
       await $.command.register({name:'watch-connect',description:'Reconnect this chat, or use a legacy Motet pairing code.',argumentHint:'[port:pair-code]',immediate:true});
       await $.command.register({name:'watch-status',description:'Show Motet connection status without secrets.',immediate:true});
+      await $.command.register({name:'watch-retry-receipts',description:'Retry held receipts in this original Motet enrollment.',argumentHint:'<request-id>',immediate:true});
       await $.command.register({name:'watch-disconnect',description:'Keep this chat disconnected until explicit reconnect.',immediate:true});
       state.timer = $.clock.every(2000,()=>{
         // Count actual dispatch before any supervisor gate, never imply installation is dispatch.
@@ -554,9 +733,11 @@ export function register(on) {
   });
   on('command.run',async($,e,next)=>{
     if (TRANSITIONS.has(e.command)) {invalidateEligibility(state); suspend($,state); return next(e);}
-    if (e.command === 'watch-status') {await readSurfaces($,state); return {text:JSON.stringify(publicStatus(state))};}
-    if (!['watch-connect','watch-disconnect','watch-setup'].includes(e.command)) return next(e);
-    if (!['composer','bridge'].includes(e.origin?.kind)) return {text:'Motet connection commands require direct owner input.'};
+    const owner = ['composer','bridge'].includes(e.origin?.kind);
+    if (e.command === 'watch-status') {await readSurfaces($,state); return {text:JSON.stringify(publicStatus(state,owner))};}
+    if (!['watch-connect','watch-disconnect','watch-setup','watch-retry-receipts'].includes(e.command)) return next(e);
+    if (!owner) return {text:'Motet connection commands require direct owner input.'};
+    if (e.command === 'watch-retry-receipts') return retryHeldReceipts($,state,e.args.trim());
     if (e.command === 'watch-disconnect') {
       try {await explicitDisconnect($,state); return {text:'Motet disconnected. ' + LIMITATION};}
       catch {return {text:'Motet disconnect could not be saved; readiness expires when its heartbeat stops.'};}
@@ -578,6 +759,7 @@ export function register(on) {
         await $.store.set(preferenceKey(id),{version:1,disconnected:false});
         suspend($,state);
         state.data = null; state.key = null; state.config = config;
+        state.flight = null; state.envelope = null; state.bound.clear();
         state.retryAt = 0; state.failures = 0;
         return {text:'Motet automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
       }
@@ -590,6 +772,7 @@ export function register(on) {
         const response = await post($,state,'enroll',{code:pair.code,native_id:id,project},{anonymous:true});
         if (typeof response.token !== 'string' || response.token.length < 16 || !UUID.test(response.enrollment_id)) throw Error('Invalid enrollment.');
         state.data.token = response.token; state.data.enrollment_id = response.enrollment_id;
+        state.flight = null; state.envelope = null; state.bound.clear();
         await activate($,state,response);
         return {text:'Motet connected to this existing chat. ' + LIMITATION};
       }
@@ -605,7 +788,7 @@ export function register(on) {
       return {text:'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
     } catch {stop(state); return {text:'Motet connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.'};}
     finally {state.connecting = false;}
-  }).catch(($,e,next)=>{stop(state); return ['watch-connect','watch-disconnect','watch-status','watch-setup'].includes(e.command)?{text:'Motet command failed; no automatic request retry.'}:next(e);});
+  }).catch(($,e,next)=>{stop(state); return ['watch-connect','watch-disconnect','watch-status','watch-setup','watch-retry-receipts'].includes(e.command)?{text:'Motet command failed; no automatic request retry.'}:next(e);});
   on('prompt.submit',async($,e,next)=>{
     try {await observeInput($,state,e);} catch { /* Native input is never blocked. */ }
     return next(e);
@@ -616,8 +799,11 @@ export function register(on) {
   });
   on('turn.start',async($,e,next)=>{
     try {
-      const request = state.flight;
-      if (request && request.kind!=='peer_reply_notice' && !request.turn_id && e.agentId === undefined && matchingPrompt(e.text,state.envelope) && await $.session.id() === state.data.native_id) {
+      const request = state.flight, data = state.data, eligibility = state.eligibilityEpoch;
+      if (request && data && request.kind!=='peer_reply_notice' && !request.turn_id && e.agentId === undefined &&
+          turnIdentifier(e.turnId) && matchingPrompt(e.text,state.envelope) &&
+          await $.session.id() === data.native_id && await $.session.cwd() === data.project &&
+          state.data === data && state.flight === request && state.eligibilityEpoch === eligibility && !request.turn_id) {
         request.turn_id = e.turnId;
         state.bound.set(e.turnId,{request,native_id:state.data.native_id,project:state.data.project,enrollment_id:state.data.enrollment_id});
         await event($,state,request,'started',{turn_id:e.turnId});
@@ -627,10 +813,11 @@ export function register(on) {
   });
   on('turn.complete',async($,e,next)=>{
     try {
+      if (e.agentId !== undefined || !turnIdentifier(e.turnId)) return next(e);
       const bound = state.bound.get(e.turnId), request = bound?.request, data=state.data, eligibility=state.eligibilityEpoch;
       const native=await $.session.id(), project=await $.session.cwd();
-      if (state.data!==data || state.eligibilityEpoch!==eligibility) return next(e);
-      if (request && !request.execution_completed && e.agentId === undefined && state.data && state.data.requests[request.request_id] === request &&
+      if (state.eligibilityEpoch!==eligibility) return next(e);
+      if (request && !request.execution_completed && data && state.data === data && data.requests[request.request_id] === request &&
           bound.native_id === state.data.native_id && bound.project === state.data.project && bound.enrollment_id === state.data.enrollment_id &&
           native === bound.native_id && project === bound.project) {
         const outcome = request.mixed_input ? 'withheld' : e.isAborted ? 'aborted' :
@@ -641,6 +828,12 @@ export function register(on) {
         else {await event($,state,request,'unknown'); await save($,state,()=>{request.execution_completed=true;request.capture=outcome;});}
         state.bound.delete(e.turnId);
         if (!state.submitting && state.flight === request) {state.flight = null; state.envelope = null;}
+      } else if (!bound && UUID.test(native) && typeof project === 'string' && project) {
+        const occurred_at = await $.clock.now();
+        if (state.eligibilityEpoch !== eligibility) return next(e);
+        state.observedCompletions.set(e.turnId, {native_id:native, project, occurred_at});
+        if (state.observedCompletions.size > 32) state.observedCompletions.delete(state.observedCompletions.keys().next().value);
+        await completeRecoveredTurns($, state);
       }
     } catch { /* Retained completion can replay without a new prompt. */ }
     return next(e);

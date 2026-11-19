@@ -144,6 +144,26 @@ class CliTests(unittest.TestCase):
         self.runcli('revoke', replacement['credential_id'])
         self.assertTrue(all(not c['active'] for c in json.loads(self.runcli('status'))['credentials']))
 
+    def test_antigravity_config_uses_shared_credential_and_absolute_stdio_paths(self):
+        result = json.loads(self.runcli('init', '--providers', 'codex,claude'))
+        path = result['credential_file']
+        credential = w.read_credential(path)
+        repo = Path(self.root) / 'fixture checkout'
+        adapter = repo / 'integrations' / 'claude' / 'peer.mjs'
+        for directory in (repo, repo / 'integrations', adapter.parent):
+            directory.mkdir(mode=0o755)
+        adapter.write_text('// fixture adapter\n')
+        adapter.chmod(0o644)
+        executable = Path(self.root) / 'node'
+        executable.write_text('#!/bin/sh\nexit 0\n')
+        executable.chmod(0o700)
+        with patch.object(w, 'ROOT', repo):
+            config = self.runcli('config', path, '--node', str(executable), '--client', 'antigravity')
+        self.assertNotIn(credential['secret'], config)
+        self.assertEqual(json.loads(config), {'mcpServers': {'motet-bridge': {
+            'command': str(executable),
+            'args': [str(adapter), '--credential', path], 'cwd': str(adapter.parent)}}})
+
     def test_shared_all_history_filters_and_no_legacy_enrollment(self):
         self.runcli('init', '--providers', 'codex', '--history', 'all', '--allow-project', self.root)
         policy = json.loads(self.runcli('status'))['policy']

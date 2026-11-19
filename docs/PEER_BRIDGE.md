@@ -7,6 +7,8 @@ Agent-to-agent routing uses native tools within a provider and Motet only betwee
 - Codex to Codex: use Codex's native chat tools.
 - Claude to Claude: use Claude's native coordination tools when they support the intended chat.
 - Codex to Claude, or Claude to Codex: use Motet.
+- Antigravity to Codex or Claude: use the optional Motet Bridge plugin to send a request and retrieve its answer. For incoming requests, use the separately configured shared pull inbox; it does not target or wake a native chat.
+- Antigravity to Antigravity: use Antigravity's native coordination tools.
 
 If native tools cannot reach a same-provider chat, report that limitation; do not fall back to Motet. Determine both providers before sending. These are agent routing instructions, not server-side caller authentication: the shared service cannot verify a caller's provider from its shared credential or declared sender label. Existing Motet requests can still finish and their replies can be recovered. Owner messages sent through the Motet UI are unaffected. Reconnect the MCP in existing clients to load the updated instructions.
 
@@ -68,7 +70,7 @@ The older development channel stays blocked for peer delivery. Its process can s
 
 ## Tools and delivery
 
-The MCP exposes four tools: `list_agents`, `send_message`, `get_reply`, and `list_requests`. There are no steering, interruption, enrollment, settings, or arbitrary-command tools.
+The native messaging tools are `list_agents`, `send_message`, `get_reply`, and `list_requests`. The separate Antigravity inbox tools are described in the [plugin guide](../integrations/antigravity-bridge/README.md). There are no steering, interruption, settings, or arbitrary-command tools.
 
 The adapter generates a fresh request UUID for a new send and returns it, including in a recovery receipt when the outcome is uncertain. An explicitly supplied recovery ID must be a valid accepted version-4 UUID. An identical replay returns the original request with a duplicate indication; conflicting reuse is rejected. A retry never silently follows a renamed or replaced destination.
 
@@ -80,7 +82,7 @@ For larger messages to Claude, upgrade the bridge first, then reload the **Motet
 
 Request content expires after 24 hours. Permanent, bounded deduplication tombstones prevent expired operations from being sent again, including across service credential rotation. Old endpoint-prototype history is not exposed as shared history.
 
-Peer capacity remains separate from Motet's reserved capacity. Limits allow up to 100 requests per day service-wide, 10 per target per hour, and four unsettled requests in the current 15-minute window; declared sender names do not create independent quotas. Completed turns with unusable replies release their slots. A genuinely uncertain execution keeps a small reservation for its destination until completion can be verified; deleting expired message content does not release it. A rejected follow-up explicitly says it was not accepted and identifies the earlier request needing recovery. The bridge does not grow a second queue behind that request or resend it. Late replies can still be recovered within content retention; a verified completion received afterward may release execution capacity without restoring expired answer content.
+Peer capacity remains separate from Motet's reserved capacity. Limits allow up to 100 requests per day service-wide across native and inbox sends, 10 per target per hour, and four unsettled requests in the current 15-minute window; declared sender names do not create independent quotas. Completed turns with unusable replies release their slots. A genuinely uncertain execution keeps a small reservation for its destination until completion can be verified; deleting expired message content does not release it. A rejected follow-up explicitly says it was not accepted and identifies the earlier request needing recovery. The bridge does not grow a second queue behind that request or resend it. Late replies can still be recovered within content retention; a verified completion received afterward may release execution capacity without restoring expired answer content.
 
 
 ### Resumed Codex chats
@@ -102,6 +104,8 @@ It reports execution counts without changing the source database or printing mes
 Acceptance, execution, answer capture, and retrieval are separate facts. A successful send means the bridge accepted the request. Native queue acceptance does not prove execution, and a retained answer does not prove the asking agent has read it.
 
 Claude plugin 0.5.0 negotiates lifecycle reporting with a compatible bridge. A reconnect in the same runtime preserves the original bound request and turn. The plugin saves completion reports before sending them; retries report that same completion, never submit the original question again. Confirmed execution cannot be undone by a delayed “started” or “unknown” report. A completed turn can release capacity even when its answer is malformed or withheld because other input entered the turn.
+
+Plugin 0.6.2 also checks retained receipts against the server's original attempt before observing completion after a full reload. A completion observed across that gap releases the reservation with its answer withheld. It cannot reconstruct a native completion that happened while no observer was present. Conflicting retained turns or completion records remain unresolved. A rejected receipt stays retained while other receipts and heartbeats continue. A marker without a nonempty usable answer never counts as an answered request.
 
 Old plugins and servers keep their existing wire format. New completion features are enabled only after negotiation, and incompatible local receipt formats are stored separately. Upgrade the bridge before the plugin. Do not downgrade with unresolved lifecycle-v2 work: retain the compatible installation until those attempts have settled or an explicit recovery procedure has been agreed. Reloading a plugin does not reconstruct a missing native completion event.
 

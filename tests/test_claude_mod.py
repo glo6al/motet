@@ -204,6 +204,29 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(self.row(payload['request_id'])['state'],'unknown')
         self.assertEqual(self.event(claim,'answered',turn_id=turn,answer='x'*16001)[0],400)
 
+    def test_legacy_marker_only_completion_acknowledges_original_bound_turn(self):
+        self.enroll()
+        for question, suffix in (('Fictional first question.', ''), ('Fictional second question.', '\n \t\x1f\u00a0\u3000')):
+            payload, _ = self.request(question)
+            claim = self.poll()[1]['claim']
+            turn = uid()
+            answer = 'WATCH_REPLY ' + claim['request_id'] + suffix
+            self.assertEqual(self.event(claim, 'answered', turn_id=turn, answer=answer)[0], 409)
+            self.assertEqual(self.event(claim, 'started', turn_id=turn)[0], 200)
+            self.assertEqual(self.event(claim, 'answered', turn_id=uid(), answer=answer)[0], 409)
+            self.assertEqual(self.event(dict(claim, attempt_id=uid()), 'answered', turn_id=turn, answer=answer)[0], 409)
+            self.assertEqual(self.row(payload['request_id'])['state'], 'awaiting_reply')
+            completed = self.event(claim, 'answered', turn_id=turn, answer=answer)
+            self.assertEqual(completed, (200, dict(request_id=claim['request_id'], state='unknown', turn_id=turn)))
+            self.assertEqual(self.event(claim, 'answered', turn_id=turn, answer=answer), completed)
+            result = self.row(payload['request_id'])
+            self.assertEqual(result['reply'], '')
+            self.assertIn('turn completed', result['error'])
+            with self.store.lock:
+                retained = next(r for r in self.store.mods.rows() if r['request_id'] == claim['request_id'])
+            self.assertEqual((retained['execution_outcome'], retained['capture_disposition'], retained['settled']),
+                             ('completed', 'unusable', True))
+
     def test_peer_row_never_claimed_or_exposed_as_owner_mod_history(self):
         self.enroll();payload,_=self.request()
         with self.store.lock,self.store.db:
