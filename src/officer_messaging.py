@@ -1191,11 +1191,8 @@ class MessagingStore:
             # The native pointer may already name a single-hop successor the
             # previous worker has not followed. Require the same bounded chain
             # proof as live tracking before checking the original consumed tail.
-            try:
-                probe = copy.deepcopy(row)
-                continuation = codex_transcript.tracking_source(self.sessions_dir, probe, MAX_READ)
-            except OSError:
-                raise error
+            probe = copy.deepcopy(row)
+            continuation = codex_transcript.tracking_source(self.sessions_dir, probe, MAX_READ)
             if probe.get('codex_continuation'):
                 row['codex_continuation'] = probe['codex_continuation']
             if continuation is None:
@@ -1509,6 +1506,8 @@ class MessagingStore:
                 else:
                     row.update(state='unknown', error='A transcript record exceeded the safe limit; reply tracking stopped.')
                     row['tracking_stopped'] = True
+        except codex_transcript.TemporaryUnavailable:
+            row['error'] = 'The transcript is unavailable; Motet will keep checking for a reply.'
         except codex_transcript.Unavailable as error:
             row.update(state='unknown', error=str(error))
         except (OSError, MessagingError):

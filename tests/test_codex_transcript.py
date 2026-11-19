@@ -543,6 +543,80 @@ class TranscriptTests(unittest.TestCase):
         self.retain_previous_worker_binding(prefix=[('response_item', image)])
         self.assert_held_reply_tracks_to_exact_end(self.old)
 
+    def live_tracking_survives_temporary_source(self, origin, *, lock_index=False):
+        if origin == 'peer':
+            self.retain_previous_worker_binding()
+        else:
+            self.row.update(origin='owner', envelope=m.envelope(self.rid, 'Fictional owner question.', version=1))
+            self.store._save(self.row)
+            self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+            self.message(self.old, 'bound', self.row['envelope'])
+        self.store.tick()
+        before = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual((before['state'], before['bound_turn']), ('awaiting_reply', 'bound'))
+        self.pointer(self.old)
+        if lock_index:
+            locked = sqlite3.connect(self.root / 'state_5.sqlite')
+            try:
+                locked.execute('BEGIN EXCLUSIVE')
+                self.store.tick()
+            finally:
+                locked.close()
+        else:
+            hidden = self.root / 'temporarily-hidden-live-source'
+            self.old.rename(hidden)
+            try:
+                self.store.tick()
+            finally:
+                hidden.rename(self.old)
+        after = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual((after['state'], after['bound_turn'], after['cursor']),
+                         (before['state'], before['bound_turn'], before['cursor']))
+        self.assertFalse(after.get('tracking_stopped'))
+        self.assertFalse(after.get('settled'))
+        self.assertIn('will keep checking', after['error'])
+        if origin == 'peer':
+            self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'running')
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional recovered answer.'))
+        with patch.object(m.subprocess, 'Popen') as launch:
+            self.store.tick()
+            launch.assert_not_called()
+        result = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual((result['state'], result['reply']), ('answered', 'Fictional recovered answer.'))
+
+    def test_live_owner_missing_source_keeps_awaiting_then_answers(self):
+        self.live_tracking_survives_temporary_source('owner')
+
+    def test_live_peer_missing_source_keeps_running_then_answers(self):
+        self.live_tracking_survives_temporary_source('peer')
+
+    def test_live_owner_locked_index_keeps_awaiting_then_answers(self):
+        self.live_tracking_survives_temporary_source('owner', lock_index=True)
+
+    def test_live_peer_locked_index_keeps_running_then_answers(self):
+        self.live_tracking_survives_temporary_source('peer', lock_index=True)
+
+    def test_previous_worker_unfollowed_successor_waits_until_successor_can_open(self):
+        self.retain_previous_worker_binding()
+        self.successor()
+        hidden = self.root / 'temporarily-hidden-successor'
+        self.new.rename(hidden)
+        try:
+            self.store.tick()
+            self.assert_previous_proof_waiting()
+        finally:
+            hidden.rename(self.new)
+        self.append(self.new, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional late successor answer.'))
+        with patch.object(m.subprocess, 'Popen') as launch:
+            for _ in range(5):
+                self.store.tick()
+            launch.assert_not_called()
+        result = self.public_result(2)
+        self.assertEqual((result['state'], result['reply']), ('answered', 'Fictional late successor answer.'))
+        self.assertIsNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
+
     def test_previous_worker_unfollowed_successor_tracks_to_exact_end(self):
         self.retain_previous_worker_binding()
         self.successor()
@@ -735,6 +809,9 @@ class TranscriptTests(unittest.TestCase):
 
     def test_previous_worker_holds_when_native_index_selects_another_transcript(self):
         self.retain_previous_worker_binding(dict(type='task_aborted', turn_id='bound'))
+        # A readable file without continuation metadata is contradictory; a
+        # temporarily unopenable native pointer is retryable, not that proof.
+        self.append(self.new, 'session_meta', self.meta)
         self.pointer(self.new)
         self.store.tick()
         self.assert_previous_proof_held()
