@@ -164,6 +164,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_watch_peer.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_install_antigravity_bridge.py
+        if: ${{ !cancelled() }}
+      - run: python tests/test_peer_inbox.py
+        if: ${{ !cancelled() }}
       - run: python tests/test_peer_reply_delivery.py
         if: ${{ !cancelled() }}
       - run: python tests/test_watch_reply_hook.py
@@ -196,6 +200,9 @@ jobs:
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: npm --prefix integrations/claude test
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+      - run: python tests/test_inbox_stdio.py
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python tests/test_claude_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5

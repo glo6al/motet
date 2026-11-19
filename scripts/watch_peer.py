@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Set up shared Motet service access. Never edits host configuration."""
 import argparse
+from collections import deque
 import glob
 import json
 import os
@@ -52,7 +53,8 @@ def parser():
     config = sub.add_parser('config')
     config.add_argument('credential_file')
     config.add_argument('--node')
-    config.add_argument('--client', choices=('codex', 'claude'), default='codex')
+    config.add_argument('--client', choices=('codex', 'claude', 'antigravity'), default='codex')
+    config.add_argument('--inbox-credential', help='Private receiver capability for the Antigravity plugin only')
     sub._choices_actions[:] = [action for action in sub._choices_actions if action.dest not in ('enroll', 'receive', 'prune')]
     return out
 
@@ -123,13 +125,16 @@ def enroll_launch(state, session, instance, project, label, port=8793):
         db.close()
 
 
-def read_credential(path):
+def read_credential(path, *, exact_mode=False):
     path = os.path.abspath(path)
     directory = p.private_directory(os.path.dirname(path))
     p.private_directory(os.path.dirname(directory))
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        claude_channel._private(os.fstat(fd))
+        info = os.fstat(fd)
+        claude_channel._private(info)
+        if exact_mode and stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError('Use an owner-only read-write credential file.')
         raw = os.read(fd, 8193)
     finally:
         os.close(fd)
@@ -155,6 +160,111 @@ def config(path, node=None):
         raise ValueError('Node.js is required.')
     return {'mcpServers': {'watch-peer': {'command': os.path.abspath(node),
             'args': [str(ROOT / 'integrations/claude/peer.mjs'), '--credential', os.path.abspath(path)]}}}
+
+
+class AntigravityPathError(ValueError):
+    """A refused launch path safe to report without credential details."""
+
+
+def antigravity_path_stat(path):
+    try:
+        return path.lstat()
+    except OSError:
+        raise AntigravityPathError(f'Cannot inspect Antigravity launch path {path}.') from None
+
+
+def trusted_antigravity_path(path, *, directory=False, symlinks=False):
+    """Verify every lexical component and resolved symlink hop of a launch path."""
+    path = Path.cwd() / Path(path).expanduser()
+    if '..' in path.parts:
+        raise AntigravityPathError(f'Use a direct Antigravity launch path for {path}.')
+    pending = deque(path.parts[1:])
+    resolved = Path(path.anchor)
+    owners = (0, os.getuid())
+    hops = 0
+    while pending:
+        part = pending.popleft()
+        if part == '..':
+            resolved = resolved.parent
+            continue
+        candidate = resolved / part
+        info = antigravity_path_stat(candidate)
+        if info.st_uid not in owners:
+            raise AntigravityPathError(f'Antigravity launch path must be owned by you or root: {candidate}.')
+        if stat.S_ISLNK(info.st_mode):
+            hops += 1
+            if not symlinks or hops > 40:
+                raise AntigravityPathError(f'Antigravity launch path has an unsupported symlink at {candidate}.')
+            try:
+                target = Path(os.readlink(candidate))
+            except OSError:
+                raise AntigravityPathError(f'Cannot inspect Antigravity launch link {candidate}.') from None
+            parts = target.parts
+            if target.is_absolute():
+                resolved = Path(target.anchor)
+                parts = parts[1:]
+            pending.extendleft(reversed(parts))
+            continue
+        kind = stat.S_ISDIR if pending or directory else stat.S_ISREG
+        shared = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        # A root-owned sticky ancestor protects the next entry from replacement
+        # by a different ordinary user. That entry is checked in the next hop.
+        sticky_ancestor = pending and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+        if not kind(info.st_mode) or (shared and not sticky_ancestor):
+            raise AntigravityPathError(f'Antigravity launch path has an unsafe type or write permissions: {candidate}.')
+        resolved = candidate
+    final = antigravity_path_stat(resolved)
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not kind(final.st_mode) or final.st_uid not in owners or final.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise AntigravityPathError(f'Antigravity launch path has an unsafe type, owner or write permissions: {resolved}.')
+    return path
+
+
+def antigravity_config(path, node=None, repo=None, inbox_credential=None):
+    path = os.path.abspath(os.path.expanduser(path))
+    if read_credential(path, exact_mode=True)['version'] != 2:
+        raise ValueError('Use a private shared Motet credential.')
+    node = node or shutil.which('node')
+    if not node:
+        raise ValueError('Node.js is required.')
+    executable = trusted_antigravity_path(node, symlinks=True)
+    if not os.access(executable, os.X_OK):
+        raise AntigravityPathError(f'Node.js path is not executable: {executable}.')
+    adapter = trusted_antigravity_path(Path(repo or ROOT) / 'integrations/claude/peer.mjs')
+    inbox_adapter = adapter.parent / 'inbox.mjs'
+    if os.path.lexists(inbox_adapter):
+        trusted_antigravity_path(inbox_adapter)
+    for directory in adapter.parents:
+        for relative in ('node_modules', 'node_modules/@modelcontextprotocol', 'node_modules/@modelcontextprotocol/sdk'):
+            candidate = directory / relative
+            if os.path.lexists(candidate):
+                trusted_antigravity_path(candidate, directory=True, symlinks=True)
+        sdk_manifest = directory / 'node_modules/@modelcontextprotocol/sdk/package.json'
+        if os.path.lexists(sdk_manifest):
+            trusted_antigravity_path(sdk_manifest, symlinks=True)
+    arguments = [str(adapter), '--credential', path]
+    if inbox_credential is not None:
+        trusted_antigravity_path(inbox_adapter)
+        capabilities = trusted_antigravity_path(adapter.parent / 'bridge-capabilities.json')
+        try:
+            with capabilities.open('rb') as stream:
+                raw = stream.read(4097)
+        except OSError:
+            raise AntigravityPathError(f'Cannot read the Antigravity receiver manifest: {capabilities}.') from None
+        try:
+            capability = json.loads(raw.decode('utf-8')) if len(raw) <= 4096 else None
+        except (ValueError, RecursionError):
+            capability = None
+        if (not isinstance(capability, dict) or set(capability) != {'shared_pull_inbox_receiver'}
+                or type(capability['shared_pull_inbox_receiver']) is not int
+                or capability['shared_pull_inbox_receiver'] != 1):
+            raise AntigravityPathError(f'Use a Motet checkout supporting the shared pull inbox receiver. Invalid file {capabilities}.')
+        from peer_inbox import read_config_file
+        inbox_path = os.path.abspath(os.path.expanduser(inbox_credential))
+        read_config_file(inbox_path)
+        arguments.extend(['--inbox-credential', inbox_path])
+    return {'mcpServers': {'motet-bridge': {'command': str(executable),
+            'args': arguments, 'cwd': str(adapter.parent)}}}
 
 
 def status(db, state):
@@ -189,6 +299,11 @@ def main(argv=None):
     if not 1 <= args.port <= 65535:
         raise ValueError('Use a valid Motet port.')
     if args.command == 'config':
+        if args.inbox_credential and args.client != 'antigravity':
+            raise ValueError('Inbox receiving is configured only for the Antigravity plugin.')
+        if args.client == 'antigravity':
+            print(json.dumps(antigravity_config(args.credential_file, args.node, inbox_credential=args.inbox_credential), indent=2))
+            return
         settings = config(args.credential_file, args.node)['mcpServers']['watch-peer']
         if args.client == 'claude':
             print(json.dumps({'mcpServers': {'watch-peer': settings}}, indent=2))
@@ -289,6 +404,9 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         main()
+    except AntigravityPathError as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
     except Exception:
         print('Motet setup failed. Check the command, selected policy, and private state files.', file=sys.stderr)
         sys.exit(1)

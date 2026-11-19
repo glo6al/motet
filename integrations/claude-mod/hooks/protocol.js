@@ -1,6 +1,7 @@
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const LIMITATION = 'Avoid clearing, switching or resuming this conversation until queued Motet work settles; reconnect the intended chat afterward. Disconnect does not cancel native queued input.';
 export const TRANSITIONS = new Set(['clear', 'reset', 'new', 'resume', 'branch', 'fork', 'logout', 'exit']);
+export const MAX_RECEIPT_REJECTIONS = 2;
 
 export function pairing(value) {
   const match = /^(\d{1,5}):([A-Za-z0-9_-]{16,256})$/.exec(value.trim());
@@ -40,9 +41,23 @@ export function matchingPrompt(text, envelope) {
 }
 
 export function matchingAnswer(answer, id) {
-  if (typeof answer !== 'string' || [...answer].length > 16000) return false;
-  const markers = answer.split(/\r?\n/).filter(line => /^WATCH_REPLY\s/.test(line));
-  return markers.length === 1 && markers[0] === 'WATCH_REPLY ' + id;
+  if (!retainedAnswer(answer) || /[\x00\ud800-\udfff]/u.test(answer)) return false;
+  // Keep these line boundaries in sync with Python's str.splitlines().
+  const lines = answer.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/);
+  const marker = 'WATCH_REPLY ' + id;
+  const markers = lines.filter(line => line.includes('WATCH_REPLY'));
+  // Python's str.strip() uses a different whitespace set from JavaScript trim().
+  const hasBody = lines.some(line => line !== marker && /[^\t-\r\x1c-\x20\x85\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/.test(line));
+  return markers.length === 1 && markers[0] === marker && hasBody;
+}
+
+function retainedAnswer(answer) {
+  // A persisted candidate can fail capture and still carry completion evidence.
+  return typeof answer === 'string' && [...answer].length <= 16000;
+}
+
+export function turnIdentifier(turn) {
+  return typeof turn === 'string' && turn.length > 0 && [...turn].length <= 128 && !/[\x00-\x1f\ud800-\udfff]/u.test(turn);
 }
 
 // The public host roster is small and contains only these supported render surfaces.
@@ -53,13 +68,22 @@ export function surfaceRoster(value) {
   return [...new Set(value)];
 }
 
-export function publicStatus(state) {
+export function publicStatus(state, owner) {
+  const conflicts = state.data?.conflict_ids || [];
+  const held = Object.values(state.data?.requests || {}).filter(request =>
+    Object.values(request.rejections || {}).some(result => result.count >= MAX_RECEIPT_REJECTIONS));
   return {connected:state.connected, native_id:state.data?.native_id || null,
     pending:state.flight?.request_id || null, setup:!!state.config, registration:state.connected?'connected':'waiting', error:state.error || '', limitation:LIMITATION,
     start_seen:state.startSeen === true, startup_interactive:typeof state.startupInteractive === 'boolean' ? state.startupInteractive : null,
     startup_surface:surfaceRoster([state.startupSurface])?.[0] ?? null, timer_installed:!!state.timer,
     timer_ticks:Number.isSafeInteger(state.timerTicks) && state.timerTicks >= 0 ? state.timerTicks : 0,
-    current_surfaces:surfaceRoster(state.currentSurfaces)};
+    current_surfaces:surfaceRoster(state.currentSurfaces),
+    receipt_recovery:owner && (conflicts.length || held.length) ? {
+      conflict_count:conflicts.length, conflicts:conflicts.slice(0,32),
+      held_count:held.length, held:held.slice(0,32).map(request=>request.request_id),
+      next_step:'Keep the original receipts. Inspect linked requests with python3 scripts/watch_bridge_clear.py --port '+
+        state.data.port+' --transport-id <request-id> and owner messages in Motet. For held receipts after correcting the problem, use /watch-retry-receipts <request-id> in this same enrollment.'
+    } : null};
 }
 
 export function globalConfiguration(value) {
@@ -73,12 +97,13 @@ export function receiptRecord(value,id) {
       !/^[a-f0-9]{64}$/.test(value.envelope_digest) || !['claimed','pending','submitted','started','answered','unknown','dropped'].includes(value.phase) ||
       !Array.isArray(value.events) || value.events.length > 8) return false;
   if (value.completed !== undefined && typeof value.completed !== 'boolean') return false;
+  if (value.rejections !== undefined && !validReceiptRejections(value.rejections)) return false;
   return value.events.every(event => {
     if (!event || event.request_id !== id || event.attempt_id !== value.attempt_id) return false;
     const fields = {submitted:[],started:['turn_id'],answered:['turn_id','answer'],unknown:[],dropped:[]}[event.kind];
     if (!fields || Object.keys(event).sort().join(',') !== ['request_id','attempt_id','kind',...fields].sort().join(',')) return false;
-    if (fields.includes('turn_id') && (typeof event.turn_id !== 'string' || !event.turn_id.length || event.turn_id.length > 128 || /[\x00-\x1f]/.test(event.turn_id))) return false;
-    return event.kind !== 'answered' || matchingAnswer(event.answer,id);
+    if (fields.includes('turn_id') && !turnIdentifier(event.turn_id)) return false;
+    return event.kind !== 'answered' || retainedAnswer(event.answer);
   });
 }
 
@@ -98,9 +123,17 @@ export function lifecycleReceipt(value,id) {
     value.lifecycle_protocol===2 && event.request_id===id && event.attempt_id===value.attempt_id &&
     Object.keys(event).sort().join(',')==='answer,attempt_id,event_id,kind,occurred_at,outcome,request_id,turn_id' &&
     UUID.test(event.event_id) && Number.isSafeInteger(event.occurred_at) && event.occurred_at>=0 &&
-    typeof event.turn_id==='string' && event.turn_id.length>0 && event.turn_id.length<=128 && !/[\x00-\x1f]/.test(event.turn_id) &&
+    turnIdentifier(event.turn_id) &&
     ['answered','unusable','aborted','withheld'].includes(event.outcome) &&
-    (event.outcome==='answered'?matchingAnswer(event.answer,id):event.answer==='')));
+    (event.outcome==='answered'?retainedAnswer(event.answer):event.answer==='')));
+}
+
+function validReceiptRejections(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length <= 8 &&
+    Object.entries(value).every(([key,result]) => /^[a-f0-9]{64}$/.test(key) && result &&
+      Object.keys(result).length === 2 && Number.isInteger(result.count) &&
+      result.count >= 1 && result.count <= MAX_RECEIPT_REJECTIONS &&
+      Number.isSafeInteger(result.retry_at) && result.retry_at >= 0);
 }
 
 export function replyNoticeText(id) {

@@ -70,17 +70,27 @@ def is_terminal(db, request_id):
     return bool(row and row['execution'] in TERMINAL)
 
 
+def withheld_message(*, gap, interrupted):
+    if interrupted:
+        if gap:
+            return 'The identified Codex turn was interrupted, and transcript gaps prevent a trustworthy reply. Its reply is withheld.'
+        return 'The identified Codex turn was interrupted. Its reply is withheld.'
+    if gap:
+        return 'The identified turn ended, but transcript gaps prevent a trustworthy reply; its reply is withheld.'
+    return 'The identified turn ended, but its reply could not be safely captured and is withheld.'
+
+
 def project_terminal(db, request_id, row):
     """A stale transport copy cannot revive released, permanently withheld input."""
     record = get(db, request_id)
     if record and record['execution'] == 'completed' and record['capture'] == 'withheld':
         gap = record['evidence'].get('codex_gap_seen') is True
+        interrupted = record['evidence'].get('codex_abort_seen') is True
         row.update(state='unknown', reply='', candidate_reply='', final='', final_turn='', tracking_stopped=True,
                    execution_outcome='completed', settled=True, capture_disposition='withheld',
-                   error=('The identified turn ended, but transcript gaps prevent a trustworthy reply; its reply is withheld.'
-                          if gap else 'The identified turn ended, but its reply could not be safely captured and is withheld.'))
+                   error=withheld_message(gap=gap, interrupted=interrupted))
         if gap:
-            row['codex_gap_needs_envelope'] = True
+            row.update(codex_gap_seen=True, codex_gap_needs_envelope=True)
         return True
     if record and record['execution'] == 'dropped':
         # A row that already failed before dispatch keeps its own reason; the general wording is for rows without one.
@@ -200,8 +210,10 @@ def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
     if not old and db.execute('SELECT COUNT(*) FROM peer_execution').fetchone()[0] >= MAX_RESERVATIONS:
         raise ValueError('Peer execution history is full; owner maintenance is required.')
     evidence = dict(old['evidence']) if old else {}
-    if row.get('runtime') == 'codex' and row.get('codex_gap_needs_envelope') is True:
+    if row.get('runtime') == 'codex' and (row.get('codex_gap_seen') is True or row.get('codex_gap_needs_envelope') is True):
         evidence['codex_gap_seen'] = True
+    if row.get('codex_abort_seen') is True:
+        evidence['codex_abort_seen'] = True
     for key in ('mod_enrollment', 'mod_attempt_id', 'mod_generation', 'mod_turn', 'bound_turn', 'lifecycle_protocol',
                 'completion_event_id', 'completion_fingerprint', 'answer_event_id', 'answer_fingerprint'):
         value = row.get(key)
@@ -266,9 +278,12 @@ def valid_payload(tid, row, meta):
             or row.get('state') not in ('sending', 'queued', 'awaiting_reply', 'quarantined', 'unknown', 'expired', 'failed', 'answered')
             or row.get('runtime') != ('claude' if target.startswith('c:') else 'codex')):
         return False
-    for flag in ('settled', 'peer_mixed_input', 'peer_context_overflow', 'tracking_stopped'):
+    for flag in ('settled', 'peer_mixed_input', 'peer_context_overflow', 'tracking_stopped', 'codex_gap_seen', 'codex_abort_seen'):
         if flag in row and type(row[flag]) is not bool:
             return False
+    if row.get('codex_abort_seen') is True and (row['runtime'] != 'codex' or row.get('settled') is not True
+                                                or row.get('capture_disposition') != 'withheld'):
+        return False
     if (row.get('execution_outcome', '') not in ('', 'completed', 'dropped')
             or row.get('capture_disposition', '') not in ('', 'pending', 'captured', 'unusable', 'withheld')
             or type(row.get('lifecycle_protocol', 0)) is not int or row.get('lifecycle_protocol', 0) not in (0, 2)):

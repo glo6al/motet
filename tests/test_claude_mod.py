@@ -261,6 +261,68 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(self.row(payload['request_id'])['state'],'unknown')
         self.assertEqual(self.event(claim,'answered',turn_id=turn,answer='x'*16001)[0],400)
 
+    def test_legacy_marker_only_completion_acknowledges_original_bound_turn(self):
+        self.enroll()
+        for question, suffix in (('Fictional first question.', ''), ('Fictional second question.', '\n \t\x1f\u00a0\u3000')):
+            payload, _ = self.request(question)
+            claim = self.poll()[1]['claim']
+            turn = uid()
+            answer = 'WATCH_REPLY ' + claim['request_id'] + suffix
+            self.assertEqual(self.event(claim, 'answered', turn_id=turn, answer=answer)[0], 409)
+            self.assertEqual(self.event(claim, 'started', turn_id=turn)[0], 200)
+            self.assertEqual(self.event(claim, 'answered', turn_id=uid(), answer=answer)[0], 409)
+            self.assertEqual(self.event(dict(claim, attempt_id=uid()), 'answered', turn_id=turn, answer=answer)[0], 409)
+            self.assertEqual(self.row(payload['request_id'])['state'], 'awaiting_reply')
+            completed = self.event(claim, 'answered', turn_id=turn, answer=answer)
+            self.assertEqual(completed, (200, dict(request_id=claim['request_id'], state='unknown', turn_id=turn)))
+            self.assertEqual(self.event(claim, 'answered', turn_id=turn, answer=answer), completed)
+            result = self.row(payload['request_id'])
+            self.assertEqual(result['reply'], '')
+            self.assertIn('turn completed', result['error'])
+            with self.store.lock:
+                retained = next(r for r in self.store.mods.rows() if r['request_id'] == claim['request_id'])
+            self.assertEqual((retained['execution_outcome'], retained['capture_disposition'], retained['settled']),
+                             ('completed', 'unusable', True))
+
+    def test_locked_storage_returns_503_then_accepts_original_completion(self):
+        self.enroll()
+        payload, _ = self.request()
+        claim = self.poll()[1]['claim']
+        turn = uid()
+        self.assertEqual(self.event(claim, 'started', turn_id=turn)[0], 200)
+        locker = sqlite3.connect(self.base/'state'/'officer-messages.sqlite3')
+        try:
+            locker.execute('BEGIN IMMEDIATE')
+            failed_status, failure = self.answer(claim, turn)
+        finally:
+            locker.rollback()
+            locker.close()
+        self.assertEqual(failed_status, 503, failure)
+        self.assertNotIn('locked', json.dumps(failure))
+        self.assertEqual(self.row(payload['request_id'])['state'], 'awaiting_reply')
+        self.assertEqual(self.answer(claim, turn)[0], 200)
+        self.assertEqual(self.row(payload['request_id'])['reply'], 'Fictional completion.')
+
+    def test_malformed_request_stays_400_and_store_value_error_is_503(self):
+        self.enroll()
+        with patch.object(self.store.mods, 'call', side_effect=ValueError('Fictional internal storage detail')) as call:
+            malformed = [(b'{"unfinished":', {}), (b'{"text":"\xff"}', {}), (b'{}', {'Content-Length': 'invalid'})]
+            for body, extra_headers in malformed:
+                with self.subTest(body=body, extra_headers=extra_headers):
+                    conn = http.client.HTTPConnection('127.0.0.1', server.PORT, timeout=3)
+                    try:
+                        conn.request('POST', '/claude-mod/event', body,
+                                     {'Authorization': 'Bearer '+self.token, **extra_headers})
+                        response = conn.getresponse()
+                        self.assertEqual(response.status, 400)
+                        self.assertEqual(json.loads(response.read())['error_code'], 'invalid_request')
+                    finally:
+                        conn.close()
+            call.assert_not_called()
+            status, failure = self.http('/claude-mod/event', {}, token=self.token)
+            self.assertEqual(status, 503, failure)
+            self.assertNotIn('Fictional internal storage detail', json.dumps(failure))
+
     def test_peer_row_never_claimed_or_exposed_as_owner_mod_history(self):
         self.enroll();payload,_=self.request()
         with self.store.lock,self.store.db:

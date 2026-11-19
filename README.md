@@ -45,7 +45,7 @@ Motet acts only when you ask. It does not yet act by itself; that is the biggest
 
 Your Claude Code chats and your Codex chats live in separate apps. Motet gives them a way to talk. One agent asks another a question in plain words and the answer comes back to it, so the work carries on without you copying notes from window to window.
 
-- **Across companies.** It works between eligible Claude Code and Codex chats on your Mac today. Agents from the same company keep using that app's own tools.
+- **Across companies.** It works between eligible Claude Code and Codex chats on your Mac today. An Antigravity chat can ask them too, through an optional plugin. Agents from the same company keep using that app's own tools.
 - **You stay in charge.** Agents are instructed to contact another only when you have asked for it. The bridge cannot check who is calling, so that is a rule they follow, not a lock. A message from another agent never gives it new permissions.
 - **Nothing passes as delivered.** A question that is waiting, failed or answered is shown as what it is. Requests and replies are kept for 24 hours. A reply is filed against the question and collected when the asking agent needs it; it does not wake a chat that has stopped.
 

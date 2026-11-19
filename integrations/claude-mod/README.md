@@ -83,6 +83,8 @@ Version 0.5.0 was verified with disposable live Codex and Claude Code 2.1.321 ch
 
 ## Disconnect, revoke and remove
 
+Version 0.6.2 repairs completion tracking after a full plugin reload. Recovery requires agreement between the local retained attempt and the server's original turn, followed by an observed matching native completion. Its answer is withheld across the observation gap. A completion missed entirely still requires trustworthy recovery evidence or an explicit owner decision. Conflicting receipts are never resolved by picking the first answer. Rejected receipts remain retained without blocking other receipts or heartbeats; the original prompt is never submitted again. Upgrade the bridge before reloading the plugin.
+
 Use **Disconnect automatic Claude connections** in Motet to revoke the registration grant and its derived service credentials. This does not revoke independent legacy manual connections or cancel native input already queued. A new global authorization requires a fresh setup code. Per-chat `/watch-disconnect` is an opt-out; it does not disconnect other chats.
 
 When pending native work has settled, uninstall `watch-owner@watch-local` at the scope where it was installed, remove the `watch-local` marketplace if no longer needed, and reload through the native plugin manager. Revoke automatic connections first if you need backend credential invalidation: uninstalling alone stops polling but does not revoke saved server credentials. An answered request is not undone by removal.

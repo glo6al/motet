@@ -43,6 +43,9 @@ class EnvelopeEncodingTests(unittest.TestCase):
             self.assertIn('this WATCH MCP', original_watch)
             for envelope in (current, original_watch):
                 self.assertEqual(recovery.envelope_proof(ledger, key, envelope), envelope)
+                historical_rule = envelope.replace('Do not call send_message or send_inbox_message,',
+                                                   'Do not call send_message,')
+                self.assertEqual(recovery.envelope_proof(ledger, key, historical_rule), historical_rule)
             # Historical ASCII envelopes were admitted under the old 2000-point raw cap.
             old_text=text[:1000]
             old=dict(ledger,payload_hash=peer_bridge.mac(key,'watch-bridge-dedupe-v2',json.dumps([target,revision,old_text,sender],ensure_ascii=True)))
@@ -154,6 +157,66 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(result['requests'][0]['status'], 'excluded', result)
         with self.assertRaises(recovery.RecoveryError): self.run_recovery(row, apply=True)
         self.assertIsNone(peer_lifecycle.get(self.db,row['tid']))
+
+    def lifecycle_receipt(self, row):
+        store = json.loads(self.store_path.read_text())
+        shard = store.pop(row['namespace'])
+        shard['version'] = 3
+        receipt = shard['requests'][row['tid']]
+        receipt.update(phase='completed', lifecycle_protocol=2, execution_completed=True,
+                       capture='answered', origin='peer')
+        receipt['events'] = [dict(request_id=row['tid'], attempt_id=row['attempt'],
+                                  kind='completed', turn_id=row['turn'], outcome='answered',
+                                  event_id=ident(), occurred_at=5000, answer='WATCH_REPLY '+row['tid']+'\n42')]
+        store[row['namespace'].replace('runtime-v2:', 'runtime-v3:', 1)] = shard
+        return store, receipt
+
+    def test_current_claude_receipt_can_verify_pruned_execution_without_restoring_reply(self):
+        row = self.ledger('claude')
+        row['turn'] = 'fictional-opaque-turn-😀'
+        store, receipt = self.lifecycle_receipt(row)
+        receipt['turn_id'] = row['turn']
+        self.store_path.write_text(json.dumps(store))
+        self.assertEqual(self.run_recovery(row)['requests'][0]['status'], 'eligible')
+        receipt['events'] = []  # An acknowledged receipt still requires the same native proof.
+        self.store_path.write_text(json.dumps(store))
+        self.assertEqual(self.run_recovery(row, apply=True)['requests'][0]['status'], 'recovered')
+        record = peer_lifecycle.get(self.db, row['tid'])
+        self.assertEqual((record['execution'], record['capture']), ('completed', 'withheld'))
+        self.assertEqual(record['evidence']['mod_turn'], row['turn'])
+
+    def test_current_claude_recovery_rejects_uncertain_and_conflicting_receipts(self):
+        row = self.ledger('claude')
+        original = self.store_path.read_text()
+        for field, value in (('generation', ident()), ('turn_id', ident()), ('answer', 'No marker'),
+                             ('outcome', 'withheld'), ('occurred_at', False), ('event_id', 'invalid')):
+            store, receipt = self.lifecycle_receipt(row)
+            target = receipt if field == 'generation' else receipt['events'][0]
+            target[field] = value
+            if field == 'generation':
+                self.db.execute('INSERT OR REPLACE INTO peer_execution VALUES (?,?,?,?,?,?)',
+                                (row['tid'], row['target'], 1., 'uncertain', 'pending',
+                                 json.dumps({'mod_generation':row['generation']})))
+                self.db.commit()
+                self.store_path.write_text(json.dumps(store))
+                self.assertEqual(self.run_recovery(row)['requests'][0]['status'], 'excluded')
+                self.db.execute('DELETE FROM peer_execution WHERE request_id=?', (row['tid'],))
+                self.db.commit()
+            else:
+                self.store_path.write_text(json.dumps(store))
+                self.assert_excluded(row)
+            # Restore the original fixture for the next mutation.
+            self.store_path.write_text(original)
+
+    def test_current_claude_recovery_rejects_malformed_opaque_turns(self):
+        row = self.ledger('claude')
+        original = self.store_path.read_text()
+        for turn in ('', 'x'*129, 'opaque\x00turn', 'opaque\ud800turn'):
+            store, receipt = self.lifecycle_receipt(row)
+            receipt['turn_id'] = receipt['events'][0]['turn_id'] = turn
+            self.store_path.write_text(json.dumps(store))
+            self.assert_excluded(row)
+            self.store_path.write_text(original)
 
     def test_dry_run_is_read_only_then_apply_is_withheld_idempotent(self):
         a,b = self.ledger(),self.ledger('claude',legacy=True)

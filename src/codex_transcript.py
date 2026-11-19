@@ -16,6 +16,10 @@ class Unavailable(ValueError):
     pass
 
 
+class TemporaryUnavailable(Unavailable):
+    """The same evidence can be checked again after a temporary read failure."""
+
+
 def filename_id(name):
     match = NAME.fullmatch(name)
     if match:
@@ -88,6 +92,19 @@ def header(source, ident, project=None):
     return meta
 
 
+def _sqlite_index_locked(error):
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    code = getattr(error, 'sqlite_errorcode', None)
+    if code is not None:
+        return code & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    # Python 3.9 and 3.10 expose only SQLite's diagnostic text.
+    return error.args in (
+        ('database is locked',), ('database table is locked',),
+        ('database table is locked: threads',), ('database schema is locked: main',),
+    )
+
+
 def index(root, ident=None, limit=MAX_ENTRIES):
     """None means absent; invalid/present metadata never enables legacy fallback.
 
@@ -122,9 +139,13 @@ def index(root, ident=None, limit=MAX_ENTRIES):
             check, current = open_regular(root, path)
             check.close()
             if (original.st_dev, original.st_ino) != (current.st_dev, current.st_ino):
-                raise Unavailable('Codex native index changed during lookup.')
+                raise TemporaryUnavailable('Codex native index changed during lookup.')
         return {row[0]: dict(zip(fields, row)) for row in rows}
-    except (OSError, sqlite3.Error) as error:
+    except OSError as error:
+        raise TemporaryUnavailable('Codex native index cannot be read safely.') from error
+    except sqlite3.Error as error:
+        if _sqlite_index_locked(error):
+            raise TemporaryUnavailable('Codex native index is temporarily locked.') from error
         raise Unavailable('Codex native index cannot be read safely.') from error
 
 
@@ -194,7 +215,7 @@ def open_pinned(sessions, path, ident, project=None):
     try:
         meta = header(source, ident, project)
         if entries != index(os.path.dirname(sessions), ident):
-            raise Unavailable('Codex native index changed during identity validation.')
+            raise TemporaryUnavailable('Codex native index changed during identity validation.')
         return path, source, st, meta
     except BaseException:
         source.close()
@@ -220,7 +241,10 @@ def tracking_source(sessions, row, budget):
     """
     current = segment(row)
     ident = row['agent'][2:]
-    source, st = open_regular(sessions, current['path'])
+    try:
+        source, st = open_regular(sessions, current['path'])
+    except OSError as error:
+        raise TemporaryUnavailable('The pinned Codex predecessor is temporarily unavailable.') from error
     successor = None
     try:
         meta = header(source, ident)
@@ -281,7 +305,10 @@ def tracking_source(sessions, row, budget):
         check = index(os.path.dirname(sessions), ident)
         if check is None or selected(check.get(ident)) != path:
             raise Unavailable('Codex native pointer changed during continuation proof.')
-        again, check_stat = open_regular(sessions, current['path'])
+        try:
+            again, check_stat = open_regular(sessions, current['path'])
+        except OSError as error:
+            raise TemporaryUnavailable('The pinned Codex predecessor cannot be rechecked yet.') from error
         again.close()
         if (check_stat.st_dev, check_stat.st_ino, check_stat.st_size) != (st.st_dev, st.st_ino, st.st_size):
             raise Unavailable('Codex predecessor changed before the tracking switch.')

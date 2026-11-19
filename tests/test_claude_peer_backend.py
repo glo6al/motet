@@ -234,6 +234,55 @@ class ClaudePeerBackendTests(unittest.TestCase):
         self.assertEqual(result['state'], 'unknown'); self.assertEqual(result['reply'], '')
         self.assertIn('withheld', result['error'])
 
+    def test_v2_invalid_answer_settles_original_execution_without_capturing(self):
+        import peer_lifecycle
+        self.enable_lifecycle()
+        for suffix in ('', '\n \t\x1f\u00a0\u2009\u3000', '\nMentions WATCH_REPLY in prose.',
+                       '\n\x00', '\n\ud800', '\nx'*16000):
+            sent = self.send()
+            claim = self.global_poll(self.body['client_id'])[1]['claim']
+            self.assertEqual(self.event(claim, 'started', turn_id='fictional-turn')[0], 200)
+            data = dict(outcome='answered', answer='WATCH_REPLY '+claim['request_id']+suffix, event_id=uid())
+            self.assertEqual(self.completion(claim, **data, turn_id='another-turn')[0], 409)
+            self.assertEqual(self.completion(dict(claim, attempt_id=uid()), **data)[0], 409)
+            self.assertEqual(self.store.shared.result(sent['request_id'])['state'], 'awaiting_reply')
+            self.assertEqual(self.completion(claim, **data)[0], 200)
+            self.assertEqual(self.completion(claim, **data)[0], 200)
+            self.assertEqual(self.completion(claim, **dict(data, answer='changed'))[0], 409)
+            result = self.store.shared.result(sent['request_id'])
+            self.assertEqual((result['state'], result['reply']), ('unknown', ''))
+            self.assertIn('turn completed', result['error'])
+            lifecycle = peer_lifecycle.get(self.store.db, claim['request_id'])
+            self.assertEqual((lifecycle['execution'], lifecycle['capture']), ('completed', 'unusable'))
+            self.assertEqual(peer_lifecycle.blockers(self.store.db, self.aid), [])
+
+    def test_recoverable_turn_proof_comes_from_original_execution_and_survives_pruning(self):
+        self.enable_lifecycle()
+        sent = self.send()
+        claim = self.global_poll(self.body['client_id'])[1]['claim']
+        self.assertEqual(self.global_poll(self.body['client_id'])[1]['recoverable_turns'], [])
+        self.assertEqual(self.event(claim, 'started', turn_id='fictional-turn')[0], 200)
+        expected = dict(request_id=claim['request_id'], attempt_id=claim['attempt_id'],
+                        generation=self.generation, turn_id='fictional-turn')
+        old_generation = self.generation
+        self.body = dict(self.body, connection_seq=2)
+        status, registration = self.http('/claude-mod/register', self.body, token=self.grant['grant'])
+        self.assertEqual(status, 200)
+        self.generation = registration['generation']
+        self.assertNotEqual(self.generation, old_generation)
+        self.assertEqual(self.global_poll(self.body['client_id'])[1]['recoverable_turns'], [expected])
+        with self.store.lock, self.store.db:
+            row = self.peer_row(sent['request_id'])
+            row['created'] -= 86410
+            self.store.db.execute('UPDATE shared_bridge_requests SET created=? WHERE client_id=?',
+                                  (row['created'], sent['request_id']))
+            self.store.mods.put(row)
+            self.store._prune(self.store._rows(), time.time())
+        self.assertEqual(self.global_poll(self.body['client_id'])[1]['recoverable_turns'], [expected])
+        self.assertEqual(self.completion(claim, 'withheld', generation=old_generation)[0], 409)
+        self.assertEqual(self.completion(claim, 'withheld')[0], 200)
+        self.assertEqual(self.global_poll(self.body['client_id'])[1]['recoverable_turns'], [])
+
     def test_v2_original_completion_after_payload_pruning_releases_without_republishing(self):
         import peer_lifecycle
         self.enable_lifecycle(); sent = self.send(); claim = self.global_poll(self.body['client_id'])[1]['claim']
@@ -580,7 +629,7 @@ class ClaudePeerBackendTests(unittest.TestCase):
                 raise sqlite3.OperationalError('Fictional persistence fault')
             return put(row)
         with patch.object(self.store.mods,'put',side_effect=fail_attempt):
-            self.assertEqual(self.global_poll(self.body['client_id'])[0],400)
+            self.assertEqual(self.global_poll(self.body['client_id'])[0],503)
         self.assertIsNone(self.store.db.execute('SELECT launched FROM shared_bridge_requests').fetchone()[0])
         row=self.peer_row(sent['request_id']);self.assertFalse(row['launched']);self.assertNotIn('mod_attempt_id',row)
         self.assertEqual(self.global_poll(self.body['client_id'])[1]['claim']['request_id'],row['request_id'])
