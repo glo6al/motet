@@ -11,6 +11,10 @@ change, and how you tested it. Run the relevant checks from the
 [workflow](.github/workflows/tests.yml), and keep recorded facts distinct
 from inferences in any change that presents session data.
 
+Base your pull request on the `dev` branch. Changes are checked together
+on `dev` before they reach `main`, which only moves to a `dev` commit that
+has already been tested.
+
 ## Contributions and the license
 
 Motet is licensed under the [Apache License 2.0](LICENSE). Unless you
