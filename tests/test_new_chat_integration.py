@@ -136,7 +136,10 @@ class AdmissionTests(unittest.TestCase):
     def test_authenticated_work_first_turn_and_read_only_request_recovery(self):
         self.http_launch_flow('work')
 
-    def http_launch_flow(self, mode):
+    def test_registered_empty_project_launches_and_admits_first_chat(self):
+        self.http_launch_flow('blank', register=True)
+
+    def http_launch_flow(self, mode, *, register=False):
         from new_chat_service import NewChatService
         ident = str(uuid.uuid4())
         new_path = self.sessions / ('rollout-' + ident + '.jsonl')
@@ -180,7 +183,8 @@ class AdmissionTests(unittest.TestCase):
             def close(self):
                 pass
         adapter = Adapter()
-        store = NewChatService(self.home / 'private-state', adapter, lambda: [self.identity], enabled=True)
+        store = NewChatService(self.home / 'private-state', adapter,
+                               lambda: [] if register else [self.identity], enabled=True, home=self.home)
         httpd = server.Server(('127.0.0.1', 0), server.H)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         def request(method, route, data=None):
@@ -196,6 +200,24 @@ class AdmissionTests(unittest.TestCase):
                     patch.object(server, 'KEY', 'fictional-key'):
                 thread.start()
                 _, context = request('GET', '/api/new-chat/context')
+                if register:
+                    self.assertEqual(context['folders'], [])
+                    self.assertTrue(context['canRegisterFolders'])
+                    code, rejected = request('POST', '/api/new-chat/folders', {'path': str(self.path)})
+                    self.assertEqual(code, 400)
+                    self.assertEqual(rejected['error'],
+                                     {'code': 'invalid_folder', 'message': 'That is a file, not a folder.'})
+                    code, saved = request('POST', '/api/new-chat/folders', {'path': '~/fictional-project'})
+                    self.assertEqual(code, 201)
+                    self.assertTrue(saved['folder']['registered'])
+                    self.assertEqual(set(saved['folder']), {'id', 'revision', 'label', 'displayPath', 'registered'})
+                    self.assertEqual(saved['folder']['displayPath'], self.frozen.path)
+                    self.assertEqual((adapter.creates, adapter.starts), (0, 0))
+                    self.assertFalse(server.AGENTS)
+                    self.assertEqual(store.db.execute('SELECT count(*) FROM intents').fetchone()[0], 0)
+                    self.assertEqual(store.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+                    _, context = request('GET', '/api/new-chat/context')
+                    self.assertEqual(context['folders'], [saved['folder']])
                 folder = context['folders'][0]
                 selected = dict(provider='codex', folderId=folder['id'], folderRevision=folder['revision'], mode=mode)
                 code, intent = request('POST', '/api/new-chat/intents', selected)

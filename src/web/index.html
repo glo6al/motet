@@ -800,7 +800,7 @@ svg.workspace-nc-working circle{stroke:#2459d6;stroke-width:2;stroke-dasharray:2
 #workspaceNewChatBanner .workspace-nc-acts{flex:none;display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end}
 #workspaceNewChatBanner button{font:inherit;color:inherit;cursor:pointer;background:#fff;height:30px;padding:0 12px;border-radius:9px;border:1px solid #c9c6be;font-size:13px;font-weight:600;white-space:nowrap}
 #workspaceNewChatBanner button:hover{background:#f6f6f4}
-#workspaceNewChatBanner button:focus-visible{outline:2px solid #2459d6;outline-offset:1px}
+#workspaceNewChatBanner button:focus-visible{outline:2px solid var(--ws-ink);outline-offset:1px}
 #workspaceNewChatBanner button[data-nc-icon]{width:40px;height:40px;padding:0;border-color:transparent;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;color:var(--ws-ink)}
 #workspaceNewChatBanner button[data-nc-icon] svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 #workspaceNewChatDialog{width:min(580px,calc(100vw - 24px));max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px);overflow:hidden;padding:8px 22px 18px;border-radius:18px;border-color:#d9d6cf;box-shadow:0 24px 60px rgba(28,27,25,.24);font-size:14px;line-height:1.45}
@@ -831,7 +831,7 @@ svg.workspace-nc-working circle{stroke:#2459d6;stroke-width:2;stroke-dasharray:2
 .workspace-nc-app+.workspace-nc-app{border-top:1px solid var(--ws-line)}
 .workspace-nc-app input,.workspace-nc-folders input{appearance:none;-webkit-appearance:none;margin:2px 0 0;width:16px;height:16px;border-radius:50%;border:1.5px solid #a9a69f;box-sizing:border-box;background:#fff;cursor:pointer}
 .workspace-nc-app input:checked,.workspace-nc-folders input:checked{border:5px solid var(--ws-ink)}
-.workspace-nc-app input:focus-visible,.workspace-nc-folders input:focus-visible{outline:2px solid #2459d6;outline-offset:2px}
+.workspace-nc-app input:focus-visible,.workspace-nc-folders input:focus-visible{outline:2px solid var(--ws-ink);outline-offset:2px}
 .workspace-nc-app input:disabled{border-style:dashed;border-color:#c9c6be;cursor:default}
 .workspace-nc-app>span{display:flex;flex-direction:column;gap:1px;min-width:0}
 .workspace-nc-app b{font-weight:600;font-size:14.5px}
@@ -840,7 +840,7 @@ svg.workspace-nc-working circle{stroke:#2459d6;stroke-width:2;stroke-dasharray:2
 .workspace-nc-app[data-warn] small{color:#765118}
 .workspace-nc-app[data-status=not_yet] b,.workspace-nc-app[data-status=unavailable] b{color:var(--ws-mute);font-weight:500}
 #workspaceNewChatDraft{width:100%;box-sizing:border-box;border:1px solid #d9d6cf;border-radius:10px;padding:8px 10px;font:inherit;font-size:14.5px;line-height:1.45;resize:none;background:#fff;color:var(--ws-ink)}
-#workspaceNewChatDraft:focus-visible{outline:2px solid #2459d6;outline-offset:1px}
+#workspaceNewChatDraft:focus{outline:none;border-color:var(--ws-ink);box-shadow:none}
 .workspace-nc-note{display:flex;gap:10px;align-items:flex-start;background:#f6f6f4;border:1px solid var(--ws-line);border-radius:12px;padding:10px 12px;font-size:13.5px;margin-top:10px}
 .workspace-nc-note svg{flex:none;width:16px;height:16px;margin-top:1px;fill:none;stroke:var(--ws-mute);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .workspace-nc-note span{min-width:0}
@@ -851,7 +851,32 @@ svg.workspace-nc-working circle{stroke:#2459d6;stroke-width:2;stroke-dasharray:2
 #workspaceNewChatDialog footer [data-nc-open]{background:#1c1b19;border-color:#1c1b19;color:#fff}
 #workspaceNewChatDialog footer [data-nc-open]:hover{background:#34322e}
 #workspaceNewChatDialog footer [data-nc-open]:disabled{background:#c9c6be;border-color:#c9c6be;cursor:default}
+#workspaceAddFolderDialog{width:min(460px,calc(100vw - 24px));box-sizing:border-box;max-height:calc(100dvh - 24px);overflow:auto;font-size:14px}
+#workspaceAddFolderDialog header{display:flex;align-items:center;gap:8px}
+#workspaceAddFolderDialog header h2{flex:1}
+#workspaceAddFolderDialog header [data-close]{flex:none;box-sizing:border-box;width:40px;min-width:40px;height:40px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:22px}
+#workspaceAddFolderDialog form{display:grid;gap:8px}
+#workspaceAddFolderDialog input{box-sizing:border-box;width:100%;min-width:0;padding:9px;font:inherit;font-size:16px;border:1px solid var(--ws-line);border-radius:8px;color:var(--ws-ink);background:#fff}
+#workspaceAddFolderDialog input:focus{outline:none;border-color:var(--ws-ink);box-shadow:none}
+#workspaceAddFolderDialog input[aria-invalid=true]{border-color:#b8430a}
+#workspaceAddFolderDialog [role=status][data-error=true]{color:#b8430a}
+#workspaceAddFolderDialog small,#workspaceAddFolderDialog [role=status]{font-size:13px;line-height:1.5}
+#workspaceAddFolderDialog .workspace-nc-folder-hint{color:var(--ws-mute)}
+#workspaceAddFolderDialog .workspace-nc-folder-message{display:grid;min-width:0}
+#workspaceAddFolderDialog .workspace-nc-folder-message>:is(#workspaceAddFolderHint,#workspaceAddFolderStatus){grid-area:1/1;min-width:0}
+#workspaceAddFolderDialog .workspace-nc-folder-message #workspaceAddFolderHint[hidden]{display:block!important;visibility:hidden}
+.workspace-nc-disabled-reason{margin:10px 0 0;font-size:13.5px;line-height:1.5;color:var(--ws-mute)}
+#workspaceAddFolderDialog footer{display:flex;justify-content:flex-end;margin-top:4px}
+#workspaceAddFolderDialog [type=submit]{background:var(--ws-ink);border:1px solid var(--ws-ink);color:#fff;border-radius:10px;padding:10px 18px;font-weight:600}
+#workspaceAddFolderDialog [type=submit]:disabled{background:#c9c6be;border-color:#c9c6be;cursor:default}
+#workspaceAddFolderDialog button:focus-visible,.workspace-nc-recover:focus-visible,.workspace-nc-empty button:focus-visible,#workspaceNewChatSettings button:focus-visible{outline:2px solid var(--ws-ink);outline-offset:2px}
 #workspaceNewChatSettings{margin-top:18px}
+#workspaceNewChatSettings .workspace-nc-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin:16px 0 6px}
+#workspaceControlsBody #workspaceNewChatSettings .workspace-nc-heading h4{margin:0}
+#workspaceNewChatSettings .workspace-nc-heading button,#workspaceAddFolderDialog [data-refresh],.workspace-nc-recover{border:1px solid #c9c6be;border-radius:9px;background:#fff;color:var(--ws-ink);padding:7px 10px;font:inherit;font-size:13px;cursor:pointer}
+html.workspace #workspaceNewChatDialog .workspace-nc-recover{border:1px solid #c9c6be;border-radius:9px;background:#fff;color:var(--ws-ink);padding:7px 10px;font:inherit;font-size:13px;cursor:pointer;align-self:flex-start;max-width:100%}
+.workspace-nc-saved{padding:10px 12px;background:#f6f6f4;border-radius:8px;margin:6px 0 12px}
+.workspace-nc-empty p{margin:10px 0 6px}.workspace-nc-empty button{border:0;background:none;color:var(--ws-ink);font:inherit;text-decoration:underline;cursor:pointer;pointer-events:auto;padding:8px}
 #workspaceControlsBody #workspaceNewChatSettings h4{margin:16px 0 2px;font:600 14.5px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
 #workspaceNewChatSettings p{margin:0 0 6px;font-size:13.5px;line-height:1.45;color:var(--ws-mute)}
 #workspaceNewChatSettings .workspace-nc-row:has(svg.workspace-folder){box-sizing:border-box;min-height:49px}
@@ -2403,7 +2428,7 @@ html.workspace body.workspace-officer-desk .workspace-wod-memory-host #deckSetti
 #workspaceNewChatDialog .workspace-nc-choice input{appearance:none;-webkit-appearance:none;box-sizing:border-box;flex:none;margin:0;width:16px;height:16px;border-radius:50%;border:1.5px solid #a9a69f;background:#fff;cursor:pointer}
 #workspaceNewChatDialog .workspace-nc-choice input:checked{border:5px solid var(--ws-ink)}
 #workspaceNewChatDialog .workspace-nc-choice input:disabled{border-style:dashed;border-color:#c9c6be;cursor:default}
-#workspaceNewChatDialog .workspace-nc-choice input:focus-visible{outline:2px solid #2459d6;outline-offset:2px}
+#workspaceNewChatDialog .workspace-nc-choice input:focus-visible{outline:2px solid var(--ws-ink);outline-offset:2px}
 
 #workspaceNewChatBanner[data-state=needs]{border-color:#e7b9a4}
 #workspaceNewChatBanner .workspace-nc-needs{animation:none}
@@ -3206,6 +3231,7 @@ let PROJ=null; try{PROJ=store.getItem('liveRoomProj')||null}catch(err){}
 function projInfo(id){
   const a=A[id]; if(!a) return {n:'',how:''};
   let n=projName(a.cwd), how='';
+  if(typeof workspaceNewChatReady==='function'&&workspaceNewChatReady()&&(n==='—'||WNC_TEMP.test(a.cwd||''))&&WNC.adapter?.isRegistered?.(a.cwd))return {n:workspaceNewChatProjectKey(a.cwd),how:''};
   if(!n){let p=a, g=0; while(!n&&p.parent&&A[p.parent]&&!p.soft&&g++<10){p=A[p.parent]; n=projName(p.cwd)} if(n) how='inherited'}
   if(!n) return {n:'',how:''};
   /* a folder under a temporary directory named "<known project>" plus "-rest" or ".XXXXXX" is grouped with that project BY NAME ONLY
@@ -7035,11 +7061,11 @@ function createAttachmentsClient(o={}){
 /* New chat HTTP client: no native launch, path authority or instruction persistence lives in the page. */
 function createNewChatClient(o){
   const base='/api/new-chat/',uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-  let owner='',epoch=0,context=null,scope='',timer=0,active=null,busy=false,loading=false,launchEpoch=0;
-  const api={production:true,apps:{},host:null,waitMs:120000,answerMs:30000,managedPermissionTimeoutSeconds:null};
+  let owner='',epoch=0,context=null,scope='',timer=0,active=null,busy=false,loading=null,recovered=false,projects=null,refreshTimer=null,launchEpoch=0;
+  const api={production:true,apps:{},host:null,waitMs:120000,answerMs:30000,managedPermissionTimeoutSeconds:null,inventoryFresh:false,inventoryReason:''};
   const valid=(e,k)=>e===epoch&&k===owner&&o.auth()===k&&!!k;
   const changed=()=>o.changed&&o.changed();
-  const unavailable=reason=>{api.managedPermissionTimeoutSeconds=null;api.apps={codex:{status:'unavailable',reason},claude:{status:'unavailable',reason:'Claude new chats are not available.'}};context=null;changed()};
+  const unavailable=reason=>{api.inventoryReason=reason;api.managedPermissionTimeoutSeconds=null;api.apps={codex:{...api.apps.codex,status:'unavailable',reason},claude:{...api.apps.claude,status:'unavailable',reason}};api.inventoryFresh=false;changed()};
   const err=(message,status=0)=>Object.assign(Error(message),{status});
   async function request(path,body,e=epoch,k=owner,root=base){
     if(!valid(e,k))throw err('Owner authentication changed.');
@@ -7050,7 +7076,7 @@ function createNewChatClient(o){
       if(!valid(e,k))throw err('Owner authentication changed.');
       let value;try{value=await response.json()}catch(_){throw err('The New chat response could not be read.')}
       if(!valid(e,k))throw err('Owner authentication changed.');
-      if(!response.ok||value?.error)throw err(value?.error?.message||'New chat is unavailable.',response.status);
+      if(!response.ok||value?.error)throw Object.assign(err(value?.error?.message||'New chat is unavailable.',response.status),{code:value?.error?.code});
       if(value?.schemaVersion!==1||value.fixture!==undefined&&value.fixture!==false)throw err('The New chat response is unsupported.');
       return value;
     })();
@@ -7058,24 +7084,35 @@ function createNewChatClient(o){
   }
   function clearStored(){if(scope)try{o.storage.removeItem(scope)}catch(_){}}
   function halt(){o.clearTimeout(timer);timer=0;}
-  function reset(){epoch++;launchEpoch++;halt();clearStored();active=null;context=null;scope='';busy=false;loading=false;owner='';api.apps={};api.host=null;api.managedPermissionTimeoutSeconds=null;if(o.authChanged)o.authChanged();}
+  function reset(){epoch++;launchEpoch++;halt();if(refreshTimer!==null)o.clearTimeout(refreshTimer);refreshTimer=null;projects=null;clearStored();active=null;context=null;scope='';busy=false;loading=null;recovered=false;owner='';api.apps={};api.host=null;api.inventoryFresh=false;api.inventoryReason='';registering=null;api.managedPermissionTimeoutSeconds=null;if(o.authChanged)o.authChanged();}
   function folder(path){const matches=context?.folders.filter(f=>f.displayPath===path)||[];return matches.length===1?matches[0]:null;}
+  const validFolder=f=>f&&typeof f.id==='string'&&!!f.id&&typeof f.revision==='string'&&!!f.revision&&typeof f.displayPath==='string'&&!!f.displayPath&&typeof f.label==='string'&&!!f.label&&(f.registered===undefined||typeof f.registered==='boolean');
   api.hasFolder=path=>!!folder(path);
+  api.folderRevision=path=>folder(path)?.revision||'';
+  api.isRegistered=path=>folder(path)?.registered===true;
+  api.registeredFolders=()=>context?.folders.filter(f=>f.registered===true)||[];
+  api.canRegisterFolders=()=>context?.canRegisterFolders===true;
   api.pending=()=>!!active||busy;
   api.sync=()=>{const key=o.auth()||'';if(key===owner)return;if(owner)reset();owner=key;if(!key){unavailable('Unlock Motet to start a new chat.');return}load();};
-  async function load(){
-    if(loading)return;loading=true;const e=epoch,k=owner;
-    unavailable('Checking New chat availability…');
-    try{
-      const tag=await o.scope(k);if(!valid(e,k))return;scope='watch-new-chat:'+tag;
-      const c=await request('context',undefined,e,k);if(!valid(e,k))return;
-      if(!Array.isArray(c.folders)||!Array.isArray(c.providers)||!c.host||c.folders.some(f=>!f||typeof f.id!=='string'||!f.id||typeof f.revision!=='string'||!f.revision||typeof f.displayPath!=='string'))throw err('The New chat inventory is unavailable.');
-      context=c;api.host=c.host;api.waitMs=Math.max(5000,Math.min(600000,Number(c.limits?.observationWindowMs)||120000));
+  function load(){
+    if(loading)return loading;
+    const e=epoch,k=owner;
+    if(!valid(e,k))return Promise.resolve(false);
+    loading=Promise.resolve().then(async()=>{
+      if(!valid(e,k))return false;
+      api.inventoryFresh=false;api.inventoryReason='Checking New chat availability…';if(!context)unavailable('Checking New chat availability…');else changed();
+      if(!scope){const tag=await o.scope(k);if(!valid(e,k))return false;scope='watch-new-chat:'+tag;}
+      if(!recovered){recovered=true;let saved='';try{saved=o.storage.getItem(scope)||''}catch(_){}if(!active&&uuid.test(saved)){active={id:saved,ui:saved,attempt:null,polls:0,seq:0};await recover(e,k)}}
+      const c=await request('context',undefined,e,k);if(!valid(e,k))return false;
+      if(!Array.isArray(c.folders)||!Array.isArray(c.providers)||!c.host||typeof c.host.label!=='string'||!c.folders.every(validFolder)||c.providers.some(p=>!p||typeof p.id!=='string')||c.canRegisterFolders!==undefined&&typeof c.canRegisterFolders!=='boolean'||new Set(c.folders.map(f=>f.id)).size!==c.folders.length||new Set(c.folders.map(f=>f.displayPath)).size!==c.folders.length)throw err('Motet could not load the list of apps and folders. Try again.');
+      context=c;api.inventoryFresh=true;api.inventoryReason='';api.host=c.host;api.waitMs=Math.max(5000,Math.min(600000,Number(c.limits?.observationWindowMs)||120000));
       api.managedPermissionTimeoutSeconds=Number.isInteger(c.limits?.managedPermissionTimeoutSeconds)&&c.limits.managedPermissionTimeoutSeconds>0?c.limits.managedPermissionTimeoutSeconds:null;
       api.apps={};for(const [app,id] of [['codex','codex'],['claude','claude_code']]){const p=c.providers.find(p=>p.id===id);api.apps[app]={provider:id,status:p?.available===true&&(p.supportsWork===true||p.supportsBlank===true)?'ready':'unavailable',supportsWork:p?.supportsWork===true,supportsBlank:p?.supportsBlank===true,ownership:p?.ownership,reason:p?.available===true?'':p?.unavailableReason?.message||'New chats are unavailable.'};}
-      let saved='';try{saved=o.storage.getItem(scope)||''}catch(_){}if(uuid.test(saved)){active={id:saved,ui:saved,attempt:null,polls:0,seq:0};await recover(e,k)}
+      if(!valid(e,k))return false;
       changed();
-    }catch(error){if(valid(e,k))unavailable(error.message)}finally{if(valid(e,k))loading=false}
+      return true;
+    }).catch(error=>{if(valid(e,k))unavailable(error.status===503&&error.code==='unavailable'&&error.message==='New chat is unavailable on this host.'?'New chat is unavailable on this host.':'Motet could not load the list of apps and folders. Try again.');return false;}).finally(()=>{if(valid(e,k))loading=null;});
+    return loading;
   }
   function report(value){
     if(!active||value.requestId!==active.id||!uuid.test(value.attemptId||''))throw err('The New chat receipt does not match this request.');
@@ -7083,7 +7120,7 @@ function createNewChatClient(o){
     if(active.selection&&(value.provider!==active.selection.provider||value.mode!==active.selection.mode||value.folder?.id!==active.selection.folderId||value.folder?.revision!==active.selection.folderRevision))throw err('The New chat receipt differs from the prepared choice.');
     const s=value.state==='unavailable'?'failed':value.state,session=value.session,mismatch=value.mismatch;
     const needsPoll=value.observation==='active'||value.execution?.pending===true||['accepted','running','needs_attention'].includes(value.execution?.outcome)||value.execution?.outcome==='unknown'&&!!value.execution?.turnId;
-    o.report(active.ui,{server:true,statusPolling:needsPoll&&active.polls>=60?'paused':'active',state:s,requestId:active.id,attemptId:active.attempt,mode:value.mode,folder:value.folder?.displayPath,app:value.provider==='claude_code'?'claude':value.provider,key:value.folder?.label,agent:session?.roomAgentId,reason:value.reason?.message||'',ownership:value.ownership,managed:value.managed,creation:value.creation,uiOpen:value.uiOpen,execution:value.execution,session:value.session,capabilities:value.capabilities,observation:value.observation,other:mismatch?.displayPath,raw:value});
+    o.report(active.ui,{server:true,statusPolling:needsPoll&&active.polls>=60?'paused':'active',state:s,requestId:active.id,attemptId:active.attempt,mode:value.mode,folder:value.folder?.displayPath,folderRevision:value.folder?.revision,app:value.provider==='claude_code'?'claude':value.provider,key:value.folder?.label,agent:session?.roomAgentId,reason:value.reason?.message||'',ownership:value.ownership,managed:value.managed,creation:value.creation,uiOpen:value.uiOpen,execution:value.execution,session:value.session,capabilities:value.capabilities,observation:value.observation,other:mismatch?.displayPath,raw:value});
     if(needsPoll)schedule();else halt();
     return undefined;
   }
@@ -7092,14 +7129,14 @@ function createNewChatClient(o){
     const id=active.id,read=++active.seq;try{const value=await request('requests/'+id,undefined,e,k);if(!valid(e,k)||active?.id!==id||active.seq!==read)return;
       if(value.requestId!==id)throw err('The recovered request does not match.');
       if(value.status==='attempted'&&value.attempt)return report(value.attempt);
-      if(value.status==='prepared'){o.report(active.ui,{server:true,state:'unknown',requestId:id,mode:value.mode,folder:value.folder?.displayPath,app:value.provider==='claude_code'?'claude':value.provider,key:value.folder?.label,reason:'This request was prepared, but no dispatch is recorded. Nothing is resubmitted. Dismiss it to prepare a new request.'});return}
+      if(value.status==='prepared'){o.report(active.ui,{server:true,state:'unknown',requestId:id,mode:value.mode,folder:value.folder?.displayPath,folderRevision:value.folder?.revision,app:value.provider==='claude_code'?'claude':value.provider,key:value.folder?.label,reason:'This request was prepared, but no dispatch is recorded. Nothing is resubmitted. Dismiss it to prepare a new request.'});return}
       throw err('The request recovery response is unavailable.');
     }catch(error){if(valid(e,k)&&active?.id===id&&active.seq===read)o.report(active.ui,{server:true,state:'unknown',requestId:id,reason:error.message+' Nothing is resubmitted.'})}
   }
   api.launch=async req=>{
     api.sync();if(busy||active)throw err('Resolve the previous New chat request first.');
     const p=api.apps[req.app],f=folder(req.folder),mode=req.mode;
-    if(!['codex','claude'].includes(req.app)||p?.status!=='ready'||!f||!['work','blank'].includes(mode)||mode==='work'&&!p.supportsWork||mode==='blank'&&!p.supportsBlank)throw err('This New chat choice is unavailable.');
+    if(!api.inventoryFresh||!['codex','claude'].includes(req.app)||p?.status!=='ready'||!f||req.folderRevision!==undefined&&req.folderRevision!==f.revision||!['work','blank'].includes(mode)||mode==='work'&&!p.supportsWork||mode==='blank'&&!p.supportsBlank)throw err('This New chat choice is unavailable.');
     const text=mode==='work'?req.instruction:req.draft;
     if(typeof text!=='string'||text.length>8000||mode==='work'&&!text.trim())throw err('Enter an instruction of at most 8,000 characters.');
     busy=true;const e=epoch,k=owner,operation=++launchEpoch,live=()=>valid(e,k)&&operation===launchEpoch,selection={provider:p.provider,folderId:f.id,folderRevision:f.revision,mode};
@@ -7117,7 +7154,38 @@ function createNewChatClient(o){
   api.managedStatus=runId=>{if(!uuid.test(runId||''))throw err('Invalid managed session handle.');return request('runs/'+runId,undefined,epoch,owner,'/api/managed-claude/');};
   api.decidePermission=(runId,permissionId,requestId,decision)=>{if(![runId,permissionId,requestId].every(id=>uuid.test(id||''))||!['allow','deny'].includes(decision))throw err('Invalid permission decision.');return request('runs/'+runId+'/permissions/'+permissionId,{requestId,decision},epoch,owner,'/api/managed-claude/');};
   api.dismiss=()=>{launchEpoch++;busy=false;halt();clearStored();active=null;};
-  api.retryContext=()=>{if(!loading&&owner)load()};
+  api.retryContext=load;
+  api.projectsChanged=signature=>{
+    if(!owner||signature===projects)return;
+    const initial=projects===null;
+    projects=signature;
+    if(initial||refreshTimer!==null)return;
+    const e=epoch,k=owner;
+    refreshTimer=o.setTimeout(async()=>{
+      refreshTimer=null;
+      if(loading)await loading;
+      if(valid(e,k))await load();
+    },500);
+  };
+  let registering=null;
+  api.registerFolder=async path=>{
+    const e=epoch,k=owner;
+    if(registering)throw err('A folder addition is already being checked.');
+    if(!api.canRegisterFolders())throw err('Motet cannot add folders right now. Refresh availability in Settings, Connections and try again.');
+    const registration={};registering=registration;
+    try{
+      let receipt;
+      try{receipt=await request('folders',{path},e,k)}catch(error){if(!error.status||error.status>=500)error.registrationUnknown=true;throw error}
+      if(!validFolder(receipt.folder)||receipt.folder.registered!==true||typeof receipt.folder.label!=='string'||!receipt.folder.label){throw Object.assign(err('Motet could not confirm whether the folder was added. Refresh availability to check before adding it again.'),{registrationUnknown:true})}
+      if(loading)await loading;
+      if(!valid(e,k))throw err('Owner authentication changed.');
+      context={...context,folders:[...(context?.folders||[]).filter(f=>f.id!==receipt.folder.id&&f.displayPath!==receipt.folder.displayPath),receipt.folder]};
+      const refreshed=await load();
+      if(!valid(e,k))throw err('Owner authentication changed.');
+      return {...receipt.folder,availabilityChecked:refreshed===true};
+    }finally{if(registering===registration)registering=null}
+  };
+
   return api;
 }
 /* end New chat HTTP client */
@@ -7152,8 +7220,11 @@ function workspaceNewChatFolders(key){
   for(const id of Object.keys(A)){const a=A[id];if(!a||a.observed||typeof a.cwd!=='string'||!a.cwd)continue;
     const info=projInfo(id);if(info.n!==key||info.how)continue;if(WNC_TEMP.test(a.cwd))continue;
     const at=Number.isFinite(a.last)?a.last:0;if(!seen.has(a.cwd)||seen.get(a.cwd)<at)seen.set(a.cwd,at)}
+  for(const f of WNC.adapter?.registeredFolders?.()||[])if(workspaceNewChatProjectKey(f.displayPath)===key&&!seen.has(f.displayPath))seen.set(f.displayPath,0);
   return [...seen.entries()].filter(x=>!WNC.adapter?.production||WNC.adapter.hasFolder(x[0])).sort((x,y)=>y[1]-x[1]||x[0].localeCompare(y[0])).map(x=>x[0]);
 }
+function workspaceNewChatFolderRevision(path){return WNC.adapter?.folderRevision?.(path)||path}
+function workspaceNewChatProjectKey(path){const key=projName(path);return key==='—'?path:key}
 function workspaceNewChatSettled(p){return !p||['added','mismatch','failed','timeout','unknown'].includes(p.state)}
 function workspaceNewChatWait(ms){const s=Math.round(ms/1000);return s>=120||s%60===0&&s>=60?Math.round(s/60)+' minute'+(Math.round(s/60)===1?'':'s'):s+' second'+(s===1?'':'s')}
 
@@ -7161,7 +7232,17 @@ function workspaceNewChatWait(ms){const s=Math.round(ms/1000);return s>=120||s%6
 function workspaceNewChatManaged(app){return !!app&&app.id==='claude'&&app.ownership==='watch_managed'}
 function workspaceNewChatPermissionLimit(){const seconds=WNC.adapter?.managedPermissionTimeoutSeconds;if(typeof seconds!=='number'||!Number.isFinite(seconds)||!Number.isInteger(seconds)||seconds<=0)return null;return seconds%60===0?seconds/60+' minute'+(seconds===60?'':'s'):seconds+' second'+(seconds===1?'':'s')}
 function workspaceNewChatAppPresentation(a,narrow=false,settings=false){if(workspaceNewChatManaged(a)&&a.status==='ready'&&!a.reason)return {tag:WNC_TAG[a.status],text:'Motet runs Claude Code itself in this folder and sends your first message. It does not open the Claude app.'};const codex=a.supportsWork&&a.supportsBlank?(narrow?'Opens a new chat in this folder.':'Opens a new chat in this folder. It can start working on your first message, or keep it as a draft.'):a.supportsWork?'Opens a new chat in this folder and starts working on your first message.':a.supportsBlank?'Opens a new chat in this folder with an optional unsent draft.':'No first-message action is currently available from Motet.';const demoClaude=!!WNC.adapter?.demo&&a.id==='claude'&&a.status!=='ready'&&a.reason==='Claude new-chat creation is unavailable. This demo does not open native apps.';const phoneUnavailable=narrow&&!settings&&(demoClaude||(a.id==='antigravity'&&a.status==='not_yet'&&!a.reason));return {tag:demoClaude?'Not yet':WNC_TAG[a.status],text:phoneUnavailable?'Not available from Motet yet.':demoClaude?'Starting a Claude conversation from Motet is not available yet.':a.reason||(a.id==='codex'?codex:(settings?a.settings:narrow?a.short:a.text))}}
-function workspaceNewChatFormActionPaint(d,f,app,remote,supported,busy){const open=d.querySelector('[data-nc-open]'),managed=workspaceNewChatManaged(app),work=f.mode==='work',label=work?'Start working'+(remote?' on that computer':''):app?'Open in '+app.name+(remote?' on that computer':''):'Open';if(open._workspaceNewChatLabel!==label||open._workspaceNewChatIcon!==!managed){open.textContent=label;if(!managed)open.append(wncIcon('M9 3h4v4M13 3L7.5 8.5M11 9.5V13H3V5h3.5'));open._workspaceNewChatLabel=label;open._workspaceNewChatIcon=!managed}open.disabled=!app||app.status!=='ready'||!supported||!f.folder||busy||managed&&(f.mode!=='work'||!workspaceNewChatPermissionLimit())||f.mode==='work'&&!String(f.draft||'').trim()}
+function workspaceNewChatDisabledReason(f,app,supported,busy){
+  if(WNC.adapter?.inventoryFresh===false)return WNC.adapter.inventoryReason||'Motet could not load the list of apps and folders. Try again.';
+  if(f.missing||!f.folder||!app)return '';
+  if(app.status!=='ready')return app.reason||'No app can open a new chat right now.';
+  const reasons=[];
+  if(busy)reasons.push('A new chat is already being opened. Stop waiting for it, or let it finish, before opening another.');
+  if(!supported)reasons.push('This action is not available for '+app.name+'.');
+  if(workspaceNewChatManaged(app)&&!workspaceNewChatPermissionLimit())reasons.push('Motet cannot report the permission timeout. Starting this Claude chat is unavailable until that limit is known.');
+  return reasons.join(' ');
+}
+function workspaceNewChatFormActionPaint(d,f,app,remote,supported,busy){const open=d.querySelector('[data-nc-open]'),managed=workspaceNewChatManaged(app),work=f.mode==='work',label=work?'Start working'+(remote?' on that computer':''):app?'Open in '+app.name+(remote?' on that computer':''):'Open';if(open._workspaceNewChatLabel!==label||open._workspaceNewChatIcon!==!managed){open.textContent=label;if(!managed)open.append(wncIcon('M9 3h4v4M13 3L7.5 8.5M11 9.5V13H3V5h3.5'));open._workspaceNewChatLabel=label;open._workspaceNewChatIcon=!managed}open.disabled=f.missing||WNC.adapter?.inventoryFresh===false||!app||app.status!=='ready'||!supported||!f.folder||busy||managed&&(f.mode!=='work'||!workspaceNewChatPermissionLimit())||f.mode==='work'&&!String(f.draft||'').trim();const reason=d.querySelector('.workspace-nc-disabled-reason');if(reason){const text=workspaceNewChatDisabledReason(f,app,supported,busy);if(reason.textContent!==text)reason.textContent=text;reason.hidden=!text}}
 function workspaceNewChatRememberDraft(){const d=WNC.dialog,f=WNC.form;if(d&&f&&d._workspaceNewChatForm===f){const text=d.querySelector('#workspaceNewChatDraft');if(text)f.draft=text.value}}
 function workspaceNewChatDialog(){
   if(WNC.dialog)return WNC.dialog;
@@ -7184,7 +7265,7 @@ function workspaceNewChatDialog(){
   d.addEventListener('change',e=>{const f=WNC.form;if(!f)return;
     if(e.target.name==='workspaceNewChatMode'){workspaceNewChatRememberDraft();f.mode=e.target.value;workspaceNewChatFormPaint();d.querySelector('input[name=workspaceNewChatMode]:checked')?.focus()}
     else if(e.target.name==='workspaceNewChatApp'){workspaceNewChatRememberDraft();f.app=e.target.value;workspaceNewChatFormPaint();d.querySelector('input[name=workspaceNewChatApp]:checked')?.focus()}
-    else if(e.target.name==='workspaceNewChatFolder'&&f.folders.includes(e.target.value)){f.folder=e.target.value;f.changing=false;workspaceNewChatFormPaint();d.querySelector('.workspace-nc-change')?.focus()}});
+    else if(e.target.name==='workspaceNewChatFolder'&&f.folders.includes(e.target.value)){f.folder=e.target.value;f.oldFolder=f.folder;f.folderRevision=workspaceNewChatFolderRevision(f.folder);f.missing=false;f.changing=false;workspaceNewChatFormPaint();d.querySelector('.workspace-nc-change')?.focus()}});
   return WNC.dialog=d;
 }
 /* Closing is done here, not in the dialog's close event, so focus and state are settled before anything else runs. */
@@ -7204,7 +7285,7 @@ function workspaceNewChatWatchWidth(){
 }
 /* Everything an open form depends on. When it changes underneath the form, the form is painted again. */
 function workspaceNewChatFormSig(f){
-  return JSON.stringify([workspaceNewChatFolders(f.key),workspaceNewChatApps().map(a=>[a.status,a.reason,a.ownership,a.supportsWork,a.supportsBlank,a.supportsDraft,workspaceNewChatAppPresentation(a,typeof matchMedia==='function'&&matchMedia('(max-width:600px)').matches)]),f.mode,WNC.adapter?.managedPermissionTimeoutSeconds, WNC.adapter?.host?.label,!workspaceNewChatSettled(WNC.pending),typeof matchMedia==='function'&&matchMedia('(max-width:600px)').matches,!!(WNC.adapter&&WNC.adapter.remote===true)]);
+  return JSON.stringify([WNC.adapter?.inventoryFresh,workspaceNewChatFolders(f.key).map(path=>[path,workspaceNewChatFolderRevision(path)]),workspaceNewChatApps().map(a=>[a.status,a.reason,a.ownership,a.supportsWork,a.supportsBlank,a.supportsDraft,workspaceNewChatAppPresentation(a,typeof matchMedia==='function'&&matchMedia('(max-width:600px)').matches)]),f.mode,WNC.adapter?.managedPermissionTimeoutSeconds, WNC.adapter?.host?.label,!workspaceNewChatSettled(WNC.pending),typeof matchMedia==='function'&&matchMedia('(max-width:600px)').matches,!!(WNC.adapter&&WNC.adapter.remote===true)]);
 }
 /* A repaint replaces the form's controls, so it waits while text is being composed (an input method's composition
    would be lost with its textarea), and afterwards focus returns to the same control: the draft with its caret, the
@@ -7226,21 +7307,24 @@ function workspaceNewChatOpen(key,trigger,again){
   if(!workspaceNewChatReady()||!key||key==='—')return;
   const folders=workspaceNewChatFolders(key),apps=workspaceNewChatApps(),first=apps.find(a=>a.status==='ready');
   const d=workspaceNewChatDialog();workspaceClose(true);
-  WNC.form={key,folders,folder:again&&folders.includes(again.folder)?again.folder:folders[0]||'',app:again&&apps.some(a=>a.id===again.app&&a.status==='ready')?again.app:first?first.id:'',draft:again?again.draft||'':'',mode:again?.mode||WNC_DEFAULT_MODE,changing:false};
+  WNC.form={key,folders,folder:again?.folder||folders[0]||'',oldFolder:again?.folder||folders[0]||'',folderRevision:again?.folderRevision||workspaceNewChatFolderRevision(again?.folder||folders[0]||''),app:again&&apps.some(a=>a.id===again.app)?again.app:first?first.id:'',draft:again?again.draft||'':'',mode:again?.mode||WNC_DEFAULT_MODE,added:again?.added||'',changing:false};
   WNC.returnTo=trigger||null;if(trigger&&trigger.classList&&trigger.classList.contains('workspace-nc-add'))trigger.setAttribute('aria-expanded','true');
   workspaceNewChatFormPaint();if(!d.open)d.showModal();
   (d.querySelector('input[name=workspaceNewChatApp]:checked')||d.querySelector('[data-close]')).focus();
 }
 function workspaceNewChatFormPaint(){
   const d=WNC.dialog,f=WNC.form;if(!d||!f)return;if(WNC.composing){f.stale=true;return}workspaceNewChatRememberDraft();
-  f.folders=workspaceNewChatFolders(f.key);if(!f.folders.includes(f.folder)){f.folder=f.folders[0]||'';f.changing=false}if(f.folders.length<2)f.changing=false;
+  f.folders=workspaceNewChatFolders(f.key);if(f.folderRevision===undefined)f.folderRevision=workspaceNewChatFolderRevision(f.folder);
+  if(WNC.adapter?.inventoryFresh!==false&&f.folder){if(!f.folders.includes(f.folder)||f.folderRevision!==workspaceNewChatFolderRevision(f.folder)){f.oldFolder=f.folder;f.missing=true;f.changing=false}else if(f.missing)f.missing=false}if(f.folders.length<2)f.changing=false;
   const apps=workspaceNewChatApps(),app=apps.find(a=>a.id===f.app)||null,remote=WNC.adapter&&WNC.adapter.remote===true,busy=!workspaceNewChatSettled(WNC.pending)||!!(WNC.adapter?.production&&WNC.adapter.pending()),narrow=typeof matchMedia==='function'&&matchMedia('(max-width:600px)').matches;
   const managed=workspaceNewChatManaged(app),permissionLimit=managed?workspaceNewChatPermissionLimit():null;if(managed)f.mode='work';
   const form=d.querySelector('.workspace-nc-form');form.textContent='';
+  if(f.added){const saved=wncEl('p','workspace-nc-saved',f.added+' added. Start its first chat now, or close this and do it later.');saved.setAttribute('role','status');form.append(saved)}
   const field=(text,stack,forId)=>{const row=wncEl('div','workspace-nc-field'),body=document.createElement('div'),label=wncEl(forId?'label':'span','',text);if(stack)row.dataset.stack='';if(forId){label.htmlFor=forId;label.id=forId+'Label'}row.append(label,body);form.append(row);return body};
   const project=wncEl('span','workspace-nc-project'),folderIcon=workspaceFolder();project.style.color=workspaceProjectColour(projColour(f.key));const name=wncEl('span','',projLabel(f.key));name.style.color='var(--ws-ink)';project.append(folderIcon,name);field('Project').append(project);
   const folder=field('Folder');
-  if(!f.folder)folder.append(wncEl('small','workspace-nc-plain','No folder is recorded for this project, so a new chat cannot be opened in it.'));
+  if(f.missing){folder.append(wncPath(f.oldFolder||f.folder),wncEl('small','workspace-nc-plain','Motet can no longer find this folder where it was recorded. Add it again to continue.'+(f.draft?' Your message is kept.':'')));const recover=wncEl('button','workspace-nc-recover','Add project folder');recover.type='button';recover.onclick=()=>workspaceNewChatAddFolder(recover,f);folder.append(recover)}
+  else if(!f.folder)folder.append(wncEl('small','workspace-nc-plain',"Choose this project's folder before starting the chat."));
   else{const path=wncEl('span','workspace-nc-path');path.append(workspaceFolder(),wncPath(f.folder));
     if(f.folders.length>1){const change=wncEl('button','workspace-nc-change',f.changing?'Keep this folder':'Change');change.type='button';change.setAttribute('aria-expanded',String(f.changing));path.append(change)}
     folder.append(path);
@@ -7257,15 +7341,16 @@ function workspaceNewChatFormPaint(){
   const choice=()=>{const modes=wncEl('div','workspace-nc-choice');modes.setAttribute('role','radiogroup');modes.setAttribute('aria-label','What to do with the first message');for(const [value,text] of [['blank','Keep it as a draft'],['work','Send it and start working']]){const label=document.createElement('label'),input=document.createElement('input');input.type='radio';input.name='workspaceNewChatMode';input.value=value;input.checked=f.mode===value;input.disabled=!!app&&(managed&&value==='blank'||!(value==='work'?app.supportsWork:app.supportsBlank));label.append(input,document.createTextNode(text));modes.append(label)}return modes};
   if(!app)first.append(wncEl('small','workspace-nc-plain','No app can open a new chat right now.'));
   else if(app.draft||managed){
-    const ta=document.createElement('textarea');ta.id='workspaceNewChatDraft';ta.rows=2;ta.maxLength=8000;ta.placeholder='Optional';ta.setAttribute('aria-labelledby','workspaceNewChatDraftLabel');ta.setAttribute('aria-describedby','workspaceNewChatDraftHelp');ta.value=f.draft||'';ta.addEventListener('input',()=>{f.draft=ta.value;workspaceNewChatFormActionPaint(d,f,app,remote,supported,busy)});first.append(ta);
+    const ta=document.createElement('textarea');ta.id='workspaceNewChatDraft';ta.rows=2;ta.maxLength=8000;ta.placeholder=f.mode==='work'?'Write a first message':'Optional';ta.setAttribute('aria-required',String(f.mode==='work'));ta.setAttribute('aria-labelledby','workspaceNewChatDraftLabel');ta.setAttribute('aria-describedby','workspaceNewChatDraftHelp');ta.value=f.draft||'';ta.addEventListener('input',()=>{f.draft=ta.value;workspaceNewChatFormActionPaint(d,f,app,remote,supported,busy)});first.append(ta);
     first.append(choice());
     const help=wncEl('small','',managed?'Sent to Claude when you press Start working. A chat that Motet runs cannot keep a draft.':f.mode==='work'?(narrow?'Sent to Codex when you press Start working.':'Sent to Codex as the first message when you press Start working. Codex may ask for approval in its own window.'):'Placed in the new chat as a draft. Nothing is sent until you send it in '+app.name+'.');help.id='workspaceNewChatDraftHelp';first.append(help);
   }else first.append(wncEl('small','workspace-nc-plain',app.name+' cannot be given a first message from here. Type it in the new conversation.'),choice());
   if(!narrow)field('Opens on').append(wncEl('small','workspace-nc-plain',WNC.adapter?.host?.label|| (remote?'The computer running Motet, not this device.':'This computer, where Motet is running.')));
   const note=wncEl('div','workspace-nc-note'),words=document.createElement('span');
   if(narrow)words.append(wncEl('b','',(f.mode==='work'?'Starts':'Opens')+' on the computer running Motet'+(remote?', not on this phone':'')+'. '));
-  words.append(managed&&!permissionLimit?'Motet cannot report the permission timeout. Starting this Claude chat is unavailable until that limit is known.':!supported&&app?'This action is not available for '+app.name+'. ':busy?'A new chat is already being opened. Stop waiting for it, or let it finish, before opening another.':managed?'Claude starts working in this folder straight away. When it needs permission to use a tool, it asks you here in Motet; a request you do not answer is denied after '+permissionLimit+'.':app&&app.confirm?'Claude will ask you to confirm the folder. That step happens in Claude, on '+(remote?'the computer running Motet':'this computer')+'. Motet adds a monitor only after it sees the new session in this folder.':f.mode==='work'?(narrow?'Codex may ask for approval there.':'Codex starts working in this folder straight away. Motet adds a monitor only after it sees the new session here.'):'Motet adds a monitor only after it sees the new session in this folder.');
-  note.append(wncIcon('M8 7.2v3.6M8 5.2v.2',6),words);form.append(note);
+  words.append(managed?'Claude starts working in this folder straight away. When it needs permission to use a tool, it asks you here in Motet; a request you do not answer is denied after '+permissionLimit+'.':app&&app.confirm?'Claude will ask you to confirm the folder. That step happens in Claude, on '+(remote?'the computer running Motet':'this computer')+'. Motet adds a monitor only after it sees the new session in this folder.':f.mode==='work'?(narrow?'Codex may ask for approval there.':'Codex starts working in this folder straight away. Motet adds a monitor only after it sees the new session here.'):'Motet adds a monitor only after it sees the new session in this folder.');
+  note.append(wncIcon('M8 7.2v3.6M8 5.2v.2',6),words);if(app?.status==='ready'&&supported&&(!managed||permissionLimit)&&!f.missing&&WNC.adapter?.inventoryFresh!==false&&!!f.folder)form.append(note);
+  const reason=wncEl('p','workspace-nc-disabled-reason');reason.setAttribute('role','status');reason.hidden=true;form.append(reason);
   if(WNC.adapter&&WNC.adapter.demo)form.append(wncEl('small','workspace-nc-demo','Demo: no app is opened. What happens next is scripted.'));
   workspaceNewChatFormActionPaint(d,f,app,remote,supported,busy);
   d.setAttribute('aria-label','New chat in '+projLabel(f.key));d._workspaceNewChatForm=f;f.sig=workspaceNewChatFormSig(f);
@@ -7273,16 +7358,16 @@ function workspaceNewChatFormPaint(){
 function workspaceNewChatSubmit(){
   const f=WNC.form;if(!f)return;const app=workspaceNewChatApps().find(a=>a.id===f.app);
   /* The folder is checked against what is recorded now, not against what was recorded when the dialog opened. */
-  if(!app||app.status!=='ready'||!f.folder||!workspaceNewChatFolders(f.key).includes(f.folder)||!workspaceNewChatReady()||!workspaceNewChatSettled(WNC.pending)){workspaceNewChatFormRefresh();return}
+  if(f.missing||WNC.adapter?.inventoryFresh===false||!app||app.status!=='ready'||!f.folder||!workspaceNewChatFolders(f.key).includes(f.folder)||f.folderRevision!==undefined&&f.folderRevision!==workspaceNewChatFolderRevision(f.folder)||!workspaceNewChatReady()||!workspaceNewChatSettled(WNC.pending)){workspaceNewChatFormRefresh();return}
   const managed=workspaceNewChatManaged(app),mode=f.mode||'blank',draft=(app.draft||managed)?String(WNC.dialog.querySelector('#workspaceNewChatDraft')?.value||''):'';
   if(managed&&(mode!=='work'||!workspaceNewChatPermissionLimit())||draft.length>8000||mode==='work'&&(!app.supportsWork||!draft.trim())||mode==='blank'&&WNC.adapter.production&&!app.supportsBlank||WNC.adapter.production&&WNC.adapter.pending()){workspaceNewChatFormRefresh();return}
   const id=typeof crypto!=='undefined'&&crypto.randomUUID?crypto.randomUUID():'new-chat-'+Date.now()+'-'+(++WNC.serial);
-  WNC.pending={id,key:f.key,folder:f.folder,app:app.id,appName:app.name,confirm:!!app.confirm&&!managed,...(managed?{ownership:'watch_managed'}:{}),draft,mode,state:'opening',at:Date.now()/1000,reason:'',agent:null,expect:null,other:'',otherAgent:null,seenAt:0,timing:''};
+  WNC.pending={id,key:f.key,folder:f.folder,folderRevision:f.folderRevision,app:app.id,appName:app.name,confirm:!!app.confirm&&!managed,...(managed?{ownership:'watch_managed'}:{}),draft,mode,state:'opening',at:Date.now()/1000,reason:'',agent:null,expect:null,other:'',otherAgent:null,seenAt:0,timing:''};
   workspaceNewChatDialogClose();
   /* An adapter that never answers is not waited on for ever. After a bounded wait the outcome is shown as unknown. */
   workspaceNewChatTimer(Math.max(5000,Math.min(120000,Number(WNC.adapter.answerMs)||30000)),'answer',q=>{if(q.state==='opening')q.state='unknown'});
   workspaceNewChatPaint();
-  let result;try{result=WNC.adapter.launch({request_id:id,project:f.key,folder:f.folder,app:app.id,mode,...(mode==='work'?{instruction:draft}:{draft})})}catch(err){result=Promise.reject(err)}
+  let result;try{result=WNC.adapter.launch({request_id:id,project:f.key,folder:f.folder,app:app.id,mode,...(WNC.adapter.folderRevision?{folderRevision:f.folderRevision}:{}),...(mode==='work'?{instruction:draft}:{draft})})}catch(err){result=Promise.reject(err)}
   /* A rejected call says nothing about whether the app opened: that is unknown, never failed. */
   Promise.resolve(result).then(r=>{if(r)workspaceNewChatReport(id,r)},()=>workspaceNewChatReport(id,{state:'unknown'}));
 }
@@ -7297,7 +7382,7 @@ function workspaceNewChatReport(id,r){
   let p=WNC.pending;if(r?.server){
     if(!p){if(!r.requestId)return;const folder=r.folder||'';let key=r.key||'';for(const a of Object.keys(A))if(A[a].cwd===folder&&!projInfo(a).how){key=projInfo(a).n;break}p=WNC.pending={id,key,folder,app:r.app||'codex',appName:r.app==='claude'?'Claude Code':'Codex',mode:r.mode||'work',state:'unknown',timing:'',draft:''}}
     if(p.id!==id)return;for(const k of ['requestId','attemptId','ownership','managed','creation','uiOpen','execution','session','capabilities','observation','statusPolling'])if(r[k]!==undefined)p[k]=r[k];
-    p.reason=typeof r.reason==='string'?r.reason.slice(0,300):'';p.mode=r.mode||p.mode;if(r.folder)p.folder=r.folder;
+    p.reason=typeof r.reason==='string'?r.reason.slice(0,300):'';p.mode=r.mode||p.mode;if(r.folder)p.folder=r.folder;if(r.folderRevision)p.folderRevision=r.folderRevision;
     p.state=WNC_STATES.includes(r.state)?r.state:'unknown';if(p.state==='added'){p.expect=r.agent||null;p.agent=r.agent||null;p.seenAt=Date.now()/1000;if(!r.agent||!A[r.agent])p.state='waiting'}if(p.state==='mismatch')p.other=r.other||'';workspaceNewChatTimer();workspaceNewChatPaint();return;
   }if(!p||p.id!==id)return;
   const state=r&&WNC_STATES.includes(r.state)?r.state:'unknown';
@@ -7336,7 +7421,7 @@ async function workspaceNewChatProductionAct(act,p){
     if(['stop','again','dismiss','go'].includes(act)){
       if(p.observation==='active')await WNC.adapter.observe('stop');
       if(WNC.pending!==p)return;WNC.adapter.dismiss();workspaceNewChatTimer();WNC.pending=null;workspaceNewChatPaint();
-      if(act==='again')workspaceNewChatOpen(p.key,null,{folder:p.folder,app:p.app,mode:p.mode,draft:''});
+      if(act==='again')workspaceNewChatOpen(p.key,null,{folder:p.folder,folderRevision:p.folderRevision,app:p.app,mode:p.mode,draft:''});
       else if(act==='go'&&p.agent&&A[p.agent]){setFocus(p.agent);workspaceDeskFocus()}
       else workspaceNewChatFocusHome();
     }
@@ -7391,6 +7476,9 @@ function workspaceNewChatPresentation(p,agent,other,project,adapter){
 function workspaceNewChatPaint(){
   if(!WORKSPACE||!WS.side)return;
   WNC.adapter?.sync?.();
+  if(WNC.adapter?.projectsChanged){const roots=Object.keys(A).filter(id=>/^[xc]:/.test(id)&&!A[id].observed&&!A[id].parent&&A[id].cwd);WNC.adapter.projectsChanged(JSON.stringify(roots.sort().map(id=>[id,A[id].cwd])))}
+  if(WS.addFolderButton)WS.addFolderButton.hidden=!workspaceNewChatCanAdd();
+  workspaceNewChatEmptyEntry();
   const ready=workspaceNewChatReady(),p=WNC.pending;if(typeof workspaceManagedSync==='function')workspaceManagedSync();
   if(p&&WNC.adapter?.production)for(const id of Object.keys(A))if(A[id].cwd===p.folder&&!projInfo(id).how){p.key=projInfo(id).n;break}
   if(p&&p.expect&&A[p.expect]&&!['added','mismatch','failed'].includes(p.state)){p.state='added';p.agent=p.expect;workspaceNewChatTimer()}
@@ -7424,20 +7512,87 @@ function workspaceNewChatPaint(){
   if(WNC.adapter&&WNC.adapter.demo)line('small',['Demo: no app was opened. This outcome is scripted.']);
   b.dataset.state=visual;b.textContent='';b.append(mark,words,acts);b.hidden=false;
 }
-function workspaceNewChatSettingsPaint(){
+function workspaceNewChatCanAdd(){return workspaceNewChatReady()&&WNC.adapter?.canRegisterFolders?.()===true}
+function workspaceNewChatEmptyEntry(){
+  const empty=$('#empty');if(!empty)return;const previous=empty.querySelector('.workspace-nc-empty');
+  if(!workspaceNewChatCanAdd()||order.length||empty.hidden){previous?.remove();return}
+  if(previous)return;const entry=wncEl('div','workspace-nc-empty'),line=wncEl('p','','Or add a project folder and start a chat from here.'),button=wncEl('button','','Add project folder');button.type='button';button.onclick=()=>workspaceNewChatAddFolder(button);entry.append(line,button);(empty.querySelector('.workspace-empty-lines')||empty).append(entry);
+}
+function workspaceNewChatAddFolderClose(restore=true){
+  const d=WNC.addFolder;if(!d)return;const opening=d._opening;d._opening=null;
+  if(d.open)d.close();d.querySelector('form').reset();d.querySelector('input').readOnly=false;d.querySelector('input').removeAttribute('aria-invalid');d.querySelector('[type=submit]').disabled=false;
+  if(restore&&opening&&workspaceNewChatReady()){if(opening.recovery&&WNC.form===opening.recovery&&WNC.dialog?.open)(opening.trigger?.isConnected?opening.trigger:WNC.dialog.querySelector('.workspace-nc-recover')||WNC.dialog.querySelector('[data-close]'))?.focus();else workspaceNewChatFocusHome(opening.trigger)}
+}
+function workspaceNewChatAddFolder(trigger,recovery=null){
+  if(!workspaceNewChatCanAdd())return;workspaceNewChatRememberDraft();
+  if(!WNC.addFolder){
+    const d=wncEl('dialog','workspace-dialog');d.id='workspaceAddFolderDialog';d.setAttribute('aria-labelledby','workspaceAddFolderTitle');
+    d.innerHTML='<header><h2 id="workspaceAddFolderTitle">Add project folder</h2><button type="button" data-close aria-label="Close Add project folder">×</button></header><form><label for="workspaceAddFolderPath">Folder path</label><input id="workspaceAddFolderPath" type="text" required maxlength="4096" autocapitalize="off" spellcheck="false" autocomplete="off" aria-describedby="workspaceAddFolderHint workspaceAddFolderTrust"><div class="workspace-nc-folder-message"><small id="workspaceAddFolderHint" class="workspace-nc-folder-hint">Paste the folder\'s full path. In Finder: right-click the folder, hold Option, choose Copy as Pathname. A path starting with ~/ also works.</small><span id="workspaceAddFolderStatus" role="status" hidden></span></div><small id="workspaceAddFolderTrust" class="workspace-nc-folder-hint">Add only folders you trust. A chat started there uses that folder\'s own settings and hooks.</small><button type="button" data-refresh hidden>Refresh availability</button><footer><button type="submit">Add folder</button></footer></form>';
+    document.body.append(d);WNC.addFolder=d;
+    const form=d.querySelector('form'),path=form.querySelector('input'),hint=form.querySelector('small'),status=form.querySelector('[role=status]'),submit=form.querySelector('[type=submit]'),refresh=form.querySelector('[data-refresh]');
+    const current=opening=>d.open&&d._opening===opening&&WNC.adapter===opening.adapter&&workspaceNewChatReady()&&(typeof KEY==='undefined'||KEY===opening.owner);
+    const message=(text,error=false)=>{hint.hidden=true;hint.setAttribute('aria-hidden','true');path.setAttribute('aria-describedby','workspaceAddFolderStatus workspaceAddFolderTrust');status.hidden=false;status.textContent=text;status.dataset.error=String(error);if(error)path.setAttribute('aria-invalid','true');else path.removeAttribute('aria-invalid')};
+    const savedUnavailable='The folder was saved, but Motet could not check it just now. Open Settings, Connections and press Refresh availability.';
+    const revealRefresh=opening=>{refresh.hidden=false;const active=document.activeElement;if(current(opening)&&(active===path||active===submit||(active===document.body||active===d)&&opening.submissionFocus===submit))refresh.focus()};
+    const finish=(opening,folder)=>{
+      const key=workspaceNewChatProjectKey(folder.displayPath);
+      if(!folder.availabilityChecked||WNC.adapter.inventoryFresh===false||WNC.adapter.folderRevision(folder.displayPath)!==folder.revision){opening.saved=folder;message(savedUnavailable);revealRefresh(opening);return false}
+      if(opening.recovery&&folder.displayPath!==(opening.recovery.oldFolder||opening.recovery.folder)){opening.saved=folder;message('The folder was added separately. Close this dialog to keep your original chat choice and message.');return false}
+      if(opening.recovery){const f=opening.recovery;if(WNC.form!==f||!WNC.dialog?.open)return false;f.folder=folder.displayPath;f.oldFolder=folder.displayPath;f.folderRevision=folder.revision;f.missing=false;f.added=folder.label;workspaceNewChatAddFolderClose(false);workspaceNewChatFormRefresh();WNC.dialog.querySelector('#workspaceNewChatDraft')?.focus()}
+      else{workspaceNewChatAddFolderClose(false);workspaceNewChatOpen(key,opening.trigger,{folder:folder.displayPath,folderRevision:folder.revision,added:folder.label})}return true;
+    };
+    d.querySelector('[data-close]').onclick=()=>workspaceNewChatAddFolderClose();
+    d.addEventListener('cancel',event=>{event.preventDefault();workspaceNewChatAddFolderClose()});
+    d.addEventListener('close',()=>{if(!d.open&&d._opening)workspaceNewChatAddFolderClose()});
+    path.addEventListener('input',()=>{if(!d._opening?.unknown&&!d._opening?.saved){hint.hidden=false;hint.removeAttribute('aria-hidden');path.setAttribute('aria-describedby','workspaceAddFolderHint workspaceAddFolderTrust');status.hidden=true;path.removeAttribute('aria-invalid')}});
+    form.onsubmit=async event=>{
+      event.preventDefault();const opening=d._opening;if(!opening||submit.disabled||opening.unknown||opening.saved)return;
+      opening.submissionFocus=document.activeElement;submit.disabled=true;path.readOnly=true;message('Verifying folder…');
+      try{const folder=await opening.adapter.registerFolder(path.value);if(!current(opening))return;finish(opening,folder)}
+      catch(error){if(!current(opening))return;if(error.registrationUnknown){opening.unknown=true;message('Motet could not confirm whether the folder was added. Refresh availability to check before adding it again.');revealRefresh(opening)}else{message(error.message,true);submit.disabled=false;path.readOnly=false;path.focus()}}
+    };
+    refresh.onclick=async()=>{const opening=d._opening;if(!opening||refresh.disabled)return;refresh.disabled=true;message('Checking…');const ok=await opening.adapter.retryContext();if(!current(opening))return;refresh.disabled=false;if(ok&&opening.saved){finish(opening,{...opening.saved,availabilityChecked:true});return}message(ok?'Availability updated. Check the project folders in Settings, Connections before adding again.':opening.saved?savedUnavailable:'Could not refresh availability. Try again.')};
+  }
+  workspaceClose(true);const d=WNC.addFolder;workspaceNewChatAddFolderClose(false);
+  const form=d.querySelector('form');form.reset();const path=form.querySelector('input');path.value=recovery?.oldFolder||recovery?.folder||'';path.readOnly=false;path.removeAttribute('aria-invalid');form.querySelector('small').hidden=false;form.querySelector('small').removeAttribute('aria-hidden');path.setAttribute('aria-describedby','workspaceAddFolderHint workspaceAddFolderTrust');form.querySelector('[role=status]').hidden=true;form.querySelector('[role=status]').textContent='';form.querySelector('[type=submit]').disabled=false;form.querySelector('[data-refresh]').hidden=true;form.querySelector('[data-refresh]').disabled=false;
+  d._opening={trigger,recovery,adapter:WNC.adapter,owner:typeof KEY==='undefined'?null:KEY};d.showModal();path.focus();
+}
+function workspaceNewChatSettingsPaint(refreshOnOpen=false){
+  if(refreshOnOpen)WNC.adapter?.retryContext?.();
   const pane=WS.controls&&WS.controls.querySelector('[data-settings-pane=connections]');if(!pane)return;
   let host=pane.querySelector('#workspaceNewChatSettings');
-  if(!workspaceNewChatReady()){if(host)host.hidden=true;return}
-  if(!host){host=wncEl('div','');host.id='workspaceNewChatSettings';pane.append(host)}
+  const ownerKey=typeof KEY==='undefined'?null:KEY,adapter=WNC.adapter,ready=workspaceNewChatReady();
+  if(host&&(host._refreshOwner!==ownerKey||host._refreshAdapter!==adapter||!ready)){
+    host._refreshTicket=null;host._refreshOwner=ownerKey;host._refreshAdapter=adapter;
+    if(host._refreshButton){host._refreshButton.disabled=false;host._refreshStatus.textContent=''}
+  }
+  if(!ready){if(host)host.hidden=true;return}
+  if(!host){
+    host=wncEl('div','');host.id='workspaceNewChatSettings';host._refreshOwner=ownerKey;host._refreshAdapter=adapter;pane.append(host);
+    const heading=wncEl('div','workspace-nc-heading');heading.append(wncEl('h4','','Starting new chats'));
+    if(adapter?.retryContext){
+      const refresh=wncEl('button','','Refresh availability'),status=wncEl('span','','');refresh.type='button';status.setAttribute('role','status');
+      host._refreshButton=refresh;host._refreshStatus=status;
+      refresh.onclick=async()=>{
+        if(refresh.disabled)return;const adapter=WNC.adapter,key=typeof KEY==='undefined'?null:KEY,ticket={};
+        host._refreshTicket=ticket;refresh.disabled=true;status.textContent='Checking…';
+        let ok=false;try{ok=await adapter.retryContext()}catch(_){}
+        if(host._refreshTicket!==ticket||WNC.adapter!==adapter||typeof KEY!=='undefined'&&KEY!==key||!workspaceNewChatReady())return;
+        host._refreshTicket=null;refresh.disabled=false;status.textContent=ok?'Availability updated.':'Could not refresh availability. Try again.';
+      };
+      heading.append(refresh);host.append(heading,status);
+    }else host.append(heading);
+    host._details=wncEl('div','');host.append(host._details);
+  }
   const keys=[...WS.projects.keys()].filter(k=>typeof k==='string'&&k!=='—').sort((x,y)=>projLabel(x).localeCompare(projLabel(y))),apps=workspaceNewChatApps(),sig=JSON.stringify([apps.map(a=>[a.id,a.status,a.reason,a.supportsWork,a.supportsBlank,workspaceNewChatAppPresentation(a,false,true)]),keys.map(k=>[k,projLabel(k),workspaceNewChatFolders(k)])]);
-  host.hidden=false;if(sig===WNC.settingsSig&&host.childElementCount)return;WNC.settingsSig=sig;host.textContent='';
-  host.append(wncEl('h4','','Starting new chats'),wncEl('p','','Which apps Motet can ask to open a new chat in a project’s folder. A new chat is added to the stage only after its session is seen there.'));
-  for(const a of apps){const presentation=workspaceNewChatAppPresentation(a,false,true),row=wncEl('div','workspace-nc-row'),tag=wncEl('em','',presentation.tag);tag.dataset.status=a.status;row.append(wncEl('b','',a.name),wncEl('span','',presentation.text),tag);host.append(row)}
-  host.append(wncEl('h4','','Project folders'),wncEl('p','','The folders recorded for each project. A new chat is asked to open in one of them.'));
+  const details=host._details;host.hidden=false;if(sig===WNC.settingsSig&&details.childElementCount)return;WNC.settingsSig=sig;details.textContent='';
+  details.append(wncEl('p','','Which apps Motet can ask to open a new chat in a project’s folder. A new chat is added to the stage only after its session is seen there.'));
+  for(const a of apps){const presentation=workspaceNewChatAppPresentation(a,false,true),row=wncEl('div','workspace-nc-row'),tag=wncEl('em','',presentation.tag);tag.dataset.status=a.status;row.append(wncEl('b','',a.name),wncEl('span','',presentation.text),tag);details.append(row)}
+  details.append(wncEl('h4','','Project folders'),wncEl('p','','The folders recorded for each project. A new chat is asked to open in one of them.'));
   for(const k of keys){const folders=workspaceNewChatFolders(k),row=wncEl('div','workspace-nc-row'),name=document.createElement('b'),icon=workspaceFolder(),where=document.createElement('span');icon.style.color=workspaceProjectColour(projColour(k));name.append(icon,wncEl('span','',projLabel(k)));
     if(folders.length){where.append(wncPath(folders[0]));if(folders.length>1)where.append(' and '+(folders.length-1)+' more')}else where.textContent='No folder recorded';
-    row.append(name,where,wncEl('em','',folders.length?'':'No new chats'));host.append(row)}
-  host.append(wncEl('p','','New chats open on the computer running Motet, also when you ask from another device.'));
+    row.append(name,where,wncEl('em','',folders.length?'':'No new chats'));details.append(row)}
+  details.append(wncEl('p','','New chats open on the computer running Motet, also when you ask from another device.'));
 }
 /* The public demo launches nothing. Codex work/blank outcomes and monitor records are fictional and scripted. */
 function workspaceNewChatDemoAdapter(){
@@ -7462,7 +7617,7 @@ function workspaceNewTransition(old,next){if(typeof WORKSPACE==='undefined'||!WO
 function workspaceNewCount(a){if(!WORKSPACE||STEADY||!a||focus===a.id)return null;const v=WNEW.visits.get(a);if(!v||v.frozen)return null;const current=workspaceNewProjection(a),count=[...current.keys()].filter(k=>!v.base.has(k)).length;return count?{count,leftAt:v.leftAt,lost:workspaceNewLost(a,v)}:null}
 function workspaceNewRemoveMarker(){if(WNEW.marker)WNEW.marker.remove()}
 function workspaceNewPaint(rows){if(!WORKSPACE)return;workspaceNewRemoveMarker();for(const r of rows){r.el.classList.remove('workspace-new-dot');const owned=r._workspaceNewA11y;if(owned){if(owned.target.getAttribute('aria-describedby')===owned.applied){if(owned.previous===null)owned.target.removeAttribute('aria-describedby');else owned.target.setAttribute('aria-describedby',owned.previous)}delete r._workspaceNewA11y}r.el.querySelectorAll('.workspace-new-a11y,.workspace-new-inside,.workspace-new-dot-mark').forEach(n=>n.remove())}if(STEADY||!focus||OFUI.recipient!=='agent'||!OFUI.docked)return;const a=A[focus],v=a&&WNEW.visits.get(a);if(!v?.frozen?.size)return;const projected=workspaceNewProjection(a),mapped=new Map();for(const [k,x] of projected){const row=x.kind==='step'?rows.find(r=>r.kind==='step'&&r.agent===a&&r.event===x.item&&r.eventRef===x.item.e):CU.nodes.get(x.dom);if(row&&rows.includes(row)&&!row.el.hidden&&(x.kind!=='source'||row.workspaceNewOwner===workspaceNewToken(a)&&row.workspaceNewSource===k))mapped.set(k,row)}const present=[...v.frozen].filter(k=>mapped.has(k));if(!present.length)return;const byRow=new Map([...mapped].map(([k,r])=>[r,k]));if(!v.mode){if([...v.returned].some(k=>projected.has(k)&&!mapped.has(k)))return;const atReturn=rows.filter(r=>v.returned.has(byRow.get(r))),first=atReturn.findIndex(r=>v.frozen.has(byRow.get(r)));v.mode=atReturn.slice(first+1).some(r=>!v.frozen.has(byRow.get(r)))?'interleaved':'clean'}const newRows=rows.filter(r=>present.includes(byRow.get(r)));const closed=new Map(),heads=workspaceSourceRuns(rows);for(const r of newRows){const head=heads.get(r),details=r.el.querySelector('details');if(head&&details&&!details.open)closed.set(head,(closed.get(head)||0)+1)}for(const [r,n] of closed){const summary=r.el.querySelector('summary'),label=document.createElement('span');label.className='workspace-new-inside';txt(label,n+' new inside');summary.append(label)}if(v.mode==='clean'){const first=newRows[0],details=first.el.querySelector('details');if(!details||details.open||!first.el.querySelector('summary')?.hidden){const marker=document.createElement('div');marker.dataset.workspaceNewMarker='true';marker.className='workspace-new-divider';const label=document.createElement('span');txt(label,'New since you left · '+clock(v.leftAt/1000));marker.append(label);first.el.before(marker);WNEW.marker=marker}}else{for(const r of newRows){const details=r.el.querySelector('details');if(details&&!details.open)continue;r.el.classList.add('workspace-new-dot');const mark=document.createElement('span');mark.className='workspace-new-dot-mark';mark.title='New since you left';mark.setAttribute('aria-hidden','true');r.el.append(mark);const target=r.el.querySelector('button,summary,[tabindex]')||r.el,label=document.createElement('span'),previous=target.getAttribute('aria-describedby');label.className='workspace-new-a11y';label.id='workspace-new-label-'+ ++WNEW.serial;txt(label,'New since you left');r.el.append(label);const applied=[previous,label.id].filter(Boolean).join(' ');target.setAttribute('aria-describedby',applied);r._workspaceNewA11y={target,previous,applied}}const marker=document.createElement('div');marker.dataset.workspaceNewMarker='true';marker.className='workspace-new-summary';const count=present.length;txt(marker,(workspaceNewLost(a,v)?'At least ':'')+count+' new since you left at '+clock(v.leftAt/1000)+'. Some have earlier recorded times and are marked above.');ofLog.append(marker);WNEW.marker=marker}}
-function workspaceForeground(){return !!(typeof workspaceNativeAttachments==='function'&&workspaceNativeAttachments.current?.foreground())||!!(typeof workspaceLiveDocumentsForeground==='function'&&workspaceLiveDocumentsForeground())||!!(typeof workspaceAttachmentsForeground==='function'&&workspaceAttachmentsForeground())||!!(typeof workspaceOfficerHistoryActive==='function'&&workspaceOfficerHistoryActive())||!!(WORKSPACE&&[WS.nav,WS.bell,WS.controls,WS.menu].some(d=>d?.open))||!!(typeof WNC!=='undefined'&&WNC.dialog?.open)}
+function workspaceForeground(){return !!(typeof workspaceNativeAttachments==='function'&&workspaceNativeAttachments.current?.foreground())||!!(typeof workspaceLiveDocumentsForeground==='function'&&workspaceLiveDocumentsForeground())||!!(typeof workspaceAttachmentsForeground==='function'&&workspaceAttachmentsForeground())||!!(typeof workspaceOfficerHistoryActive==='function'&&workspaceOfficerHistoryActive())||!!(WORKSPACE&&[WS.nav,WS.bell,WS.controls,WS.menu].some(d=>d?.open))||!!(typeof WNC!=='undefined'&&(WNC.dialog?.open||WNC.addFolder?.open))}
 function workspaceMove(el,parent){if(!WS.anchors.has(el)){const a=document.createComment('workspace restore');el.before(a);WS.anchors.set(el,a)}parent.appendChild(el)}
 function workspaceRestore(el){const a=WS.anchors.get(el);if(a){a.after(el);a.remove();WS.anchors.delete(el)}}
 function workspaceClose(navigate=false){const d=[WS.nav,WS.bell,WS.controls,WS.menu].find(x=>x?.open);if(!d)return;if(d===WS.controls)workspaceSettingsUnmount();d.close();if(d===WS.bell)$('#workspaceBell').setAttribute('aria-expanded','false');if(d===WS.nav){workspaceRestore(WS.side);workspaceNavSync()}workspaceRestore($('#needs'));for(const id of ['#console','#acts','#deckOpen','#roomTheme'])workspaceRestore($(id));responseInvalidate();if(!navigate){const visible=el=>el?.isConnected&&!el.disabled&&el.getClientRects?.().length&&(typeof getComputedStyle!=='function'||getComputedStyle(el).visibility!=='hidden'),t=[WS.returnTo,$('#workspaceNav'),$('#workspaceControls')].find(visible);if(t)t.focus({preventScroll:true})}}
@@ -7496,6 +7651,7 @@ function workspacePaint(now){if(!WORKSPACE||!WS.side)return;if(focus&&A[focus]&&
   $('#clearQ').hidden=!quiet||order.length<2;txt($('#clearQ .workspace-action-label'),'Dismiss '+quiet+' idle');txt($('#bringB .workspace-action-label'),'Bring back '+(Object.keys(A).length-order.length));}
   const forest=focus?new Map(deskAgentForest(order,A).map(n=>[n.id,n])):null;
   const groups=new Map();for(const id of order){const a=A[id];if(!a)continue;const key=a.observed?WORKSPACE_SEEN:proj(id)||'—';if(!groups.has(key))groups.set(key,[]);groups.get(key).push(id)}
+  if(typeof workspaceNewChatReady==='function'&&workspaceNewChatReady())for(const folder of WNC.adapter?.registeredFolders?.()||[]){const key=workspaceNewChatProjectKey(folder.displayPath);if(key&&!groups.has(key))groups.set(key,[])}
   const names=[...groups.keys()].sort((a,b)=>a===WORKSPACE_SEEN?1:b===WORKSPACE_SEEN?-1:a==='—'?1:b==='—'?-1:projLabel(a).localeCompare(projLabel(b)));
   for(const [k,node] of WS.projects)if(!groups.has(k)){node.remove();WS.projects.delete(k)}
   for(const [id,node] of WS.agents)if(!order.includes(id)){node.remove();WS.agents.delete(id)}
@@ -7558,7 +7714,7 @@ function workspaceSettingsMount(){const idle=$('#workspaceAutoDismiss');WS.idleH
 function workspaceMemoryDetach(){if(!WS.memory)return;WS.memory=false;DECK.token++;DECK.readEpoch++;DECK.loadToken++;if(DECK.mode==='settings')DECK.mode=null;$('#deckSettingsPane').hidden=true;workspaceSettingsRestore($('#deckSettingsPane'));$('#deckOpen').hidden=false;$('#deckOpen').setAttribute('aria-expanded','false');$('#workspaceMemoryState').hidden=true;$('#workspaceMemoryRetry').hidden=true;$('#workspaceMemoryIntro').hidden=false;WS.memoryLoadError=null}
 function workspaceSettingsLeaveModel(){if(!WS.model)return;officerModelClose(false);OMODEL.token++;OMODEL.loading=false;WS.model=false;for(const [name,saved] of Object.entries(WS.modelStyle||{})){if(saved.value)$('#ofModelMenu').style.setProperty(name,saved.value,saved.priority);else $('#ofModelMenu').style.removeProperty(name)}WS.modelStyle=null;workspaceSettingsRestore($('#ofModelPicker'));officerModelPaint()}
 function workspaceSettingsUnmount(){if(WS.idleHidden!==undefined){$('#workspaceAutoDismiss').hidden=WS.idleHidden;delete WS.idleHidden}if(WS.watchRulesOpen!==undefined){$('#watchRules').open=WS.watchRulesOpen;delete WS.watchRulesOpen}if(WS.settingLabels){txt($('#help'),WS.settingLabels.help);txt($('#deckOpen'),WS.settingLabels.memory);WS.settingLabels=null}workspaceMemoryDetach();workspaceSettingsLeaveModel();if(!$('#watchP').hidden)watchOpen(false);for(const id of ['#hint','#needs','#workspaceBellEarlier','#workspaceBellAlerts','#deskAntigravityConnect','#claudeSetup','#deckOpen','#watchW','#roomTheme','#helpW','#appr','#notify'])workspaceSettingsRestore($(id));WS.section=null;responseInvalidate()}
-function workspaceSettingsSelect(section){if(!['general','rules','officer','connections','alerts'].includes(section))return;if(WS.section!==section){if(WS.section==='rules'&&WS.watchRulesOpen!==undefined)$('#watchRules').open=WS.watchRulesOpen;workspaceMemoryDetach();workspaceSettingsLeaveModel();if(!$('#watchP').hidden&&section!=='rules')watchOpen(false)}WS.section=section;if(section==='rules')$('#watchRules').open=true;for(const b of WS.controls.querySelectorAll('[data-settings]'))b.setAttribute('aria-current',String(b.dataset.settings===section));for(const p of WS.controls.querySelectorAll('[data-settings-pane]'))p.hidden=p.dataset.settingsPane!==section;if(section==='officer'&&typeof workspaceSettingsStatus==='function')workspaceSettingsStatus();if(section==='officer'&&!WS.model){workspaceSettingsMove($('#ofModelPicker'),$('#workspaceSettingsModel'));WS.model=true;WS.modelStyle=Object.fromEntries(['top','bottom','max-height'].map(name=>[name,{value:$('#ofModelMenu').style.getPropertyValue(name),priority:$('#ofModelMenu').style.getPropertyPriority(name)}]));for(const name of ['top','bottom','max-height'])$('#ofModelMenu').style.removeProperty(name);officerModelPaint()}if(section==='connections'){if(typeof workspaceNewChatSettingsPaint==='function')workspaceNewChatSettingsPaint();const a=focus&&A[focus],eligible=!!(a&&cuClaudeEligible(cuTarget(),a,OFUI.recipient==='agent'));txt($('#workspaceConnectionState'),eligible?'Claude connection for the current chat.':a?'Connection controls are available for an eligible current chat.':'Choose an eligible chat at its desk to manage its connection.');$('#deskAntigravityConnect').hidden=!(a&&!a.observed&&a.runtime==='Antigravity'&&String(a.id).startsWith('a:'))}responseInvalidate()}
+function workspaceSettingsSelect(section){if(!['general','rules','officer','connections','alerts'].includes(section))return;if(WS.section!==section){if(WS.section==='rules'&&WS.watchRulesOpen!==undefined)$('#watchRules').open=WS.watchRulesOpen;workspaceMemoryDetach();workspaceSettingsLeaveModel();if(!$('#watchP').hidden&&section!=='rules')watchOpen(false)}WS.section=section;if(section==='rules')$('#watchRules').open=true;for(const b of WS.controls.querySelectorAll('[data-settings]'))b.setAttribute('aria-current',String(b.dataset.settings===section));for(const p of WS.controls.querySelectorAll('[data-settings-pane]'))p.hidden=p.dataset.settingsPane!==section;if(section==='officer'&&typeof workspaceSettingsStatus==='function')workspaceSettingsStatus();if(section==='officer'&&!WS.model){workspaceSettingsMove($('#ofModelPicker'),$('#workspaceSettingsModel'));WS.model=true;WS.modelStyle=Object.fromEntries(['top','bottom','max-height'].map(name=>[name,{value:$('#ofModelMenu').style.getPropertyValue(name),priority:$('#ofModelMenu').style.getPropertyPriority(name)}]));for(const name of ['top','bottom','max-height'])$('#ofModelMenu').style.removeProperty(name);officerModelPaint()}if(section==='connections'){if(typeof workspaceNewChatSettingsPaint==='function')workspaceNewChatSettingsPaint(true);const a=focus&&A[focus],eligible=!!(a&&cuClaudeEligible(cuTarget(),a,OFUI.recipient==='agent'));txt($('#workspaceConnectionState'),eligible?'Claude connection for the current chat.':a?'Connection controls are available for an eligible current chat.':'Choose an eligible chat at its desk to manage its connection.');$('#deskAntigravityConnect').hidden=!(a&&!a.observed&&a.runtime==='Antigravity'&&String(a.id).startsWith('a:'))}responseInvalidate()}
 async function workspaceMemoryActivate(){if(!WORKSPACE||!WS.controls?.open||WS.section!=='officer')return;if(locked||claiming){$('#workspaceMemoryState').hidden=false;txt($('#workspaceMemoryState'),'Unlock Motet to manage memory.');return}if(!WS.memory){WS.memory=true;workspaceSettingsMove($('#deckSettingsPane'),$('#workspaceMemoryHost'));DECK.token++;DECK.readEpoch++;DECK.loadToken++;DECK.mode='settings';$('#deckOpen').hidden=true;$('#deckOpen').setAttribute('aria-expanded','true')}const epoch=DECK.readEpoch;$('#deckSettingsPane').hidden=true;$('#workspaceMemoryRetry').hidden=true;$('#workspaceMemoryState').hidden=false;$('#workspaceMemoryState').tabIndex=-1;txt($('#workspaceMemoryState'),'Loading memory settings…');$('#workspaceMemoryState').focus({preventScroll:true});const ok=await deckLoad();if(!WS.memory||DECK.readEpoch!==epoch||!WS.controls.open||WS.section!=='officer')return;const restore=document.activeElement===$('#workspaceMemoryState'),message=$('#deckNotice').textContent||'Memory settings could not be loaded.';if(ok&&WS.memoryLoadError&&$('#deckNotice').textContent===WS.memoryLoadError&&!DECK.pending)txt($('#deckNotice'),'');WS.memoryLoadError=ok?null:message;$('#deckSettingsPane').hidden=!ok;$('#workspaceMemoryIntro').hidden=!!ok;$('#workspaceMemoryRetry').hidden=!!ok;txt($('#workspaceMemoryState'),ok?'':message);$('#workspaceMemoryState').hidden=!!ok;if(restore){const next=ok?[...$('#deckSettingsPane').querySelectorAll('button,input,select,summary')].find(el=>!el.disabled&&el.getClientRects().length):$('#workspaceMemoryRetry');next?.focus({preventScroll:true})}}
 function workspaceMemoryResume(ready){WS.memory=true;workspaceSettingsMove($('#deckSettingsPane'),$('#workspaceMemoryHost'));DECK.mode='settings';$('#deckOpen').hidden=true;$('#deckOpen').setAttribute('aria-expanded','true');$('#deckSettingsPane').hidden=!ready;$('#workspaceMemoryIntro').hidden=ready;$('#workspaceMemoryRetry').hidden=ready;$('#workspaceMemoryState').hidden=ready;if(!ready)txt($('#workspaceMemoryState'),'Memory settings were not loaded. Retry.')}
 function workspaceSettingsSubflow(section,origin=document.activeElement){WS.subflow={section,origin,scroll:$('#workspaceControlsBody').scrollTop,memory:!!WS.memory,memoryReady:!!WS.memory&&!$('#deckSettingsPane').hidden};workspaceClose(true)}
@@ -7599,8 +7755,9 @@ function workspaceInit(){
   addEventListener('pointerdown',e=>{if(WS.bell.open&&!WS.bell.contains(e.target)&&!$('#workspaceBell').contains(e.target)||WS.menu?.open&&!WS.menu.contains(e.target)&&!$('#workspaceAgentMenuButton').contains(e.target))workspaceClose(true)},true);
   addEventListener('keydown',e=>{if((WS.bell.open||WS.menu?.open)&&e.key==='Escape'){e.preventDefault();e.stopImmediatePropagation();workspaceClose()}},true);
   bell.addEventListener('focusout',e=>{if(WS.bell.open&&e.relatedTarget&&!bell.contains(e.relatedTarget)&&e.relatedTarget!==$('#workspaceBell'))workspaceClose(true)});
+  if(!DEMO){const addFolder=wncEl('button','workspace-grid','');addFolder.type='button';addFolder.hidden=true;const mark=wncEl('span','workspace-leading','');mark.setAttribute('aria-hidden','true');mark.append(wncIcon('M4 8h6l2 2h8v8H4z M12 12v4m-2-2h4'));addFolder.append(mark,wncEl('span','workspace-label','Add project folder'));addFolder.onclick=()=>workspaceNewChatAddFolder(addFolder);side.querySelector('#workspaceProjects').before(addFolder);WS.addFolderButton=addFolder;}
   if(DEMO&&typeof workspaceNewChatDemoAdapter==='function')WNC.adapter=workspaceNewChatDemoAdapter();
-  else WNC.adapter=createNewChatClient({auth:()=>!locked&&!claiming?KEY:'',fetch:(...args)=>fetch(...args),storage:{getItem:k=>sessionStorage.getItem(k),setItem:(k,v)=>sessionStorage.setItem(k,v),removeItem:k=>sessionStorage.removeItem(k)},scope:async key=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(key))),b=>b.toString(16).padStart(2,'0')).join(''),setTimeout:(...args)=>window.setTimeout(...args),clearTimeout:(...args)=>window.clearTimeout(...args),controller:()=>new AbortController(),report:workspaceNewChatReport,changed:()=>{WNC.sig='';workspaceNewChatPaint();workspaceNewChatSettingsPaint()},authChanged:()=>{workspaceNewChatTimer();WNC.pending=null;WNC.sig=''}});
+  else WNC.adapter=createNewChatClient({auth:()=>!locked&&!claiming?KEY:'',fetch:(...args)=>fetch(...args),storage:{getItem:k=>sessionStorage.getItem(k),setItem:(k,v)=>sessionStorage.setItem(k,v),removeItem:k=>sessionStorage.removeItem(k)},scope:async key=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(key))),b=>b.toString(16).padStart(2,'0')).join(''),setTimeout:(...args)=>window.setTimeout(...args),clearTimeout:(...args)=>window.clearTimeout(...args),controller:()=>new AbortController(),report:workspaceNewChatReport,changed:()=>{WNC.sig='';if(typeof render==='function')render();else workspaceNewChatPaint();workspaceNewChatSettingsPaint()},authChanged:()=>{workspaceNewChatTimer();WNC.pending=null;WNC.sig='';workspaceNewChatAddFolderClose(false);WNC.returnTo=null;workspaceNewChatDialogClose()}});
   side.addEventListener('click',e=>{const nc=typeof workspaceNewChatOpen==='function'&&e.target.closest('[data-newchat]');if(nc){workspaceNewChatOpen(nc.dataset.newchat,nc);return}if(e.target.closest('[data-newchat-pending]')){workspaceClose(true);workspaceOfficerDeskClose(false);if(focus)setFocus(null);return}const p=e.target.closest('[data-project]'),a=e.target.closest('[data-agent]');if(p){setProj(p.dataset.project);return}if(a){workspaceClose(true);setFocus(a.dataset.agent);workspaceDeskFocus();return}if(e.target.closest('[data-officer]')){workspaceClose(true);workspaceOfficerDeskOpen()}else if(e.target.closest('[data-room]')){workspaceClose(true);workspaceOfficerDeskClose(false);if(focus)leaveDesk();setProj(null)}});
   side.addEventListener('dblclick',e=>{const p=e.target.closest('[data-project]');if(p&&p.dataset.project!=='—'){renameProj(p.dataset.project);e.preventDefault()}});
   $('#workspaceNav').onclick=workspaceToggleNav;$('#workspaceReset').onclick=resetRoomView;
