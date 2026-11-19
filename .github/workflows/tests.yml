@@ -38,6 +38,12 @@ jobs:
           python -u -X faulthandler -c "import faulthandler, runpy; print('parser checks started', flush=True); faulthandler.dump_traceback_later(60, repeat=True); runpy.run_path('tests/test_parsers.py', run_name='__main__')"
       - run: python tests/test_app_icons.py
         if: ${{ !cancelled() }}
+      - name: Check optional dictation helper without native dependencies
+        if: ${{ !cancelled() }}
+        run: |
+          python tests/test_dictation_assets.py
+          python tests/test_dictation_runtime.py
+          python tests/test_dictation_helper.py
       - run: python tests/test_native_sqlite_support.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
