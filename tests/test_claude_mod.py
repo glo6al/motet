@@ -528,6 +528,71 @@ class ClaudeModTests(unittest.TestCase):
                 native_id=self.sid, client_id=client), token=self.token)[0], 200)
         self.assertEqual(peer_lifecycle.blockers(self.store.db, self.aid)[0][:2], (tid, 'uncertain'))
 
+    def test_shared_mod_live_disconnect_stamps_one_hold_and_restart_preserves_it(self):
+        tid, _, client = self.shared_progress_request()
+        claim = self.global_poll(client)[1]['claim']
+        self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+        observed = time.time() + 2
+        with patch.object(peer_lifecycle, 'time', wraps=time) as clock:
+            clock.time.return_value = observed
+            status, result = self.http('/claude-mod/disconnect', dict(generation=self.generation,
+                native_id=self.sid, client_id=client), token=self.token)
+        self.assertEqual(status, 200, result)
+        first = peer_lifecycle.hold_episode(peer_lifecycle.get(self.store.db, tid))
+        self.assertIsNotNone(first)
+        self.assertEqual((first['since'], first['due_at']), (observed, observed + 300))
+        self.store.close()
+        self.store = messaging.MessagingStore(str(self.base/'state'), str(self.base/'sessions'))
+        self.store.codex_available = False
+        server.MESSAGING = self.store
+        self.assertEqual(peer_lifecycle.hold_episode(peer_lifecycle.get(self.store.db, tid)), first)
+
+    def test_shared_mod_restart_does_not_invent_a_hold_start(self):
+        tid, _, client = self.shared_progress_request()
+        claim = self.global_poll(client)[1]['claim']
+        self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+        self.assertIsNone(peer_lifecycle.hold_episode(peer_lifecycle.get(self.store.db, tid)))
+        self.store.close()
+        self.store = messaging.MessagingStore(str(self.base/'state'), str(self.base/'sessions'))
+        self.store.codex_available = False
+        server.MESSAGING = self.store
+        record = peer_lifecycle.get(self.store.db, tid)
+        self.assertEqual(record['execution'], 'uncertain')
+        self.assertIsNone(peer_lifecycle.hold_episode(record))
+
+    def test_pruned_shared_mod_unknown_receipt_dates_its_first_genuine_hold(self):
+        tid, _, client = self.shared_progress_request()
+        claim = self.global_poll(client)[1]['claim']
+        self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+        observed = peer_lifecycle.get(self.store.db, tid)['created'] + messaging.RETENTION + 1
+        with self.store.lock, self.store.db:
+            self.store._prune(self.store._rows(), observed)
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM requests WHERE id=?', (tid,)).fetchone())
+        self.assertEqual(peer_lifecycle.get(self.store.db, tid)['execution'], 'running')
+        with patch.object(peer_lifecycle, 'time', wraps=time) as clock:
+            clock.time.return_value = observed
+            status, result = self.progress_event(claim, client, 'unknown')
+        self.assertEqual(status, 200, result)
+        record = peer_lifecycle.get(self.store.db, tid)
+        self.assertEqual(record['execution'], 'uncertain')
+        episode = peer_lifecycle.hold_episode(record)
+        self.assertIsNotNone(episode)
+        self.assertEqual((episode['since'], episode['due_at']), (observed, observed + 300))
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM requests WHERE id=?', (tid,)).fetchone())
+
+    def test_pruned_submitted_receipt_does_not_date_a_synthesized_unknown(self):
+        tid, _, client = self.shared_progress_request()
+        claim = self.global_poll(client)[1]['claim']
+        self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+        observed = peer_lifecycle.get(self.store.db, tid)['created'] + messaging.RETENTION + 1
+        with self.store.lock, self.store.db:
+            self.store._prune(self.store._rows(), observed)
+        with patch.object(peer_lifecycle, 'time', wraps=time) as clock:
+            clock.time.return_value = observed
+            status, result = self.progress_event(claim, client, 'submitted')
+        self.assertEqual(status, 200, result)
+        self.assertIsNone(peer_lifecycle.hold_episode(peer_lifecycle.get(self.store.db, tid)))
+
     def assert_shared_mod_unsent(self, tid, request_id, poll):
         self.assertIsNone(poll['claim'])
         result = self.store.shared.result(request_id)

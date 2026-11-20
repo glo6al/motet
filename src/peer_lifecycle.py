@@ -16,6 +16,8 @@ RETIRE_MESSAGE = ('This attempt was retired by the owner. Provider outcome remai
                   'late replies are withheld. Nothing was cancelled or resent.')
 DROP_MESSAGE = 'The native input was dropped before it started. Nothing was resubmitted.'
 CODEX_RETENTION_HOLD = 'Content retention passed before an end was observed.'
+HOLD_NOTICE_DELAY = 300
+_HOLD_VERSION = 1
 MAX_RESERVATIONS = 200000  # Both immutable ledgers are individually capped at 100000.
 MAX_EVENTS, EVENT_RETENTION = 2048, 86400
 
@@ -59,6 +61,47 @@ def exact_admission(db, request_id):
 def get(db, request_id):
     r = db.execute('SELECT agent,created,execution,capture,evidence FROM peer_execution WHERE request_id=?', (request_id,)).fetchone()
     return dict(request_id=request_id, agent=r[0], created=r[1], execution=r[2], capture=r[3], evidence=json.loads(r[4])) if r else None
+
+
+def _hold_timestamp(value):
+    return type(value) in (int, float) and 0 < value <= 253402300799
+
+
+def _canonical_uuid(value):
+    try:
+        return isinstance(value, str) and len(value) == 36 and str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def hold_episode(record):
+    """Return validated metadata for a current hold, including no message content."""
+    if (not isinstance(record, dict) or record.get('execution') != 'uncertain'
+            or record.get('capture') == 'captured'):
+        return None
+    evidence = record.get('evidence')
+    if not isinstance(evidence, dict) or evidence.get('launched') is not True:
+        return None
+    hold = evidence.get('hold')
+    if (not isinstance(hold, dict) or set(hold) != {'version', 'episode_id', 'since', 'due_at'}
+            or type(hold['version']) is not int or hold['version'] != _HOLD_VERSION
+            or not _canonical_uuid(hold['episode_id'])):
+        return None
+    since, due = hold['since'], hold['due_at']
+    created = record.get('created')
+    if (not all(_hold_timestamp(value) for value in (created, since, due))
+            or since < created or due != since + HOLD_NOTICE_DELAY):
+        return None
+    return dict(episode_id=hold['episode_id'], since=since, due_at=due)
+
+
+def begin_hold_episode(evidence, *, created, launched, now):
+    """Record an observed transition in the caller's lifecycle write."""
+    evidence.pop('hold', None)
+    if all(_hold_timestamp(value) for value in (created, launched, now)) and created <= launched <= now:
+        due = now + HOLD_NOTICE_DELAY
+        if _hold_timestamp(due):
+            evidence['hold'] = dict(version=_HOLD_VERSION, episode_id=str(uuid.uuid4()), since=now, due_at=due)
 
 
 def is_retired(db, request_id):
@@ -155,6 +198,7 @@ def retire(db, transport_id, owner_reason, *, expected_agent=None, source='offli
     if old['execution'] in TERMINAL or old['capture'] == 'captured':
         raise ValueError('A verified terminal attempt cannot be retired.')
     evidence = dict(old['evidence'])
+    evidence.pop('hold', None)
     evidence['owner_retirement'] = dict(reason=owner_reason, decided_at=time.time(),
                                         source=source, provider_outcome='unknown')
     db.execute("UPDATE peer_execution SET execution='retired',capture='withheld',evidence=? WHERE request_id=?",
@@ -171,8 +215,8 @@ def _update_payload(db, request_id, row):
     db.execute('UPDATE requests SET data=? WHERE id=? AND data IS NOT ?', (data, request_id, data))
 
 
-def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
-    """Called inside the caller's request-write transaction. No payload retained."""
+def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True, hold_observed=False):
+    """Persist a lifecycle update in the caller's transaction. Only live writers opt in to dating holds."""
     payload = row
     tid = row.get('request_id')
     if not write_payload and (meta is None or missing_payload or not isinstance(tid, str)
@@ -203,7 +247,8 @@ def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
         return
     if old and old['execution'] == 'uncertain' and old['evidence'].get('codex_retention_hold') == CODEX_RETENTION_HOLD:
         return  # A detached tracker cannot revise a retention hold. The owner can still retire it.
-    if write_payload and not missing_payload and not valid_payload(tid, row, meta):
+    valid_body = write_payload and not missing_payload and valid_payload(tid, row, meta)
+    if write_payload and not missing_payload and not valid_body:
         row = dict(request_id=tid, agent=target, state='unknown')
     if row.get('execution_outcome') == 'dropped' and old and (
             old['execution'] in ('running', 'completed')
@@ -257,6 +302,13 @@ def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
             capture = 'captured'
         elif capture != 'captured' and row.get('capture_disposition') == 'unusable':
             capture = 'unusable'
+    if execution != 'uncertain':
+        evidence.pop('hold', None)
+    elif (hold_observed and valid_body and row['state'] == 'unknown' and capture != 'captured' and old
+          and old['execution'] in ('reserved', 'submitted', 'running') and old['created'] == created
+          and launched is not None and target[:2] in ('x:', 'c:') and _canonical_uuid(target[2:])
+          and _canonical_uuid(tid) and exact_admission(db, tid) == meta):
+        begin_hold_episode(evidence, created=created, launched=launched, now=time.time())
     values = (tid, target, created, execution, capture, json.dumps(evidence, sort_keys=True))
     db.execute('''INSERT OR REPLACE INTO peer_execution SELECT ?,?,?,?,?,?
         WHERE NOT EXISTS (SELECT 1 FROM peer_execution

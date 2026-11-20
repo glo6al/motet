@@ -123,7 +123,7 @@ class ClaudeMod:
         for row in self.rows():
             if row.get('launched') and not row.get('settled') and row['state'] not in ('answered', 'failed'):
                 row.update(state='unknown', error='Motet restarted after a Claude mod claim. It will not resubmit.')
-                self.put(row)
+                self.put(row, hold_observed=False)
         self.db.commit()
 
     def rows(self):
@@ -140,8 +140,8 @@ class ClaudeMod:
                                  (row['request_id'],)).fetchone()
         return bool(ledger and ledger[0] == row.get('agent') and ident(row.get('mod_enrollment')))
 
-    def put(self, row):
-        peer_lifecycle.reconcile(self.db, row)
+    def put(self, row, *, hold_observed=True):
+        peer_lifecycle.reconcile(self.db, row, hold_observed=hold_observed)
         self.db.execute('INSERT OR REPLACE INTO requests VALUES (?,?)', (row['request_id'], json.dumps(row)))
         peer_progress.ensure(self.store, row)
 
@@ -761,7 +761,9 @@ class ClaudeMod:
         if row['state'] == 'answered':
             self.store.peers.owner_warning(row)
         if payload_expired:
-            peer_lifecycle.reconcile(self.db, row)
+            # Only an explicit authenticated unknown receipt observes a hold.
+            # The synthesized unknown body used for other late events is not one.
+            peer_lifecycle.reconcile(self.db, row, hold_observed=kind == 'unknown')
         else:
             self.put(row)
             if fresh_start or fresh_end:

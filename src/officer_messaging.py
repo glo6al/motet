@@ -387,9 +387,11 @@ class MessagingStore:
             except Exception:
                 pass  # History failure never changes delivery or triggers a retry.
 
-    def _save(self, row, *, commit=True, ordinary_proof=None, observations=()):
+    def _save(self, row, *, commit=True, ordinary_proof=None, observations=(), hold_observed=False):
         runtime = self._native_owner_runtime
         progress = {'observations': observations} if observations else {}
+        if hold_observed:
+            progress['hold_observed'] = True
         if commit and runtime is not None and not self.db.in_transaction:
             with runtime.ledger.ordinary_writer() as proof:
                 self._write_request(row, proof, **progress)
@@ -407,7 +409,7 @@ class MessagingStore:
     def _ordinary_row(self, row):
         return row.get('origin') != 'peer' and not peer_lifecycle.metadata(self.db, row['request_id'])
 
-    def _write_request(self, row, proof, observations=()):
+    def _write_request(self, row, proof, observations=(), *, hold_observed=False):
         if self._attachment_reserved(row['request_id']):
             raise OwnerGuardError('A protected owner request needs recovery before ordinary writeback.')
         if proof is not None and not self._ordinary_row(row):
@@ -423,7 +425,7 @@ class MessagingStore:
         # payload. A pruned terminal attempt must never regain its content.
         terminal = peer_lifecycle.project_terminal(self.db, row['request_id'], dict(row))
         retained = self.db.execute('SELECT 1 FROM requests WHERE id=?', (row['request_id'],)).fetchone() if terminal else True
-        peer_lifecycle.reconcile(self.db, row)
+        peer_lifecycle.reconcile(self.db, row, hold_observed=hold_observed)
         peer_lifecycle.project_terminal(self.db, row['request_id'], row)
         if not terminal or retained:
             identity, payload = row['request_id'], json.dumps(row)
@@ -1054,6 +1056,7 @@ class MessagingStore:
                 if proof is not None and not self._ordinary_row(row):
                     proof.eligible = False
                 peer_lifecycle.reconcile(self.db, row)
+        newly_pruned = set()
         for row in rows:
             if now - row['created'] > RETENTION:
                 fulfillment = self._unreserved('request_fulfillments.request_id')
@@ -1065,6 +1068,9 @@ class MessagingStore:
                 if removed.rowcount and row.get('origin') == 'peer':
                     meta = peer_lifecycle.exact_admission(self.db, row['request_id'])
                     retained = peer_lifecycle.get(self.db, row['request_id'])
+                    if (meta and retained and row.get('runtime') == 'codex' and retained['execution'] == 'running'
+                            and peer_lifecycle.valid_payload(row['request_id'], row, meta)):
+                        newly_pruned.add(row['request_id'])
                     if (meta and meta[2] is None and retained and retained['execution'] == 'reserved'
                             and not any(retained['evidence'].get(key) for key in ('launched', 'bound_turn', 'mod_turn'))
                             and self.db.execute('SELECT 1 FROM requests WHERE id=?', (row['request_id'],)).fetchone() is None):
@@ -1084,16 +1090,16 @@ class MessagingStore:
                                           (now - RETENTION,))
         if proof is not None and (shared_removed.rowcount != 0 or preview_removed.rowcount != 0):
             proof.eligible = False
-        self._hold_pruned_codex(now - RETENTION, proof)
+        self._hold_pruned_codex(now, proof, newly_pruned)
         return [row for row in rows if now - row['created'] <= RETENTION]
 
-    def _hold_pruned_codex(self, cutoff, proof):
+    def _hold_pruned_codex(self, now, proof, newly_pruned):
         clear = self._unreserved('e.request_id')
         records = self.db.execute(f'''SELECT e.request_id,e.agent,e.created,e.evidence
             FROM peer_execution AS e INDEXED BY peer_execution_active_created
             WHERE e.execution='running' AND e.capture<>'captured' AND e.agent GLOB 'x:*' AND e.created < ?
                 AND e.execution NOT IN ('completed','dropped','retired')
-                AND NOT EXISTS (SELECT 1 FROM requests WHERE id=e.request_id) AND {clear}''', (cutoff,)).fetchall()
+                AND NOT EXISTS (SELECT 1 FROM requests WHERE id=e.request_id) AND {clear}''', (now - RETENTION,)).fetchall()
         for ident, agent, created, raw in records:
             meta = peer_lifecycle.exact_admission(self.db, ident)
             if (not meta or meta[:2] != (agent, created) or not self._timestamp(meta[2])
@@ -1109,6 +1115,9 @@ class MessagingStore:
             except (ValueError, TypeError, RecursionError):
                 continue
             evidence['codex_retention_hold'] = peer_lifecycle.CODEX_RETENTION_HOLD
+            # An already absent or unreadable body does not establish when tracking stopped.
+            if ident in newly_pruned:
+                peer_lifecycle.begin_hold_episode(evidence, created=created, launched=meta[2], now=now)
             self.db.execute("UPDATE peer_execution SET execution='uncertain',capture='withheld',evidence=? WHERE request_id=?",
                             (json.dumps(evidence, sort_keys=True), ident))
             if proof is not None:
@@ -1683,7 +1692,7 @@ class MessagingStore:
                     # Codex candidates are private until all owner cursors catch up.
                     if not was_answered and row['state'] == 'answered':
                         self.peers.owner_warning(row)
-                    self._save(row, observations=observations or ())
+                    self._save(row, observations=observations or (), hold_observed=peer)
                 except (sqlite3.OperationalError, OwnerGuardError):
                     self.db.rollback()
         with self.lock:
