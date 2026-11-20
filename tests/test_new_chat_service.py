@@ -1,5 +1,6 @@
 """Durable New chat behavior using injected fictional native identities only."""
 from dataclasses import replace
+from contextlib import ExitStack, closing
 import json
 import os
 from pathlib import Path
@@ -87,6 +88,40 @@ class FakeAdapter:
     def close(self):
         self.closed = True
         self.create_release.set()
+
+
+class DatabaseProbe:
+    def __init__(self, db, execute=None, committed=None):
+        self.db, self.before_execute, self.committed = db, execute, committed
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    def execute(self, sql, *args):
+        if self.before_execute:
+            override = self.before_execute(sql, *args)
+            if override is not None:
+                return override
+        return self.db.execute(sql, *args)
+
+    def __enter__(self):
+        self.db.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        result = self.db.__exit__(*args)
+        if args[0] is None and self.committed:
+            self.committed()
+        return result
+
+
+class LegacyTransactionProbe(DatabaseProbe):
+    """Exercise pre-fix sqlite3 context-manager COMMIT failure semantics."""
+    def __exit__(self, kind, value, traceback):
+        if kind is None:
+            self.db.commit()
+        else:
+            self.db.rollback()
 
 
 @unittest.skipIf(os.name == 'nt', 'New chat uses private POSIX storage; Windows native launch is unavailable.')
@@ -278,6 +313,9 @@ class ServiceTests(unittest.TestCase):
                     s.db.execute('UPDATE registered_folders SET data=? WHERE id=?', (raw, damaged['id']))
                 before = s.db.execute('SELECT id,data FROM registered_folders ORDER BY id').fetchall()
                 self.assertEqual(s.context()['folders'], [healthy])
+                self.assertEqual(s.saved_folders(), {'schemaVersion': 1,
+                    'savedFolders': [{key: healthy[key] for key in ('id', 'revision', 'label', 'displayPath')}],
+                    'complete': False, 'unreadableCount': 1})
                 self.assertEqual(s.db.execute('SELECT id,data FROM registered_folders ORDER BY id').fetchall(), before)
         with s.db:
             s.db.execute('UPDATE registered_folders SET id=?,data=? WHERE id=?',
@@ -322,9 +360,525 @@ class ServiceTests(unittest.TestCase):
                         s.db.execute('UPDATE registered_folders SET id=CAST(? AS TEXT) WHERE id=?', (invalid, damaged['id']))
                 before = s.db.execute('SELECT CAST(id AS BLOB),CAST(data AS BLOB) FROM registered_folders ORDER BY id').fetchall()
                 self.assertEqual(s.context()['folders'], [healthy])
+                listing = s.saved_folders()
+                self.assertEqual((listing['complete'], listing['unreadableCount']), (False, 1))
+                self.assertEqual([row['id'] for row in listing['savedFolders']], [healthy['id']])
                 choice = dict(provider='codex', folderId=healthy['id'], folderRevision=healthy['revision'])
                 self.assertIn('requestId', s.prepare(choice))
                 self.assertEqual(s.db.execute('SELECT CAST(id AS BLOB),CAST(data AS BLOB) FROM registered_folders ORDER BY id').fetchall(), before)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
+
+    def test_saved_management_uses_only_stored_metadata_for_unavailable_targets(self):
+        s = self.service()
+        saved = [s.register_folder({'path': str(self.folder)})['folder']]
+        missing, replaced = self.root / 'missing-project', self.root / 'replaced-project'
+        for path in (missing, replaced):
+            path.mkdir()
+            saved.append(s.register_folder({'path': str(path)})['folder'])
+        missing.rmdir()
+        replaced.rename(self.root / 'previous-project')
+        replaced.mkdir()
+        private = self.root / '.claude'
+        private.mkdir()
+        frozen = s.inventory._folder(str(private), private.stat())
+        with s.db:
+            s.db.execute('INSERT INTO registered_folders VALUES (?,?)', (frozen.id, json.dumps(vars(frozen))))
+        saved.append(dict(id=frozen.id, revision=frozen.revision, label=frozen.label, displayPath=frozen.path))
+        protected = self.folder / 'kept.txt'
+        protected.write_text('Fictional owner file stays in place.')
+        self.adapter.available = False
+        with ExitStack() as stack:
+            for obj, name in ((s, 'context'), (s, '_capability'), (s, '_chooser'),
+                              (s, 'prepare'), (s, 'open'), (s.inventory, 'source'),
+                              (s.inventory, 'require_allowed'), (self.adapter, 'preflight'),
+                              (self.adapter, 'create_once'), (self.adapter, 'open_existing'),
+                              (self.adapter, 'verify_existing')):
+                stack.enter_context(patch.object(obj, name, side_effect=AssertionError('Management reached a launch effect.')))
+            stack.enter_context(patch('new_chat_inventory.os.stat', side_effect=AssertionError('Management probed a target.')))
+            stack.enter_context(patch('new_chat_inventory._physical_path', side_effect=AssertionError('Management resolved a target.')))
+            stack.enter_context(patch('new_chat_service.validate_folder', side_effect=AssertionError('Management validated a target.')))
+            listing = s.saved_folders()
+            self.assertEqual((listing['schemaVersion'], listing['complete'], listing['unreadableCount']), (1, True, 0))
+            self.assertEqual({row['id'] for row in listing['savedFolders']}, {row['id'] for row in saved})
+            self.assertTrue(all(set(row) == {'id', 'revision', 'label', 'displayPath'} for row in listing['savedFolders']))
+            for row in saved:
+                self.assertEqual(s.remove_saved_folder(row['id'], {'revision': row['revision']}),
+                                 {'schemaVersion': 1, 'removed': {'id': row['id'], 'revision': row['revision']}})
+            self.assertEqual(s.saved_folders(), {'schemaVersion': 1, 'savedFolders': [], 'complete': True, 'unreadableCount': 0})
+        self.assertEqual(protected.read_text(), 'Fictional owner file stays in place.')
+        self.assertFalse(missing.exists())
+        self.assertTrue(replaced.is_dir())
+        self.assertTrue(private.is_dir())
+        self.assertEqual(s.db.execute('SELECT count(*) FROM intents').fetchone()[0], 0)
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+        self.assertEqual(s.jobs, {})
+
+    def test_saved_remove_refuses_unknown_discovered_stale_corrupt_and_invalid_requests(self):
+        s = self.service()
+        discovered = s.context()['folders'][0]
+        with self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(discovered['id'], {'revision': discovered['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message),
+                         (404, 'unknown_saved_folder', 'This folder is no longer saved in Motet.'))
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        before = s.db.execute('SELECT id,data FROM registered_folders').fetchall()
+        invalid = [(value, {'revision': saved['revision']}) for value in (None, True, 'a' * 63, 'A' * 64, 'z' * 64)]
+        invalid += [(saved['id'], value) for value in (None, [], {}, {'revision': True}, {'revision': 'A' * 64},
+                     {'revision': 'a' * 63}, {'revision': saved['revision'], 'path': str(self.folder)})]
+        for ident, data in invalid:
+            with self.subTest(ident=ident, data=data):
+                with self.assertRaises(NewChatError) as failed:
+                    s.remove_saved_folder(ident, data)
+                self.assertEqual((failed.exception.status, failed.exception.code), (400, 'invalid_request'))
+        with self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': '0' * 64})
+        self.assertEqual((failed.exception.status, failed.exception.code), (409, 'saved_folder_changed'))
+        self.assertEqual(s.db.execute('SELECT id,data FROM registered_folders').fetchall(), before)
+        with s.db:
+            s.db.execute('UPDATE registered_folders SET data=?', ('{',))
+        with self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message),
+                         (409, 'unreadable_saved_folder', 'This saved project folder could not be verified. Nothing was removed.'))
+        self.assertEqual(s.db.execute('SELECT data FROM registered_folders').fetchone()[0], '{')
+
+    def test_saved_remove_old_revision_cannot_remove_replacement_registration(self):
+        s = self.service()
+        old = s.register_folder({'path': str(self.folder)})['folder']
+        self.folder.rename(self.root / 'previous-project')
+        self.folder.mkdir()
+        current = s.register_folder({'path': str(self.folder)})['folder']
+        self.assertEqual(current['id'], old['id'])
+        self.assertNotEqual(current['revision'], old['revision'])
+        with self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(old['id'], {'revision': old['revision']})
+        self.assertEqual(failed.exception.code, 'saved_folder_changed')
+        self.assertEqual(s.saved_folders()['savedFolders'][0]['revision'], current['revision'])
+
+    def test_saved_remove_raw_compare_and_one_row_check_protect_concurrent_changes(self):
+        s = self.service()
+        for action in ('replace', 'blob', 'delete'):
+            saved = s.register_folder({'path': str(self.folder)})['folder']
+            original = s.db.execute('SELECT data FROM registered_folders').fetchone()[0]
+            changed = json.dumps(dict(json.loads(original), label='Fictional concurrent label'))
+            def interfere(sql, *args):
+                if sql.startswith('DELETE FROM registered_folders'):
+                    with closing(sqlite3.connect(s.root / 'journal.sqlite')) as other, other:
+                        if action == 'replace':
+                            other.execute('UPDATE registered_folders SET data=? WHERE id=?', (changed, saved['id']))
+                        elif action == 'blob':
+                            other.execute('UPDATE registered_folders SET data=? WHERE id=?',
+                                          (sqlite3.Binary(original.encode()), saved['id']))
+                        else:
+                            other.execute('DELETE FROM registered_folders WHERE id=?', (saved['id'],))
+            with self.subTest(action=action), patch.object(s, 'db', DatabaseProbe(s.db, execute=interfere)):
+                with self.assertRaises(NewChatError) as failed:
+                    s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+                self.assertEqual((failed.exception.status, failed.exception.code), (409, 'saved_folder_changed'))
+            remaining = s.db.execute('SELECT data FROM registered_folders').fetchone()
+            self.assertEqual(remaining, (changed,) if action == 'replace' else (original.encode(),) if action == 'blob' else None)
+
+    def test_saved_database_failures_are_unavailable_and_committed_response_can_be_uncertain(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        unavailable = (503, 'saved_folders_unavailable',
+                       'Saved project folders are unavailable. Refresh saved folders to check.')
+        def broken(sql, *args):
+            raise sqlite3.OperationalError('/fictional/private database failure')
+        for operation in (lambda: s.saved_folders(), lambda: s.remove_saved_folder(saved['id'], {'revision': saved['revision']})):
+            with patch.object(s, 'db', DatabaseProbe(s.db, execute=broken)), self.assertRaises(NewChatError) as failed:
+                operation()
+            self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message), unavailable)
+        class InterruptedRead:
+            def __iter__(self):
+                yield tuple(value.encode() for value in s.db.db.execute('SELECT id,data FROM registered_folders').fetchone())
+                raise sqlite3.DatabaseError('/fictional/interrupted read')
+        with patch.object(s, 'db', DatabaseProbe(s.db, execute=lambda *args: InterruptedRead())), self.assertRaises(NewChatError) as failed:
+            s.saved_folders()
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message), unavailable)
+        def delete_failed(sql, *args):
+            if sql.startswith('DELETE FROM registered_folders'):
+                raise sqlite3.OperationalError('/fictional/delete failed')
+        with patch.object(s, 'db', DatabaseProbe(s.db, execute=delete_failed)), self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message), unavailable)
+        self.assertEqual(s.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
+        def lost_commit_response():
+            raise sqlite3.OperationalError('/fictional/lost commit response')
+        with patch.object(s, 'db', DatabaseProbe(s.db, committed=lost_commit_response)), self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message), unavailable)
+        self.assertEqual(s.saved_folders()['savedFolders'], [])
+
+    def test_saved_busy_commit_rolls_back_before_another_operation_can_commit(self):
+        for legacy in (False, True):
+            with self.subTest(legacy_context=legacy):
+                s = self.service()
+                saved = s.register_folder({'path': str(self.folder)})['folder']
+                database = s.db
+                database.execute('PRAGMA busy_timeout=1')
+                reader = sqlite3.connect(s.root / 'journal.sqlite', timeout=.01)
+                self.addCleanup(reader.close)
+                reader.execute('BEGIN')
+                reader.execute('SELECT * FROM registered_folders').fetchall()
+                rollbacks = []
+                class Probe(LegacyTransactionProbe):
+                    def rollback(probe):
+                        rollbacks.append(s.lock._is_owned())
+                        return database.rollback()
+                try:
+                    if legacy:
+                        s.db = Probe(database)
+                    with self.assertRaises(NewChatError) as failed:
+                        s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+                    self.assertEqual((failed.exception.status, failed.exception.code),
+                                     (503, 'saved_folders_unavailable'))
+                    self.assertFalse(database.in_transaction)
+                    self.assertEqual(len(s.saved_folders()['savedFolders']), 1)
+                    self.assertEqual(reader.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
+                    if legacy:
+                        self.assertEqual(rollbacks, [True], 'rollback completes under the service lock')
+                    reader.rollback()
+                    with s.db:
+                        s.db.execute('SELECT 1')
+                    self.assertEqual(reader.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1,
+                                     'an unrelated transaction cannot commit the refused delete')
+                finally:
+                    reader.rollback()
+                    s.db = database
+                    s.close()
+
+    def test_saved_rollback_failure_quarantines_journal_without_cancelling_claimed_work(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        request = self.request(s)
+        entered, release = threading.Event(), threading.Event()
+        def held_create(folder, callback):
+            self.adapter.creates += 1
+            entered.set()
+            release.wait()
+            identity = self.adapter.make_identity()
+            callback(identity.native_id, identity.cwd)
+            return identity
+        self.adapter.create_once = held_create
+        _, attempt = s.open(request)
+        self.assertTrue(entered.wait(3))
+        database, file_lock = s.db, s._file_lock
+        calls = (self.adapter.preflights, self.adapter.verifies, self.adapter.creates, self.adapter.opens)
+        class Poison(LegacyTransactionProbe):
+            def __exit__(probe, *args):
+                raise sqlite3.OperationalError('Fictional COMMIT failure')
+            def rollback(probe):
+                self.assertTrue(s.lock._is_owned())
+                raise sqlite3.OperationalError('Fictional rollback failure')
+            def close(probe):
+                self.assertTrue(s.lock._is_owned())
+                self.assertTrue(s._journal_unavailable, 'quarantine precedes the close attempt')
+                database.close()
+                raise sqlite3.OperationalError('Fictional close response failure')
+        s.db = Poison(database)
+        try:
+            with self.assertRaises(NewChatError) as failed:
+                s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+            self.assertEqual((failed.exception.status, failed.exception.code), (503, 'saved_folders_unavailable'))
+            self.assertIsNone(s.db, 'even a failed close cannot leave a reusable dirty journal')
+            self.assertEqual(s._file_lock, file_lock)
+            os.fstat(file_lock)
+            self.assertFalse(s.closing or self.adapter.closed)
+            self.assertIn(attempt['attemptId'], s.jobs)
+            self.assertTrue(s.jobs[attempt['attemptId']].is_alive())
+            for operation in (s.context, s.saved_folders,
+                              lambda: s.remove_saved_folder(saved['id'], {'revision': saved['revision']}),
+                              lambda: s.register_folder({'path': str(self.folder)}),
+                              lambda: s.prepare({key: request[key] for key in ('provider', 'folderId', 'folderRevision')}),
+                              lambda: s.open(request), lambda: s.request_status(request['requestId']),
+                              lambda: s.status(attempt['attemptId']),
+                              lambda: s.observe(attempt['attemptId'], {'action': 'stop'})):
+                with self.assertRaises(NewChatError) as unavailable:
+                    operation()
+                self.assertEqual((unavailable.exception.status, unavailable.exception.code),
+                                 (503, 'saved_folders_unavailable'))
+            s.process_admissions(lambda *args: self.fail('A poisoned journal cannot admit a native session'))
+            self.assertEqual((self.adapter.preflights, self.adapter.verifies,
+                              self.adapter.creates, self.adapter.opens), calls)
+            reader = sqlite3.connect(s.root / 'journal.sqlite')
+            self.addCleanup(reader.close)
+            with reader:
+                self.assertEqual(reader.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
+        finally:
+            release.set()
+            self.settle(s)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (1, 0))
+        self.assertFalse(self.adapter.closed)
+
+    def test_saved_close_failure_cannot_expose_the_quarantined_pending_delete(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        database = s.db
+        class Poison(LegacyTransactionProbe):
+            def __exit__(probe, *args):
+                raise sqlite3.OperationalError('Fictional COMMIT failure')
+            def rollback(probe):
+                raise sqlite3.OperationalError('Fictional rollback failure')
+            def close(probe):
+                raise sqlite3.OperationalError('Fictional close failure')
+        s.db = Poison(database)
+        try:
+            with self.assertRaises(NewChatError):
+                s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+            self.assertIsNone(s.db)
+            self.assertTrue(database.in_transaction, 'the fault fixture really leaves its connection dirty')
+            for operation in (s.context, s.saved_folders, lambda: s.request_status(str(uuid.uuid4()))):
+                with self.assertRaises(NewChatError) as failed:
+                    operation()
+                self.assertEqual(failed.exception.status, 503)
+            reader = sqlite3.connect(s.root / 'journal.sqlite')
+            self.addCleanup(reader.close)
+            with reader:
+                self.assertEqual(reader.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
+        finally:
+            database.close()
+
+    def poison_saved_journal(self, service, saved):
+        class Poison(LegacyTransactionProbe):
+            def __exit__(probe, *args):
+                raise sqlite3.OperationalError('Fictional COMMIT failure')
+            def rollback(probe):
+                raise sqlite3.OperationalError('Fictional rollback failure')
+        service.db = Poison(service.db)
+        with self.assertRaises(NewChatError) as failed:
+            service.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code), (503, 'saved_folders_unavailable'))
+        self.assertIsNone(service.db)
+
+    def test_saved_quarantine_wins_before_late_register_prepare_and_open_entries(self):
+        for action in ('register', 'prepare', 'open'):
+            with self.subTest(action=action), closing(self.service()) as s:
+                saved = s.register_folder({'path': str(self.folder)})['folder']
+                request = self.request(s)
+                selection = {key: request[key] for key in ('provider', 'folderId', 'folderRevision')}
+                paused, release = threading.Event(), threading.Event()
+                results, reads, guard = [], [], s._guard
+                def unexpected_read(*args, **kwargs):
+                    reads.append(True)
+                    raise AssertionError('Quarantined work cannot inspect project folders')
+                def pause_after_first_guard():
+                    guard()
+                    if threading.current_thread().name == 'fictional-late-entry' and not paused.is_set():
+                        paused.set()
+                        release.wait()
+                def invoke():
+                    try:
+                        results.append({'register': lambda: s.register_folder({'path': str(self.folder)}),
+                                        'prepare': lambda: s.prepare(selection),
+                                        'open': lambda: s.open(request)}[action]())
+                    except Exception as error:
+                        results.append(error)
+                thread = threading.Thread(name='fictional-late-entry', target=invoke)
+                calls = (self.adapter.preflights, self.adapter.creates, self.adapter.opens, self.adapter.verifies)
+                with patch.object(s, '_guard', side_effect=pause_after_first_guard), ExitStack() as stack:
+                    try:
+                        thread.start()
+                        self.assertTrue(paused.wait(3))
+                        self.poison_saved_journal(s, saved)
+                        for name in ('register', 'refresh', 'get', 'require_allowed'):
+                            stack.enter_context(patch.object(s.inventory, name,
+                                side_effect=unexpected_read))
+                    finally:
+                        release.set()
+                        thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(len(results), 1)
+                self.assertIsInstance(results[0], NewChatError)
+                self.assertEqual((results[0].status, results[0].code), (503, 'saved_folders_unavailable'))
+                self.assertEqual((self.adapter.preflights, self.adapter.creates,
+                                  self.adapter.opens, self.adapter.verifies), calls)
+                self.assertEqual(reads, [], 'even a caught physical-read failure is forbidden after quarantine')
+                self.assertEqual(s.jobs, {})
+
+    def test_saved_quarantine_between_context_and_admission_read_phases(self):
+        for phase in ('inventory', 'provider', 'admission'):
+            with self.subTest(phase=phase), closing(self.service()) as s:
+                saved = s.register_folder({'path': str(self.folder)})['folder']
+                if phase == 'admission':
+                    s.open(self.request(s))
+                    self.settle(s)
+                paused, release = threading.Event(), threading.Event()
+                results, reads = [], []
+                def unexpected_read(*args, **kwargs):
+                    reads.append(True)
+                    raise AssertionError('No project read after quarantine')
+                def pause():
+                    if threading.current_thread().name == 'fictional-late-read' and not paused.is_set():
+                        paused.set()
+                        release.wait()
+                inventory, capability, loads = s._inventory, s._capability, json.loads
+                def late_inventory(*args):
+                    pause()
+                    return inventory(*args)
+                def late_capability(*args):
+                    pause()
+                    return capability(*args)
+                class Snapshot(dict):
+                    def __getitem__(row, key):
+                        if key == 'observation' and not s.lock._is_owned():
+                            pause()
+                        return super().__getitem__(key)
+                def snapshots(*args, **kwargs):
+                    value = loads(*args, **kwargs)
+                    return Snapshot(value) if isinstance(value, dict) and 'creation_attempts' in value else value
+                def invoke():
+                    try:
+                        results.append(s.process_admissions(lambda *args: self.fail('No admission after quarantine'))
+                                       if phase == 'admission' else s.context())
+                    except Exception as error:
+                        results.append(error)
+                thread = threading.Thread(name='fictional-late-read', target=invoke)
+                with ExitStack() as stack:
+                    if phase == 'inventory':
+                        stack.enter_context(patch.object(s, '_inventory', side_effect=late_inventory))
+                    elif phase == 'provider':
+                        stack.enter_context(patch.object(s, '_capability', side_effect=late_capability))
+                    else:
+                        stack.enter_context(patch('new_chat_service.json.loads', side_effect=snapshots))
+                    try:
+                        thread.start()
+                        self.assertTrue(paused.wait(3))
+                        calls = (self.adapter.preflights, self.adapter.verifies, self.adapter.creates, self.adapter.opens)
+                        self.poison_saved_journal(s, saved)
+                        for name in ('refresh', 'get', 'require_allowed'):
+                            stack.enter_context(patch.object(s.inventory, name,
+                                side_effect=unexpected_read))
+                    finally:
+                        release.set()
+                        thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(len(results), 1)
+                if phase == 'admission':
+                    self.assertEqual(results, [None])
+                else:
+                    self.assertIsInstance(results[0], NewChatError)
+                    self.assertEqual((results[0].status, results[0].code), (503, 'saved_folders_unavailable'))
+                self.assertEqual((self.adapter.preflights, self.adapter.verifies,
+                                  self.adapter.creates, self.adapter.opens), calls)
+                self.assertEqual(reads, [], 'caught policy errors must not hide a post-quarantine read')
+
+    def test_saved_management_preserves_guards_and_shutdown_race(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        for flag, code in (('enabled', 'disabled'), ('demo', 'demo_unavailable')):
+            value = False if flag == 'enabled' else True
+            with patch.object(s, flag, value):
+                for operation in (s.saved_folders, lambda: s.remove_saved_folder(saved['id'], {'revision': saved['revision']})):
+                    with self.assertRaises(NewChatError) as failed:
+                        operation()
+                    self.assertEqual((failed.exception.status, failed.exception.code), (503, code))
+        guard = s._guard
+        def close_after_initial_guard():
+            guard()
+            s.close()
+        with patch.object(s, '_guard', side_effect=close_after_initial_guard), self.assertRaises(NewChatError) as failed:
+            s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        self.assertEqual((failed.exception.status, failed.exception.code), (503, 'service_closed'))
+
+    def test_saved_removal_keeps_discovery_and_claimed_work_but_blocks_manual_preclaim(self):
+        s = self.service()
+        saved = s.register_folder({'path': str(self.folder)})['folder']
+        s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        discovered = s.context()['folders'][0]
+        self.assertEqual(discovered['id'], saved['id'])
+        self.assertNotIn('registered', discovered)
+        manual = self.root / 'manual-project'
+        manual.mkdir()
+        saved = s.register_folder({'path': str(manual)})['folder']
+        choice = dict(provider='codex', folderId=saved['id'], folderRevision=saved['revision'])
+        intent = s.prepare(choice)
+        s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+        with self.assertRaises(NewChatError) as failed:
+            s.open(dict(choice, requestId=intent['requestId']))
+        self.assertEqual(failed.exception.code, 'folder_changed')
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+        s.register_folder({'path': str(manual)})
+        request = dict(choice, requestId=s.prepare(choice)['requestId'])
+        entered, release = threading.Event(), threading.Event()
+        create = self.adapter.create_once
+        def held(folder, callback):
+            entered.set()
+            release.wait()
+            return create(folder, callback)
+        with patch.object(self.adapter, 'create_once', side_effect=held):
+            try:
+                _, attempt = s.open(request)
+                self.assertTrue(entered.wait(3))
+                tables = ('intents', 'attempts', 'native_receipts', 'intent_issues', 'folders', 'meta')
+                before = {table: s.db.execute('SELECT * FROM ' + table).fetchall() for table in tables}
+                s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
+                self.assertEqual({table: s.db.execute('SELECT * FROM ' + table).fetchall() for table in tables}, before)
+            finally:
+                release.set()
+                self.settle(s)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (1, 1))
+        s.process_admissions(lambda identity, folder, permit: 'x:' + identity.native_id if permit() else None)
+        self.assertEqual(s.status(attempt['attemptId'])['state'], 'added')
+        self.assertEqual(s.open(request)[0], 200)
+        self.assertEqual((self.adapter.creates, self.adapter.opens), (1, 1))
+
+    def test_remove_and_preclaim_open_share_the_same_service_lock(self):
+        s = self.service()
+        manual = self.root / 'manual-project'
+        manual.mkdir()
+        saved = s.register_folder({'path': str(manual)})['folder']
+        choice = dict(provider='codex', folderId=saved['id'], folderRevision=saved['revision'])
+        request = dict(choice, requestId=s.prepare(choice)['requestId'])
+        entered, release, open_at_lock = threading.Event(), threading.Event(), threading.Event()
+        outputs, failures = {}, {}
+        class TrackedLock:
+            def __init__(self, lock):
+                self.lock, self.owners = lock, []
+            def __enter__(self):
+                if threading.current_thread().name == 'fictional-open':
+                    open_at_lock.set()
+                self.lock.acquire()
+                self.owners.append(threading.current_thread())
+                return self
+            def __exit__(self, *args):
+                self.owners.pop()
+                self.lock.release()
+        tracked = TrackedLock(s.lock)
+        decode = s._decode_registered_folder
+        def held_decode(*args):
+            if threading.current_thread().name == 'fictional-remove':
+                entered.set()
+                self.assertIs(tracked.owners[-1] if tracked.owners else None, threading.current_thread())
+                release.wait()
+            return decode(*args)
+        def invoke(name, operation):
+            try:
+                outputs[name] = operation()
+            except BaseException as error:
+                failures[name] = error
+        remove = threading.Thread(name='fictional-remove', target=invoke,
+            args=('remove', lambda: s.remove_saved_folder(saved['id'], {'revision': saved['revision']})))
+        launch = threading.Thread(name='fictional-open', target=invoke, args=('open', lambda: s.open(request)))
+        with patch.object(s, 'lock', tracked), patch.object(s, '_decode_registered_folder', side_effect=held_decode):
+            try:
+                remove.start()
+                self.assertTrue(entered.wait(3))
+                launch.start()
+                self.assertTrue(open_at_lock.wait(3))
+                self.assertNotIn('open', outputs)
+                self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
+            finally:
+                release.set()
+                remove.join(5)
+                if launch.ident is not None:
+                    launch.join(5)
+        self.assertFalse(remove.is_alive() or launch.is_alive())
+        self.assertNotIn('remove', failures)
+        self.assertEqual(outputs['remove']['removed'], {'id': saved['id'], 'revision': saved['revision']})
+        self.assertIsInstance(failures.get('open'), NewChatError)
+        self.assertEqual(failures['open'].code, 'folder_changed')
+        self.assertEqual(s.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
         self.assertEqual((self.adapter.creates, self.adapter.opens), (0, 0))
 
     def test_codex_worktree_allows_fake_creation_only_after_an_explicit_attempt(self):
