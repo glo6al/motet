@@ -279,7 +279,7 @@ def _held_item(store, candidate, now):
         return item
     item.update(name=_display_name(name, provider), clearable=eligible, unavailable_reason=None,
                 group='held', reason_code='completion_unverified',
-                reason='Delivery or completion could not be verified.')
+                reason='Motet could not confirm the message arrived or that the turn ended.')
     if provider == 'codex' and evidence.get('codex_retention_hold') == lifecycle.CODEX_RETENTION_HOLD:
         item.update(reason_code='codex_retention', reason='The message was kept for a day and no end was seen.')
     episode = lifecycle.hold_episode(record)

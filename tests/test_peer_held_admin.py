@@ -114,6 +114,9 @@ class HeldAdminTests(unittest.TestCase):
         self.assertEqual(items[legacy_tid]['name'], 'Fictional legacy')
         self.assertEqual(items[pruned]['reason_code'], 'codex_retention')
         self.assertEqual(items[pruned]['reason'], 'The message was kept for a day and no end was seen.')
+        self.assertEqual(items[held]['reason_code'], 'completion_unverified')
+        self.assertEqual(items[held]['reason'],
+                         'Motet could not confirm the message arrived or that the turn ended.')
         for key in (held, pruned, legacy_tid):
             self.assertEqual(items[key]['group'], 'held')
             self.assertIsNone(items[key]['held_since'])
@@ -342,6 +345,40 @@ class HeldAdminTests(unittest.TestCase):
             unavailable, = self.held()['items']
             self.assertEqual(unavailable['group'], 'unavailable')
             self.assertFalse(unavailable['clearable'])
+
+    def test_reserved_codex_with_a_bound_turn_is_not_hidden_as_queueing(self):
+        for source in ('payload', 'ledger'):
+            with self.subTest(source=source):
+                turn = 'fictional-bound-turn'
+                cid, tid, _ = self.add_shared(state='sending',
+                    bound_turn=turn if source == 'payload' else '')
+                evidence = {'bound_turn': turn} if source == 'ledger' else {}
+                with self.store.lock, self.store.db:
+                    self.store.db.execute('UPDATE peer_execution SET execution=?,capture=?,evidence=? WHERE request_id=?',
+                                          ('reserved', 'pending', json.dumps(evidence), tid))
+                item = next((row for row in self.held()['items'] if row['selector'] == {'request_id': cid}), None)
+                self.assertIsNotNone(item, 'a bound turn must not be hidden as the Codex queue interval')
+                self.assertEqual((item['provider'], item['group'], item['clearable']),
+                                 ('codex', 'unavailable', False))
+
+    def test_reserved_claude_is_not_hidden_as_the_codex_queue_interval(self):
+        cid, tid, row = self.add_shared(state='sending', bound_turn='')
+        target = 'c:' + uid()
+        snapshot = dict(self.snapshot, agent_id=target, provider='claude')
+        row.update(agent=target, runtime='claude', transport='claude_mod',
+                   mod_enrollment=uid(), mod_attempt_id=uid(), mod_generation=uid(),
+                   mod_project='/fictional/reserved-claude', target_project='/fictional/reserved-claude')
+        with self.store.lock, self.store.db:
+            self.store.db.execute('UPDATE shared_bridge_requests SET target=?,target_snapshot=? WHERE client_id=?',
+                                  (target, json.dumps(snapshot), cid))
+            self.store.db.execute('UPDATE requests SET data=? WHERE id=?', (json.dumps(row), tid))
+            self.store.db.execute('UPDATE peer_execution SET agent=?,execution=?,capture=?,evidence=? WHERE request_id=?',
+                                  (target, 'reserved', 'pending', '{}', tid))
+        self.assertTrue(lifecycle.valid_payload(tid, row, lifecycle.exact_admission(self.store.db, tid)))
+        item = next((item for item in self.held()['items'] if item['selector'] == {'request_id': cid}), None)
+        self.assertIsNotNone(item, 'the Codex queue exception must not hide a Claude record')
+        self.assertEqual((item['provider'], item['group'], item['clearable']),
+                         ('claude', 'unavailable', False))
 
     def test_exact_clear_rechecks_current_evidence_after_listing(self):
         item, = self.held()['items']
