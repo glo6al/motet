@@ -1,14 +1,54 @@
 'use strict';
 /* Actual-browser proof, deliberately runtime-injected: no browser dependency or launch here.
-   A caller supplies a fresh, isolated Puppeteer-compatible page with evaluate/setContent/keyboard.press.
+   A caller supplies a fresh, isolated Puppeteer-compatible page with evaluate/setContent/waitForFunction, keyboard.press and mouse.click.
+   Run from the repository root with an installed puppeteer-core and CHROME_BIN:
+   node -e 'const p=require("puppeteer-core"),fs=require("node:fs");(async()=>{const b=await p.launch({executablePath:process.env.CHROME_BIN,headless:true});try{await require("./tests/workspace_focus_browser.js").runWorkspaceFocusBrowserTests(await b.newPage(),fs.readFileSync("src/web/index.html","utf8"))}finally{await b.close()}})().catch(e=>{console.error(e);process.exitCode=1})'
+   Real Chrome is required; VM/fake DOM tests cannot measure UA styles or painted contrast.
    This module changes focus and its own fixture only; use a separate page from a running application. */
 const assert = require('node:assert/strict');
 const FALLBACK = ':where(html.workspace *):focus-visible{outline:1px solid rgb(28,27,25);outline-offset:2px}';
+function focusRGBA(value) {
+  if(value==='transparent')return [0,0,0,0];
+  const match=String(value).match(/^rgba?\((.*)\)$/i);assert(match,'unmeasurable color: '+value);
+  const parts=match[1].replace(/,/g,' ').replace(/\//g,' ').trim().split(/\s+/);assert(parts.length===3||parts.length===4,'unmeasurable color: '+value);
+  const rgba=parts.map((v,i)=>v.endsWith('%')?Number(v.slice(0,-1))/100*(i===3?1:255):Number(v));if(rgba.length===3)rgba.push(1);
+  assert(rgba.every((v,i)=>Number.isFinite(v)&&v>=0&&v<=(i===3?1:255)),'unmeasurable color: '+value);return rgba;
+}
+function focusComposite(fg,bg) {const a=fg[3]+bg[3]*(1-fg[3]);return [...[0,1,2].map(i=>a?(fg[i]*fg[3]+bg[i]*bg[3]*(1-fg[3]))/a:0),a];}
+function focusBlue(rgba) {const [r,g,b]=rgba,max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;if(d<12||d/max<0.05)return false;let h=max===r?((g-b)/d)%6:max===g?(b-r)/d+2:(r-g)/d+4;h=(h*60+360)%360;return h>=170&&h<=270;}
+function focusLuminance(rgb) {return rgb.slice(0,3).reduce((sum,v,i)=>{v/=255;return sum+[0.2126,0.7152,0.0722][i]*(v<=0.04045?v/12.92:((v+0.055)/1.055)**2.4)},0);}
+function focusContrast(a,b) {const x=focusLuminance(a),y=focusLuminance(b);return (Math.max(x,y)+0.05)/(Math.min(x,y)+0.05);}
+function focusMeasurement(row) {
+  assert(!row.settleTimedOut,'unmeasurable focus transition did not settle');
+  assert(row.borderImageSource==='none','unmeasurable border image');
+  assert(!row.effects?.length,'unmeasurable focus effects: '+JSON.stringify(row.effects));
+  const offset=Number.parseFloat(row.offset),width=Number.parseFloat(row.width);assert(Number.isFinite(offset)&&Number.isFinite(width),'unmeasurable outline geometry');
+  assert(!(offset<0&&offset+width>0),'unmeasurable outline crosses element border');
+  assert(!row.modalOutside,'unmeasurable outside modal outline: real backdrop/underlying surface required');
+  if(offset<0)assert(row.backgroundClip==='border-box'&&row.borderWidths.every(v=>Number.isFinite(Number.parseFloat(v))),'unmeasurable inset background clip');
+  if(offset<0&&row.backdrop)assert(-offset-width>Math.max(...row.borderWidths.map(Number.parseFloat)),'unmeasurable modal inset must be beyond its border');
+  const layers=[];let opaque=false;
+  for(const layer of row.backgrounds||[]){assert(layer.image==='none','unmeasurable background image: '+layer.image);const color=focusRGBA(layer.color);layers.push({...layer,rgba:color});if(color[3]===1){opaque=true;break;}}
+  assert(opaque,'unmeasurable focus background: no opaque ancestor');let background=layers.at(-1).rgba;for(let i=layers.length-2;i>=0;i--)background=focusComposite(layers[i].rgba,background);
+  const surfaces=[{role:'fill',background}];
+  if(offset<0)for(let i=0;i<4;i++)if(Number.parseFloat(row.borderWidths[i])>-offset-width){assert(row.borderStyles?.[i]==='solid','unmeasurable non-solid overlapped border');surfaces.push({role:'border-'+i,background:focusComposite(focusRGBA(row.borderColors[i]),background)});}
+  const samples=surfaces.map(s=>{const outline=focusComposite(focusRGBA(row.color),s.background);return {...s,outline,contrast:focusContrast(outline,s.background)}}),sides=samples.map(s=>Math.sign(focusLuminance(s.outline)-focusLuminance(s.background)));
+  assert(!sides.some(s=>s>0)||!sides.some(s=>s<0),'unmeasurable border and fill straddle outline luminance');
+  return {background,outline:samples[0].outline,contrast:Math.min(...samples.map(s=>s.contrast)),samples,layers,basis:offset<0?'self':'parent'};
+}
 async function auditWorkspaceFocus(page) {
   await page.keyboard.press('Tab'); // Real keyboard modality; programmatic focus must not fake :focus-visible.
-  const result = await page.evaluate(() => {
+  const result = await page.evaluate(async () => {
     if (!document.documentElement.classList.contains('workspace')) throw Error('Workspace document required');
+    async function settle(target){
+      const deadline=performance.now()+1200;
+      const bounded=promise=>new Promise(resolve=>{const remaining=deadline-performance.now();if(remaining<=0){resolve(false);return;}let done=false;const timer=setTimeout(()=>{done=true;resolve(false)},remaining);promise.then(()=>{if(!done){done=true;clearTimeout(timer);resolve(true)}});});
+      const paints=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+      if(!await bounded(paints()))return false;
+      while(true){const animations=[];if(target){for(let n=target;n;n=n.parentElement)animations.push(...n.getAnimations());}else animations.push(...document.getAnimations());const finite=animations.filter(a=>a.playState==='running'&&a.effect?.getTiming().iterations!==Infinity);if(!finite.length)return true;if(!await bounded(Promise.all(finite.map(a=>a.finished.catch(()=>{})))))return false;if(!await bounded(paints()))return false;}
+    }
     const rows = [], skipped = [], before = document.activeElement;
+    if(!await settle(null))return {rows,skipped,initialSettleTimedOut:true};
     // Probe every rendered HTMLElement. This discovers browser-focusable scroll containers even
     // when tabIndex is -1 and there is no tabindex attribute. Do not manufacture focusability.
     for (const el of Array.from(document.querySelectorAll('*'))) {
@@ -20,42 +60,69 @@ async function auditWorkspaceFocus(page) {
       el.focus({preventScroll:true});
       if (document.activeElement!==el) { skipped.push({...identity,reason:document.querySelector('dialog:modal')?'browser rejected focus while a modal is open':'not browser-focusable'}); continue; }
       if (!el.matches(':focus-visible')) { skipped.push({...identity,reason:'not focus-visible'}); continue; }
+      const settleTimedOut=!await settle(el);
+      if(document.activeElement!==el||!el.isConnected||!el.matches(':focus-visible')){skipped.push({...identity,reason:'focus changed during settlement'});continue;}
       const focused = getComputedStyle(el);
-      rows.push({...identity,color:focused.outlineColor,style:focused.outlineStyle,width:focused.outlineWidth,offset:focused.outlineOffset});
+      const offset=parseFloat(focused.outlineOffset),backgrounds=[],effects=[];
+      for(let n=el;n;n=n.parentElement){const t=getComputedStyle(n);if(Number(t.opacity)!==1||t.filter!=='none'||t.backdropFilter!=='none'||t.mixBlendMode!=='normal')effects.push({tag:n.tagName,id:n.id,opacity:t.opacity,filter:t.filter,backdropFilter:t.backdropFilter,blend:t.mixBlendMode});}
+      for(let n=offset<0?el:el.parentElement;n;n=n.parentElement){const t=getComputedStyle(n);backgrounds.push({tag:n.tagName.toLowerCase(),id:n.id,color:t.backgroundColor,image:t.backgroundImage});}
+      rows.push({...identity,color:focused.outlineColor,style:focused.outlineStyle,width:focused.outlineWidth,offset:focused.outlineOffset,backgrounds,effects,settleTimedOut,borderImageSource:focused.borderImageSource,borderColors:[focused.borderTopColor,focused.borderRightColor,focused.borderBottomColor,focused.borderLeftColor],borderStyles:[focused.borderTopStyle,focused.borderRightStyle,focused.borderBottomStyle,focused.borderLeftStyle],backgroundClip:focused.backgroundClip,borderWidths:[focused.borderTopWidth,focused.borderRightWidth,focused.borderBottomWidth,focused.borderLeftWidth],modalOutside:offset>=0&&el.matches('dialog:modal'),backdrop:el.matches('dialog:modal')?{color:getComputedStyle(el,'::backdrop').backgroundColor,image:getComputedStyle(el,'::backdrop').backgroundImage}:null});
     }
     before?.focus?.({preventScroll:true});
     return {rows,skipped};
   });
+  assert(!result.initialSettleTimedOut,'unmeasurable initial document transition did not settle');
   assert(result.rows.length>0,'actual browser focus walk must not be vacuous');
   for (const row of result.rows) {
-    const rgb = row.color.match(/^rgba?\(\s*(\d+)[, ]+\s*(\d+)[, ]+\s*(\d+)/);
-    assert(rgb,'actual computed outline color must be RGB: '+row.color);
     const drawn = !['none','hidden'].includes(row.style)&&parseFloat(row.width)>0;
-    const blue = +rgb[3]>+rgb[1]&&+rgb[3]>+rgb[2];
-    assert(!(drawn&&blue),'blue keyboard outline: '+JSON.stringify(row));
+    if(!drawn)continue;
+    const measurement=focusMeasurement(row);Object.assign(row,{measurement});
+    assert(!focusBlue(measurement.outline),'blue keyboard outline: '+JSON.stringify(row));
+    assert(measurement.contrast>=3,'low-contrast keyboard outline: '+JSON.stringify(row));
   }
   return result;
+}
+async function runWorkspaceFlagFocusTests(page,css) {
+  const rule='html.workspace[data-theme=original] .st.idle>.flag.r:has(:focus-visible){opacity:1}';
+  const mount=async(theme,workspace=true,sheet=css)=>page.setContent('<!doctype html><html '+(workspace?'class="workspace"':'')+' data-theme="'+theme+'"><head><style>'+sheet+'</style></head><body><button id="flag-before" style="position:absolute;top:8px;left:8px;z-index:9999;outline-color:var(--ink)">Outside</button><div class="st idle" style="position:relative;left:40px;top:70px;transform:none;width:300px"><div class="flag r" id="focus-flag"><button id="flag-target">Flag action</button></div></div></body></html>');
+  const settled=async()=>{await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));await page.waitForFunction(()=>!document.getAnimations().some(a=>a.playState==='running'&&a.effect?.getTiming().iterations!==Infinity),{timeout:1200});};
+  const state=()=>page.evaluate(()=>({opacity:getComputedStyle(document.getElementById('focus-flag')).opacity,active:document.activeElement.id,visible:document.getElementById('flag-target').matches(':focus-visible')}));
+  const keyboard=async expected=>{await page.keyboard.press('Tab');await page.keyboard.press('Tab');await settled();const value=await state();assert.equal(value.active,'flag-target');assert.equal(value.visible,true);assert.equal(value.opacity,expected,'actual keyboard flag opacity');return value;};
+  await mount('original');const original=await keyboard('1');await page.evaluate(()=>document.activeElement.blur());await settled();assert.equal((await state()).opacity,'0.5','blur restores idle dimming');
+  await mount('original');const point=await page.evaluate(()=>{const r=document.getElementById('flag-target').getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2}});await page.mouse.click(point.x,point.y);await settled();const pointer=await state();assert.equal(pointer.active,'flag-target');assert.equal(pointer.visible,false,'real pointer-only button focus is not focus-visible');assert.equal(pointer.opacity,'0.5','pointer-only focus keeps idle dimming');
+  await mount('neutral');const neutral=await keyboard('0.5');await mount('original',false);const classic=await keyboard('0.5');
+  assert(css.includes(rule));await mount('original',true,css.replace(rule,''));await assert.rejects(()=>keyboard('1'),{name:'AssertionError'},'same behavior assertion detects removal of flag focus rule');
+  await assert.rejects(()=>auditWorkspaceFocus(page),{name:'AssertionError',message:/unmeasurable focus effects:.*focus-flag/},'missing flag rule restores strict opacity uncertainty at the flag descendant');
+  return {original,pointer,neutral,classic,ruleDeletion:'rejected by same keyboard assertion and strict opacity audit'};
 }
 async function runWorkspaceFocusBrowserTests(page, html) {
   assert(html.includes(FALLBACK),'use the actual page stylesheet with its exact fallback');
   const css = html.slice(html.indexOf('<style>')+7,html.indexOf('</style>'));
   const fixture = '<main><button id="ordinary">Action</button><details open><summary id="summary">Details</summary><span class="sw" id="switch" tabindex="0">Toggle</span></details><div id="return-target" tabindex="-1">Return target</div><div id="implicit-scroll" style="height:40px;width:160px;overflow:auto"><div style="height:160px">Scrollable text</div></div><section id="workspacePanelEvidence"><article class="workspace-change-card workspace-change-selected" id="selected-card">Selected change</article></section></main>';
-  const mount = async sheet => {await page.setContent('<!doctype html><html class="workspace"><head><style>'+sheet+'</style></head><body>'+fixture+'</body></html>');await page.evaluate(()=>{const n=document.createElement('button');n.id='late-unlisted';n.textContent='Another action';document.querySelector('main').append(n)});};
+  const mount = async sheet => {await page.setContent('<!doctype html><html class="workspace" data-theme="neutral"><head><style>'+sheet+'</style></head><body>'+fixture+'</body></html>');await page.evaluate(()=>{const n=document.createElement('button');n.id='late-unlisted';n.textContent='Another action';document.querySelector('main').append(n)});};
   await mount(css);
   const positive = await auditWorkspaceFocus(page);
   for (const id of ['ordinary','summary','switch','return-target','late-unlisted']) assert(positive.rows.some(r=>r.id===id),'generic walker discovers '+id);
-  await page.evaluate(()=>{for(const id of ['first-modal','top-modal']){const d=document.createElement('dialog');d.id=id;const b=document.createElement('button');b.id=id+'-action';b.textContent='Modal action';d.append(b);document.body.append(d);d.showModal();}});
+  await page.evaluate(()=>{document.documentElement.dataset.theme='original';for(const [id,action] of [['workspaceControlsDialog','first-modal-action'],['workspaceNavDialog','top-modal-action']]){const d=document.createElement('dialog');d.id=id;d.className='workspace-dialog';const b=document.createElement('button');b.id=action;b.textContent='Modal action';d.append(b);document.body.append(d);d.showModal();}});
   const implicit=positive.rows.find(r=>r.id==='implicit-scroll');assert(implicit,'real browser discovers the implicit scroll-container focus target');assert.equal(implicit.tabindex,null,'walker never adds tabindex');assert.equal(implicit.tabIndex,-1,'implicit focus does not depend on positive tabIndex');
   const modal = await auditWorkspaceFocus(page);
   assert(modal.rows.some(r=>r.id==='top-modal-action'),'generic walker checks the actual top modal');
   assert(!modal.rows.some(r=>r.id==='first-modal-action'),'browser blocks focus behind the top modal');
-  await page.evaluate(()=>{document.getElementById('top-modal').remove();document.getElementById('first-modal').remove();});
+  await page.evaluate(()=>{document.getElementById('workspaceNavDialog').remove();document.getElementById('workspaceControlsDialog').remove();document.documentElement.dataset.theme='neutral';});
   const checkSelected = async()=>{const value=await page.evaluate(()=>{const s=getComputedStyle(document.getElementById('selected-card'));return {color:s.outlineColor,width:s.outlineWidth,style:s.outlineStyle};});assert.deepEqual(value,{color:'rgb(28, 27, 25)',width:'1px',style:'solid'},'selected change card has its own ink outline');return value;};
   const selected = await checkSelected();
   await mount(css.replace(FALLBACK,''));
   await assert.rejects(()=>auditWorkspaceFocus(page),{name:'AssertionError',message:/blue keyboard outline/},'removing fallback exposes the real user-agent blue ring');
   await mount(css.replace('workspace-change-selected{outline:1px solid rgb(28,27,25)','workspace-change-selected{outline:1px solid #7195df'));
   await assert.rejects(checkSelected,{name:'AssertionError'},'the same computed ink assertion rejects the selected-card mutant');
-  return {positive,modal,selected,fallbackMutant:'rejected actual blue',selectedMutant:'rejected by same computed ink assertion'};
+  const original=async sheet=>page.setContent('<!doctype html><html class="workspace" data-theme="original"><head><style>'+sheet+'</style></head><body><div id="workspaceFilters"><button id="contrast-chip" data-filter="all" aria-pressed="false">All</button></div></body></html>');
+  await original(css);const dark=await auditWorkspaceFocus(page),chip=dark.rows.find(r=>r.id==='contrast-chip');assert(chip,'actual Original chip is measured');assert.equal(chip.measurement.basis,'parent');assert.deepEqual(chip.measurement.background.slice(0,3),[7,9,13],'outside ring uses real dark parent, not white button');assert(chip.measurement.contrast>=3);
+  const lightRule='html.workspace[data-theme=original] #workspaceFilters button:focus-visible{outline:1px solid rgb(232,233,236);outline-offset:2px}';assert(css.includes(lightRule));await original(css.replace(lightRule,lightRule.replace('232,233,236','28,27,25')));await assert.rejects(()=>auditWorkspaceFocus(page),{name:'AssertionError',message:/low-contrast keyboard outline/},'dark ink on the real dark stage fails contrast');
+  await page.setContent('<!doctype html><html class="workspace" data-theme="neutral"><head><style>'+css+'</style></head><body><button>Initial focus</button><div tabindex="0" id="border-image-probe" style="margin:20px;width:180px;height:60px;background:black;border:2px solid black;border-image:linear-gradient(white,white) 1;outline:1px solid white;outline-offset:-1px">Border image</div></body></html>');
+  await assert.rejects(()=>auditWorkspaceFocus(page),{name:'AssertionError',message:/unmeasurable border image/},'painted border image cannot be replaced by its black border-color');
+  await page.setContent('<!doctype html><html class="workspace" data-theme="neutral"><head><style>'+css+'</style></head><body><button>Initial focus</button><div tabindex="0" id="border-outset-probe" style="margin:40px;width:180px;height:60px;background:black;border:2px solid black;border-image:linear-gradient(white,white) 1;border-image-outset:8px;outline:1px solid white;outline-offset:2px">Border image outset</div></body></html>');
+  await assert.rejects(()=>auditWorkspaceFocus(page),{name:'AssertionError',message:/unmeasurable border image/},'outset border image can cover the positive-offset ring background too');
+  const flag=await runWorkspaceFlagFocusTests(page,css);
+  return {positive,modal,selected,dark,flag,fallbackMutant:'rejected actual blue',selectedMutant:'rejected by same computed ink assertion',darkInkMutant:'rejected low contrast',borderImage:'rejected unknown painted border'};
 }
-module.exports = {FALLBACK,auditWorkspaceFocus,runWorkspaceFocusBrowserTests};
+module.exports = {FALLBACK,focusRGBA,focusComposite,focusBlue,focusContrast,focusMeasurement,auditWorkspaceFocus,runWorkspaceFlagFocusTests,runWorkspaceFocusBrowserTests};
