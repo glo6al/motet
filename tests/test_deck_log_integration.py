@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 import uuid
+from datetime import datetime, timedelta
 from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import server
@@ -17,6 +18,8 @@ from deck_log import DeckLog
 
 
 class IntegrationTests(unittest.TestCase):
+    DAILY_NOON = datetime(2026, 6, 16, 12)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = os.path.realpath(self.tmp.name)
@@ -167,11 +170,30 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(server.HISTORY.search(query=secret)['events'], [])
             self.assertNotIn(secret.encode(), raw)
 
-    def test_officer_daily_omissions_and_trimmed_cursor_are_explicit(self):
+    def seed_daily_entries(self):
+        history = server.HISTORY
+        noon = self.DAILY_NOON.timestamp()
+        history.clock = lambda: noon
         self.arm()
-        for index in range(45): self.append('retained entry ' + str(index))
-        server.ClaudeTail(self.path).poll(); self.events()
-        out = server.officer_tool('session_day_summary', {'day': time.strftime('%Y-%m-%d')}, [])
+        stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(noon))
+        expected = [f'retained entry {index}' for index in range(45)]
+        for text in expected:
+            self.append(text, timestamp=False, extra={'timestamp': stamp})
+        # The fixture needs lossless admission. The production queue gate is
+        # reentrant and deliberately drops offers from a competing thread.
+        with history.wake:
+            server.ClaudeTail(self.path).poll()
+        rows = self.events()
+        status = history.status()
+        diagnostics = (f"retained={len(rows)}, dropped={status['dropped']}, queued={status['queued']}, "
+                       f"inflight={history.inflight}, coverage={[row['reason'] for row in status['coverage']]}")
+        self.assertEqual(status['dropped'], 0, diagnostics)
+        self.assertCountEqual([row['text'] for row in rows], expected, diagnostics)
+        return self.DAILY_NOON.date().isoformat()
+
+    def test_officer_daily_omissions_and_trimmed_cursor_are_explicit(self):
+        day = self.seed_daily_entries()
+        out = server.officer_tool('session_day_summary', {'day': day}, [])
         self.assertTrue(out['truncated'])
         self.assertEqual(out['counts']['message'], 45)
         self.assertEqual(out['omitted_count'], 45 - len(out['events']))
@@ -184,6 +206,75 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(cursor, page['events'][-1]['id'])
             self.assertIn('incomplete', page['note'])
         self.assertEqual(len(ids), 45)
+
+    def test_daily_fixture_owns_queue_gate_during_archive_admission(self):
+        history = server.HISTORY
+        attempted, release = threading.Event(), threading.Event()
+        acquired = []
+
+        def compete_for_gate():
+            held = history.wake.acquire(False)
+            acquired.append(held)
+            attempted.set()
+            if held:
+                try:
+                    release.wait(5)
+                finally:
+                    history.wake.release()
+
+        contender = threading.Thread(target=compete_for_gate, daemon=True)
+        prepare, writer, events = history._prepare, history._writer, self.events
+
+        def prepare_with_contention(*args, **kwargs):
+            if contender.ident is None:
+                contender.start()
+                self.assertTrue(attempted.wait(5), 'Contender did not reach the archive queue gate')
+            return prepare(*args, **kwargs)
+
+        def write_after_poll():
+            # The contender is the only competing gate owner during admission.
+            if release.wait(5):
+                writer()
+
+        def drain_after_poll():
+            release.set()
+            return events()
+
+        try:
+            with patch.object(history, '_prepare', side_effect=prepare_with_contention), \
+                    patch.object(history, '_writer', side_effect=write_after_poll), \
+                    patch.object(self, 'events', side_effect=drain_after_poll):
+                self.seed_daily_entries()
+        finally:
+            release.set()
+            if contender.ident is not None:
+                contender.join(5)
+        self.assertFalse(contender.is_alive())
+        self.assertEqual(acquired, [False])
+
+    def test_daily_fixture_stays_on_one_local_day_across_midnight(self):
+        midnight = (self.DAILY_NOON + timedelta(days=1)).replace(hour=0).timestamp()
+        appends = iter([midnight - 1] * 13 + [midnight + 1] * 32)
+        wall_time = midnight - 1
+        append, gmtime, strftime = self.append, time.gmtime, time.strftime
+
+        def append_across_midnight(*args, **kwargs):
+            nonlocal wall_time
+            wall_time = next(appends)
+            return append(*args, **kwargs)
+
+        def synthetic_gmtime(seconds=None):
+            return gmtime(wall_time if seconds is None else seconds)
+
+        def synthetic_strftime(fmt, stamp=None):
+            return strftime(fmt, time.localtime(wall_time) if stamp is None else stamp)
+
+        with patch.object(self, 'append', side_effect=append_across_midnight), \
+                patch.object(time, 'gmtime', side_effect=synthetic_gmtime), \
+                patch.object(time, 'strftime', side_effect=synthetic_strftime):
+            day = self.seed_daily_entries()
+            self.assertEqual(time.strftime('%Y-%m-%d'), (self.DAILY_NOON + timedelta(days=1)).date().isoformat())
+        self.assertEqual(server.HISTORY.session_day_summary(day)['counts'], {'message': 45})
 
     def test_operations_no_raw_content_and_exact_result_truth(self):
         self.arm()
