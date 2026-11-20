@@ -468,6 +468,127 @@ class ClaudeModTests(unittest.TestCase):
             client_id=client, request_id=claim['request_id'], attempt_id=claim['attempt_id'],
             kind=kind, **extra), token=self.token)
 
+    def peer_age_with_live_enrollment(self, clock, tid, age):
+        now = peer_lifecycle.get(self.store.db, tid)['created'] + age
+        clock.time.return_value = now
+        # Simulate intervening successful heartbeats; age alone is under test.
+        with self.store.lock, self.store.db:
+            cursor = self.store.db.execute(
+                'UPDATE claude_mod_enrollments SET last_seen=? WHERE agent=? AND generation=?',
+                (now - 1, self.aid, self.generation))
+        self.assertEqual(cursor.rowcount, 1)
+        return now
+
+    def test_started_shared_mod_remains_open_and_can_answer_before_content_cutoff(self):
+        import peer_bridge
+        tid, request_id, client = self.shared_progress_request()
+        status, poll = self.global_poll(client)
+        self.assertEqual(status, 200, poll)
+        claim = poll['claim']
+        turn = 'fictional-long-turn'
+        self.assertEqual(self.progress_event(claim, client, 'started', turn_id=turn)[0], 200)
+        with patch.object(mod, 'time', wraps=time) as clock, patch.object(peer_bridge, 'time', wraps=time) as result_clock:
+            for age in (600, mod.TTL + 1, 6 * 3600, messaging.RETENTION - 1):
+                with self.subTest(age=age):
+                    result_clock.time.return_value = self.peer_age_with_live_enrollment(clock, tid, age)
+                    status, poll = self.global_poll(client)
+                    self.assertEqual(status, 200, poll)
+                    self.assertIsNone(poll['claim'])
+                    self.assertEqual(poll['requests'][0]['state'], 'awaiting_reply')
+                    self.assertEqual(self.store.shared.result(request_id)['state'], 'awaiting_reply')
+                    self.assertEqual(peer_lifecycle.blockers(self.store.db, self.aid)[0][:2], (tid, 'running'))
+            completed = dict(turn_id=turn, outcome='answered', answer='WATCH_REPLY '+tid+'\nFictional late reply.',
+                             event_id=uid(), occurred_at=1)
+            self.assertEqual(self.progress_event(claim, client, 'completed', **dict(completed, turn_id='wrong-turn'))[0], 409)
+            self.assertEqual(peer_lifecycle.blockers(self.store.db, self.aid)[0][:2], (tid, 'running'))
+            self.assertEqual(self.progress_event(claim, client, 'completed', **completed)[0], 200)
+            result = self.store.shared.result(request_id)
+            self.assertEqual((result['state'], result['reply']), ('answered', 'Fictional late reply.'))
+            self.assertEqual(peer_lifecycle.blockers(self.store.db, self.aid), [])
+
+    def test_shared_mod_claim_without_start_keeps_fence_until_real_disconnect(self):
+        tid, _, client = self.shared_progress_request()
+        status, poll = self.global_poll(client)
+        self.assertEqual(status, 200, poll)
+        claim = poll['claim']
+        with patch.object(mod, 'time', wraps=time) as clock:
+            for age in (600, mod.TTL + 1, 6 * 3600):
+                with self.subTest(age=age):
+                    self.peer_age_with_live_enrollment(clock, tid, age)
+                    status, poll = self.global_poll(client)
+                    self.assertEqual(status, 200, poll)
+                    self.assertIsNone(poll['claim'])
+                    self.assertEqual(poll['requests'][0]['state'], 'queued')
+                    self.assertEqual(peer_lifecycle.blockers(self.store.db, self.aid)[0][:2], (tid, 'submitted'))
+            self.assertEqual(self.progress_event(claim, client, 'submitted')[0], 200)
+            progress = peer_lifecycle.get(self.store.db, tid)['evidence']['progress']
+            self.assertIsNone(progress['accepted_at'])
+            self.assertIsNone(progress['started_at'])
+            self.assertEqual(self.http('/claude-mod/disconnect', dict(generation=self.generation,
+                native_id=self.sid, client_id=client), token=self.token)[0], 200)
+        self.assertEqual(peer_lifecycle.blockers(self.store.db, self.aid)[0][:2], (tid, 'uncertain'))
+
+    def assert_shared_mod_unsent(self, tid, request_id, poll):
+        self.assertIsNone(poll['claim'])
+        result = self.store.shared.result(request_id)
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('Nothing was submitted', result['error'])
+        record = peer_lifecycle.get(self.store.db, tid)
+        self.assertEqual(record['execution'], 'dropped')
+        self.assertIsNone(record['evidence']['progress']['claim_issued_at'])
+        self.assertIsNone(self.store.db.execute('SELECT launched FROM shared_bridge_requests WHERE transport_id=?',
+                                               (tid,)).fetchone()[0])
+        self.assertEqual(peer_lifecycle.blockers(self.store.db, self.aid), [])
+
+    def test_shared_mod_unclaimed_expires_and_releases_recipient(self):
+        tid, request_id, client = self.shared_progress_request()
+        with patch.object(mod, 'time', wraps=time) as clock:
+            self.peer_age_with_live_enrollment(clock, tid, 600)
+            status, poll = self.global_poll(client, accept=False)
+            self.assertEqual(status, 200, poll)
+            self.assertEqual(poll['requests'], [])
+            self.assertEqual(peer_lifecycle.get(self.store.db, tid)['execution'], 'reserved')
+            self.peer_age_with_live_enrollment(clock, tid, mod.TTL + 1)
+            status, poll = self.global_poll(client)
+            self.assertEqual(status, 200, poll)
+            self.assert_shared_mod_unsent(tid, request_id, poll)
+
+    def test_shared_mod_claim_deadline_rechecked_at_serialized_boundary(self):
+        tid, request_id, client = self.shared_progress_request()
+        original_poll = self.store.mods.poll
+        with patch.object(mod, 'time', wraps=time) as clock:
+            before_deadline = self.peer_age_with_live_enrollment(clock, tid, mod.TTL - 1)
+            def at_boundary(*args, **kwargs):
+                clock.time.return_value = before_deadline + 1
+                return original_poll(*args, **kwargs)
+            with patch.object(self.store.mods, 'poll', side_effect=at_boundary), \
+                    patch.object(self.store.shared, 'authorize_mod_claim_in_transaction',
+                                 wraps=self.store.shared.authorize_mod_claim_in_transaction) as authorize:
+                status, poll = self.global_poll(client)
+            self.assertEqual(status, 200, poll)
+            authorize.assert_not_called()
+            self.assert_shared_mod_unsent(tid, request_id, poll)
+
+    def test_shared_mod_claim_deadline_rechecked_after_final_blocker_lookup(self):
+        import peer_bridge
+        tid, request_id, client = self.shared_progress_request()
+        blockers = peer_lifecycle.blockers
+        checked_at = []
+        with patch.object(mod, 'time', wraps=time) as clock, patch.object(peer_bridge, 'time', wraps=time) as bridge_clock:
+            before_deadline = self.peer_age_with_live_enrollment(clock, tid, mod.TTL - 1)
+            bridge_clock.time.return_value = before_deadline
+            def cross_deadline(db, agent, *, excluding=None):
+                result = blockers(db, agent, excluding=excluding)
+                if excluding == tid:
+                    checked_at.append(bridge_clock.time())
+                    bridge_clock.time.return_value = before_deadline + 1
+                return result
+            with patch.object(peer_lifecycle, 'blockers', side_effect=cross_deadline):
+                status, poll = self.global_poll(client)
+            self.assertEqual(status, 200, poll)
+            self.assertEqual(checked_at, [before_deadline])
+            self.assert_shared_mod_unsent(tid, request_id, poll)
+
     def test_shared_mod_progress_tracks_claim_start_and_exact_end_only(self):
         tid, request_id, client = self.shared_progress_request()
         observed = time.time() + 60
@@ -531,7 +652,8 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(peer_lifecycle.get(self.store.db, tid)['evidence']['progress'], empty)
 
     def test_mod_pruned_payload_completion_settles_without_new_progress_or_body(self):
-        tid, _, client = self.shared_progress_request()
+        import peer_bridge
+        tid, request_id, client = self.shared_progress_request()
         observed = time.time() + 60
         with patch.object(self.store, '_peer_progress_clock', lambda: observed, create=True):
             status, poll = self.global_poll(client)
@@ -550,6 +672,10 @@ class ClaudeModTests(unittest.TestCase):
             self.assertEqual(settled['execution'], 'completed')
             self.assertEqual(settled['evidence']['progress'], previous)
             self.assertIsNone(self.store.db.execute('SELECT data FROM requests WHERE id=?', (tid,)).fetchone())
+            with patch.object(peer_bridge, 'time', wraps=time) as clock:
+                clock.time.return_value = observed + messaging.RETENTION
+                result = self.store.shared.result(request_id)
+            self.assertEqual((result['state'], result['reply'], result['text_preview']), ('expired', '', ''))
 
     def test_global_setup_auth_single_use_status_and_secret_classes(self):
         for path in ('/claude-mod-setup','/claude-mod-setup-status','/claude-mod-revoke'):

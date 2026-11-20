@@ -190,7 +190,7 @@ with open(LAUNCHES,'a') as f:f.write(json.dumps(args)+'\\n')
                         store.db.commit()
                     store.tick()
                     expired = rpc(client_two,'get_reply',{'request_id':first['request_id']})
-                    self.assertEqual((expired['state'],expired['reply']),('expired',''))
+                    self.assertEqual((expired['state'],expired['reply']),('queued',''))
                     # Queue acceptance happens first; an independent later Codex turn writes its answer.
                     self.append_codex_turn(transcript,late,launches=launches)
                     store.tick()

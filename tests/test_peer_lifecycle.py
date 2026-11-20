@@ -99,18 +99,80 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'terminal'):
                 life.retire(self.db, self.tid, life.RETIRE_REASON)
 
-    def test_retirement_migrates_partial_index_and_preserves_recent_global_capacity(self):
-        row = self.admitted(); self.created = time.time()
-        self.db.execute('UPDATE shared_bridge_requests SET created=?,launched=?', (self.created, self.created))
-        row['created'] = self.created
+    def test_retirement_migrates_partial_index_and_excludes_retired_capacity(self):
+        row = self.admitted()
         self.db.execute('INSERT INTO requests VALUES (?,?)', (self.tid, json.dumps(row)))
         self.db.execute('DROP INDEX peer_execution_active_created')
         self.db.execute("CREATE INDEX peer_execution_active_created ON peer_execution(created) WHERE execution NOT IN ('completed','dropped')")
         life.schema(self.db)
         self.assertIn("'retired'", self.db.execute("SELECT sql FROM sqlite_master WHERE name='peer_execution_active_created'").fetchone()[0])
         life.retire(self.db, self.tid, life.RETIRE_REASON)
-        count = self.db.execute("SELECT count(*) FROM peer_execution WHERE execution NOT IN ('completed','dropped','retired') AND created>?", (time.time()-900,)).fetchone()[0]
+        count = self.db.execute("SELECT count(*) FROM peer_execution WHERE execution NOT IN ('completed','dropped','retired')").fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_bound_and_submitted_executions_stay_active_across_age_cutoffs(self):
+        self.created = 1_700_000_000
+        for execution, state in (('running', 'awaiting_reply'), ('submitted', 'queued')):
+            self.tid, self.target = uid(), 'c:' + uid()
+            row = self.admitted()
+            row['state'] = state
+            if execution == 'submitted':
+                row.pop('mod_turn')
+            life.reconcile(self.db, row)
+            before = life.get(self.db, self.tid)
+            self.assertEqual(before['execution'], execution)
+            writes = self.db.total_changes
+            for age in (899, 900, 6 * 3600, 86400):
+                with self.subTest(execution=execution, age=age):
+                    self.assertEqual(life.capacity_error(self.db, self.target, self.created + age, 900),
+                                     f'This recipient has an active request ({self.tid}). The new request was not accepted.')
+            self.assertEqual(life.get(self.db, self.tid), before)
+            self.assertEqual(self.db.total_changes, writes)
+
+    def test_aged_nonterminal_reservations_count_until_exact_settlement(self):
+        self.created = 1_700_000_000
+        now = self.created + 86400
+        by_execution = {}
+        for execution, state in (('reserved', 'sending'), ('submitted', 'queued'),
+                                 ('running', 'awaiting_reply'), ('uncertain', 'unknown')):
+            self.tid, self.target = uid(), 'c:' + uid()
+            row = self.admitted(launched=execution != 'reserved')
+            row['state'] = state
+            if execution != 'running':
+                row.pop('mod_turn')
+            life.reconcile(self.db, row)
+            self.assertEqual(life.get(self.db, self.tid)['execution'], execution)
+            by_execution[execution] = row
+
+        uncertain = by_execution['uncertain']
+        for age in (899, 900, 6 * 3600, 86400):
+            with self.subTest(age=age):
+                self.assertIn('requires recovery', life.capacity_error(self.db, uncertain['agent'], self.created + age, 900))
+        fifth = 'c:' + uid()
+        self.assertEqual(life.capacity_error(self.db, fifth, now, 900),
+                         'Four peer deliveries are active. The new request was not accepted.')
+
+        running = by_execution['running']
+        life.reconcile(self.db, dict(running, settled=True, execution_outcome='completed', capture_disposition='withheld'))
+        self.assertEqual(life.get(self.db, running['request_id'])['execution'], 'completed')
+        self.assertIsNone(life.capacity_error(self.db, fifth, now, 900))
+        self.assertIn('requires recovery', life.capacity_error(self.db, uncertain['agent'], now, 900))
+
+        self.tid, self.target = uid(), fifth
+        replacement = self.admitted(launched=False)
+        replacement.update(state='sending', mod_turn='')
+        life.reconcile(self.db, replacement)
+        self.assertIn('Four peer deliveries', life.capacity_error(self.db, 'c:' + uid(), now, 900))
+
+    def test_owner_records_never_consume_peer_capacity(self):
+        self.created = 1_700_000_000
+        for _ in range(4):
+            row = dict(request_id=uid(), origin='owner', agent=self.target, created=self.created,
+                       state='awaiting_reply', bound_turn='fictional-owner-turn', launched=True)
+            self.db.execute('INSERT INTO requests VALUES (?,?)', (row['request_id'], json.dumps(row)))
+            life.reconcile(self.db, row)
+        self.assertIsNone(life.capacity_error(self.db, self.target, self.created + 86400, 900))
+        self.assertEqual(life.blockers(self.db, self.target), [])
 
     def test_expired_payload_does_not_release_uncertain_execution(self):
         row = self.admitted()

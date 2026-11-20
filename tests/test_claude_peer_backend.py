@@ -293,7 +293,8 @@ class ClaudePeerBackendTests(unittest.TestCase):
             self.store.mods.put(row)
             self.store._prune(self.store._rows(), time.time())
         self.assertIsNone(self.store.db.execute('SELECT data FROM requests WHERE id=?', (claim['request_id'],)).fetchone())
-        with self.assertRaisesRegex(peer_bridge.PeerError, 'recovery'):
+        # Content expiry does not invalidate the retained exact execution binding.
+        with self.assertRaisesRegex(peer_bridge.PeerError, 'active request'):
             self.send()
         self.assertEqual(self.completion(dict(claim, attempt_id=uid()))[0], 409)
         self.assertEqual(self.completion(claim, 'answered')[0], 200)

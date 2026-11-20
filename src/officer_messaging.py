@@ -1056,6 +1056,16 @@ class MessagingStore:
                                           (row['request_id'],))
                 request = self._unreserved('requests.id')
                 removed = self.db.execute(f'DELETE FROM requests WHERE id=? AND {request}', (row['request_id'],))
+                if removed.rowcount and row.get('origin') == 'peer':
+                    meta = peer_lifecycle.exact_admission(self.db, row['request_id'])
+                    retained = peer_lifecycle.get(self.db, row['request_id'])
+                    if (meta and meta[2] is None and retained and retained['execution'] == 'reserved'
+                            and not any(retained['evidence'].get(key) for key in ('launched', 'bound_turn', 'mod_turn'))
+                            and self.db.execute('SELECT 1 FROM requests WHERE id=?', (row['request_id'],)).fetchone() is None):
+                        # Retention may run before the ordinary dispatch tick. An
+                        # immutable never-launched reservation cannot orphan a slot.
+                        peer_lifecycle.reconcile(self.db, dict(request_id=row['request_id'], agent=meta[0]),
+                                                 meta, missing_payload=True)
                 if proof is not None:
                     proof.record(deleted)
                     proof.record(removed)
@@ -1303,9 +1313,7 @@ class MessagingStore:
             aborted = self._previous_codex_terminal(row)
         except (peer_bridge.PeerError, OSError, ValueError, TypeError, KeyError, RecursionError) as error:
             if isinstance(error, (OSError, codex_transcript.TemporaryUnavailable)):
-                if row['state'] in ('queued', 'awaiting_reply') and time.time() - row['created'] > TTL:
-                    row.update(state='expired', error=CODEX_REPLY_EXPIRED)
-                elif not row.get('error'):
+                if not row.get('error'):
                     row['error'] = CODEX_PREVIOUS_SOURCE_UNAVAILABLE
                 return False
             row.update(state='unknown', capture_disposition='withheld', tracking_stopped=True,
@@ -1541,7 +1549,7 @@ class MessagingStore:
             if peer and row.get('bound_turn'):
                 current = codex_transcript.segment(row)
                 row['codex_peer_terminal_checked'] = [current.get(key) for key in ('device', 'inode', 'cursor')]
-        if row['state'] in ('queued', 'awaiting_reply') and time.time() - row['created'] > TTL:
+        if not peer and row['state'] in ('queued', 'awaiting_reply') and time.time() - row['created'] > TTL:
             row.update(state='expired', error=CODEX_REPLY_EXPIRED)
         return observations
 

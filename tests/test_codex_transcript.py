@@ -700,6 +700,54 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual((result['state'], result['reply']), ('answered', 'Fictional late successor answer.'))
         self.assertIsNone(peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), 900))
 
+    def test_bound_peer_age_does_not_expire_and_late_exact_end_is_captured(self):
+        self.retain_previous_worker_binding()
+        for elapsed in (m.TTL, m.TTL + 1, 6 * 3600, m.RETENTION - 1):
+            with self.subTest(elapsed=elapsed), patch.object(m.time, 'time', return_value=self.row['created'] + elapsed):
+                self.store.tick()
+                saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+                self.assertEqual(saved['state'], 'awaiting_reply')
+                self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'running')
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional long-work answer.'))
+        with patch.object(m.time, 'time', return_value=self.row['created'] + m.RETENTION - 1), patch.object(m.subprocess, 'Popen') as launch:
+            self.store.tick()
+            launch.assert_not_called()
+        self.assertEqual(self.public_result(2)['reply'], 'Fictional long-work answer.')
+
+    def test_previous_peer_proof_read_failure_does_not_expire_by_age(self):
+        self.retain_previous_worker_binding()
+        hidden = self.root / 'temporarily-hidden-long-work'
+        self.old.rename(hidden)
+        try:
+            with patch.object(m.time, 'time', return_value=self.row['created'] + 6 * 3600):
+                self.store.tick()
+            saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+            self.assertEqual(saved['state'], 'awaiting_reply')
+            self.assertFalse(saved.get('tracking_stopped'))
+        finally:
+            hidden.rename(self.old)
+
+    def test_owner_age_expiry_is_unchanged(self):
+        self.row.update(origin='owner', envelope=m.envelope(self.rid, 'Fictional owner question.', version=1))
+        self.store._save(self.row)
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.store.tick()
+        with patch.object(m.time, 'time', return_value=self.row['created'] + m.TTL + 1):
+            self.store.tick()
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(saved['state'], 'expired')
+        self.assertEqual(saved['error'], m.CODEX_REPLY_EXPIRED)
+
+    def test_peer_retention_cutoff_still_prunes_content_without_false_completion(self):
+        self.retain_previous_worker_binding()
+        with patch.object(m.time, 'time', return_value=self.row['created'] + m.RETENTION + 1):
+            self.store.tick()
+        self.assertFalse(any(row['request_id'] == self.rid for row in self.store._rows()))
+        self.assertNotIn(peer_lifecycle.get(self.store.db, self.rid)['execution'], peer_lifecycle.TERMINAL)
+        self.assertEqual(self.public_result(2)['state'], 'expired')
+
     def test_previous_worker_unfollowed_successor_tracks_to_exact_end(self):
         self.retain_previous_worker_binding()
         self.successor()

@@ -364,13 +364,15 @@ def blockers(db, agent, *, excluding=None):
 
 
 def capacity_error(db, agent, now, ttl):
-    blocked = db.execute("SELECT request_id,execution,created FROM peer_execution WHERE agent=? AND execution NOT IN ('completed','dropped','retired') ORDER BY created LIMIT 1", (agent,)).fetchall()
+    # Dispatch deadlines are applied by the worker. Capacity comes only from
+    # durable reservations and their verified terminal states.
+    blocked = db.execute("SELECT request_id,execution FROM peer_execution WHERE agent=? AND execution NOT IN ('completed','dropped','retired') ORDER BY created LIMIT 1", (agent,)).fetchone()
     if blocked:
-        tid, state, created = blocked[0]
-        if state == 'uncertain' or created <= now - ttl:
+        tid, state = blocked
+        if state == 'uncertain':
             return 'Earlier delivery requires recovery for this recipient (' + tid + '). The new request was not accepted; nothing was resent.'
         return 'This recipient has an active request (' + tid + '). The new request was not accepted.'
-    count = db.execute("SELECT COUNT(*) FROM peer_execution WHERE execution NOT IN ('completed','dropped','retired') AND created>?", (now - ttl,)).fetchone()[0]
+    count = db.execute("SELECT COUNT(*) FROM (SELECT 1 FROM peer_execution WHERE execution NOT IN ('completed','dropped','retired') LIMIT 4)").fetchone()[0]
     if count >= 4:
         return 'Four peer deliveries are active. The new request was not accepted.'
     return None

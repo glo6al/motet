@@ -256,7 +256,7 @@ class SharedTests(unittest.TestCase):
         self.store.db.execute('UPDATE shared_bridge_requests SET created=?', (row['created'],)); self.store._save(row)
         self.tick()
         duplicate = self.send(original, rid=rid, auth=auth)
-        self.assertEqual((duplicate['state'], duplicate['text_preview']), ('expired', ''))
+        self.assertEqual((duplicate['state'], duplicate['text_preview']), ('failed', ''))
         self.assertEqual(self.store.db.execute('SELECT preview FROM shared_bridge_requests').fetchone()[0], '')
         self.assertEqual(self.store._rows(), [])
 
@@ -377,13 +377,52 @@ class SharedTests(unittest.TestCase):
         self.assertTrue(self.row(result['request_id']).get('settled'))
         self.send()
 
+    def test_never_dispatched_expiry_is_rechecked_after_slow_preflight(self):
+        result = self.send()
+        row = self.row(result['request_id'])
+        clock = [row['created'] + p.TTL - .25]
+        original = self.bridge._preflight
+        def delayed(target):
+            value = original(target)
+            clock[0] = row['created'] + p.TTL
+            return value
+        with patch.object(p.time, 'time', side_effect=lambda: clock[0]), patch.object(self.bridge, '_preflight', side_effect=delayed):
+            self.assertEqual(self.tick().call_count, 0)
+        saved = self.row(result['request_id'])
+        self.assertEqual(saved['state'], 'failed')
+        self.assertFalse(saved['launched'])
+        self.assertIn('Nothing was sent', saved['error'])
+        self.assertIsNone(self.store.db.execute('SELECT launched FROM shared_bridge_requests WHERE client_id=?', (result['request_id'],)).fetchone()[0])
+        self.assertEqual(p.peer_lifecycle.get(self.store.db, saved['request_id'])['execution'], 'dropped')
+        self.assertIsNone(p.peer_lifecycle.capacity_error(self.store.db, saved['agent'], clock[0], p.TTL))
+
+    def test_never_dispatched_request_at_exact_deadline_is_not_launched(self):
+        result = self.send()
+        row = self.row(result['request_id'])
+        with patch.object(p.time, 'time', return_value=row['created'] + p.TTL):
+            self.assertEqual(self.tick().call_count, 0)
+        saved = self.row(result['request_id'])
+        self.assertEqual((saved['state'], saved['launched']), ('failed', False))
+        self.assertEqual(p.peer_lifecycle.get(self.store.db, saved['request_id'])['execution'], 'dropped')
+
+    def test_retention_prune_of_never_dispatched_request_releases_reservation(self):
+        result = self.send()
+        row = self.row(result['request_id'])
+        with patch.object(p.time, 'time', return_value=row['created'] + p.RETENTION + 1):
+            self.assertEqual(self.tick().call_count, 0)
+        self.assertIsNone(self.store.db.execute('SELECT data FROM requests WHERE id=?', (row['request_id'],)).fetchone())
+        self.assertEqual(p.peer_lifecycle.get(self.store.db, row['request_id'])['execution'], 'dropped')
+        self.assertIsNone(p.peer_lifecycle.capacity_error(self.store.db, row['agent'], row['created'] + p.RETENTION + 1, p.TTL))
+        self.send()
+
     def test_late_reply_is_polled_without_resend(self):
         result = self.send(); self.tick(); row = self.row(result['request_id'])
         row['created'] -= p.TTL+10
         self.store.db.execute('UPDATE shared_bridge_requests SET created=?', (row['created'],)); self.store._save(row)
         self.assertEqual(self.tick().call_count, 0)
-        self.assertEqual(self.bridge.result(result['request_id'])['state'], 'expired')
-        with self.assertRaises(p.PeerError): self.send()
+        self.assertEqual(self.bridge.result(result['request_id'])['state'], 'queued')
+        with self.assertRaises(p.PeerError) as blocked: self.send()
+        self.assertNotIn('requires recovery', str(blocked.exception))
         self.answer(row); self.tick()
         self.assertEqual(self.bridge.result(result['request_id'])['state'], 'answered')
         self.send()
