@@ -27,6 +27,7 @@ from attachments_owner_transport import CLAUDE_CLAIMS
 from attachments_types import AttachmentError
 from loopback_http_fixture import LoopbackHTTPServer
 from officer_messaging import MessagingStore
+from test_attachments_owner_startup import ManualWorker
 
 OWNER_KEY = 'fictional-owner-key'
 PREFIX = '/api/attachments'
@@ -114,8 +115,29 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
     def attach(self, method, path, data=None, **opts):
         return self.http(method, PREFIX + path, data, **opts)
 
-    def start(self):
-        runtime = server.start_native_attachment_maintenance(self.messaging, self.attachments)
+    def start(self, *, manual_maintenance=False):
+        if manual_maintenance:
+            from attachments_native_composition import bind_native_composition
+
+            workers = []
+
+            def schedule(checkpoint, stopped):
+                worker = ManualWorker(checkpoint, stopped)
+                workers.append(worker)
+                return worker
+
+            # Install the scheduler before binding starts the runtime. Clearing
+            # native_checkpoint later cannot revoke a captured background call.
+            def bind(*args, **kwargs):
+                return bind_native_composition(*args, scheduler=schedule, **kwargs)
+
+            with patch('attachments_native_composition.bind_native_composition', side_effect=bind):
+                runtime = server.start_native_attachment_maintenance(self.messaging, self.attachments)
+            self.assertEqual(len(workers), 1)
+            self.assertEqual(workers[0].starts, 1)
+            self.assertIs(runtime._worker, workers[0])
+        else:
+            runtime = server.start_native_attachment_maintenance(self.messaging, self.attachments)
         self.assertIsNotNone(runtime)
         self.comp = self.messaging._native_composition
         self.assertIsNotNone(self.comp, self.messaging._native_composition_error)
@@ -533,7 +555,8 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         self.assertEqual(self.messaging.db.execute(f'SELECT COUNT(*) FROM main.{CLAUDE_CLAIMS}').fetchone()[0], 0)
 
     def test_shutdown_drains_duplicate_ack_before_attachment_reads_close(self):
-        runtime = self.start()
+        runtime = self.start(manual_maintenance=True)
+        self.assertIsInstance(runtime._worker, ManualWorker)
         session = self.register()
         self.send(self.prepare(self.selection()))
         claim = self.poll(session)
@@ -541,16 +564,17 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         completion = dict(turn_id=uid(), outcome='answered', event_id=uid(), occurred_at=4000,
                           answer='WATCH_REPLY ' + claim['request_id'] + '\n' + ANSWER)
         first = self.event(session, claim, 'completed', **completion)
-        with patch.object(runtime, 'native_checkpoint', None):
-            before = (self.messaging.db.total_changes, self.attachments.store.db.total_changes)
-            replay = self.assert_activity_drains(self.comp.claude.adapter, '_attachment_record',
-                                                 lambda: self.event(session, claim, 'completed', **completion))
-            self.assertEqual(before, (self.messaging.db.total_changes, self.attachments.store.db.total_changes))
+        # No separately scheduled mirror reconciliation may write inside this
+        # measurement of the duplicate receipt's read-only activity.
+        before = (self.messaging.db.total_changes, self.attachments.store.db.total_changes)
+        replay = self.assert_activity_drains(self.comp.claude.adapter, '_attachment_record',
+                                             lambda: self.event(session, claim, 'completed', **completion))
+        self.assertEqual(before, (self.messaging.db.total_changes, self.attachments.store.db.total_changes))
         self.assertEqual(replay, first)
         self.event(session, claim, 'completed', status=503, **completion)
 
     def test_shutdown_drains_the_on_only_maintenance_checkpoint(self):
-        runtime = self.start()
+        runtime = self.start(manual_maintenance=True)
         checkpoint = runtime.native_checkpoint
         with patch.object(runtime, 'native_checkpoint', None):
             self.assert_activity_drains(self.comp.claude.adapter, 'reconcile_pending', checkpoint)
