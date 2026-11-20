@@ -4123,7 +4123,15 @@ async function quietIdentityChecks(mutate=x=>x){
 }
 async function quietAttentionChecks(mutate=x=>x){
   const h=quietRelayHarness(mutate);h.c.WSO.historyOpen=false;h.c.ofEl.classList.add('fold');h.c.ofIn.value='Live request';await h.ofSendOrdinary();const id=[...h.WQR.links.keys()][0],link=h.WQR.links.get(id),r=h.OFM.records.get(id);
+  h.c.WSO.narrow={toggle:h.c.document.createElement('button')};
   h.ofMessageMerge([{...r,state:'queued'}]);assert.equal(h.WQR.unseen.size,0,'status changes do not light dot');h.workspaceQuietRelaySnapshot([{...r,state:'answered',reply:'Live'}]);h.ofMessageMerge([{...r,state:'answered',reply:'Live'}]);assert(h.WQR.unseen.has(id),'initial snapshot must not baseline a current-page live ID');assert(h.c.WSO.desktop.toggle.classList.contains('workspace-relay-unseen'));assert.equal(h.c.WSO.historyOpen,false,'answer arrival never opens conversation');
+  const toggles=[h.c.WSO.desktop.toggle,h.c.WSO.narrow.toggle];
+  for(const toggle of toggles){assert(toggle.classList.contains('workspace-relay-unseen'),'closed desktop and phone controls show the unread-answer dot');assert.equal(toggle.getAttribute('aria-label'),'Open the conversation · new agent answer');}
+  h.c.WSO.historyOpen=true;h.c.WSO.activating=true;h.c.ofEl.classList.remove('fold');h.workspaceQuietRelaySeen();
+  assert(h.WQR.unseen.has(id),'opening during activation preserves the unread answer');
+  for(const toggle of toggles){assert.equal(toggle.classList.contains('workspace-relay-unseen'),false,'open desktop and phone controls hide the dot even while the answer remains unread');assert.equal(toggle.getAttribute('aria-label'),'Close the conversation','the open control does not announce a closed-box dot');}
+  h.c.WSO.historyOpen=false;h.c.ofEl.classList.add('fold');h.workspaceQuietRelayAttention();
+  for(const toggle of toggles)assert(toggle.classList.contains('workspace-relay-unseen'),'closing before the answer is seen restores its dot');
   h.c.WSO.historyOpen=true;h.c.WSO.activating=true;h.c.ofEl.classList.remove('fold');h.workspaceQuietRelaySeen();assert(h.WQR.unseen.has(id),'passive activation cannot consume unseen answer');h.c.WSO.activating=false;h.c.OFUI.scope='station';h.c.focus=QUIET_B;h.workspaceQuietRelaySeen();assert(h.WQR.unseen.has(id),'opening another scope cannot consume answer');h.c.OFUI.scope='room';h.c.focus=null;h.workspaceQuietRelaySeen();assert(h.WQR.seen.has(id));assert.equal(h.WQR.unseen.size,0);
   h.c.WSO.historyOpen=false;h.c.ofEl.classList.add('fold');h.ofMessageMerge([{...r,state:'queued',reply:''}]);h.ofMessageMerge([{...r,state:'answered',reply:'Live'}]);assert.equal(h.WQR.unseen.size,0,'repeated/regressed polls never relight seen identity');const E=h.c.document.createElement('button');h.c.WSO.desktop={toggle:E};h.workspaceQuietRelayAttention();assert(!E.classList.contains('workspace-relay-unseen'),'recreated arrow does not relight');assert(link.answer.el.innerHTML.includes('Live'));
   // Restored/initial historical answers are a baseline, but a later new live ID is not.
@@ -4196,6 +4204,7 @@ let quietProofDeadline;(async()=>{
   ["JSON.stringify(user.context)!==JSON.stringify(scope)","false",quietIdentityChecks],
   ["if(row.kind==='quiet-relay')continue;","if(false)continue;",quietRelayChecks],
   ["!WQR.live.has(r.request_id)","true",quietAttentionChecks],
+  ["WQR.unseen.size>0&&!WSO.historyOpen&&WSO.active","WQR.unseen.size>0&&WSO.active",quietAttentionChecks],
   ["if(typeof workspaceQuietRelaySeen==='function')workspaceQuietRelaySeen();","",quietViewportChecks],
   ["if(!WQR.seen.has(record.request_id))WQR.unseen.add(record.request_id)","WQR.seen.add(record.request_id)",quietViewportChecks],
   ["Math.min(a.right,p.right,innerWidth)<=Math.max(a.left,p.left,0)||Math.min(a.bottom,p.bottom,innerHeight)<=Math.max(a.top,p.top,0)","false",quietViewportChecks],
