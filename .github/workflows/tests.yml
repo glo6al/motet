@@ -156,6 +156,12 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_peer_admin.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_peer_hold_episodes.py
+        if: ${{ !cancelled() }}
+      - run: python tests/test_peer_held_admin.py
+        if: ${{ !cancelled() }}
+      - run: node tests/test_peer_held_page.js
+        if: ${{ !cancelled() }}
       - run: python tests/test_watch_bridge_clear.py
         if: ${{ !cancelled() }}
       - run: python tests/test_peer_recovery.py
@@ -217,7 +223,13 @@ jobs:
       - run: python tests/test_peer_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
+      - run: python tests/test_codex_proven_end_integration.py -v
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python tests/test_claude_peer_integration.py
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
+      - run: python tests/test_claude_proven_end_integration.py -v
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
       - run: python tests/test_peer_reply_integration.py

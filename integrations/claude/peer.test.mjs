@@ -193,6 +193,23 @@ test('native progress rejects malformed evidence and forged providers',()=>{
  for(const value of malformed)assert.throws(()=>safeResult('get_reply',{...codex,progress:value}));
  assert.throws(()=>safeResult('list_requests',{requests:[{...codex,progress:{...valid,provider:'claude'}}],next_cursor:null}));
 });
+test('finished-withheld projection keeps legacy unknown without suggesting a hold',()=>{
+ for(const provider of ['codex','claude']){
+  const agent_id=(provider==='codex'?'x:':'c:')+randomUUID();
+  const target={provider,agent_id,name:'Fictional chat',project_id:'c'.repeat(64),project_label:'Example',identity_revision:'d'.repeat(64)};
+  const progress={...observedProgress(provider),phase:'ended',ended_at:acceptedAt,
+    summary:`Finished; reply withheld. End observed at ${acceptedAt}.`,held_reason:null};
+  const row={origin:'peer',agent_id,request_id:randomUUID(),state:'unknown',created_at:1000,target,
+    duplicate:false,text_preview:'Fictional text',reply:'',error:'The identified turn ended; its reply is withheld.',progress};
+  const reply=safeResult('get_reply',row),listed=safeResult('list_requests',{requests:[row],next_cursor:null}).requests[0];
+  assert.equal(reply.state,'unknown');assert.equal(reply.reply,'');
+  assert.equal(reply.progress.phase,'ended');assert.equal(reply.progress.held_reason,null);
+  assert.deepEqual(listed.progress,reply.progress);assert.equal(listed.reply,undefined);
+ }
+ assert.match(nativeInstructions,/phase ended, the original turn finished even if the compatible request state is unknown/);
+ assert.match(nativeInstructions,/not that its task succeeded/);
+ assert.match(nativeInstructions,/Do not ask the owner to clear or resend a finished request merely because its state is unknown/);
+});
 test('adapter sensitivity: authentication and timeout classification are required',async()=>{
  const original=await fs.readFile(path.join(here,'peer.mjs'),'utf8');
  for(const [name,from,to,pattern='real signed HTTP',expectedFailure=/Missing expected rejection/] of [

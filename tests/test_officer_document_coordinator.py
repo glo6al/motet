@@ -1,4 +1,5 @@
 """Actual owner service, ledger and HTTP boundaries; fake provider connections only."""
+from contextlib import contextmanager
 from dataclasses import replace
 import copy
 import http.client
@@ -59,6 +60,41 @@ class CoordinatorTests(unittest.TestCase):
     def write_sql(self, sql, args=()):
         with self.store._gate():
             self.store.db.execute(sql, args)
+
+    @contextmanager
+    def contend_for_intent_read(self):
+        """Park the real deletion worker before it contends for the SQLite gate."""
+        worker = self.store._deletion_worker
+        real_sweep = worker._sweep
+        ready, attempt, attempted, entered = [threading.Event() for _ in range(4)]
+
+        def sweep(*, recover):
+            if not ready.is_set():
+                ready.set()
+                if attempt.wait(5):
+                    attempted.set()
+                    with self.store._gate():
+                        entered.set()
+            return real_sweep(recover=recover)
+
+        def read_receipt(request_id):
+            self.assertTrue(self.store.lock._is_owned(), 'fixture intent read requires the store gate')
+            attempt.set()
+            self.assertTrue(attempted.wait(5), 'deletion worker did not attempt the gate')
+            self.assertFalse(entered.is_set())
+            record, _ = self.c.intents._record(request_id)
+            _, receipt = self.c.intents.correlated(record)
+            self.assertFalse(entered.is_set(), 'deletion worker entered during the receipt read')
+            return receipt
+
+        with mock.patch.object(worker, '_sweep', sweep):
+            self.store.files.wake_cleanup()
+            try:
+                self.assertTrue(ready.wait(5), 'deletion worker did not reach the barrier')
+                yield read_receipt
+            finally:
+                attempt.set()
+        self.assertTrue(entered.wait(5), 'deletion worker did not enter after the receipt read')
 
     @property
     def selection(self):
@@ -267,9 +303,9 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual((reply['state'],reply['failure'],reply['officerDelivery']['state']),
                          ('failed','tray_unavailable','not_sent'))
         self.assertEqual(connect.requests,[])
-        selection=self.f.selection
-        record,_=self.c.intents._record(reply['requestId'])
-        _,execution=self.c.intents.correlated(record)
+        with self.contend_for_intent_read() as read_receipt:
+            with self.store._gate():
+                execution=read_receipt(reply['requestId'])
         self.assertEqual(execution['chargedUnits'],0)
         self.assertTrue(execution['settled'])
 
@@ -297,7 +333,9 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual((reply['state'],reply['failure'],reply['officerDelivery']['state']),
                          ('failed','tray_unavailable','not_sent'))
         self.assertEqual(connect.requests,[])
-        _,receipt=self.c.intents.correlated(self.c.intents._record(reply['requestId'])[0])
+        with self.contend_for_intent_read() as read_receipt:
+            with self.store._gate():
+                receipt=read_receipt(reply['requestId'])
         self.assertEqual(receipt['chargedUnits'],0)
         self.assertTrue(receipt['settled'])
 
@@ -314,7 +352,9 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual((reply['state'],reply['failure'],reply['officerDelivery']['state']),
                          ('failed','tray_unavailable','not_sent'))
         self.assertEqual(self.provider.connections,[])
-        _,receipt=self.c.intents.correlated(self.c.intents._record(reply['requestId'])[0])
+        with self.contend_for_intent_read() as read_receipt:
+            with self.store._gate():
+                receipt=read_receipt(reply['requestId'])
         self.assertEqual(receipt['chargedUnits'],0)
         self.assertTrue(receipt['settled'])
 

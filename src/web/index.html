@@ -886,6 +886,20 @@ html.workspace #workspaceNewChatDialog .workspace-nc-recover{border:1px solid #c
 .workspace-nc-row b{font-weight:600;display:inline-flex;align-items:center;gap:8px;min-width:0}
 .workspace-nc-row em{font-style:normal;font-size:12.5px;color:var(--ws-mute);white-space:nowrap}
 .workspace-nc-row em[data-status=ready]{color:#17753a;font-weight:600}
+#workspaceControlsBody #workspaceHeldChats h4{margin:16px 0 2px;font:600 14.5px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+#workspaceControlsBody #workspaceHeldChats p{margin:0 0 6px;font-size:13.5px;line-height:1.45;color:var(--ws-mute)}
+#workspaceHeldChats .workspace-held-row{align-items:start}
+.workspace-held-name,.workspace-held-copy{display:flex;min-width:0;overflow-wrap:anywhere}
+.workspace-held-name{align-items:baseline;gap:6px}
+.workspace-held-name small{flex-shrink:0;font-size:12.5px;color:rgb(102,99,93)}
+.workspace-held-copy{flex-direction:column}
+.workspace-held-detail{font-size:12.5px;color:var(--ws-mute)}
+.workspace-held-detail:not([hidden]){display:block;margin-top:4px}
+.workspace-held-empty{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+#workspaceHeldChats button.workspace-held-action,#workspaceHeldRetry{border:1px solid rgb(214,211,204);border-radius:8px;background:#fff;color:var(--ws-ink);font:600 13px/1.4 system-ui;padding:6px 12px}
+#workspaceHeldChats button.workspace-held-action:hover:not(:disabled),#workspaceHeldRetry:hover:not(:disabled){background:var(--ws-hover)}
+#workspaceHeldChats button.workspace-held-action:disabled,#workspaceHeldRetry:disabled{opacity:.55;cursor:default}
+html.workspace #workspaceHeldChats .workspace-held-row:focus-visible{outline:1px solid rgb(28,27,25);outline-offset:2px}
 #workspaceNewChatSettings .workspace-nc-saved-row{padding:12px 0;border-top:1px solid var(--ws-line);font-size:14px;line-height:1.45}
 #workspaceNewChatSettings .workspace-nc-saved-path{display:flex;align-items:start;gap:12px;justify-content:space-between;min-width:0}
 #workspaceNewChatSettings .workspace-nc-saved-path>span{display:flex;flex-direction:column;gap:4px;min-width:0}
@@ -934,6 +948,7 @@ html.workspace #workspaceNewChatDialog .workspace-nc-recover{border:1px solid #c
 .workspace-notification-title>span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .workspace-notification-title time{flex:none;margin-left:auto;white-space:nowrap;font-size:12px;color:var(--ws-mute)}
 .workspace-notification-detail{max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ws-mute);font-size:13px}
+#workspaceBellHeld .workspace-notification-detail{white-space:normal;text-overflow:clip}
 .workspace-notification-source{font-size:12px;color:var(--ws-mute)}
 .workspace-bell .workspace-notification-dismiss{grid-column:3;grid-row:1;width:24px;min-height:24px;padding:0;text-align:center;color:var(--ws-mute)}
 .workspace-notification-actions{grid-column:2/4;display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:3px}
@@ -3065,10 +3080,10 @@ try{KEY=DEMO?'':(localStorage.getItem('liveRoomKey')||'')}catch(err){}
 function takeKey(){const h=new URLSearchParams(location.hash.slice(1)), k=h.get('k'), p=h.get('p'); if(!k&&!p) return false;
   history.replaceState(null,'',location.pathname+location.search);
   if(DEMO) return false;                          /* a credential in a demo window's address is dropped, never claimed or kept */
-  const keep=v=>{if(v!==KEY){if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');workspaceAppIconsReset();KEY=v;if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();if(typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire()}try{localStorage.setItem('liveRoomKey',v)}catch(err){}};   /* retire private UI before checking a different key */
+  const keep=v=>{if(v!==KEY){if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');workspaceAppIconsReset();KEY=v;if(typeof workspaceHeldChatsOwnerChanged==='function')workspaceHeldChatsOwnerChanged();if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();if(typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire()}try{localStorage.setItem('liveRoomKey',v)}catch(err){}};   /* retire private UI before checking a different key */
   if(k){keep(k); return true}
   /* an unlock link carries a one-time code, traded here for the key */
-  if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');claiming=true;if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();                                   /* nothing else checks or connects until this settles */
+  if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');claiming=true;if(typeof workspaceHeldChatsOwnerChanged==='function')workspaceHeldChatsOwnerChanged();if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();                                   /* nothing else checks or connects until this settles */
   if(typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire();
   fetch('/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:p})}).then(r=>r.ok?r.text():Promise.reject())
     .then(v=>{keep(v)}).catch(()=>{if(!KEY) txt($('#lockMsg'),'That unlock link has expired or was already used. Press Unlock again.')})
@@ -5013,7 +5028,7 @@ const here=()=>{if(APPROVE&&KEY&&connected&&!DEMO&&document.visibilityState==='v
 $('#appr').onclick=()=>{if(DEMO){APPROVE=!APPROVE; render(); return} APPROVE=!APPROVE; try{sessionStorage.setItem('liveRoomApprove',APPROVE?'1':'0')}catch(err){} here(); render()};
 // Fence the client's authenticated state before closing the desk. Desk teardown
 // can repaint the Officer, so set the lock before it can reconnect.
-function lock(on){if(on&&typeof workspaceAppIconsReset==='function')workspaceAppIconsReset();if(on&&typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('locked');if(on&&typeof workspaceOfficerMotionCancel==='function')workspaceOfficerMotionCancel();if(on&&typeof workspaceCancelDeskReturn==='function')workspaceCancelDeskReturn();if(on&&typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire();if(on&&typeof workspaceLiveDocumentsInvalidate==='function')workspaceLiveDocumentsInvalidate('lock');if(on&&typeof workspaceManagedReset==='function')workspaceManagedReset('lock');locked=on;if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();if(on&&typeof workspaceOfficerDeskClose==='function')workspaceOfficerDeskClose(false);if(on&&typeof idleFenceReset==='function')idleFenceReset();if(on&&$('#workspaceControlsDialog')&&typeof workspaceSettingsLock==='function')workspaceSettingsLock();hid($('#lock'),!on);nativeSync();if(!on&&typeof workspaceLiveDocumentsController==='function')workspaceLiveDocumentsController.current?.sync();if(typeof workspaceDictationRefresh==='function')workspaceDictationRefresh();}
+function lock(on){if(on&&typeof workspaceAppIconsReset==='function')workspaceAppIconsReset();if(on&&typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('locked');if(on&&typeof workspaceOfficerMotionCancel==='function')workspaceOfficerMotionCancel();if(on&&typeof workspaceCancelDeskReturn==='function')workspaceCancelDeskReturn();if(on&&typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire();if(on&&typeof workspaceLiveDocumentsInvalidate==='function')workspaceLiveDocumentsInvalidate('lock');if(on&&typeof workspaceManagedReset==='function')workspaceManagedReset('lock');locked=on;if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();if(typeof workspaceHeldChatsOwnerChanged==='function'){workspaceHeldChatsOwnerChanged();if(!on)workspaceHeldChatsRefresh()}if(on&&typeof workspaceOfficerDeskClose==='function')workspaceOfficerDeskClose(false);if(on&&typeof idleFenceReset==='function')idleFenceReset();if(on&&$('#workspaceControlsDialog')&&typeof workspaceSettingsLock==='function')workspaceSettingsLock();hid($('#lock'),!on);nativeSync();if(!on&&typeof workspaceLiveDocumentsController==='function')workspaceLiveDocumentsController.current?.sync();if(typeof workspaceDictationRefresh==='function')workspaceDictationRefresh();}
 /* native observation reader: private focused state, never LOG or message transport */
 function createNativeReader({request,paint,clock=()=>Date.now()/1000,later=setTimeout,cancel=clearTimeout}){
   const state={agent:null,key:null,epoch:0,snapshot:null,note:'',busy:false,timer:null,abort:null};
@@ -8062,8 +8077,370 @@ function workspaceFilterMatch(a,s,key){return key==='all'||key==='needs'&&!!s.ne
 function workspaceProjectClear(){if(!WORKSPACE)return;setProj(null);WS.filters?.querySelector('[data-filter=all]')?.focus({preventScroll:true})}
 function workspaceFilterPaint(now){if(!WORKSPACE||!WS.filters)return;const ids=order.filter(id=>A[id]&&(!PROJ||(proj(id)||'—')===PROJ)),states=ids.map(id=>({id,a:A[id],s:stateOf(A[id],now)})),buttons=WS.filters.querySelectorAll('[data-filter]');for(const b of buttons){const key=b.dataset.filter,items=states.filter(x=>workspaceFilterMatch(x.a,x.s,key)),sure=items.filter(x=>x.s.need?.sure).length,possible=items.filter(x=>x.s.need&&!x.s.need.sure).length,label=({all:'All',needs:'Needs you',working:'Working',ended:'Ended',seen:'Seen only'})[key];txt(b,key==='needs'?label+' '+sure+(possible?' · '+possible+' possible':''):label+' '+items.length);b.title=key==='needs'?sure+' recorded · '+possible+' possible requests':label+' · '+items.length;b.setAttribute('aria-label',key==='needs'?label+' · '+sure+' recorded, '+possible+' possible':label+' · '+items.length);b.setAttribute('aria-pressed',String(WS.filter===key))}const interacting=!!focus||STEPPING||!!peek||!!document.querySelector('#room .st.approach,#room .st.release,#room .st.held');for(const id of order){const a=A[id],s=stateOf(a,now);a.el.classList.toggle('workspace-filter-muted',!interacting&&!PINS[id]&&!a.pin&&!workspaceFilterMatch(a,s,WS.filter))}const chip=$('#workspaceProjectChip');chip.hidden=!PROJ||PROJ==='—';if(!chip.hidden){const folder=workspaceFolder();folder.style.color=typeof workspaceProjectColour==='function'?workspaceProjectColour(projColour(PROJ)):projColour(PROJ);chip.replaceChildren(folder);const name=document.createElement('span');name.textContent=projLabel(PROJ)+' only';chip.append(name)}}
 function workspaceSettingsStatus(){if(!WS.controls?.open||WS.section!=='officer')return;txt($('#workspaceOfficerStatus'),ofSt.textContent)}
+/* ---------- owner-only chats on hold ---------- */
+const HELD_CHAT_UUID=/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const HELD_CHAT_DISMISSED='motetHeldChatDismissed:';
+const HELD_CHAT_UNCONFIRMED='motetHeldChatUnconfirmed:';
+const HELD_CHAT_UNMATCHED='Motet could not match this hold to a chat.';
+
+function workspaceHeldChatItem(value){
+  if(!value||typeof value.item_id!=='string'||!/^[0-9a-f]{64}$/.test(value.item_id)
+      ||!['held','unavailable'].includes(value.group))throw Error('Invalid hold list');
+  let selector=null,field=null;
+  if(value.selector&&typeof value.selector==='object'){
+    const fields=Object.keys(value.selector);
+    if(fields.length===1&&['request_id','transport_id'].includes(fields[0])
+        &&typeof value.selector[fields[0]]==='string'&&HELD_CHAT_UUID.test(value.selector[fields[0]])){
+      field=fields[0];
+      selector={[field]:value.selector[field]};
+    }
+  }
+  const agent=typeof value.agent==='string'&&/^[xc]:/.test(value.agent)&&HELD_CHAT_UUID.test(value.agent.slice(2))?value.agent:null;
+  const group=selector?value.group:'unavailable';
+  const held_since=Number.isFinite(value.held_since)&&value.held_since>0?value.held_since:null;
+  const notice_due_at=Number.isFinite(value.notice_due_at)&&held_since!==null
+    &&value.notice_due_at>=held_since+300?value.notice_due_at:null;
+  return {
+    id:value.item_id,selector,field,agent,group,held_since,notice_due_at,
+    episode:typeof value.episode_id==='string'&&HELD_CHAT_UUID.test(value.episode_id)?value.episode_id:null,
+    provider:value.provider==='codex'?'Codex':value.provider==='claude'?'Claude':'App unavailable',
+    name:typeof value.name==='string'&&value.name.trim()?value.name.trim().slice(0,120):'Chat name unavailable',
+    reason:typeof value.reason==='string'&&value.reason?value.reason.slice(0,240):'Motet could not confirm the reply.',
+    unavailable:typeof value.unavailable_reason==='string'?value.unavailable_reason.slice(0,240):'',
+    clearable:value.clearable===true&&!!selector&&!!agent&&group!=='unavailable'
+  };
+}
+
+function createWorkspaceHeldChats({owner,request,time,storage,pendingStorage,changed}){
+  let context=null,items=new Map(),results=new Map(),reading=false,error=false,active=null;
+  let checkedAt=null,loadedAt=null;
+  const dismissed=new Set(),unconfirmed=new Set(),inFlight=new Set();
+  function remember(storage,set,prefix,id,on){
+    if(on)set.add(id);else set.delete(id);
+    try{if(on)storage?.setItem(prefix+id,'1');else storage?.removeItem(prefix+id)}catch(err){}
+  }
+  function remembered(storage,set,prefix,id){
+    if(set.has(id))return true;
+    try{return storage?.getItem(prefix+id)==='1'}catch(err){return false}
+  }
+  function ownerChanged(){
+    const key=owner();
+    if(context?.key===key||!context&&!key)return context;
+    context=key?{key}:null;
+    items=new Map();results=new Map();reading=false;error=false;active=null;
+    checkedAt=null;loadedAt=null;
+    changed();
+    return context;
+  }
+  const current=ticket=>ownerChanged()===ticket;
+  const stale=()=>error||loadedAt!==null&&time()-loadedAt>60;
+  const serverNow=()=>checkedAt===null?null:checkedAt+Math.max(0,time()-loadedAt);
+  const uncertain=id=>remembered(pendingStorage,unconfirmed,HELD_CHAT_UNCONFIRMED,id);
+  function mode(item){
+    if(!item.clearable)return 'unavailable';
+    if(uncertain(item.id))return 'inspect';
+    return 'retire';
+  }
+  async function refresh(){
+    const ticket=ownerChanged();
+    if(!ticket||reading||active)return;
+    reading=true;changed();
+    try{
+      const next=new Map(),selectors=new Map(),cursors=new Set();
+      let cursor=null,checked;
+      do{
+        const page=await request(ticket.key,'held',cursor===null?{}:{cursor});
+        if(!current(ticket))return;
+        if(!Array.isArray(page?.items)||page.items.length>50||!Number.isFinite(page.checked_at)
+            ||page.checked_at<=0)throw Error('Invalid hold list');
+        checked=page.checked_at;
+        for(const value of page.items){
+          if(value?.group==='open')continue;
+          const item=workspaceHeldChatItem(value),target=item.field&&item.field+':'+item.selector[item.field];
+          const previous=next.get(item.id)||selectors.get(target);
+          if(previous){
+            if(previous.agent!==item.agent||JSON.stringify(previous.selector)!==JSON.stringify(item.selector))
+              throw Error('Conflicting hold list');
+            continue;
+          }
+          next.set(item.id,item);
+          if(target)selectors.set(target,item);
+        }
+        cursor=page.next_cursor;
+        if(cursor!==null){
+          if(typeof cursor!=='string'||!cursor||cursor.length>4096||cursors.has(cursor))
+            throw Error('Invalid hold cursor');
+          cursors.add(cursor);
+        }
+      }while(cursor!==null);
+      items=next;results=new Map();checkedAt=checked;loadedAt=time();error=false;
+    }catch(err){if(current(ticket))error=true}
+    finally{if(current(ticket)){reading=false;changed()}}
+  }
+  function exact(value,item){
+    return value?.[item.field]===item.selector[item.field]&&value.agent===item.agent;
+  }
+  async function inspect(ticket,item){
+    try{
+      const value=await request(ticket.key,'inspect',{...item.selector,require_hold:true});
+      if(!current(ticket)||!exact(value,item))return;
+      if(value.execution==='retired')results.set(item.id,'cleared');
+      else if(value.execution==='completed')
+        results.set(item.id,value.capture==='withheld'?'withheld':'finished');
+      else if(value.execution==='dropped')results.set(item.id,'closed');
+      else if(['running','submitted','reserved'].includes(value.execution))items.delete(item.id);
+      else if(value.execution==='uncertain'&&value.eligible===true)results.set(item.id,'still');
+      else if(value.execution==='uncertain'&&value.eligible===false){
+        items.set(item.id,{...item,group:'unavailable',clearable:false,held_since:null,
+          episode:null,notice_due_at:null,reason:HELD_CHAT_UNMATCHED,unavailable:HELD_CHAT_UNMATCHED});
+      }
+      else return;
+      remember(pendingStorage,unconfirmed,HELD_CHAT_UNCONFIRMED,item.id,false);
+    }catch(err){/* Keep the exact check available without repeating the write. */}
+  }
+  async function act(item,action){
+    const ticket=ownerChanged();
+    if(!ticket||reading||active||stale()||inFlight.has(item.id)||items.get(item.id)!==item
+        ||!item.clearable||action!==mode(item)||results.has(item.id)&&results.get(item.id)!=='still')return;
+    active={id:item.id,action};inFlight.add(item.id);results.delete(item.id);
+    if(action==='retire')remember(pendingStorage,unconfirmed,HELD_CHAT_UNCONFIRMED,item.id,true);
+    changed();
+    try{
+      if(action==='retire'){
+        try{
+          const value=await request(ticket.key,'retire',{
+            ...item.selector,agent:item.agent,confirm:'retire_unknown_without_resend',require_hold:true
+          });
+          if(!current(ticket))return;
+          if(exact(value,item)&&['retired','already_retired'].includes(value.status)&&value.provider_outcome==='unknown'){
+            results.set(item.id,'cleared');
+            remember(pendingStorage,unconfirmed,HELD_CHAT_UNCONFIRMED,item.id,false);
+            return;
+          }
+        }catch(err){if(!current(ticket))return}
+      }
+      await inspect(ticket,item);
+    }finally{
+      inFlight.delete(item.id);
+      if(current(ticket))active=null;
+      changed();
+    }
+  }
+  function notices(){
+    const now=serverNow(),seen=new Set(),visible=[];
+    if(now===null||stale())return visible;
+    for(const item of items.values()){
+      const result=results.get(item.id);
+      if(item.group!=='held'||!item.episode||!item.notice_due_at||now<item.notice_due_at
+          ||(result&&result!=='still')||seen.has(item.episode)
+          ||remembered(storage,dismissed,HELD_CHAT_DISMISSED,item.episode))continue;
+      seen.add(item.episode);visible.push(item);
+    }
+    return visible;
+  }
+  function dismiss(episode){
+    if(!ownerChanged()||!notices().some(item=>item.episode===episode))return;
+    remember(storage,dismissed,HELD_CHAT_DISMISSED,episode,true);changed();
+  }
+  return {ownerChanged,refresh,act,mode,notices,dismiss,
+    snapshot:()=>({items,results,reading,error,active,stale:stale(),now:serverNow(),inFlight})};
+}
+
+function workspaceHeldChatsDemo(){
+  const start=Date.now()/1000;
+  const item=(number,name,provider,group,extra={})=>{
+    const id=String(number).padStart(12,'0'),selector='00000000-0000-4000-8000-'+id;
+    return {item_id:String(number).padStart(64,'0'),selector:{request_id:selector},
+      agent:(provider==='codex'?'x:':'c:')+selector,provider,name,group,clearable:true,
+      held_since:start-360,episode_id:selector,notice_due_at:start-60,
+      reason:'Its turn ran past 15 minutes, so Motet could not confirm it ended.',...extra};
+  };
+  const rows=[item(1,'Elara','codex','held'),
+    item(2,'Robin','claude','unavailable',{selector:null,agent:null,clearable:false,held_since:null,episode_id:null,
+      reason:HELD_CHAT_UNMATCHED,unavailable_reason:HELD_CHAT_UNMATCHED})];
+  const retired=new Set();
+  return async(_key,action,body)=>{
+    if(action==='held')return {items:rows.filter(row=>!retired.has(row.item_id)),next_cursor:null,checked_at:Date.now()/1000};
+    const row=rows.find(row=>row.selector&&row.selector.request_id===body.request_id);
+    if(!row||body.require_hold!==true)throw Error('Demo row unavailable');
+    if(action==='inspect'){
+      const done=retired.has(row.item_id);
+      return {...row.selector,agent:row.agent,execution:done?'retired':'uncertain',capture:'pending',
+        eligible:!done&&row.clearable};
+    }
+    if(action==='retire'&&body.agent===row.agent&&body.confirm==='retire_unknown_without_resend'){
+      retired.add(row.item_id);
+      return {...row.selector,agent:row.agent,status:'retired',provider_outcome:'unknown'};
+    }
+    throw Error('Demo action unavailable');
+  };
+}
+
+function workspaceHeldChatsOwnerChanged(){
+  const controller=workspaceHeldChatsOwnerChanged.controller;
+  if(!controller)return;
+  controller.ownerChanged();
+}
+function workspaceHeldChatsRefresh(){
+  return workspaceHeldChatsOwnerChanged.controller?.refresh();
+}
+function workspaceHeldChatsFocus(id){
+  return [...$('#workspaceHeldChats').querySelectorAll('[data-held-chat]')].find(row=>row.dataset.heldChat===id);
+}
+function workspaceHeldChatsOpen(id){
+  workspaceOpen(WS.controls,$('#workspaceBell'));
+  workspaceSettingsSelect('connections');
+  const row=workspaceHeldChatsFocus(id);
+  if(row){row.scrollIntoView({block:'nearest'});row.focus({preventScroll:true})}
+  else WS.controls.querySelector('[data-settings=connections]').focus();
+}
+function workspaceHeldChatsSettingsPaint(controller){
+  const host=$('#workspaceHeldChats'),view=controller.snapshot();
+  const previous=document.activeElement,focusId=host.contains(previous)?previous.closest('[data-held-chat]')?.dataset.heldChat:null;
+  const pane=host.parentElement;
+  const rows=[...view.items.values()],list=$('#workspaceHeldRows');
+  $('#workspaceHeldSection').hidden=!rows.length;
+  const status=$('#workspaceHeldStatus'),retry=$('#workspaceHeldRetry');
+  status.hidden=!view.stale&&(!view.reading||view.now!==null);
+  txt(status,view.stale?(rows.length?'Could not refresh these chats. The list may be out of date.':'Could not check chats on hold.'):'Checking chats…');
+  retry.hidden=!view.stale;
+  retry.disabled=view.reading;
+  const existing=new Map([...list.children].map(row=>[row.dataset.heldChat,row]));
+  const wanted=new Set(rows.map(item=>item.id));
+  for(const [id,old] of existing)if(!wanted.has(id))old.remove();
+  for(let position=0;position<rows.length;position++){
+    const item=rows[position],action=controller.mode(item),result=view.results.get(item.id),working=view.active?.id===item.id;
+    const holdTime=item.held_since===null||view.now===null?'Hold time unavailable':
+      'On hold '+Math.max(0,Math.floor((view.now-item.held_since)/60))+' min';
+    const disabled=!!view.active||view.reading||view.stale||view.inFlight.has(item.id);
+    const signature=JSON.stringify([item,action,result,working,holdTime,disabled]);
+    let row=existing.get(item.id);
+    if(!row){
+      row=wncEl('div','workspace-nc-row workspace-held-row');
+      row.dataset.heldChat=item.id;row.tabIndex=-1;
+      row._heldStatus=wncEl('span','workspace-held-result');
+      row._heldStatus.setAttribute('role','status');
+      row.append(row._heldStatus);
+    }
+    row._heldItem=item;
+    if(row._heldSignature!==signature){
+      row._heldSignature=signature;
+      const name=wncEl('div','workspace-held-name');
+      name.append(wncEl('b','',item.name),wncEl('small','',item.provider));
+      const copy=wncEl('span','workspace-held-copy'),detail=wncEl('span','workspace-held-detail');
+      let label=holdTime+' · '+item.reason;
+      let consequence='Clearing lets new messages through. It does not stop '+item.name+', and a late answer to the earlier message is not shown.';
+      let control;
+      if(result&&result!=='still'){
+        const outcome={
+          cleared:['Cleared. '+item.name+' takes new messages again. If its earlier answer arrives, it is not shown.','Cleared'],
+          withheld:['Finished; reply withheld.','Finished'],
+          finished:['Finished.','Finished'],
+          closed:['The state changed. Clearing is unavailable.','Changed']
+        }[result];
+        label=outcome[0];consequence='';
+        control=wncEl('em','workspace-held-action',outcome[1]);
+        if(result==='cleared')control.dataset.status='ready';
+      }else if(action==='unavailable'){
+        const explanation=item.unavailable||HELD_CHAT_UNMATCHED;
+        if(item.reason===explanation)label=holdTime;
+        consequence=explanation+' New messages to '+item.name+' may keep waiting.';
+        control=wncEl('em','workspace-held-action','Can’t clear here');
+      }else{
+        if(action==='inspect')consequence='Motet could not confirm the clear. Check this chat before trying again.';
+        if(result==='still')consequence='This chat was still eligible to clear when Motet checked. '+consequence;
+        control=wncEl('button','workspace-held-action',working?(view.active.action==='inspect'?'Checking…':'Clearing…'):action==='inspect'?'Check status':'Clear');
+        control.type='button';
+        control.disabled=disabled;
+        control.setAttribute('aria-label',(action==='inspect'?'Check status of ':'Clear ')+item.name);
+        control.onclick=()=>controller.act(row._heldItem,action);
+      }
+      detail.textContent=consequence;detail.hidden=!consequence;
+      const status=row._heldStatus;
+      status.classList.toggle('workspace-held-copy',!!result&&result!=='still');
+      status.classList.toggle('workspace-held-empty',!result||result==='still');
+      if(result&&result!=='still'){
+        row.prepend(name);row.append(control);
+        for(const child of [...row.children])if(child!==name&&child!==status&&child!==control)child.remove();
+        status.textContent=label;
+      }else{
+        status.textContent='';
+        copy.append(wncEl('span','',label),detail);
+        row.prepend(name,copy);row.append(control);
+        for(const child of [...row.children])if(child!==name&&child!==copy&&child!==status&&child!==control)child.remove();
+      }
+    }
+    if(list.children[position]!==row)list.insertBefore(row,list.children[position]||null);
+  }
+  if(focusId&&WS.controls.open&&!pane.hidden&&(document.activeElement===document.body||previous.disabled||previous.dataset.heldChat&&previous._heldHadButton)){
+    const row=workspaceHeldChatsFocus(focusId),button=row?.querySelector('button:not(:disabled)');
+    if(row)row._heldHadButton=!!row.querySelector('button');
+    (button||row||WS.controls.querySelector('[data-settings=connections]')).focus({preventScroll:true});
+  }
+}
+function workspaceHeldChatsBellPaint(controller){
+  const list=$('#workspaceBellHeld'),notices=controller?.notices()||[];
+  if(!list)return 0;
+  const wanted=new Set(notices.map(item=>item.episode));
+  for(const row of [...list.children])if(!wanted.has(row.dataset.heldEpisode))row.remove();
+  for(const item of notices){
+    let row=[...list.children].find(node=>node.dataset.heldEpisode===item.episode);
+    if(row)continue;
+    row=wncEl('article','workspace-notification');
+    row.dataset.heldEpisode=item.episode;
+    const main=wncEl('button','workspace-notification-main'),dismiss=wncEl('button','workspace-notification-dismiss','×');
+    main.type=dismiss.type='button';
+    const title=wncEl('span','workspace-notification-title');
+    title.append(wncEl('b','',item.name),wncEl('span','','Chat on hold'),wncEl('time','',clock(item.notice_due_at)));
+    main.append(title,wncEl('span','workspace-notification-detail','On hold 5 min. New messages to it are waiting.'),
+      wncEl('span','workspace-notification-source','Clear it in Settings › Connections'));
+    main.onclick=()=>workspaceHeldChatsOpen(item.id);
+    dismiss.setAttribute('aria-label','Dismiss chat on hold notice');
+    dismiss.onclick=()=>{
+      controller.dismiss(item.episode);
+      if(WS.bell.open&&document.activeElement===document.body)
+        (list.querySelector('button')||WS.bell.querySelector('[data-close]')).focus({preventScroll:true});
+    };
+    row.append(workspaceNotificationMark('possible'),main,dismiss);list.append(row);
+  }
+  return notices.length;
+}
+function workspaceHeldChatsInit(){
+  const demo=DEMO&&new URLSearchParams(location.search).get('heldChats')==='1';
+  const local=['localhost','127.0.0.1'].includes(location.hostname);
+  if(!demo&&(DEMO||!local))return;
+  const request=demo?workspaceHeldChatsDemo():async(key,action,body)=>{
+    const response=await fetch('/bridge-admin/v1/'+action,{method:'POST',cache:'no-store',credentials:'same-origin',
+      headers:{'Content-Type':'application/json','X-Live-Room-Key':key},body:JSON.stringify(body),
+      signal:AbortSignal.timeout(8000)});
+    if(!response.ok)throw Error('Chat hold check unavailable');
+    return response.json();
+  };
+  let pendingStorage=null;
+  if(!demo)try{pendingStorage=sessionStorage}catch(err){}
+  const controller=createWorkspaceHeldChats({
+    owner:()=>demo?'demo':!locked&&!claiming?KEY:null,request,time:()=>performance.now()/1000,
+    storage:demo?null:store,pendingStorage,changed:()=>{
+      workspaceHeldChatsSettingsPaint(controller);
+      workspaceBellPaint(Date.now()/1000);
+    }
+  });
+  workspaceHeldChatsOwnerChanged.controller=controller;
+  $('#workspaceHeldRetry').onclick=workspaceHeldChatsRefresh;
+  addEventListener('storage',event=>{
+    if(event.key===null||event.key?.startsWith(HELD_CHAT_DISMISSED))workspaceBellPaint(Date.now()/1000);
+  });
+  if(demo)workspaceHeldChatsRefresh();
+  else{
+    setInterval(()=>{if(!document.hidden)workspaceHeldChatsRefresh()},15000);
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden)workspaceHeldChatsRefresh()});
+  }
+}
+/* end owner-only chats on hold */
+
 function workspaceBellPaint(now){if(!WS.bell)return;const previousFocus=document.activeElement,notificationFocus=WS.bell.contains(previousFocus),requests=order.map(id=>({id,n:need(A[id])})).filter(x=>x.n),alerts=ALERTS.filter(x=>order.includes(x.id)&&activeAlert(x,now,600)).slice(0,4),sure=requests.filter(x=>x.n.sure).length,possible=requests.length-sure;
-  $('#workspaceBellCount').hidden=!requests.length&&!alerts.length;$('#workspaceBellEmpty').hidden=!!(requests.length||alerts.length||ALERTS.some(x=>A[x.id]&&activeAlert(x,now,1800)));$('#workspaceBell').setAttribute('aria-label','Notifications: '+sure+' confirmed, '+possible+' possible requests; '+alerts.length+' recent alerts');const list=$('#workspaceBellNeeds'),wanted=new Set(requests.map(x=>x.id));for(const el of [...list.children])if(!wanted.has(el.dataset.agent))el.remove();for(const {id,n} of requests){let row=[...list.children].find(x=>x.dataset.agent===id);const sig=[A[id].name,n.source,n.kind,n.sure,STEADY?'':n.text,workspaceRequestTime(A[id],n)].join('|');if(row&&row._sig===sig)continue;const next=workspaceRequestRow(id,n);next._sig=sig;if(row)row.replaceWith(next);else list.append(next)}
+  const held=workspaceHeldChatsBellPaint(workspaceHeldChatsOwnerChanged.controller);
+  $('#workspaceBellCount').hidden=!requests.length&&!alerts.length&&!held;$('#workspaceBellEmpty').hidden=!!(requests.length||alerts.length||held||ALERTS.some(x=>A[x.id]&&activeAlert(x,now,1800)));$('#workspaceBell').setAttribute('aria-label','Notifications: '+sure+' confirmed, '+possible+' possible requests; '+alerts.length+' recent alerts'+(held?'; '+held+(held===1?' chat on hold':' chats on hold'):''));const list=$('#workspaceBellNeeds'),wanted=new Set(requests.map(x=>x.id));for(const el of [...list.children])if(!wanted.has(el.dataset.agent))el.remove();for(const {id,n} of requests){let row=[...list.children].find(x=>x.dataset.agent===id);const sig=[A[id].name,n.source,n.kind,n.sure,STEADY?'':n.text,workspaceRequestTime(A[id],n)].join('|');if(row&&row._sig===sig)continue;const next=workspaceRequestRow(id,n);next._sig=sig;if(row)row.replaceWith(next);else list.append(next)}
   const rendered=new Set(ALERTS.filter(x=>A[x.id]&&order.includes(x.id)&&activeAlert(x,now,600)).slice(0,4).map(x=>x.n)),earlier=ALERTS.filter(x=>A[x.id]&&activeAlert(x,now,1800)).slice(0,3).filter(x=>!rendered.has(x.n)),history=$('#workspaceBellEarlier');if(history){history.hidden=!earlier.length;put($('#workspaceBellEarlierItems'),earlier.map(al=>alertMarkup(al)).join(''))}const emptyAlerts=$('#workspaceSettingsAlertEmpty');if(emptyAlerts)emptyAlerts.hidden=!!(alerts.length||earlier.length);
   if(typeof workspaceSettingsAlertsPaint==='function')workspaceSettingsAlertsPaint(now);
   if(notificationFocus&&document.activeElement===document.body){const replacement=[...list.children].find(row=>row.dataset.agent===previousFocus.dataset?.requestAgent)?.querySelector('[data-request-agent]');(replacement||WS.bell.querySelector('[data-close]'))?.focus({preventScroll:true})}
@@ -8096,7 +8473,7 @@ function workspaceSettingsMount(){const idle=$('#workspaceAutoDismiss');WS.idleH
 function workspaceMemoryDetach(){if(!WS.memory)return;WS.memory=false;DECK.token++;DECK.readEpoch++;DECK.loadToken++;if(DECK.mode==='settings')DECK.mode=null;$('#deckSettingsPane').hidden=true;workspaceSettingsRestore($('#deckSettingsPane'));$('#deckOpen').hidden=false;$('#deckOpen').setAttribute('aria-expanded','false');$('#workspaceMemoryState').hidden=true;$('#workspaceMemoryRetry').hidden=true;$('#workspaceMemoryIntro').hidden=false;WS.memoryLoadError=null}
 function workspaceSettingsLeaveModel(){if(!WS.model)return;officerModelClose(false);OMODEL.token++;OMODEL.loading=false;WS.model=false;for(const [name,saved] of Object.entries(WS.modelStyle||{})){if(saved.value)$('#ofModelMenu').style.setProperty(name,saved.value,saved.priority);else $('#ofModelMenu').style.removeProperty(name)}WS.modelStyle=null;workspaceSettingsRestore($('#ofModelPicker'));officerModelPaint();if(typeof workspaceOfficerPaint==='function')workspaceOfficerPaint()}
 function workspaceSettingsUnmount(){if(WS.idleHidden!==undefined){$('#workspaceAutoDismiss').hidden=WS.idleHidden;delete WS.idleHidden}if(WS.watchRulesOpen!==undefined){$('#watchRules').open=WS.watchRulesOpen;delete WS.watchRulesOpen}if(WS.settingLabels){txt($('#help'),WS.settingLabels.help);txt($('#deckOpen'),WS.settingLabels.memory);WS.settingLabels=null}workspaceMemoryDetach();workspaceSettingsLeaveModel();if(!$('#watchP').hidden)watchOpen(false);for(const id of ['#hint','#needs','#workspaceBellEarlier','#workspaceBellAlerts','#deskAntigravityConnect','#claudeSetup','#deckOpen','#watchW','#roomTheme','#helpW','#appr','#notify'])workspaceSettingsRestore($(id));WS.section=null;responseInvalidate()}
-function workspaceSettingsSelect(section){if(!['general','rules','officer','connections','alerts'].includes(section))return;if(WS.section!==section){if(WS.section==='rules'&&WS.watchRulesOpen!==undefined)$('#watchRules').open=WS.watchRulesOpen;workspaceMemoryDetach();workspaceSettingsLeaveModel();if(!$('#watchP').hidden&&section!=='rules')watchOpen(false)}WS.section=section;if(section==='rules')$('#watchRules').open=true;for(const b of WS.controls.querySelectorAll('[data-settings]'))b.setAttribute('aria-current',String(b.dataset.settings===section));for(const p of WS.controls.querySelectorAll('[data-settings-pane]'))p.hidden=p.dataset.settingsPane!==section;if(section==='officer'&&typeof workspaceSettingsStatus==='function')workspaceSettingsStatus();if(section==='officer'&&!WS.model){workspaceSettingsMove($('#ofModelPicker'),$('#workspaceSettingsModel'));WS.model=true;WS.modelStyle=Object.fromEntries(['top','bottom','max-height'].map(name=>[name,{value:$('#ofModelMenu').style.getPropertyValue(name),priority:$('#ofModelMenu').style.getPropertyPriority(name)}]));for(const name of ['top','bottom','max-height'])$('#ofModelMenu').style.removeProperty(name);officerModelPaint()}if(section==='connections'){if(typeof workspaceNewChatSettingsPaint==='function')workspaceNewChatSettingsPaint(true);const a=focus&&A[focus],eligible=!!(a&&cuClaudeEligible(cuTarget(),a,OFUI.recipient==='agent'));txt($('#workspaceConnectionState'),eligible?'Claude connection for the current chat.':a?'Connection controls are available for an eligible current chat.':'Choose an eligible chat at its desk to manage its connection.');$('#deskAntigravityConnect').hidden=!(a&&!a.observed&&a.runtime==='Antigravity'&&String(a.id).startsWith('a:'))}responseInvalidate()}
+function workspaceSettingsSelect(section){if(!['general','rules','officer','connections','alerts'].includes(section))return;if(WS.section!==section){if(WS.section==='rules'&&WS.watchRulesOpen!==undefined)$('#watchRules').open=WS.watchRulesOpen;workspaceMemoryDetach();workspaceSettingsLeaveModel();if(!$('#watchP').hidden&&section!=='rules')watchOpen(false)}WS.section=section;if(section==='rules')$('#watchRules').open=true;for(const b of WS.controls.querySelectorAll('[data-settings]'))b.setAttribute('aria-current',String(b.dataset.settings===section));for(const p of WS.controls.querySelectorAll('[data-settings-pane]'))p.hidden=p.dataset.settingsPane!==section;if(section==='officer'&&typeof workspaceSettingsStatus==='function')workspaceSettingsStatus();if(section==='officer'&&!WS.model){workspaceSettingsMove($('#ofModelPicker'),$('#workspaceSettingsModel'));WS.model=true;WS.modelStyle=Object.fromEntries(['top','bottom','max-height'].map(name=>[name,{value:$('#ofModelMenu').style.getPropertyValue(name),priority:$('#ofModelMenu').style.getPropertyPriority(name)}]));for(const name of ['top','bottom','max-height'])$('#ofModelMenu').style.removeProperty(name);officerModelPaint()}if(section==='connections'){if(typeof workspaceHeldChatsRefresh==='function')workspaceHeldChatsRefresh();if(typeof workspaceNewChatSettingsPaint==='function')workspaceNewChatSettingsPaint(true);const a=focus&&A[focus],eligible=!!(a&&cuClaudeEligible(cuTarget(),a,OFUI.recipient==='agent'));txt($('#workspaceConnectionState'),eligible?'Claude connection for the current chat.':a?'Connection controls are available for an eligible current chat.':'Choose an eligible chat at its desk to manage its connection.');$('#deskAntigravityConnect').hidden=!(a&&!a.observed&&a.runtime==='Antigravity'&&String(a.id).startsWith('a:'))}responseInvalidate()}
 async function workspaceMemoryActivate(){if(!WORKSPACE||!WS.controls?.open||WS.section!=='officer')return;if(locked||claiming){$('#workspaceMemoryState').hidden=false;txt($('#workspaceMemoryState'),'Unlock Motet to manage memory.');return}if(!WS.memory){WS.memory=true;workspaceSettingsMove($('#deckSettingsPane'),$('#workspaceMemoryHost'));DECK.token++;DECK.readEpoch++;DECK.loadToken++;DECK.mode='settings';$('#deckOpen').hidden=true;$('#deckOpen').setAttribute('aria-expanded','true')}const epoch=DECK.readEpoch;$('#deckSettingsPane').hidden=true;$('#workspaceMemoryRetry').hidden=true;$('#workspaceMemoryState').hidden=false;$('#workspaceMemoryState').tabIndex=-1;txt($('#workspaceMemoryState'),'Loading memory settings…');$('#workspaceMemoryState').focus({preventScroll:true});const ok=await deckLoad();if(!WS.memory||DECK.readEpoch!==epoch||!WS.controls.open||WS.section!=='officer')return;const restore=document.activeElement===$('#workspaceMemoryState'),message=$('#deckNotice').textContent||'Memory settings could not be loaded.';if(ok&&WS.memoryLoadError&&$('#deckNotice').textContent===WS.memoryLoadError&&!DECK.pending)txt($('#deckNotice'),'');WS.memoryLoadError=ok?null:message;$('#deckSettingsPane').hidden=!ok;$('#workspaceMemoryIntro').hidden=!!ok;$('#workspaceMemoryRetry').hidden=!!ok;txt($('#workspaceMemoryState'),ok?'':message);$('#workspaceMemoryState').hidden=!!ok;if(restore){const next=ok?[...$('#deckSettingsPane').querySelectorAll('button,input,select,summary')].find(el=>!el.disabled&&el.getClientRects().length):$('#workspaceMemoryRetry');next?.focus({preventScroll:true})}}
 function workspaceMemoryResume(ready){WS.memory=true;workspaceSettingsMove($('#deckSettingsPane'),$('#workspaceMemoryHost'));DECK.mode='settings';$('#deckOpen').hidden=true;$('#deckOpen').setAttribute('aria-expanded','true');$('#deckSettingsPane').hidden=!ready;$('#workspaceMemoryIntro').hidden=ready;$('#workspaceMemoryRetry').hidden=ready;$('#workspaceMemoryState').hidden=ready;if(!ready)txt($('#workspaceMemoryState'),'Memory settings were not loaded. Retry.')}
 function workspaceSettingsSubflow(section,origin=document.activeElement){WS.subflow={section,origin,scroll:$('#workspaceControlsBody').scrollTop,memory:!!WS.memory,memoryReady:!!WS.memory&&!$('#deckSettingsPane').hidden};workspaceClose(true)}
@@ -8106,13 +8483,13 @@ function workspaceInit(){
   const top=document.createElement('div');top.id='workspaceTop';top.innerHTML='<button id="workspaceNav" type="button" aria-haspopup="dialog" aria-label="Agents" title="Agents"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></button><div id="workspaceHeading"><b id="workspaceTitle">The stage</b><span id="workspaceCounts"></span></div><button id="workspaceClear" type="button" aria-label="Clear project filter" title="Show every project" hidden>×</button><span id="workspaceDismissals"></span><button id="workspaceReset" type="button">Reset view</button><button id="workspaceBell" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="workspaceBellDialog" aria-label="Notifications" title="Recorded requests and alerts"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4zM10 20a2 2 0 0 0 4 0"/></svg><i id="workspaceBellCount" aria-hidden="true" hidden></i></button><button id="workspaceControls" type="button" aria-haspopup="dialog" aria-label="Stage controls" title="Stage controls"><svg aria-hidden="true" viewBox="0 0 16 16"><g transform="scale(.6667)" stroke-width="2.25"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></g></svg></button>';
   const side=document.createElement('aside');side.id='workspaceSide';side.setAttribute('aria-label','Agents');side.innerHTML='<div class="workspace-brand-row"><img src="/static/watch-lookout-lockup.svg?v=motet2" alt="Motet"><span id="workspaceHealth" class="workspace-health"></span></div><button type="button" class="workspace-grid" data-room><span class="workspace-leading" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m4 7 8-4 8 4v10l-8 4-8-4zm0 0 8 4 8-4M12 11v10"/></svg></span><span class="workspace-label">The stage</span></button><button type="button" class="workspace-grid" data-officer><span class="workspace-leading" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15 9-2 4-4 2 2-4z"/></svg></span><span class="workspace-label">Motet</span></button><div id="workspaceProjects"></div>';
   const nav=document.createElement('dialog');nav.id='workspaceNavDialog';nav.className='workspace-dialog';nav.setAttribute('aria-label','Agents');nav.innerHTML='<header><h2>Agents</h2><button type="button" data-close>Close</button></header><div id="workspaceNavBody"></div>';
-  const bell=document.createElement('dialog');bell.id='workspaceBellDialog';bell.className='workspace-bell';bell.setAttribute('aria-label','Notifications');bell.setAttribute('aria-modal','false');bell.innerHTML='<header><h2>Notifications</h2><button type="button" id="workspaceAllAlerts">All alerts</button><button type="button" data-close>Close</button></header><div id="workspaceBellNeeds"></div><div id="workspaceBellAlerts"></div><section id="workspaceBellEarlier" hidden><h3>Recent alerts · 30 minutes</h3><div id="workspaceBellEarlierItems"></div></section><p id="workspaceBellEmpty">No recorded requests or alerts here.</p><div id="workspaceBellFooter"><p>An app may be asking something that is not recorded.</p></div>';
+  const bell=document.createElement('dialog');bell.id='workspaceBellDialog';bell.className='workspace-bell';bell.setAttribute('aria-label','Notifications');bell.setAttribute('aria-modal','false');bell.innerHTML='<header><h2>Notifications</h2><button type="button" id="workspaceAllAlerts">All alerts</button><button type="button" data-close>Close</button></header><div id="workspaceBellHeld"></div><div id="workspaceBellNeeds"></div><div id="workspaceBellAlerts"></div><section id="workspaceBellEarlier" hidden><h3>Recent alerts · 30 minutes</h3><div id="workspaceBellEarlierItems"></div></section><p id="workspaceBellEmpty">No recorded requests or alerts here.</p><div id="workspaceBellFooter"><p>An app may be asking something that is not recorded.</p></div>';
   const nativeObserved=document.createElement('small');nativeObserved.id='workspaceNativeObserved';nativeObserved.hidden=true;$('#nativeCard header').insertBefore(nativeObserved,$('#nativeRefresh'));
   const panelBack=document.createElement('button');panelBack.id='workspacePanelBack';panelBack.type='button';panelBack.hidden=true;panelBack.textContent='Back to Documents';panelBack.onclick=workspaceDocumentsBack;const panelActions=document.createElement('div');panelActions.id='workspacePanelBodyActions';panelActions.hidden=true;panelActions.append(panelBack);$('#deskWorkContent').prepend(panelActions);const panels=document.createElement('nav');panels.id='workspacePanels';panels.setAttribute('aria-label','Evidence panels');for(const [key,label] of [['changes','Changes'],['browser','Browser'],['documents','Documents'],['terminal','Terminal']]){const b=document.createElement('button');b.type='button';b.dataset.panel=key;const icons={changes:'<path d="M12 3v12m-5-5h10M5 20h14"/>',browser:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>',documents:'<path d="M6 3h8l4 4v14H6zM14 3v5h4"/>',terminal:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3m5 0h5"/>'};b.innerHTML='<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'+icons[key]+'</svg><span></span>';txt(b.querySelector('span'),label);b.setAttribute('aria-label',label);b.title=label;b.setAttribute('aria-pressed','false');b.onclick=()=>workspacePanelToggle(key,b);panels.append(b)}const changesCount=document.createElement('small');changesCount.className='workspace-changes-count';changesCount.setAttribute('aria-hidden','true');panels.querySelector('[data-panel=changes]').append(changesCount);top.insertBefore(panels,top.querySelector('#workspaceBell'));const panelContent=document.createElement('section');panelContent.id='workspacePanelEvidence';panelContent.tabIndex=0;panelContent.hidden=true;$('#deskWorkContent').append(panelContent);
   const overview=document.createElement('button');overview.id='workspaceOverview';overview.type='button';overview.innerHTML='<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h16M4 12h16M4 18h16"/></svg>';overview.setAttribute('aria-label','Overview');overview.title='Overview';overview.setAttribute('aria-controls','deskFacts');overview.onclick=()=>workspaceOverviewToggle();top.insertBefore(overview,top.querySelector('#workspaceBell'));
   const menu=document.createElement('dialog');menu.id='workspaceAgentMenu';menu.className='workspace-bell';menu.setAttribute('aria-label','Agent actions');menu.setAttribute('aria-modal','false');
   const backdrop=document.createElement('div');backdrop.id='workspaceDeskBackdrop';document.body.append(backdrop);
-  const controls=document.createElement('dialog');controls.id='workspaceControlsDialog';controls.className='workspace-dialog';controls.setAttribute('aria-label','Settings');controls.innerHTML='<header><h2>Settings</h2><button type="button" data-close aria-label="Close Settings" title="Close Settings">×</button></header><div class="workspace-settings-grid"><nav aria-label="Settings sections"><button type="button" data-settings="general">General</button><button type="button" data-settings="rules">Watch rules</button><button type="button" data-settings="officer">Motet</button><button type="button" data-settings="connections">Connections</button><button type="button" data-settings="alerts">Alerts</button></nav><div id="workspaceControlsBody"><section data-settings-pane="general"><h3>General</h3><div id="workspaceSettingsGeneral"><div class="workspace-setting-row"><div><b>Connection</b></div><p class="workspace-health"></p></div><div class="workspace-setting-row"><div><b>Notify me</b><p id="workspaceNotifyDescription"></p></div><div id="workspaceNotifySlot"></div></div><div class="workspace-setting-row"><div><b>Answer prompts here</b><p id="workspaceAnswerDescription"></p></div><div id="workspaceAnswerSlot"></div></div><div class="workspace-setting-row"><div><label for="workspaceAutoDismiss">Dismiss idle agents automatically</label><p>Only after a recorded turn end; pinned and waiting agents stay.</p></div><select id="workspaceAutoDismiss"><option value="0">Never</option><option value="5">5 min</option><option value="10">10 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></div><div class="workspace-setting-row"><div><b>Theme</b></div><div id="workspaceThemeSlot"></div></div><div class="workspace-setting-row"><div><b>Gestures and keys</b><div id="workspaceHelpDescription"></div></div><div id="workspaceHelpSlot"></div></div></div></section><section data-settings-pane="rules" hidden><h3>Watch rules</h3><p>Rules decide what the stage flags. They never stop an agent.</p><div id="workspaceSettingsRules"></div></section><section data-settings-pane="officer" hidden><h3>Motet</h3><div class="workspace-setting-row"><div><b>Availability</b><p>This is Motet’s reported status, not a connection check.</p></div><span id="workspaceOfficerStatus"></span></div><div class="workspace-setting-row"><div><b>Model</b><p>Applies to the next Motet question.</p></div><div id="workspaceSettingsModel"></div></div><div class="workspace-setting-row"><div><b>Memory</b><p id="workspaceMemoryIntro">Keep saved activity available to Motet. Earlier activity is not imported.</p></div><div id="workspaceSettingsMemory"></div></div><p id="workspaceMemoryState" role="status" hidden></p><button type="button" id="workspaceMemoryRetry" hidden>Retry</button><div id="workspaceMemoryHost"></div></section><section data-settings-pane="connections" hidden><h3>Connections</h3><p id="workspaceConnectionState"></p><div id="workspaceSettingsConnections"></div></section><section data-settings-pane="alerts" hidden><h3>Alerts</h3><p id="workspaceSettingsAlertEmpty">No recent alert.</p><p>Pattern matching can miss things.</p><div id="workspaceSettingsAlerts"></div></section></div></div>';
+  const controls=document.createElement('dialog');controls.id='workspaceControlsDialog';controls.className='workspace-dialog';controls.setAttribute('aria-label','Settings');controls.innerHTML='<header><h2>Settings</h2><button type="button" data-close aria-label="Close Settings" title="Close Settings">×</button></header><div class="workspace-settings-grid"><nav aria-label="Settings sections"><button type="button" data-settings="general">General</button><button type="button" data-settings="rules">Watch rules</button><button type="button" data-settings="officer">Motet</button><button type="button" data-settings="connections">Connections</button><button type="button" data-settings="alerts">Alerts</button></nav><div id="workspaceControlsBody"><section data-settings-pane="general"><h3>General</h3><div id="workspaceSettingsGeneral"><div class="workspace-setting-row"><div><b>Connection</b></div><p class="workspace-health"></p></div><div class="workspace-setting-row"><div><b>Notify me</b><p id="workspaceNotifyDescription"></p></div><div id="workspaceNotifySlot"></div></div><div class="workspace-setting-row"><div><b>Answer prompts here</b><p id="workspaceAnswerDescription"></p></div><div id="workspaceAnswerSlot"></div></div><div class="workspace-setting-row"><div><label for="workspaceAutoDismiss">Dismiss idle agents automatically</label><p>Only after a recorded turn end; pinned and waiting agents stay.</p></div><select id="workspaceAutoDismiss"><option value="0">Never</option><option value="5">5 min</option><option value="10">10 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></div><div class="workspace-setting-row"><div><b>Theme</b></div><div id="workspaceThemeSlot"></div></div><div class="workspace-setting-row"><div><b>Gestures and keys</b><div id="workspaceHelpDescription"></div></div><div id="workspaceHelpSlot"></div></div></div></section><section data-settings-pane="rules" hidden><h3>Watch rules</h3><p>Rules decide what the stage flags. They never stop an agent.</p><div id="workspaceSettingsRules"></div></section><section data-settings-pane="officer" hidden><h3>Motet</h3><div class="workspace-setting-row"><div><b>Availability</b><p>This is Motet’s reported status, not a connection check.</p></div><span id="workspaceOfficerStatus"></span></div><div class="workspace-setting-row"><div><b>Model</b><p>Applies to the next Motet question.</p></div><div id="workspaceSettingsModel"></div></div><div class="workspace-setting-row"><div><b>Memory</b><p id="workspaceMemoryIntro">Keep saved activity available to Motet. Earlier activity is not imported.</p></div><div id="workspaceSettingsMemory"></div></div><p id="workspaceMemoryState" role="status" hidden></p><button type="button" id="workspaceMemoryRetry" hidden>Retry</button><div id="workspaceMemoryHost"></div></section><section data-settings-pane="connections" hidden><h3>Connections</h3><p id="workspaceConnectionState"></p><div id="workspaceHeldChats"><p id="workspaceHeldStatus" role="status" hidden></p><button type="button" id="workspaceHeldRetry" hidden>Refresh chats</button><section id="workspaceHeldSection" aria-labelledby="workspaceHeldTitle" hidden><h4 id="workspaceHeldTitle">Chats on hold</h4><p>Motet sent these chats a message and could not confirm the reply. New messages to a chat wait until it is cleared.</p><div id="workspaceHeldRows"></div></section></div><div id="workspaceSettingsConnections"></div></section><section data-settings-pane="alerts" hidden><h3>Alerts</h3><p id="workspaceSettingsAlertEmpty">No recent alert.</p><p>Pattern matching can miss things.</p><div id="workspaceSettingsAlerts"></div></section></div></div>';
   const idleSelect=controls.querySelector('#workspaceAutoDismiss');idleSelect.value=String(idleMinutes);idleSelect.onchange=()=>{const n=Number(idleSelect.value);idleMinutes=IDLE_CHOICES.includes(n)?n:0;try{store.setItem('liveRoomAutoDismiss',String(idleMinutes))}catch(err){}};
   const idleChoices=document.createElement('div');idleChoices.id='workspaceIdleChoices';idleChoices.setAttribute('role','group');idleChoices.setAttribute('aria-label','Dismiss idle agents automatically');for(const option of idleSelect.options){const b=document.createElement('button');b.type='button';b.textContent=option.textContent;b.dataset.value=option.value;b.onclick=()=>{idleSelect.value=b.dataset.value;idleSelect.dispatchEvent(new Event('change',{bubbles:true}));paintIdleChoices()};idleChoices.append(b)}const paintIdleChoices=()=>{for(const b of idleChoices.children){b.disabled=idleSelect.disabled;b.setAttribute('aria-pressed',String(b.dataset.value===idleSelect.value))}};idleSelect.addEventListener('change',paintIdleChoices);idleSelect.after(idleChoices);paintIdleChoices();
   const tryLabel=document.createElement('label');tryLabel.className='workspace-watch-try-label';tryLabel.htmlFor='watchTry';tryLabel.textContent='Try one';$('#watchTry').before(tryLabel);
@@ -8151,6 +8528,7 @@ function workspaceInit(){
   controls.addEventListener('click',e=>{if(e.target.closest('#deckOpen')){e.preventDefault();e.stopImmediatePropagation();workspaceMemoryActivate()}else if(e.target.closest('#deskAntigravityConnect')){e.preventDefault();e.stopImmediatePropagation();workspaceSettingsSubflow('connections',e.target.closest('#deskAntigravityConnect'));agDialogShow($('#workspaceControls'))}},true);
   $('#workspaceMemoryRetry').onclick=workspaceMemoryActivate;
   if(typeof ResizeObserver!=='undefined'){const observer=new ResizeObserver(()=>{if(!WORKSPACE||focus)return;workspacePlaceBell();const r=room.getBoundingClientRect(),sig=[r.left,r.top,r.width,r.height].join('|');if(sig!==WS.lastSize){WS.lastSize=sig;apply()}});observer.observe(room)}
+  workspaceHeldChatsInit();
 }
 if(WORKSPACE)workspaceInit();
 /* end workspace shell helpers */

@@ -86,6 +86,8 @@ Peer capacity remains separate from Motet's reserved capacity. Limits allow up t
 
 Native request results and history can include validated progress facts with ISO times and their zones, plus elapsed time in plain words. “Start observed” and “no end observed” describe evidence, not a promise that work continues. If a start is recorded without a timestamp, the wording is “Start recorded; start time unavailable.” The structured `last_checked_at` field records a log-read observation, not a sign of life; progress summaries omit it. If a start is much older than the task should take, tell the owner, who can clear a request whose turn has stopped. A turn that died without an observable end can remain open until the owner clears it. Progress never proves that an answer was captured, and does not extend the unchanged 24-hour content retention.
 
+An exactly identified turn can finish even when its reply cannot be trusted. Such a request releases its recipient's reservation and reports **“Finished; reply withheld”** with progress phase `ended`. Its compatible request state can remain `unknown`, and its reply stays empty. This records an observed end, not task success. It is distinct from an unresolved hold or an owner-cleared request: do not clear or resend it merely because the state says `unknown`. Missing end times remain unavailable rather than being invented. A transcript gap, an idle app or elapsed time alone does not establish completion.
+
 
 ### Resumed Codex chats
 
