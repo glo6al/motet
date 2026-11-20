@@ -366,13 +366,15 @@ def blockers(db, agent, *, excluding=None):
     return [r for r in rows if r[0] != excluding]
 
 
-def capacity_error(db, agent, now, ttl):
+def capacity_error(db, agent, now, ttl, *, describe_recipient=None):
     # Dispatch deadlines are applied by the worker. Capacity comes only from
     # durable reservations and their verified terminal states for this recipient.
     # Only recent admissions consume the shared four-slot dispatch window.
     blocked = db.execute("SELECT request_id,execution FROM peer_execution WHERE agent=? AND execution NOT IN ('completed','dropped','retired') ORDER BY created LIMIT 1", (agent,)).fetchone()
     if blocked:
         tid, state = blocked
+        if describe_recipient is not None:
+            return describe_recipient(tid, state)
         if state == 'uncertain':
             return 'Earlier delivery requires recovery for this recipient (' + tid + '). The new request was not accepted; nothing was resent.'
         return 'This recipient has an active request (' + tid + '). The new request was not accepted.'

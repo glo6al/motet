@@ -15,6 +15,7 @@ import json
 import math
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import peer_lifecycle
 
@@ -115,6 +116,100 @@ def _snapshot(db, transport_id):
 def load(db, transport_id):
     """Read one exact shared v2 peer's versioned facts without writing."""
     return dict(_snapshot(db, transport_id)[-1])
+
+
+def _iso(value):
+    if value is None:
+        return None
+    return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=value)).isoformat(timespec='seconds')
+
+
+def _when(value, now):
+    stamp = _iso(value)
+    if not _timestamp(now) or now < value:
+        return stamp
+    seconds = int(now - value)
+    for size, unit in ((86400, 'day'), (3600, 'hour'), (60, 'minute'), (1, 'second')):
+        if seconds >= size:
+            count = seconds // size
+            return f"{stamp} ({count} {unit}{'s' if count != 1 else ''} ago)"
+    return stamp + ' (just now)'
+
+
+def public_progress(db, transport_id, *, target, created, row, expired, now):
+    """Project exact shared evidence into a bounded, metadata-only public view."""
+    agent, admission_created, launched, execution, capture, _, evidence, dates = _snapshot(db, transport_id)
+    provider = 'codex' if agent.startswith('x:') else 'claude'
+    if (agent, admission_created, provider) != (target.get('agent_id'), created, target.get('provider')):
+        raise ProgressError('Peer progress target does not match its admission.')
+    if row is not None and row.get('identity_revision') != target.get('identity_revision'):
+        raise ProgressError('Peer progress target revision does not match its transport.')
+    turn = 'bound_turn' if provider == 'codex' else 'mod_turn'
+    if execution in ('running', 'completed') or evidence.get(turn) not in (None, ''):
+        keys = _binding_fields(agent, 'started', evidence)
+        _check_binding(keys, evidence, {key: evidence.get(key) for key in keys})
+        if row is not None and any(row.get(key) != evidence.get(key) for key in keys):
+            raise ProgressError('Peer progress turn does not match its transport.')
+    if execution in ('submitted', 'running', 'completed', 'retired') and (launched is None or evidence.get('launched') is not True):
+        raise ProgressError('Peer progress requires the original dispatch evidence.')
+
+    dates = {key: dates[key] for key in _FIELDS.values()}
+    if provider == 'claude':
+        dates['last_checked_at'] = None
+    started = dates['started_at']
+    ended = dates['ended_at']
+    checked = dates['last_checked_at']
+    reason = None
+    if execution == 'retired':
+        phase, summary = 'retired', 'The owner retired this request. The provider outcome is unknown.'
+    elif execution == 'dropped':
+        phase = 'not_sent'
+        summary = 'Not sent.' if launched is None else 'The provider reported that the request did not start.'
+    elif execution == 'completed':
+        phase = 'ended'
+        summary = f'End observed at {_when(ended, now)}.' if ended is not None else 'End recorded; end time unavailable.'
+        if capture == 'withheld':
+            summary += ' Reply withheld.'
+        elif (expired or row is None or capture == 'unusable'
+              or row.get('state') == 'unknown' and row.get('tracking_stopped')):
+            summary += ' Reply unavailable.'
+        elif capture == 'pending':
+            summary += ' Reply verification is pending.'
+    elif (expired or row is None) and execution != 'running':
+        phase = 'unavailable'
+        summary = ('The request is past the content retention window. No end was verified.' if expired else
+                   'The request record is unavailable. No end was verified.')
+    elif execution == 'uncertain' or row is not None and (row.get('state') in ('unknown', 'expired') or row.get('tracking_stopped')):
+        phase = 'held'
+        reason = 'Delivery or completion could not be verified. Recipient recovery is required.'
+        summary = reason
+    elif execution == 'running':
+        phase = 'started'
+        summary = (f'Start observed at {_when(started, now)}.' if started is not None else
+                   'Start recorded; start time unavailable.')
+        summary += ' No end observed yet.'
+        if checked is not None:
+            summary += f' Motet last read its log at {_when(checked, now)}.'
+        if expired:
+            summary += ' The request is past the content retention window.'
+        elif row is None:
+            summary += ' The request record is unavailable.'
+    elif execution == 'submitted' and dates['accepted_at'] is not None:
+        phase = 'accepted'
+        summary = f'Native acceptance observed at {_when(dates["accepted_at"], now)}. Start not observed.'
+    elif execution == 'submitted' and provider == 'claude':
+        keys = _binding_fields(agent, 'claim_issued', evidence)
+        _check_binding(keys, evidence, {key: row.get(key) for key in keys})
+        phase = 'claim_issued'
+        issued = dates['claim_issued_at']
+        summary = (f'Claude claim issued at {_when(issued, now)}.' if issued is not None else 'Claude claim issued.')
+        summary += ' Native submission unconfirmed.'
+    elif execution == 'reserved' and launched is None:
+        phase, summary = 'waiting_dispatch', 'Waiting for dispatch.'
+    else:
+        phase, summary = 'unavailable', 'Dispatch recorded. Native acceptance is unconfirmed.'
+    return {'version': _VERSION, 'provider': provider, 'phase': phase,
+            **{key: _iso(value) for key, value in dates.items()}, 'summary': summary, 'held_reason': reason}
 
 
 def _require_transaction(db):

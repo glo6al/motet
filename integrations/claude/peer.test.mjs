@@ -15,6 +15,11 @@ const here=path.dirname(new URL(import.meta.url).pathname),script=process.env.WA
 const {PeerClient}=await import(new URL(script,'file://').href);
 const hash=v=>createHash('sha256').update(v).digest('hex');
 const hmac=(secret,lines)=>createHmac('sha256',Buffer.from(secret,'hex')).update(lines.join('\n')).digest('hex');
+const startedAt='2024-02-29T23:59:59.123456+00:00',acceptedAt='2024-03-01T00:00:00+00:00';
+function observedProgress(provider='codex'){
+ return {version:1,provider,phase:'started',claim_issued_at:null,accepted_at:acceptedAt,started_at:startedAt,
+   last_checked_at:provider==='codex'?acceptedAt:null,ended_at:null,summary:'Start observed. No end observed. Café 😀',held_reason:null};
+}
 async function readRequestText(req){
  const chunks=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
  return Buffer.concat(chunks).toString('utf8');
@@ -35,6 +40,8 @@ async function fixture(){
  const credential={version:2,credential_id:randomUUID(),secret:'a'.repeat(64),port:1};
  const file=path.join(config,credential.credential_id+'.json');
  const native=randomUUID(),agent='x:'+native,target={agent_id:agent,name:'Worker',provider:'codex',project_id:'c'.repeat(64),project_label:'Example / Project',identity_revision:'d'.repeat(64)};
+ const busyRequestId=randomUUID();
+ const busyReason=`Busy with request ${busyRequestId}. Start observed 2024-02-29T23:59:59+00:00 (5 hours ago); no end observed. Last checked 2024-03-01T00:00:00+00:00 (4 hours ago). The new request was not accepted; nothing was resent. Check the earlier request at a meaningful task checkpoint.`;
  let mode='normal';const seen=[],run=randomUUID(),sockets=new Set();
  const server=http.createServer(async(req,res)=>{
   const raw=await readRequestText(req);seen.push({path:req.url,raw,headers:req.headers,socket:req.socket});
@@ -49,15 +56,16 @@ async function fixture(){
   if(mode==='hang-rpc')return;
   if(mode==='loss'){req.socket.destroy();return}
   const record={origin:'peer',request_id:mode==='mismatched'?randomUUID():p.params.request_id,agent_id:p.params.agent_id||agent,state:'queued',reply:'<untrusted>',error:'',created_at:Date.now()/1000,target:{...target,agent_id:p.params.agent_id||agent},duplicate:false,text_preview:'Please inspect',secret:'SHOULD NOT DISPLAY'};
+  if(mode==='progress')record.progress={...observedProgress(),private_attempt:'SHOULD NOT DISPLAY',native:{secret:'SHOULD NOT DISPLAY'}};
   const result=p.method==='list_inboxes'?{inboxes:[]}:p.method==='list_agents'?{agents:[{...target,native_id:native,capability:'unavailable',reason:'No transport',last_seen:Date.now()/1000,supported_transport:'codex_queue',secret:'SHOULD NOT DISPLAY'}],next_cursor:null,directory:{complete:false,reasons:['Scan bounded'],refreshed_at:Date.now()/1000}}:p.method==='list_requests'?{requests:[{...record,request_id:randomUUID()}],next_cursor:null}:record;
   if(mode==='claude_mod'&&p.method==='list_agents')Object.assign(result.agents[0],{agent_id:'c:'+native,provider:'claude',capability:'reachable',reason:'',supported_transport:'claude_mod'});
-  const status=mode==='message-too-long'?400:mode==='reject409'||mode==='reject-long'||mode==='reject-control'?409:['reject429','not-accepted'].includes(mode)?429:mode==='error500'?500:200;
-  const reason=mode==='message-too-long'?'Message too long for this Claude plugin: 4500 envelope characters; maximum is 4000. Reload the updated Motet plugin or reduce the message. Nothing was sent.':mode==='not-accepted'?'Four peer deliveries are active. The new request was not accepted.':mode==='reject-long'?'x'.repeat(201):mode==='reject-control'?'Invalid\nreason':status===409?'Answer your incoming peer request first.':status===429?'Peer delivery capacity is full.':'Peer service failed.';
+  const status=mode==='message-too-long'?400:mode==='reject409'||mode==='reject-long'||mode==='reject-control'?409:['reject429','not-accepted','busy-progress'].includes(mode)?429:mode==='error500'?500:200;
+  const reason=mode==='message-too-long'?'Message too long for this Claude plugin: 4500 envelope characters; maximum is 4000. Reload the updated Motet plugin or reduce the message. Nothing was sent.':mode==='not-accepted'?'Four peer deliveries are active. The new request was not accepted.':mode==='busy-progress'?busyReason:mode==='reject-long'?'x'.repeat(513):mode==='reject-control'?'Invalid\nreason':status===409?'Answer your incoming peer request first.':status===429?'Peer delivery capacity is full.':'Peer service failed.';
   const body=mode==='huge'?'x'.repeat(65537):JSON.stringify(status===200?{result}:{error:reason}),signature=hmac(credential.secret,['watch-bridge-response-v2',String(credential.port),run,n,String(status),hash(body)]);
   res.writeHead(status,{'Content-Length':Buffer.byteLength(body),'X-Watch-Signature':mode==='altered'?'b'.repeat(64):signature});res.end(body);
  });
  server.on('connection',s=>{sockets.add(s);s.on('close',()=>sockets.delete(s))});await new Promise(r=>server.listen(0,'127.0.0.1',r));credential.port=server.address().port;await fs.writeFile(file,JSON.stringify(credential),{mode:0o600});
- return {root,file,credential,seen,target,setMode(v){mode=v},async close(){for(const s of sockets)s.destroy();await new Promise(r=>server.close(r));await fs.rm(root,{recursive:true,force:true})}};
+ return {root,file,credential,seen,target,busyRequestId,busyReason,setMode(v){mode=v},async close(){for(const s of sockets)s.destroy();await new Promise(r=>server.close(r));await fs.rm(root,{recursive:true,force:true})}};
 }
 test('real signed HTTP authenticates before body on the same socket, filters output and never retries',async()=>{
  const f=await fixture();try{
@@ -88,7 +96,7 @@ test('official SDK peer adapter preserves four native tools without a configured
   assert.match(client.getInstructions(),/never send to or wake a native Antigravity chat/);
   for(const pattern of [/exact full name/,/Include unavailable and unverified duplicates/,/all relevant pages/,/incomplete discovery cannot establish uniqueness/,/Atlas is not Atla/,/stable ID/,/explicitly requests that exact self-target/,/get_reply at a meaningful task checkpoint/,/does not inject reply-ready notifications or automatically wake/,/not-found response alone/,/declared_sender is UNVERIFIED/,/across projects and providers/,/do not call send_message/])assert.match(client.getInstructions(),pattern);
   const tools=(await client.listTools()).tools;assert.deepEqual(tools.map(t=>t.name),['list_agents','send_message','get_reply','list_requests']);for(const t of tools)assert.equal(t.inputSchema.additionalProperties,false);assert.doesNotMatch(tools.find(t=>t.name==='send_message').description,/send_inbox_message/);assert.doesNotMatch(client.getInstructions(),/list_inboxes|send_inbox_message|claim_inbox_message/);
-  const value=await client.callTool({name:'send_message',arguments:{agent_id:'x:'+randomUUID(),identity_revision:'d'.repeat(64),text:'Please inspect this peer information',request_id:randomUUID()}});assert.equal(value.isError,undefined);const output=JSON.parse(value.content[0].text);assert.equal(output.origin,'peer');assert.equal(output.untrusted_peer_data.origin,'peer');assert.equal(output.untrusted_peer_data.reply,'<untrusted>');assert.doesNotMatch(value.content[0].text,/SHOULD NOT DISPLAY/);
+  const value=await client.callTool({name:'send_message',arguments:{agent_id:'x:'+randomUUID(),identity_revision:'d'.repeat(64),text:'Please inspect this peer information',request_id:randomUUID()}});assert.equal(value.isError,undefined);const output=JSON.parse(value.content[0].text);assert.equal(output.origin,'peer');assert.equal(output.untrusted_peer_data.origin,'peer');assert.equal(output.untrusted_peer_data.reply,'<untrusted>');assert.equal(Object.hasOwn(output.untrusted_peer_data,'progress'),false);assert.doesNotMatch(value.content[0].text,/SHOULD NOT DISPLAY/);
   const directory=JSON.parse((await client.callTool({name:'list_agents',arguments:{query:'Worker'}})).content[0].text).untrusted_peer_data;assert.equal(directory.directory.complete,false);assert.deepEqual(directory.directory.reasons,['Scan bounded']);assert.equal(directory.agents[0].capability,'unavailable');assert.equal(directory.agents[0].supported_transport,'codex_queue');assert.equal(directory.agents[0].secret,undefined);
   const requests=JSON.parse((await client.callTool({name:'list_requests',arguments:{}})).content[0].text).untrusted_peer_data;assert.equal(requests.requests[0].reply,undefined);assert.equal(requests.requests[0].text_preview,'Please inspect');assert.equal(requests.requests[0].target.project_label,'Example / Project');assert.ok(requests.requests[0].created_at>0);
   const before=f.seen.length;for(const [name,args] of [['owner_send',{}],['list_agents',{project:f.root}],['send_message',{agent_id:'x:'+randomUUID(),identity_revision:'d'.repeat(64),text:'hi',request_id:randomUUID(),sender:randomUUID()}],['get_reply',{request_id:'bad'}]])assert.equal((await client.callTool({name,arguments:args})).isError,true);assert.equal(f.seen.length,before,'invalid tools do not reach HTTP');
@@ -134,6 +142,48 @@ test('directory preserves duplicate names across providers/projects and request 
  const row={origin:'peer',request_id:randomUUID(),agent_id:base.agent_id,state:'answered',created_at:Date.now()/1000,target:base,duplicate:true,text_preview:'Original message',reply:'Shared answer',error:''};
  assert.equal(safeResult('send_message',row).duplicate,true);assert.equal(safeResult('send_message',row).target.name,'Same name');
  assert.equal(safeResult('list_requests',{requests:[row],next_cursor:null}).requests[0].reply,undefined);
+});
+test('signed native replies project allowlisted progress for send, get and list',async()=>{
+ const f=await fixture();
+ try{
+  f.setMode('progress');
+  const broker=new PeerClient(f.credential),request_id=randomUUID();
+  const sent=await broker.call('send_message',{agent_id:f.target.agent_id,identity_revision:f.target.identity_revision,text:'Fictional request',request_id});
+  const reply=await broker.call('get_reply',{request_id});
+  const history=await broker.call('list_requests',{});
+  for(const row of [sent,reply,...history.requests]){
+   assert.deepEqual(row.progress,observedProgress());
+   assert.deepEqual(row.target,f.target);
+  }
+  assert.equal(history.requests[0].reply,undefined);
+ }finally{await f.close()}
+});
+test('native progress rejects malformed evidence and forged providers',()=>{
+ function row(provider){
+  const agent_id=(provider==='claude'?'c:':'x:')+randomUUID();
+  const target={provider,agent_id,name:'Fictional chat',project_id:'c'.repeat(64),project_label:'Example',identity_revision:'d'.repeat(64)};
+  return {origin:'peer',agent_id,request_id:randomUUID(),state:'awaiting_reply',created_at:1000,target,duplicate:false,text_preview:'Fictional text'};
+ }
+ const codex=row('codex'),claude=row('claude'),valid=observedProgress(),validClaude=observedProgress('claude');
+ for(const phase of ['waiting_dispatch','claim_issued','accepted','started','ended','held','not_sent','retired','unavailable']){
+  const value={...valid,phase};
+  assert.deepEqual(safeResult('get_reply',{...codex,progress:value}).progress,value);
+ }
+ assert.deepEqual(safeResult('get_reply',{...claude,progress:validClaude}).progress,validClaude);
+ assert.throws(()=>safeResult('get_reply',{...claude,progress:{...validClaude,last_checked_at:acceptedAt}}));
+ assert.equal(safeResult('get_reply',{...codex,progress:{...valid,summary:'😀'.repeat(1000),held_reason:'é'.repeat(200)}}).progress.summary.length,2000);
+ const malformed=[null,[],{...valid,version:true},{...valid,version:2},{...valid,provider:'claude'},
+  {...valid,provider:'other'},{...valid,phase:'working'},{...valid,summary:{}},{...valid,summary:'😀'.repeat(1001)},
+  {...valid,summary:'\ud800'},{...valid,held_reason:'é'.repeat(201)},{...valid,held_reason:'\udfff'},
+  {...valid,claim_issued_at:undefined},{...valid,accepted_at:1000}];
+ for(const invalidDate of ['2024-02-30T00:00:00+00:00','2023-02-29T00:00:00+00:00','2024-13-01T00:00:00+00:00',
+  '2024-02-29T24:00:00+00:00','2024-02-29T00:60:00+00:00','2024-02-29T00:00:60+00:00',
+  '2024-02-29T00:00:00Z','2024-02-29T00:00:00-05:00','0000-01-01T00:00:00+00:00',
+  '2024-02-29T00:00:00.1234567+00:00','2024-02-29T00:00:00+00:00\n','\ud800']){
+  malformed.push({...valid,started_at:invalidDate});
+ }
+ for(const value of malformed)assert.throws(()=>safeResult('get_reply',{...codex,progress:value}));
+ assert.throws(()=>safeResult('list_requests',{requests:[{...codex,progress:{...valid,provider:'claude'}}],next_cursor:null}));
 });
 test('adapter sensitivity: server proof and signed response protections are required',async()=>{
  const original=await fs.readFile(path.join(here,'peer.mjs'),'utf8');
@@ -228,6 +278,11 @@ test('reply guidance uses explicit task checkpoints without injected notices or 
  assert.match(instructions,/does not inject reply-ready notifications or automatically wake a finished chat/);
  assert.match(instructions,/Do not run a polling loop/);
  assert.match(instructions,/Legacy WATCH_PEER_REPLY notices are not new owner requests/);
+ assert.match(nativeInstructions,/Busy means a prior open request.*Retain the earlier request ID.*get_reply at a meaningful task checkpoint/);
+ assert.match(nativeInstructions,/Start observed with no end observed.*leaves current liveness unknown/);
+ assert.match(nativeInstructions,/For Codex, “Motet last read its log” reports a successful read of the bound transcript/);
+ assert.match(nativeInstructions,/Unknown or expired requests may have been dispatched/);
+ assert.match(nativeInstructions,/24-hour retention limit from request creation/);
  assert.doesNotMatch(instructions,/notice authorizes|event-driven get_reply/);
  assert.equal(validArgs('send_message',{agent_id:'c:'+randomUUID(),identity_revision:'a'.repeat(64),text:'Fictional',return_address:'guessed'}),false);
 });
@@ -244,6 +299,15 @@ test('explicit signed capacity rejection does not suggest an unconfirmed accepta
   assert.match(result.content[1].text,/This attempt was not accepted/);
   assert.doesNotMatch(result.content[1].text,/Acceptance is not confirmed/);
   assert.equal(f.seen.length-before,2,'one challenge and one RPC, no retry');
+  f.setMode('busy-progress');
+  assert.ok(f.busyReason.length>200&&f.busyReason.length<=512);
+  const busyBefore=f.seen.length;
+  const busy=await client.callTool({name:'send_message',arguments:{agent_id:f.target.agent_id,identity_revision:f.target.identity_revision,text:'Fictional busy check'}});
+  assert.equal(busy.isError,true);
+  assert.equal(busy.content[0].text,'Peer request rejected (429): '+f.busyReason);
+  assert.match(busy.content[0].text,new RegExp(f.busyRequestId));
+  assert.match(busy.content[1].text,/This attempt was not accepted/);
+  assert.equal(f.seen.length-busyBefore,2,'a long busy result still has one transport attempt');
   f.setMode('loss');
   const lost=await client.callTool({name:'send_message',arguments:{agent_id:f.target.agent_id,identity_revision:f.target.identity_revision,text:'Fictional uncertain check'}});
   assert.match(lost.content[1].text,/Acceptance is not confirmed/);

@@ -152,6 +152,8 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_peer_progress_store.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_peer_progress_projection.py
+        if: ${{ !cancelled() }}
       - run: python tests/test_peer_admin.py
         if: ${{ !cancelled() }}
       - run: python tests/test_watch_bridge_clear.py
