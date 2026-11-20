@@ -20,7 +20,7 @@ Names are addresses, not authentication. When names are duplicated, specify the 
 
 For a connected Claude recipient, the plugin submits the complete peer envelope with plugin attribution, waits for its matching main-turn answer, and returns that answer to the original shared request. It does not turn the peer text into an owner instruction.
 
-A pending reply is reported as pending. The requesting agent retains the request ID and uses `get_reply` at a meaningful task checkpoint, before relying on the answer, or when the owner asks for an update. It can continue independent work while waiting. It must not repeatedly poll, resend the question, or turn a peer reply into a new owner instruction. Unknown, failed, expired, and rejected operations remain distinct from successful delivery. If several earlier questions could match a follow-up, clarify which one rather than guess.
+A pending reply is reported as pending. Busy means an earlier request remains open, not that it failed. Keep its request ID, wait, and check at a meaningful checkpoint; do not resend. The requesting agent retains the request ID and uses `get_reply` at a meaningful task checkpoint, before relying on the answer, or when the owner asks for an update. It can continue independent work while waiting. It must not repeatedly poll, resend the question, or turn a peer reply into a new owner instruction. Unknown, failed, expired, and rejected operations remain distinct from successful delivery. If several earlier questions could match a follow-up, clarify which one rather than guess.
 
 ## Retrieving replies
 
@@ -82,7 +82,9 @@ For larger messages to Claude, upgrade the bridge first, then reload the **Motet
 
 Request content expires after 24 hours. Permanent, bounded deduplication tombstones prevent expired operations from being sent again, including across service credential rotation. Old endpoint-prototype history is not exposed as shared history.
 
-Peer capacity remains separate from Motet's reserved capacity. Limits allow up to 100 requests per day service-wide across native and inbox sends, 10 per target per hour, and four unsettled requests in the current 15-minute window; declared sender names do not create independent quotas. Completed turns with unusable replies release their slots. A genuinely uncertain execution keeps a small reservation for its destination until completion can be verified; deleting expired message content does not release it. A rejected follow-up explicitly says it was not accepted and identifies the earlier request needing recovery. The bridge does not grow a second queue behind that request or resend it. Late replies can still be recovered within content retention; a verified completion received afterward may release execution capacity without restoring expired answer content.
+Peer capacity remains separate from Motet's reserved capacity. Limits allow up to 100 requests per day service-wide across native and inbox sends, 10 per target per hour, and four unresolved native admissions in the last 15 minutes; declared sender names do not create independent quotas. A request proven never dispatched expires after 15 minutes, with a final check before dispatch. Crossing the 15-minute dispatch window does not expire a dispatched request or make it recovery-needed; its own recipient remains reserved across all ages. A start exactly bound to the request stays open until an end or contradictory evidence is observed, or the owner explicitly clears it. When the 24-hour content cutoff removes a still-open Codex tracker, it becomes recovery-needed: content retention passed before an end was observed. Motet does not continue tracking it beyond that cutoff. An issued claim is not native acceptance. Completed turns with unusable replies release their slots. Genuine uncertainty keeps the destination fenced; deleting expired message content does not release it. A rejected follow-up says the new request was not accepted and identifies the earlier open request. The bridge does not grow a second queue behind it or resend it. Late replies can still be recovered within content retention; an authenticated Claude completion received afterward may release its execution reservation without restoring expired answer content. A pruned Codex retention hold requires an explicit owner clear. When shared capacity is full, the response says “Four peer deliveries from the last 15 minutes are still open. Try again shortly.” This counts delivery admissions, not evidence that native turns started.
+
+Native request results and history can include validated progress facts with ISO times and their zones, plus elapsed time in plain words. “Start observed” and “no end observed” describe evidence, not a promise that work continues. If a start is recorded without a timestamp, the wording is “Start recorded; start time unavailable.” The structured `last_checked_at` field records a log-read observation, not a sign of life; progress summaries omit it. If a start is much older than the task should take, tell the owner, who can clear a request whose turn has stopped. A turn that died without an observable end can remain open until the owner clears it. Progress never proves that an answer was captured, and does not extend the unchanged 24-hour content retention.
 
 
 ### Resumed Codex chats
@@ -117,11 +119,27 @@ A verified Claude host drop for the original pending submission releases its exe
 
 This relies on the original Claude runtime receiving the host's submission result. Reloading the plugin can lose that pending native result; queue disappearance alone cannot recover it. Codex's current queue notifications also do not distinguish deletion from starting or steering a message. Those ambiguous cases remain unresolved and require evidence or explicit owner recovery; they are not automatically labelled cancelled.
 
+### Clearing the public request named in a refusal
+
+The request ID in a busy or recovery refusal is the shared **public** request ID, also used by `get_reply`. The owner can inspect that exact request while Motet runs:
+
+```sh
+python3 scripts/watch_bridge_clear.py --port 8793 --request-id PUBLIC_REQUEST_UUID
+```
+
+The owner server resolves it to the original transport and checks its immutable recipient and execution evidence. To clear an eligible unresolved attempt, repeat the same public ID with the exact agent shown by inspection:
+
+```sh
+python3 scripts/watch_bridge_clear.py --port 8793 --request-id PUBLIC_REQUEST_UUID --expected-agent EXACT_NATIVE_AGENT_ID --apply
+```
+
+Use the complete `x:UUID` or `c:UUID` recipient. The existing `--transport-id TRANSPORT_UUID` option remains available; choose exactly one ID option. No local database lookup or guessed ID conversion is required. Clearing remains an explicit owner choice with provider outcome unknown. It does not cancel work, resend a message, or reconstruct its answer. If the result is unconfirmed, inspect the same request; do not retry automatically.
+
 ### Historical recovery and owner clearing
 
 `scripts/watch_bridge_recover.py` previews recovery for an explicit list of old client request IDs. It validates the original admission and native evidence; an audit report saying “verified” is not sufficient. Applying recovery requires stopping the bridge and obtaining its existing exclusive storage lock. Every selected proof must pass again before the transaction commits.
 
-Verified historical completion releases the execution reservation while keeping expired replies unavailable. An owner can separately select uncertain reservations to clear. Those remain recorded as **retired**, with the provider outcome unknown and answer capture withheld. Clearing a reservation does not cancel native work, resend the question, erase its replay guard, or claim that the provider finished it. Late reports cannot restore its answer or make it block the recipient again. A database containing retired reservations cannot be downgraded to a version that does not understand retirement.
+Verified historical completion releases the execution reservation while keeping expired replies unavailable. An owner can separately select uncertain reservations to clear, or use online inspection and exact confirmation to clear launched, non-terminal, non-captured running or submitted attempts after their dispatch deadline. Clearing a healthy aged attempt is an owner decision, not a liveness judgment. Those remain recorded as **retired**, with the provider outcome unknown and answer capture withheld. Clearing a reservation does not cancel native work, resend the question, erase its replay guard, or claim that the provider finished it. Late reports cannot restore its answer or make it block the recipient again. A database containing retired reservations cannot be downgraded to a version that does not understand retirement.
 
 Use the tool's `--help` for the explicit request-selection and native-source options. It defaults to a dry run; `--apply` is a separate operator action. Keep request manifests, source evidence, and database backups private. Review the exact selected set before applying either recovery or owner clearing.
 

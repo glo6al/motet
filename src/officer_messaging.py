@@ -1522,6 +1522,8 @@ class MessagingStore:
             with f:
                 f.seek(current['cursor'])
                 data = f.read(MAX_READ)
+            if row.get('error') == 'The transcript is unavailable; Motet will keep checking for a reply.':
+                row['error'] = ''
             if row.get('codex_discard_record'):
                 if tuple(row['codex_discard_record']) != codex_transcript.segment_key(row):
                     raise codex_transcript.Unavailable('An incomplete oversized record belongs to another Codex segment.')

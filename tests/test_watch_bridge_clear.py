@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import sys
@@ -18,6 +19,7 @@ spec = importlib.util.spec_from_file_location('watch_bridge_clear', Path(__file_
 cli = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cli)
 TID = '11111111-1111-4111-8111-111111111111'
+PUBLIC = '6fa01ff3-20e4-47c5-91fd-6d77a48c70d7'
 AGENT = 'x:22222222-2222-4222-8222-222222222222'
 KEY = 'fictional-owner-test-key'
 
@@ -50,7 +52,10 @@ class ClearTests(unittest.TestCase):
                           'retained_payload': True, 'eligible': True}
                          if self.path.endswith('inspect') else
                          {'transport_id': TID, 'agent': AGENT, 'status': 'retired', 'provider_outcome': 'unknown'})
+                if 'request_id' in data and outer.mode != 'missing_public':
+                    value['request_id'] = TID if outer.mode == 'wrong_public' else PUBLIC
                 if outer.mode == 'wrong_identity': value['transport_id'] = AGENT[2:]
+                if outer.mode == 'bad_transport': value['transport_id'] = 'invalid'
                 if outer.mode == 'secret_extra': value.update(error=KEY, preview=KEY, secret=KEY)
                 if outer.mode == 'large': value['extra'] = 'x' * (cli.MAX_RESPONSE+1)
                 if outer.mode == 'wrong_outcome': value['provider_outcome'] = 'success'
@@ -65,9 +70,9 @@ class ClearTests(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=2); self.temp.cleanup()
 
-    def run_cli(self, *extra):
+    def run_cli(self, *extra, selector=('--transport-id', TID)):
         out, err = io.StringIO(), io.StringIO()
-        args = ['--port', str(self.port), '--state-dir', str(self.state), '--transport-id', TID, *extra]
+        args = ['--port', str(self.port), '--state-dir', str(self.state), *selector, *extra]
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), patch.dict(os.environ, {'http_proxy':'http://127.0.0.1:1', 'HTTP_PROXY':'http://127.0.0.1:1'}):
             result = cli.main(args)
         self.assertNotIn(KEY, out.getvalue()+err.getvalue())
@@ -85,11 +90,7 @@ class ClearTests(unittest.TestCase):
         self.assertIn('Nothing was cancelled or resent', value['explanation'])
         self.assertEqual(list(self.state.iterdir()), [self.key])  # No database/offline fallback.
 
-    def test_cli_reaches_real_owner_route_and_retires_only_the_exact_attempt(self):
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-        import server
-        from officer_messaging import MessagingStore
-        import peer_lifecycle as life
+    def use_real_owner_server(self, server):
         self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=2)
         class OwnerHandler(server.H):
             def log_message(self, *args):
@@ -97,6 +98,13 @@ class ClearTests(unittest.TestCase):
         self.server = LoopbackHTTPServer(('127.0.0.1', 0), OwnerHandler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+
+    def test_cli_reaches_real_owner_route_and_retires_only_the_exact_attempt(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+        import server
+        from officer_messaging import MessagingStore
+        import peer_lifecycle as life
+        self.use_real_owner_server(server)
         store = MessagingStore(str(self.state), str(self.root / 'sessions'))
         self.addCleanup(store.close)
         db = store.db
@@ -126,10 +134,96 @@ class ClearTests(unittest.TestCase):
             self.assertEqual(saved['state'],'unknown');self.assertEqual(saved['reply'],'')
             self.assertNotIn('settled',saved)
 
+    def test_busy_refusal_public_id_retires_the_exact_shared_attempt(self):
+        import test_shared_bridge as fixture
+        import server
+        from officer_messaging import MessagingStore
+        import peer_bridge as bridge
+        import peer_lifecycle as life
+
+        self.use_real_owner_server(server)
+        self.sessions = str(self.root / 'sessions')
+        os.mkdir(self.sessions)
+        self.store = MessagingStore(str(self.state), self.sessions)
+        self.addCleanup(self.store.close)
+        self.store.available = True
+        self.directory = fixture.FixtureDirectory()
+        self.store.shared.directory = self.directory
+        db = self.store.db
+        credential = bridge.initialize_service(db, {'providers': ['codex', 'claude'], 'history_days': 'all'})
+        auth = bridge.service_credential(db, credential['credential_id'])
+        self.append = fixture.SharedTests.append.__get__(self)
+        target = fixture.SharedTests.target(self, 'Fictional recipient', project=str(self.root))
+        args = (auth, target['agent_id'], target['identity_revision'], 'Fictional question')
+        old, rejected = fixture.uid(), fixture.uid()
+        start = time.time() - 1200
+        with patch.object(bridge.time, 'time', return_value=start):
+            self.store.shared.send(*args, old)
+        tid = db.execute('SELECT transport_id FROM shared_bridge_requests WHERE client_id=?', (old,)).fetchone()[0]
+        row = next(row for row in self.store._rows() if row['request_id'] == tid)
+        row.update(state='awaiting_reply', launched=True, bound_turn='fictional-turn')
+        db.execute('UPDATE shared_bridge_requests SET launched=created WHERE transport_id=?', (tid,))
+        self.store._save(row)
+        with self.assertRaises(bridge.PeerError) as refused:
+            self.store.shared.send(*args, rejected)
+        self.assertEqual(refused.exception.status, 429)
+        matched = re.search(r'Busy with request \(([0-9a-f-]{36})\)', str(refused.exception))
+        self.assertIsNotNone(matched)
+        public = matched.group(1)
+        self.assertEqual(public, old)
+        self.assertNotIn(tid, str(refused.exception))
+        self.assertNotEqual(public, tid)
+        self.assertIsNone(db.execute('SELECT 1 FROM shared_bridge_requests WHERE client_id=?', (rejected,)).fetchone())
+        with patch.multiple(server, MESSAGING=self.store, KEY=KEY, PORT=self.port):
+            selector = ('--request-id', public)
+            with patch.object(cli, 'owner_request', wraps=cli.owner_request) as request:
+                result, out, err = self.run_cli(selector=selector)
+                self.assertEqual(result, 0)
+                self.assertEqual(err, '')
+                request.assert_called_once_with(self.port, KEY, 'inspect', {'request_id': public})
+            view = json.loads(out)
+            self.assertEqual((view['request_id'], view['transport_id'], view['agent'], view['eligible']),
+                             (public, tid, target['agent_id'], True))
+            with patch.object(cli, 'owner_request', wraps=cli.owner_request) as request:
+                result, out, err = self.run_cli('--apply', '--expected-agent', view['agent'], selector=selector)
+                self.assertEqual(result, 0)
+                self.assertEqual(err, '')
+                request.assert_called_once_with(self.port, KEY, 'retire',
+                                                {'request_id': public, 'agent': view['agent'], 'confirm': cli.CONFIRM})
+            self.assertEqual(life.get(db, tid)['execution'], 'retired')
+            applied = json.loads(out)
+            self.assertEqual((applied['request_id'], applied['transport_id'], applied['provider_outcome']),
+                             (public, tid, 'unknown'))
+
     def test_apply_requires_exact_identity_before_network(self):
         for extra in [('--apply',), ('--transport-id', '11111111'), ('--expected-agent','x:invalid'), ('--port','70000')]:
             with self.subTest(extra=extra), self.assertRaises(SystemExit): self.run_cli(*extra)
         self.assertEqual(self.calls, [])
+
+    def test_public_cli_requires_one_exact_selector_and_expected_agent_to_apply(self):
+        for selector in ((), ('--request-id', PUBLIC, '--transport-id', TID), ('--request-id', PUBLIC[:8]),
+                         ('--request-id', PUBLIC.upper())):
+            with self.subTest(selector=selector), self.assertRaises(SystemExit):
+                self.run_cli(selector=selector)
+        with self.assertRaises(SystemExit):
+            self.run_cli('--apply', selector=('--request-id', PUBLIC))
+        self.assertEqual(self.calls, [])
+
+    def test_public_cli_validates_echoed_public_id_and_canonical_transport_in_one_response(self):
+        selector = ('--request-id', PUBLIC)
+        result, out, err = self.run_cli(selector=selector)
+        self.assertEqual((result, err), (0, ''))
+        self.assertEqual((json.loads(out)['request_id'], json.loads(out)['transport_id']), (PUBLIC, TID))
+        for mode in ('missing_public', 'wrong_public', 'bad_transport', 'lost', 'redirect'):
+            self.mode = mode
+            before = len(self.calls)
+            with self.subTest(mode=mode):
+                result, out, err = self.run_cli('--apply', '--expected-agent', AGENT, selector=selector)
+                self.assertEqual((result, out), (1, ''))
+                self.assertIn('outcome is unknown', err)
+                self.assertEqual(self.calls[before:], [
+                    ('/bridge-admin/v1/retire', {'request_id': PUBLIC, 'agent': AGENT, 'confirm': cli.CONFIRM}, KEY)
+                ])
 
     def test_lost_response_redirect_and_invalid_receipts_never_retry(self):
         for mode in ('lost', 'redirect', 'large', 'wrong_identity', 'wrong_outcome', 'nested'):

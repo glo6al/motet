@@ -39,11 +39,14 @@ class AdminTests(unittest.TestCase):
         self.addCleanup(clock_patch.stop)
         self.clock = clock.time
         self.clock.return_value = self.created + 2
+        self.snapshot = dict(agent_id=self.agent, provider='codex', project_id='b'*64, identity_revision='c'*64)
         self.row = dict(request_id=self.tid, agent=self.agent, created=self.created, launched=True,
                         state='unknown', origin='peer', runtime='codex', bridge_version=2,
+                        identity_revision=self.snapshot['identity_revision'],
                         reply='', candidate_reply='', final='', bound_turn='fictional-turn')
         self.store.db.execute('INSERT INTO shared_bridge_requests VALUES (?,?,?,?,?,?,?,?,?)',
-                             (self.cid, self.agent, '{}', 'a'*64, self.tid, uid(), self.created, 101., 'PRIVATE PROMPT'))
+                             (self.cid, self.agent, json.dumps(self.snapshot), 'a'*64, self.tid, uid(),
+                              self.created, 101., 'PRIVATE PROMPT'))
         self.store._save(self.row)
 
     def request(self):
@@ -67,6 +70,148 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(self.store.shared.result(self.cid)['state'], 'unknown')
         self.assertEqual(life.blockers(self.store.db, self.agent), [])
         self.assertNotIn('settled', json.loads(self.store.db.execute('SELECT data FROM requests').fetchone()[0]))
+
+    def test_public_id_inspect_and_retire_resolve_one_exact_shared_mapping(self):
+        db = self.store.db
+        public = {'request_id': self.cid}
+        transport = admin.inspect(self.store, {'transport_id': self.tid})
+        before = db.total_changes
+        queries = []
+        db.set_trace_callback(queries.append)
+        try:
+            self.assertEqual(admin.inspect(self.store, public), dict(transport, **public))
+            self.assertEqual(db.total_changes, before)
+            self.assertEqual(sum('FROM shared_bridge_requests WHERE client_id=' in query for query in queries), 1)
+            queries.clear()
+            result = admin.retire(self.store, dict(public, agent=self.agent, confirm=admin.CONFIRM))
+            self.assertEqual(sum('FROM shared_bridge_requests WHERE client_id=' in query for query in queries), 1)
+        finally:
+            db.set_trace_callback(None)
+        self.assertEqual((result['request_id'], result['transport_id'], result['provider_outcome']),
+                         (self.cid, self.tid, 'unknown'))
+        self.assertEqual(admin.retire(self.store, dict(public, agent=self.agent, confirm=admin.CONFIRM))['status'],
+                         'already_retired')
+
+    def test_public_id_rejects_wrong_scope_noncanonical_and_ambiguous_selectors(self):
+        db = self.store.db
+        legacy_id, legacy_transport = uid(), uid()
+        db.execute('INSERT INTO peer_requests VALUES (?,?,?,?,?,?,?)',
+                   (uid(), legacy_id, uid(), 'a'*64, legacy_transport, self.created, 101.))
+        db.commit()
+        for public, status in ((self.tid, 404), (legacy_id, 404), (legacy_transport, 404), (uid(), 404),
+                               (self.cid.upper(), 400), (self.cid[:8], 400), ([], 400)):
+            with self.subTest(public=public), self.assertRaises(peer_bridge.PeerError) as error:
+                admin.inspect(self.store, {'request_id': public})
+            self.assertEqual(error.exception.status, status)
+        selectors = {'request_id': self.cid, 'transport_id': self.tid}
+        with self.assertRaises(peer_bridge.PeerError) as error:
+            admin.inspect(self.store, selectors)
+        self.assertEqual(error.exception.status, 400)
+        with self.assertRaises(peer_bridge.PeerError) as error:
+            admin.retire(self.store, dict(selectors, agent=self.agent, confirm=admin.CONFIRM))
+        self.assertEqual(error.exception.status, 400)
+
+        public_request = {'request_id': self.cid}
+        apply = dict(public_request, agent=self.agent, confirm=admin.CONFIRM)
+        self.assertTrue(admin.inspect(self.store, public_request)['eligible'])
+        db.execute('UPDATE peer_requests SET transport_id=? WHERE client_id=?', (self.tid, legacy_id))
+        db.commit()
+        for operation, body in ((admin.inspect, public_request), (admin.retire, apply)):
+            with self.assertRaises(peer_bridge.PeerError) as error:
+                operation(self.store, body)
+            self.assertEqual(error.exception.status, 409)
+        self.assertEqual(life.get(db, self.tid)['execution'], 'uncertain')
+
+    def test_public_id_is_available_after_pruning_but_refuses_an_inbox_collision(self):
+        db = self.store.db
+        public = {'request_id': self.cid}
+        apply = dict(public, agent=self.agent, confirm=admin.CONFIRM)
+        db.execute('DELETE FROM requests WHERE id=?', (self.tid,))
+        db.execute('INSERT INTO peer_inbox_requests VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                   (self.cid, uid(), 'c'*64, 'a'*64, uid(), 100000, 200000, 'queued', None, None, None))
+        db.commit()
+        for operation, body in ((admin.inspect, public), (admin.retire, apply)):
+            with self.assertRaises(peer_bridge.PeerError) as error:
+                operation(self.store, body)
+            self.assertEqual(error.exception.status, 409)
+        db.execute('DELETE FROM peer_inbox_requests WHERE request_id=?', (self.cid,))
+        db.commit()
+        view = admin.inspect(self.store, public)
+        self.assertTrue(view['eligible'])
+        self.assertFalse(view['retained_payload'])
+        self.assertEqual(admin.retire(self.store, apply)['transport_id'], self.tid)
+        self.assertIsNone(db.execute('SELECT data FROM requests WHERE id=?', (self.tid,)).fetchone())
+
+    def test_public_id_rechecks_target_snapshot_namespace_and_expected_agent(self):
+        db = self.store.db
+        public = {'request_id': self.cid}
+        apply = dict(public, agent=self.agent, confirm=admin.CONFIRM)
+        self.assertTrue(admin.inspect(self.store, public)['eligible'])
+        with self.assertRaises(peer_bridge.PeerError) as error:
+            admin.retire(self.store, dict(apply, agent='x:'+uid()))
+        self.assertEqual(error.exception.status, 409)
+        for update in (dict(agent_id='x:'+uid()), dict(provider='claude'), dict(identity_revision='bad'),
+                       dict(identity_revision='d'*64), dict(project_id='bad')):
+            db.execute('UPDATE shared_bridge_requests SET target_snapshot=? WHERE client_id=?',
+                       (json.dumps(dict(self.snapshot, **update)), self.cid))
+            db.commit()
+            for operation, request in ((admin.inspect, public), (admin.retire, apply)):
+                with self.subTest(update=update), self.assertRaises(peer_bridge.PeerError) as error:
+                    operation(self.store, request)
+                self.assertEqual(error.exception.status, 409)
+        db.execute('UPDATE shared_bridge_requests SET target_snapshot=? WHERE client_id=?',
+                   (json.dumps(self.snapshot), self.cid))
+        db.execute('UPDATE requests SET data=? WHERE id=?',
+                   (json.dumps(dict(self.row, attachment_owner_version=None)), self.tid))
+        db.commit()
+        for operation, request in ((admin.inspect, public), (admin.retire, apply)):
+            with self.assertRaises(peer_bridge.PeerError) as error:
+                operation(self.store, request)
+            self.assertEqual(error.exception.status, 409)
+        self.assertEqual(life.get(db, self.tid)['execution'], 'uncertain')
+
+    def test_public_selector_cannot_inspect_or_retire_an_owner_desk_id(self):
+        owner_id = uid()
+        owner = dict(request_id=owner_id, agent=self.agent, origin='owner', runtime='codex',
+                     state='awaiting_reply', created=self.created, launched=True, bound_turn='owner-turn')
+        self.store._save(owner)
+        db = self.store.db
+        saved = db.execute('SELECT data FROM requests WHERE id=?', (owner_id,)).fetchone()
+        self.assertIsNotNone(saved)
+        public = {'request_id': owner_id}
+        apply = dict(public, agent=self.agent, confirm=admin.CONFIRM)
+        for operation, body in ((admin.inspect, public), (admin.retire, apply)):
+            with self.assertRaises(peer_bridge.PeerError) as error:
+                operation(self.store, body)
+            self.assertEqual(error.exception.status, 404)
+        self.assertEqual(db.execute('SELECT data FROM requests WHERE id=?', (owner_id,)).fetchone(), saved)
+        self.assertIsNone(life.get(db, owner_id))
+
+    def test_public_selector_cannot_retire_a_healthy_attempt_at_sixty_seconds(self):
+        self.store._save(dict(self.row, state='awaiting_reply'))
+        self.clock.return_value = self.created + 60
+        db = self.store.db
+        before = life.get(db, self.tid)
+        saved = db.execute('SELECT data FROM requests WHERE id=?', (self.tid,)).fetchone()
+        public = {'request_id': self.cid}
+        view = admin.inspect(self.store, public)
+        self.assertEqual((view['transport_id'], view['execution'], view['eligible']), (self.tid, 'running', False))
+        with self.assertRaises(peer_bridge.PeerError) as error:
+            admin.retire(self.store, dict(public, agent=self.agent, confirm=admin.CONFIRM))
+        self.assertEqual(error.exception.status, 409)
+        self.assertEqual(life.get(db, self.tid), before)
+        self.assertEqual(db.execute('SELECT data FROM requests WHERE id=?', (self.tid,)).fetchone(), saved)
+
+    def test_public_id_retirement_rechecks_completion_after_inspection(self):
+        public = {'request_id': self.cid}
+        self.assertTrue(admin.inspect(self.store, public)['eligible'])
+        self.store._save(dict(self.row, state='answered', settled=True, reply='Fictional answer'))
+        self.assertFalse(admin.inspect(self.store, public)['eligible'])
+        with self.assertRaises(peer_bridge.PeerError) as error:
+            admin.retire(self.store, dict(public, agent=self.agent, confirm=admin.CONFIRM))
+        self.assertEqual(error.exception.status, 409)
+        record = life.get(self.store.db, self.tid)
+        self.assertEqual((record['execution'], record['capture']), ('completed', 'captured'))
 
     def test_pruned_payload_remains_absent_and_wrong_identity_rejects_even_after_retirement(self):
         self.store.db.execute('DELETE FROM requests'); self.store.db.commit()

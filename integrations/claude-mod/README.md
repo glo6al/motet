@@ -35,6 +35,8 @@ Automatic registration runs in interactive terminal sessions and sessions observ
 
 `/watch-status` reports setup/connection state without secrets. `/watch-disconnect` intentionally opts this chat out, including after reload; `/watch-connect` without arguments re-enables it. Temporary native lifecycle transitions do not count as an owner opt-out. Legacy per-chat `/watch-connect <port>:<pair-code>` enrollment remains compatible; an existing manual enrollment is retained rather than silently replaced by automatic registration.
 
+Check the original request to confirm delivery, since `/watch-status` can show no deferred or held receipts just after a plugin reload or while a receipt waits to retry after its first typed rejection.
+
 ## Authorization and local trust
 
 Motet issues a shared registration grant that is accepted directly only by the registration route. Registration returns service credentials for an eligible chat; those credentials can claim that chat's owner deliveries and, when the grant explicitly permits it and the connection negotiates peer protocol 1, shared peer deliveries. They report only matching replies. Possession of the registration grant therefore permits obtaining eligible-chat delivery credentials. It cannot originate owner messages, control an agent, or use peer/native routes. Each registered chat has separate service credentials and a per-runtime membership lease. Service credentials cannot register another chat or invoke owner actions. Owner requests still enter through Motet's authenticated owner gateway.
