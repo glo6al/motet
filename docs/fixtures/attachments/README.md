@@ -428,9 +428,15 @@ still refuse without mutating the draft; the page's exact-byte guard remains.
 ## VM test probes
 
 Run `node --test docs/fixtures/attachments/fixture.test.mjs` from the repository
-root. The five previously time-limited VM probes run in disposable Node child
+root for the fixture cases. Run
+`node --test docs/fixtures/attachments/fixture-vm-probe.test.mjs` for the
+supervision contracts; CI runs this as a separate step. The five previously
+time-limited VM probes run in disposable Node child
 processes. Their functional assertions and forbidden-capability getters remain
 in the child; success requires an explicit completion message and exit 0.
 A responsive parent kills and reaps a hung child after a 30-second operational
 watchdog. This contains hangs without treating fixture execution speed as a
 one-second performance requirement. Other VM checks keep their existing paths.
+The contract tests cover both the initial watchdog and the entry-triggered
+watchdog with intentional loops, independent cleanup and exact-child reaping.
+Only those negative tests inject shorter deadlines; normal probes keep 30 seconds.

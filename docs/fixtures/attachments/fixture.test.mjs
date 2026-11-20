@@ -3,7 +3,6 @@ import test from 'node:test';
 import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
 import {supervisedVmProbe} from './fixture-vm-probe.mjs';
-import './fixture-vm-probe.test.mjs';
 import {ATTACHMENT_SCENARIOS, createAttachmentsFixture} from './fixture.mjs';
 
 const active = scenario => createAttachmentsFixture({enabled: true, search: '?demo', scenario});
