@@ -424,3 +424,13 @@ Reattachment advertises current-profile sample sizes, identical to selection
 and storage charging: 128,000 bytes for the direct PDF, 64,000 for the direct
 PNG. Native relay and text sample sizes are unchanged. Unsupported choices
 still refuse without mutating the draft; the page's exact-byte guard remains.
+
+## VM test probes
+
+Run `node --test docs/fixtures/attachments/fixture.test.mjs` from the repository
+root. The five previously time-limited VM probes run in disposable Node child
+processes. Their functional assertions and forbidden-capability getters remain
+in the child; success requires an explicit completion message and exit 0.
+A responsive parent kills and reaps a hung child after a 30-second operational
+watchdog. This contains hangs without treating fixture execution speed as a
+one-second performance requirement. Other VM checks keep their existing paths.

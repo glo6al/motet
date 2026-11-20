@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
+import {supervisedVmProbe} from './fixture-vm-probe.mjs';
+import './fixture-vm-probe.test.mjs';
 import {ATTACHMENT_SCENARIOS, createAttachmentsFixture} from './fixture.mjs';
 
 const active = scenario => createAttachmentsFixture({enabled: true, search: '?demo', scenario});
@@ -289,19 +291,16 @@ test('all scenarios and in-memory actions run with effectful browser capabilitie
   let source = await readFile(new URL('./fixture.mjs', import.meta.url), 'utf8');
   source = source.replace('export const ATTACHMENT_SCENARIOS', 'const ATTACHMENT_SCENARIOS')
     .replace('export function createAttachmentsFixture', 'function createAttachmentsFixture');
-  const sandbox = {URLSearchParams};
-  for (const name of ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'localStorage', 'sessionStorage',
-    'navigator', 'Notification', 'File', 'Blob', 'document', 'window', 'location', 'setTimeout', 'setInterval']) {
-    Object.defineProperty(sandbox, name, {get() {throw Error(`Forbidden access: ${name}`);}});
-  }
-  vm.runInNewContext(source + `\nfor (const key of ATTACHMENT_SCENARIOS) {
+  const forbidden = ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'localStorage', 'sessionStorage',
+    'navigator', 'Notification', 'File', 'Blob', 'document', 'window', 'location', 'setTimeout', 'setInterval'];
+  await supervisedVmProbe(source + `\nfor (const key of ATTACHMENT_SCENARIOS) {
     const a = createAttachmentsFixture({enabled:true,search:'?demo',scenario:key});
     a.snapshot(); a.selectScenario(key);
   }
   const a = createAttachmentsFixture({enabled:true,search:'?demo'});
   const d = a.snapshot().draft;
   a.act({type:'edit_text',draftId:d.id,destination:d.destination,revision:d.revision,writerGeneration:d.writerGeneration,text:'Fictional text'});
-  `, sandbox, {timeout: 1000});
+  `, {forbidden});
 });
 
 
@@ -547,11 +546,9 @@ test('all phase 2 actions execute with browser effects forbidden and disabled ad
   let source = await readFile(new URL('./fixture.mjs', import.meta.url), 'utf8');
   source = source.replace('export const ATTACHMENT_SCENARIOS', 'const ATTACHMENT_SCENARIOS')
     .replace('export function createAttachmentsFixture', 'function createAttachmentsFixture');
-  const sandbox = {URLSearchParams};
-  for (const name of ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'localStorage', 'sessionStorage',
-    'navigator', 'Notification', 'File', 'Blob', 'document', 'window', 'location', 'setTimeout', 'setInterval'])
-    Object.defineProperty(sandbox, name, {get() {throw Error(`Forbidden access: ${name}`);}});
-  vm.runInNewContext(source + `
+  const forbidden = ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'localStorage', 'sessionStorage',
+    'navigator', 'Notification', 'File', 'Blob', 'document', 'window', 'location', 'setTimeout', 'setInterval'];
+  await supervisedVmProbe(source + `
   const run = (scenario, type, isMessage = false) => {
     const a = createAttachmentsFixture({enabled:true,search:'?demo',scenario});
     const s = a.snapshot(), d = s.draft, m = s.messages[0];
@@ -562,7 +559,7 @@ test('all phase 2 actions execute with browser effects forbidden and disabled ad
   };
   run('a04-folder','retry_preparation'); run('a05-resume','resume_draft'); run('a05-conflict','create_draft');
   run('a06-unknown','check_status',true); run('a06-partial','finish_send',true); run('a06-partial','delete_saved_copies',true);
-  `, sandbox, {timeout: 1000});
+  `, {forbidden});
   const disabled = createAttachmentsFixture();
   for (const [scenario, type, isMessage] of [['a04-folder', 'retry_preparation', false], ['a05-resume', 'resume_draft', false],
     ['a05-conflict', 'create_draft', false], ['a06-unknown', 'check_status', true], ['a06-partial', 'finish_send', true], ['a06-partial', 'delete_saved_copies', true]]) {
@@ -749,11 +746,9 @@ test('room selection and Send are inert without both demo gates and execute with
   let source = await readFile(new URL('./fixture.mjs', import.meta.url), 'utf8');
   source = source.replace('export const ATTACHMENT_SCENARIOS', 'const ATTACHMENT_SCENARIOS')
     .replace('export function createAttachmentsFixture', 'function createAttachmentsFixture');
-  const sandbox = {URLSearchParams};
-  for (const name of ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'localStorage', 'sessionStorage',
-    'navigator', 'Notification', 'File', 'Blob', 'document', 'window', 'location', 'setTimeout', 'setInterval'])
-    Object.defineProperty(sandbox, name, {get() {throw Error(`Forbidden access: ${name}`);}});
-  vm.runInNewContext(source + `
+  const forbidden = ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'localStorage', 'sessionStorage',
+    'navigator', 'Notification', 'File', 'Blob', 'document', 'window', 'location', 'setTimeout', 'setInterval'];
+  await supervisedVmProbe(source + `
     for (const scenario of ['a01-room', 'a03-room-one', 'a03-room-five']) {
       const a = createAttachmentsFixture({enabled:true,search:'?demo',scenario});
       const run = (type, extra = {}) => {
@@ -763,7 +758,7 @@ test('room selection and Send are inert without both demo gates and execute with
       if (scenario === 'a01-room') {run('open_picker'); run('add_sample_files',{fileIds:['fixture-file-plan']});}
       run('send_sample');
     }
-  `, sandbox, {timeout: 1000});
+  `, {forbidden});
 });
 
 
@@ -1288,11 +1283,9 @@ test('new phase4 workflow executes with effects forbidden and disabled commands 
   let source = await readFile(new URL('./fixture.mjs', import.meta.url), 'utf8');
   source = source.replace('export const ATTACHMENT_SCENARIOS', 'const ATTACHMENT_SCENARIOS')
     .replace('export function createAttachmentsFixture', 'function createAttachmentsFixture');
-  const sandbox = {URLSearchParams};
-  for (const name of ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'localStorage', 'sessionStorage',
-    'navigator', 'Notification', 'File', 'Blob', 'document', 'window', 'location', 'setTimeout', 'setInterval'])
-    Object.defineProperty(sandbox, name, {get() {throw Error(`Forbidden access: ${name}`);}});
-  vm.runInNewContext(source + `
+  const forbidden = ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'localStorage', 'sessionStorage',
+    'navigator', 'Notification', 'File', 'Blob', 'document', 'window', 'location', 'setTimeout', 'setInterval'];
+  await supervisedVmProbe(source + `
     const a = createAttachmentsFixture({enabled:true,search:'?demo',scenario:'a09-pdf'});
     const run = (type, authority, extra = {}) => a.act({type,authority,...extra});
     run('open_files',a.snapshot().management.context);
@@ -1301,7 +1294,7 @@ test('new phase4 workflow executes with effects forbidden and disabled commands 
     run('close_delete',a.snapshot().deleteDialog.viewAuthority);
     run('advance_sample_deletion',a.snapshot().management.deletions[0].authority);
     run('open_delete_result',a.snapshot().management.deletions[0].authority);
-  `, sandbox, {timeout: 1000});
+  `, {forbidden});
   const enabled = active('a10-files'), disabled = createAttachmentsFixture();
   assert.equal(disabled.snapshot().management, null);
   rejectsUnchanged(disabled, {type: 'open_files', authority: enabled.snapshot().management.context}, /unavailable/);
@@ -1406,13 +1399,13 @@ async function quotaProbe(usage, program) {
   source = source.replace('usedBytes: enabled ? 1_200_000_000 : 0', 'usedBytes: enabled ? quotaUsage : 0')
     .replace('export const ATTACHMENT_SCENARIOS', 'const ATTACHMENT_SCENARIOS')
     .replace('export function createAttachmentsFixture', 'function createAttachmentsFixture');
-  vm.runInNewContext(source + `
+  await supervisedVmProbe(source + `
     const a = createAttachmentsFixture({enabled:true,search:'?demo',scenario:quotaScenario});
     const run = (type,extra={}) => {const d=a.snapshot().draft;return a.act({type,draftId:d.id,destination:d.destination,revision:d.revision,writerGeneration:d.writerGeneration,...extra});};
     const step = (type,authority,extra={}) => a.act({type,authority,...extra});
     const unchanged = (fn) => {const before=JSON.stringify(a.snapshot());assert.throws(fn);assert.equal(JSON.stringify(a.snapshot()),before);};
     ${program.body}
-  `, {URLSearchParams, assert, quotaUsage: usage, quotaScenario: program.scenario || 'a01-agent'}, {timeout: 1000});
+  `, {assertions: true, globals: {quotaUsage: usage, quotaScenario: program.scenario || 'a01-agent'}});
 }
 
 test('D3 exact-fit versus one-byte-short staged selection, retry, reattachment, Send and Finish admission', async () => {
