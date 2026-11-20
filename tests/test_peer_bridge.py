@@ -111,8 +111,10 @@ class PeerTests(unittest.TestCase):
         self.store.db.execute('UPDATE peer_requests SET created=?', (row['created'],))
         self.store._save(row)
         self.store.db.commit()
-        self.tick()
-        self.assertEqual(self.send(rid=rid)['state'], 'expired')
+        self.assertEqual(self.tick().call_count, 0)
+        # The immutable ledger proves this was never dispatched before pruning.
+        self.assertEqual(self.send(rid=rid)['state'], 'failed')
+        self.assertEqual(p.peer_lifecycle.get(self.store.db, row['request_id'])['execution'], 'dropped')
         self.assertFalse(self.store._rows())
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM peer_requests').fetchone()[0], 1)
 
