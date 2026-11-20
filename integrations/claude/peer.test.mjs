@@ -202,7 +202,9 @@ test('adapter sensitivity: authentication and timeout classification are require
  ]){
   assert.ok(original.includes(from));const dir=await fs.mkdtemp(path.join(here,'.peer-mutation-')),target=path.join(dir,'peer.mjs');try{
    await fs.copyFile(path.join(here,'inbox.mjs'),path.join(dir,'inbox.mjs'));
-   await fs.writeFile(target,original.replace(from,to));const result=await new Promise(resolve=>{const env={...process.env,WATCH_PEER_TEST_SCRIPT:target};delete env.NODE_TEST_CONTEXT;const child=spawn(process.execPath,['--test','--test-name-pattern',pattern,path.join(here,'peer.test.mjs')],{env,stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);child.on('exit',code=>resolve({code,output}))});assert.notEqual(result.code,0,name+' mutation must fail');assert.match(result.output,expectedFailure);if(name==='timeout-classification')assert.match(result.output,/not ok \d+ - loss/);
+   // The timeout mutation assertion identifies its failing subtest in TAP.
+   const testArgs=['--test','--test-reporter=tap','--test-name-pattern',pattern,path.join(here,'peer.test.mjs')];
+   await fs.writeFile(target,original.replace(from,to));const result=await new Promise(resolve=>{const env={...process.env,WATCH_PEER_TEST_SCRIPT:target};delete env.NODE_TEST_CONTEXT;const child=spawn(process.execPath,testArgs,{env,stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);child.on('exit',code=>resolve({code,output}))});assert.notEqual(result.code,0,name+' mutation must fail');assert.match(result.output,expectedFailure);if(name==='timeout-classification')assert.match(result.output,/not ok \d+ - loss/);
   }finally{await fs.rm(dir,{recursive:true,force:true})}
  }
 });
