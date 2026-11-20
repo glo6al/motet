@@ -353,6 +353,9 @@ jobs:
       - run: node tests/test_page.js      # the page's path helpers, outside a browser
         if: ${{ !cancelled() }}
         timeout-minutes: 7
+      - run: node tests/test_officer_documents_page.js
+        if: ${{ !cancelled() }}
+        timeout-minutes: 7
       - run: node tests/test_officer_documents_page_http.js
         if: ${{ !cancelled() }}
         timeout-minutes: 7

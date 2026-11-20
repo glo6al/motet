@@ -4001,8 +4001,7 @@ require('./test_attachments_storage_polish.js');
 require('./test_attachments_relay.js');
 require('./test_attachments_officer_direct.js');
 require('./test_attachments_history_time.js');
-require('./test_officer_documents_page.js');
-// The real owner HTTP/storage suite runs in its own workflow step. It must
+// Document consumer and owner HTTP/storage suites run in separate workflow steps. They must
 // not seed durable files while unrelated asynchronous page suites run here.
 
 /* Stored owner-message time travels through actual merge, card, paint and order paths. */

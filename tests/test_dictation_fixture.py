@@ -11,7 +11,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import traceback
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -21,7 +24,83 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 
 
+def _node_check_output(value, check):
+    text = value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value or ''
+    text = text.replace('\r\n', '\n').replace(check.replace('\r\n', '\n'), '<inline check>')
+    prefixes = [(str(ROOT), '<repo>'), (str(Path.home()), '<home>'),
+                (tempfile.gettempdir(), '<tmp>')]
+    variants = {(path.replace('\\', '/'), label) for path, label in prefixes}
+    variants.update((path.replace('/', '\\'), label) for path, label in prefixes)
+    for path, label in sorted(variants, key=lambda pair: len(pair[0]), reverse=True):
+        text = re.sub(re.escape(path), label, text,
+                      flags=re.IGNORECASE if os.name == 'nt' else 0)
+    lines = [line if len(line) <= 400 else '<line truncated>...' + line[-400:]
+             for line in text.splitlines()]
+    return '\n'.join(lines)[-2048:] or '<empty>'
+
+
+def _run_node_check(check, bootstrap, *, label, marker, timeout=10):
+    started = time.monotonic()
+    try:
+        return subprocess.run(['node', '-e', check], input=bootstrap,
+                              text=True, encoding='utf-8', capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        elapsed = time.monotonic() - started
+        stdout = error.output.decode('utf-8', errors='replace') if isinstance(error.output, bytes) else error.output or ''
+        message = ('%s Node check timed out after %.3fs (limit %ss); completion marker: %s; '
+                   'args: node -e <inline check>\nstdout tail:\n%s\nstderr tail:\n%s' %
+                   (label, elapsed, timeout, 'reached' if marker in stdout else 'not reached',
+                    _node_check_output(error.output, check), _node_check_output(error.stderr, check)))
+        # run() has already killed and reaped the child. Do not dump its inline argv via chaining.
+        raise AssertionError(message) from None
+
+
 class FixtureTests(unittest.TestCase):
+    def test_inline_node_timeout_diagnostic_is_bounded_and_does_not_dump_source_or_paths(self):
+        check = '\n'.join('private inline fixture source %s' % n for n in range(120))
+        bootstrap = 'fictional bootstrap input'
+        marker = 'generated capture lifecycle passed'
+        stderr = ('paths: %s/child | %s/item | %s/item\n%s\n%s\nshort stderr signal' %
+                  (ROOT, Path.home(), tempfile.gettempdir(), check, 'x' * 6000)).encode('utf-8')
+        for output, errors, reached in [((marker + '\n' + 'y' * 6000).encode(), stderr, 'reached'),
+                                        (None, None, 'not reached')]:
+            with self.subTest(marker=reached):
+                expired = subprocess.TimeoutExpired(['node', '-e', check], 10,
+                                                    output=output, stderr=errors)
+                with mock.patch.object(subprocess, 'run', side_effect=expired) as run, \
+                        mock.patch.object(time, 'monotonic', side_effect=[50, 52.5]):
+                    try:
+                        _run_node_check(check, bootstrap, label='synthetic lifecycle', marker=marker)
+                    except Exception as error:
+                        failure = error
+                    else:
+                        self.fail('The controlled timeout must be reported')
+                self.assertEqual(run.call_count, 1)
+                self.assertTrue(run.call_args.args == (['node', '-e', check],),
+                                'The original Node check must be invoked exactly once')
+                self.assertEqual(run.call_args.kwargs,
+                                 {'input': bootstrap, 'text': True, 'encoding': 'utf-8',
+                                  'capture_output': True, 'timeout': 10})
+                self.assertTrue(isinstance(failure, AssertionError), 'Raw subprocess timeout escaped')
+                self.assertTrue(failure.__suppress_context__, 'Inline argv exception must not be chained')
+                message = str(failure)
+                rendered = ''.join(traceback.format_exception(type(failure), failure, failure.__traceback__))
+                self.assertFalse(check in rendered, 'Rendered failure leaked the inline source')
+                self.assertFalse('subprocess.TimeoutExpired' in rendered,
+                                 'Rendered failure leaked the raw subprocess exception')
+                self.assertIn('2.500s (limit 10s)', message)
+                self.assertIn('completion marker: ' + reached, message)
+                self.assertIn('args: node -e <inline check>', message)
+                self.assertLess(len(message), 4600)
+                self.assertFalse(check in message, 'Full inline source leaked')
+                for path in (str(ROOT), str(Path.home()), tempfile.gettempdir()):
+                    self.assertFalse(path in message, 'Local path prefix leaked')
+                if errors:
+                    self.assertIn('<repo>', message)
+                    self.assertIn('<home>', message)
+                    self.assertIn('<tmp>', message)
+                    self.assertIn('short stderr signal', message)
+
     @unittest.skipUnless(shutil.which('node'), 'Node is optional for diagnostic checks')
     def test_motion_probe_is_opt_in_hidden_bounded_and_observes_real_animation_objects(self):
         self.assertNotIn(b'dictationMotionProbe', fixture.review_bootstrap(False))
@@ -54,8 +133,9 @@ records=JSON.parse(output.textContent).records;assert.equal(records.length,12);a
 const count=records.length;new h.Element('unrelated').animate([],options);assert.equal(JSON.parse(output.textContent).records.length,count);assert.equal(h.calls(),18);
 console.log('motion diagnostic gate, geometry, lifecycle and bounds passed');
 """
-        result = subprocess.run(['node', '-e', check], input=fixture.review_bootstrap(False, True).decode('utf-8'),
-                                text=True, encoding='utf-8', capture_output=True, timeout=10)
+        result = _run_node_check(check, fixture.review_bootstrap(False, True).decode('utf-8'),
+                                 label='motion diagnostic',
+                                 marker='motion diagnostic gate, geometry, lifecycle and bounds passed')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_scripted_recognition_revises_an_earlier_word_on_the_same_line(self):
@@ -247,8 +327,9 @@ vm.runInNewContext(code,{location:{search:''},localStorage:{setItem(){storage++}
  assert.equal(originalCalls,0);assert.equal(stops,3);console.log('generated capture lifecycle passed');
 })().catch(error=>{console.error(error);process.exitCode=1});
 """
-        result = subprocess.run(['node', '-e', check], input=fixture.review_bootstrap(True).decode(),
-                                text=True, encoding='utf-8', capture_output=True, timeout=10)
+        result = _run_node_check(check, fixture.review_bootstrap(True).decode(),
+                                 label='generated capture lifecycle',
+                                 marker='generated capture lifecycle passed')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_native_mode_has_no_capture_substitution(self):
