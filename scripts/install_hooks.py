@@ -9,7 +9,7 @@
   PermissionRequest  asks Motet for your Allow / Deny and passes the answer back to Claude.
                      This one DOES decide prompts on your behalf when you press a button on the stage.
                      With the stage closed, or no answer, it prints nothing. Claude is then expected to ask in the app
-                     as usual; that has not yet been confirmed against a real prompt (see README).
+                     as usual; that has not yet been confirmed against a real prompt (see docs/TRUST_BOUNDARY.md).
 
 All send the key from ~/.live-room/header, which the server writes when it starts. Only entries carrying this script's
 marker are ever touched; other hooks in the same group are left alone. The file is replaced atomically and a
