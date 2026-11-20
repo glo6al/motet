@@ -36,13 +36,14 @@ class ClaudeProvenEndIntegration(unittest.TestCase):
     def snapshot(self, request_id, sibling, sibling_request):
         with self.store.lock:
             db = self.store.db
-            transport, = db.execute('SELECT transport_id FROM shared_bridge_requests WHERE client_id=?',
-                                    (request_id,)).fetchone()
+            transport, launched = db.execute('SELECT transport_id,launched FROM shared_bridge_requests WHERE client_id=?',
+                                             (request_id,)).fetchone()
             sibling_transport, = db.execute('SELECT transport_id FROM shared_bridge_requests WHERE client_id=?',
                                             (sibling_request,)).fetchone()
             public = self.store.shared.result(request_id)
             return dict(
                 transport=transport,
+                launched=launched,
                 public=public,
                 lifecycle=peer_lifecycle.get(db, transport),
                 raw=db.execute('SELECT data FROM requests WHERE id=?', (transport,)).fetchone()[0],
@@ -95,7 +96,7 @@ class ClaudeProvenEndIntegration(unittest.TestCase):
                 registration = result['client_id']
                 self.reserve_requests(request_id, sibling, sibling_request)
             if kind == 'started':
-                started.append(snapshot())
+                started.append((dict(data), snapshot()))
             if (target and method == 'poll' and data['client_id'] != registration and result['recoverable_turns']):
                 recoverable.append(snapshot())
             if kind == 'completed':
@@ -109,14 +110,31 @@ class ClaudeProvenEndIntegration(unittest.TestCase):
                 answer=ANSWER, owner_input=OWNER_INPUT)), text=True, capture_output=True, timeout=25)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         node = json.loads(process.stdout)
-        self.assertEqual(len(started), 1)
-        start, = started
+        replay_start = mode == 'start_ack_replay'
+        self.assertEqual(node['submissions'], [1, 0, 0])
+        self.assertEqual([len(posts) for posts in node['starts']], [1, 0, int(replay_start)])
+        self.assertEqual(len(started), 2 if replay_start else 1)
+        posts = [post for runtime_posts in node['starts'] for post in runtime_posts]
+        self.assertEqual(posts, [dict(body=body, status=200) for body, _ in started])
+        original_start, start = started[0]
+        self.assertEqual(node['originalStart'], original_start)
+        self.assertEqual(original_start['native_id'], self.sid)
         receipt = node['completion']
         self.assertEqual(start['transport'], receipt['request_id'])
         self.assertEqual(start['public']['progress']['phase'], 'started')
         self.assertIsNotNone(start['public']['progress']['started_at'])
         self.assertIsNone(start['public']['progress']['ended_at'])
         self.assertIn('active request', start['capacity'])
+        if replay_start:
+            replay, after_replay = started[1]
+            connection_fields = {'client_id', 'generation'}
+            self.assertEqual({k: v for k, v in replay.items() if k not in connection_fields},
+                             {k: v for k, v in original_start.items() if k not in connection_fields})
+            for key in connection_fields:
+                self.assertNotEqual(replay[key], original_start[key])
+                self.assertEqual(replay[key], receipt[key])
+            self.assertEqual(after_replay['lifecycle']['evidence']['progress']['started_at'],
+                             start['lifecycle']['evidence']['progress']['started_at'])
         self.assertEqual([blocker[:2] for blocker in start['sibling_blockers']],
                          [(start['sibling_transport'], 'reserved')])
         expected_events = 2 if mode == 'lost_ack' else 1
@@ -124,7 +142,7 @@ class ClaudeProvenEndIntegration(unittest.TestCase):
         self.assertEqual(len(before_end), expected_events)
         self.assertEqual(len(after_end), expected_events)
         if mode != 'lost_ack':
-            self.assertGreaterEqual(len(recoverable), 2, 'production polls before and after unrelated events')
+            self.assertEqual(len(recoverable), 2, 'production polls before and after unrelated events')
             for pending in recoverable:
                 progress = pending['public']['progress']
                 self.assertEqual((progress['phase'], pending['lifecycle']['capture']), ('held', 'pending'))
@@ -135,6 +153,8 @@ class ClaudeProvenEndIntegration(unittest.TestCase):
         end = snapshot()
         self.assertEqual(end['lifecycle'], after_end[-1]['lifecycle'])
         self.assertEqual(end['events'], after_end[-1]['events'])
+        self.assertIsNotNone(start['launched'])
+        self.assertEqual(end['launched'], start['launched'])
         self.assertEqual(end['sibling_blockers'], start['sibling_blockers'])
         self.assertIsNone(end['capacity'])
         public = end['public']
@@ -184,6 +204,9 @@ class ClaudeProvenEndIntegration(unittest.TestCase):
 
     def test_replacement_runtime_observes_the_exact_original_turn_end(self):
         self.exercise('reloaded')
+
+    def test_replacement_replays_unacknowledged_start_without_resubmitting(self):
+        self.exercise('start_ack_replay')
 
     def test_owner_retirement_wins_after_replacement_receives_recovery_proof(self):
         self.exercise('retired_race')
