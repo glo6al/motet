@@ -40,19 +40,31 @@ def _node_check_output(value, check):
 
 
 def _run_node_check(check, bootstrap, *, label, marker, timeout=10):
-    started = time.monotonic()
-    try:
-        return subprocess.run(['node', '-e', check], input=bootstrap,
-                              text=True, encoding='utf-8', capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        elapsed = time.monotonic() - started
-        stdout = error.output.decode('utf-8', errors='replace') if isinstance(error.output, bytes) else error.output or ''
-        message = ('%s Node check timed out after %.3fs (limit %ss); completion marker: %s; '
-                   'args: node -e <inline check>\nstdout tail:\n%s\nstderr tail:\n%s' %
-                   (label, elapsed, timeout, 'reached' if marker in stdout else 'not reached',
-                    _node_check_output(error.output, check), _node_check_output(error.stderr, check)))
-        # run() has already killed and reaped the child. Do not dump its inline argv via chaining.
-        raise AssertionError(message) from None
+    # A closed file removes the synchronous stdin read's dependency on pipe EOF.
+    with tempfile.TemporaryDirectory(prefix='motet-node-check-') as directory:
+        path = Path(directory) / 'bootstrap.js'
+        path.write_bytes(bootstrap.encode('utf-8'))
+        started = time.monotonic()
+        try:
+            result = subprocess.run(['node', '-e', check, '--', str(path)], stdin=subprocess.DEVNULL,
+                                    text=True, encoding='utf-8', capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            elapsed = time.monotonic() - started
+            stdout = error.output.decode('utf-8', errors='replace') if isinstance(error.output, bytes) else error.output or ''
+            message = ('%s Node check timed out after %.3fs (limit %ss); completion marker: %s; '
+                       'args: node -e <inline check> -- <bootstrap file>\nstdout tail:\n%s\nstderr tail:\n%s' %
+                       (label, elapsed, timeout, 'reached' if marker in stdout else 'not reached',
+                        _node_check_output(error.output, check), _node_check_output(error.stderr, check)))
+            # run() has already killed and reaped the child. Never dump its inline argv via chaining.
+            raise AssertionError(message) from None
+        # Preserve failure details without exposing the parent-owned temporary filename.
+        for field in ('stdout', 'stderr'):
+            value = getattr(result, field)
+            for spelling in (str(path), str(path).replace('\\', '/'),
+                             json.dumps(str(path))[1:-1]):
+                value = value.replace(spelling, '<bootstrap file>')
+            setattr(result, field, value)
+        return result
 
 
 class FixtureTests(unittest.TestCase):
@@ -67,7 +79,12 @@ class FixtureTests(unittest.TestCase):
             with self.subTest(marker=reached):
                 expired = subprocess.TimeoutExpired(['node', '-e', check], 10,
                                                     output=output, stderr=errors)
-                with mock.patch.object(subprocess, 'run', side_effect=expired) as run, \
+                paths = []
+                def expire(argv, **kwargs):
+                    paths.append(Path(argv[4]))
+                    self.assertTrue(paths[-1].read_bytes() == bootstrap.encode('utf-8'))
+                    raise expired
+                with mock.patch.object(subprocess, 'run', side_effect=expire) as run, \
                         mock.patch.object(time, 'monotonic', side_effect=[50, 52.5]):
                     try:
                         _run_node_check(check, bootstrap, label='synthetic lifecycle', marker=marker)
@@ -76,11 +93,12 @@ class FixtureTests(unittest.TestCase):
                     else:
                         self.fail('The controlled timeout must be reported')
                 self.assertEqual(run.call_count, 1)
-                self.assertTrue(run.call_args.args == (['node', '-e', check],),
+                self.assertTrue(run.call_args.args[0][:4] == ['node', '-e', check, '--'] and len(run.call_args.args[0]) == 5,
                                 'The original Node check must be invoked exactly once')
                 self.assertEqual(run.call_args.kwargs,
-                                 {'input': bootstrap, 'text': True, 'encoding': 'utf-8',
+                                 {'stdin': subprocess.DEVNULL, 'text': True, 'encoding': 'utf-8',
                                   'capture_output': True, 'timeout': 10})
+                self.assertFalse(paths[0].parent.exists(), 'Timed-out bootstrap directory must be removed')
                 self.assertTrue(isinstance(failure, AssertionError), 'Raw subprocess timeout escaped')
                 self.assertTrue(failure.__suppress_context__, 'Inline argv exception must not be chained')
                 message = str(failure)
@@ -101,11 +119,62 @@ class FixtureTests(unittest.TestCase):
                     self.assertIn('<tmp>', message)
                     self.assertIn('short stderr signal', message)
 
+    def test_node_file_transport_preserves_bytes_and_cleans_up_all_outcomes(self):
+        bootstrap = 'fictional bootstrap: café · 雪\r\n'
+        for code in (0, 7):
+            with self.subTest(returncode=code):
+                paths = []
+                def child(argv, **kwargs):
+                    self.assertTrue(argv[:4] == ['node', '-e', 'fictional check', '--'] and len(argv) == 5)
+                    paths.append(Path(argv[4]))
+                    self.assertTrue(paths[-1].read_bytes() == bootstrap.encode('utf-8'))
+                    self.assertEqual(kwargs, {'stdin': subprocess.DEVNULL, 'text': True,
+                                             'encoding': 'utf-8', 'capture_output': True, 'timeout': 10})
+                    return subprocess.CompletedProcess(argv, code, 'signal',
+                                                       'failure at ' + str(paths[-1]) + '\n' +
+                                                       json.dumps(str(paths[-1]))[1:-1] + '\n' +
+                                                       str(paths[-1]).replace('\\', '/'))
+                with mock.patch.object(subprocess, 'run', side_effect=child) as run:
+                    result = _run_node_check('fictional check', bootstrap, label='transport', marker='signal')
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(result.returncode, code)
+                self.assertEqual(result.stderr, 'failure at <bootstrap file>\n<bootstrap file>\n<bootstrap file>')
+                self.assertFalse(paths[0].exists(), 'Closed bootstrap file must be removed')
+                self.assertFalse(paths[0].parent.exists(), 'Owned temporary directory must be removed')
+
+    def test_node_file_transport_cleans_up_when_spawn_fails(self):
+        paths = []
+        def failed_spawn(argv, **kwargs):
+            paths.append(Path(argv[4]))
+            self.assertTrue(paths[-1].is_file())
+            raise OSError('fictional spawn failure')
+        with mock.patch.object(subprocess, 'run', side_effect=failed_spawn) as run:
+            with self.assertRaisesRegex(OSError, '^fictional spawn failure$'):
+                _run_node_check('fictional check', 'input', label='spawn', marker='never')
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse(paths[0].parent.exists(), 'Failed spawn must not leave its input file')
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is optional for transport checks')
+    def test_node_reads_utf8_file_and_reports_synchronous_phases(self):
+        check = r"""require('node:fs').writeSync(2,'entered\n');
+const fs=require('node:fs');fs.writeSync(2,'before read\n');
+const code=fs.readFileSync(process.argv[1],'utf8');fs.writeSync(2,'after read\n');
+require('node:assert/strict').equal(code,'café · 雪\r\n');
+console.log('transport passed');"""
+        result = _run_node_check(check, 'café · 雪\r\n', label='UTF8 transport', marker='transport passed')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, 'entered\nbefore read\nafter read\n')
+        self.assertEqual(result.stdout.strip(), 'transport passed')
+
     @unittest.skipUnless(shutil.which('node'), 'Node is optional for diagnostic checks')
     def test_motion_probe_is_opt_in_hidden_bounded_and_observes_real_animation_objects(self):
         self.assertNotIn(b'dictationMotionProbe', fixture.review_bootstrap(False))
         check = r"""
-const assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs'),code=fs.readFileSync(0,'utf8');
+require('node:fs').writeSync(2,'node-check: entered\n');
+const assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
+fs.writeSync(2,'node-check: before bootstrap read\n');
+const code=fs.readFileSync(process.argv[1],'utf8');
+fs.writeSync(2,'node-check: bootstrap read\n');
 function harness(pathname,search){
  let now=0,next=0,calls=0;const nodes=[],frames=new Map(),animations=[];
  class Element{
@@ -116,9 +185,12 @@ function harness(pathname,search){
  const original=Element.prototype.animate;
  const document={hidden:false,body:{appendChild(node){nodes.push(node)}},createElement(){return {style:{},dataset:{},setAttribute(k,v){this[k]=v}}}};
  const context={location:{pathname,search},document,Element,URLSearchParams,performance:{now:()=>now},getComputedStyle:node=>({opacity:String(node.opacity)}),requestAnimationFrame:fn=>{frames.set(++next,fn);return next},cancelAnimationFrame:id=>frames.delete(id),localStorage:{setItem(){if(/[?&]demo\b/.test(search))throw Error('demo storage')}}};
+ fs.writeSync(2,'node-check: before VM\n');
  vm.runInNewContext(code,context);
+ fs.writeSync(2,'node-check: after VM\n');
  return {nodes,frames,animations,Element,original,calls:()=>calls,frame(){now+=16;const pending=[...frames.values()];frames.clear();for(const fn of pending)fn()}};
 }
+fs.writeSync(2,'node-check: before assertions\n');
 for(const [path,query]of [['/review',''],['/review','?motionProbe=0'],['/other','?motionProbe=1'],['/review','?demo&motionProbe=1']]){
  const h=harness(path,query);assert.equal(h.nodes.length,0);assert.equal(h.Element.prototype.animate,h.original);assert.equal(h.calls(),0);
 }
@@ -131,12 +203,17 @@ const prompts=new h.Element('workspaceOfficerPrompts'),promptAnimation=prompts.a
 for(let i=0;i<14;i++){const a=target.animate([{height:'200px',opacity:0,privateText:'discard me'},{height:'unsafe text',opacity:Infinity}],options);for(let f=0;f<30;f++)h.frame();a.events.finish();h.frame()}
 records=JSON.parse(output.textContent).records;assert.equal(records.length,12);assert(records.every(r=>r.samples.length<=24));assert(records.every(r=>r.keyframes.every(f=>!('privateText'in f))));assert.deepEqual(records.at(-1).keyframes,[{height:'200px',opacity:0},{}]);assert.equal(output.dataset.count,'12');assert.equal(h.frames.size,0);
 const count=records.length;new h.Element('unrelated').animate([],options);assert.equal(JSON.parse(output.textContent).records.length,count);assert.equal(h.calls(),18);
+fs.writeSync(2,'node-check: assertions passed\n');
 console.log('motion diagnostic gate, geometry, lifecycle and bounds passed');
 """
         result = _run_node_check(check, fixture.review_bootstrap(False, True).decode('utf-8'),
                                  label='motion diagnostic',
                                  marker='motion diagnostic gate, geometry, lifecycle and bounds passed')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(result.stderr.startswith('node-check: entered\nnode-check: before bootstrap read\nnode-check: bootstrap read\n'))
+        self.assertIn('node-check: before VM\n', result.stderr)
+        self.assertIn('node-check: after VM\n', result.stderr)
+        self.assertTrue(result.stderr.endswith('node-check: assertions passed\n'))
 
     def test_scripted_recognition_revises_an_earlier_word_on_the_same_line(self):
         runtime = fixture.FakeRuntime()
@@ -301,10 +378,16 @@ console.log('motion diagnostic gate, geometry, lifecycle and bounds passed');
     @unittest.skipUnless(shutil.which('node'), 'Node is optional for bootstrap checks')
     def test_generated_capture_is_inert_until_gesture_and_releases_resources(self):
         check = r"""
-const assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs'),code=fs.readFileSync(0,'utf8');
+require('node:fs').writeSync(2,'node-check: entered\n');
+const assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs');
+fs.writeSync(2,'node-check: before bootstrap read\n');
+const code=fs.readFileSync(process.argv[1],'utf8');
+fs.writeSync(2,'node-check: bootstrap read\n');
 for(const query of ['?demo','?x=1&demo&y=2']){
  const ctx={location:{search:query},localStorage:{setItem(){throw Error('demo storage')}},navigator:new Proxy({},{get(){throw Error('demo capture')}})};
+ fs.writeSync(2,'node-check: before VM\n');
  vm.runInNewContext(code,ctx);
+ fs.writeSync(2,'node-check: after VM\n');
 }
 const contexts=[],connections=[],events={},docEvents={},labels=[];
 let originalCalls=0,storage=0,stops=0;
@@ -317,20 +400,26 @@ class Context{
 }
 const document={hidden:false,body:{appendChild(value){labels.push(value)}},createElement(){return {style:{},setAttribute(){}}},addEventListener(type,fn){docEvents[type]=fn}};
 const navigator={mediaDevices:{getUserMedia(){originalCalls++;throw Error('real capture forbidden')}}};
+fs.writeSync(2,'node-check: before VM\n');
 vm.runInNewContext(code,{location:{search:''},localStorage:{setItem(){storage++}},document,navigator,AudioContext:Context,DOMException,addEventListener:(type,fn)=>events[type]=fn});
+fs.writeSync(2,'node-check: after VM\n');
 (async()=>{
+ fs.writeSync(2,'node-check: before assertions\n');
  assert.equal(storage,1);assert.equal(contexts.length,0,'bootstrap must not start audio');
  assert.equal(labels[0].textContent,'Simulated audio · microphone not used');
  const first=await navigator.mediaDevices.getUserMedia({audio:true,video:false});assert.equal(contexts.length,1);assert(contexts[0].oscillator.started);assert(!connections.some(n=>n.speaker));first.getTracks()[0].stop();assert.equal(contexts[0].state,'closed');assert(contexts[0].oscillator.stopped);
  await navigator.mediaDevices.getUserMedia({audio:true});document.hidden=true;docEvents.visibilitychange();assert.equal(contexts[1].state,'closed');document.hidden=false;
  await navigator.mediaDevices.getUserMedia({audio:true});events.pagehide();assert.equal(contexts[2].state,'closed');
- assert.equal(originalCalls,0);assert.equal(stops,3);console.log('generated capture lifecycle passed');
+ assert.equal(originalCalls,0);assert.equal(stops,3);fs.writeSync(2,'node-check: assertions passed\n');console.log('generated capture lifecycle passed');
 })().catch(error=>{console.error(error);process.exitCode=1});
 """
         result = _run_node_check(check, fixture.review_bootstrap(True).decode(),
                                  label='generated capture lifecycle',
                                  marker='generated capture lifecycle passed')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        phases = (['entered', 'before bootstrap read', 'bootstrap read'] +
+                  ['before VM', 'after VM'] * 3 + ['before assertions', 'assertions passed'])
+        self.assertEqual(result.stderr.splitlines(), ['node-check: ' + phase for phase in phases])
 
     def test_native_mode_has_no_capture_substitution(self):
         script = fixture.review_bootstrap(False).decode()
