@@ -225,14 +225,14 @@ function harness(fixture,{query='?ui=workspace&demo&attachments=a03-five',worksp
  // both desks. The editor stays first through repeated attachment repaints.
  function deskAttachmentOrderProof(mutate=x=>x){
   for(const officer of [false,true]){
-   const q=harness(fixture(officer?'a01-officer':'a03-one'),{globals:{workspaceDictationPlacesFiles:()=>true}});
+   const q=harness(fixture(officer?'a01-officer':'a03-one'));
    const row=q.ids['#ofRow'],compose=q.ids['#ofCompose'],send=q.ids['#ofSend'],address=q.ids['#ofAddress'],toolbar=q.ids['#workspaceStationToolbar'];
    q.doc.body.classList.add(officer?'workspace-officer-desk':'stepped');
    const recipient=officer?address:toolbar;
    if(officer){q.officer(true);q.context.OFUI.recipient='watch';q.context.OFUI.scope='station';toolbar.remove();row.insertBefore(address,send);address.append(q.ids['#ofModelPicker']);}
    const mic=new Node(q.doc),cancel=new Node(q.doc),wave=new Node(q.doc);mic.className='dictation-mic';cancel.className='dictation-cancel';wave.className='dictation-wave';row.insertBefore(cancel,send);row.insertBefore(wave,send);row.insertBefore(mic,send);
    const init=()=>{};init.current={view:{mic,cancel,wave}};q.context.workspaceDictationInit=init;q.context.workspaceDictationTarget=()=> 'fictional-desk-draft';
-   q.run(mutate(sourceFunction('workspaceDictationOrderControls')));
+   q.run(mutate(sourceFunction('workspaceDictationOrderControls'))+'\n'+sourceFunction('workspaceDictationPlacesFiles'));
    assert.equal(q.install(),true);const draft=q.input.value;
    q.input.setSelectionRange(2,5,'backward');q.input.scrollTop=17;
    for(const active of [false,true,false,true,false]){
@@ -240,15 +240,15 @@ function harness(fixture,{query='?ui=workspace&demo&attachments=a03-five',worksp
     q.api.workspaceAttachmentsSync();
     const plus=row.querySelector('.workspace-attachments-plus'),files=row.querySelector('.workspace-attachments-files');
     assert(plus&&files);assert.equal(row.children[0]===compose,true,'The desk words remain above its control row');
-    if(active){assert.equal(plus.nextSibling,files);assert.equal(files.nextSibling,cancel);}
-    else {assert.equal(plus.nextSibling,recipient);assert.equal(recipient.nextSibling,files);}
-    assert.equal(mic.nextSibling,send);assert.equal(q.input.parentNode,compose);assert.equal(q.input.value,draft);
+    if(active){assert.equal(plus.nextSibling===files,true);assert.equal(files.nextSibling===cancel,true);}
+    else {assert.equal(plus.nextSibling===recipient,true);if(officer){assert.equal(files.parentNode===address,true,'Motet idle Files returns inside the scope group');assert.equal(files.nextSibling===q.ids['#ofModelPicker'],true,'Files precedes the real model choice');}else assert.equal(recipient.nextSibling===files,true);}
+    assert.equal(mic.nextSibling===send,true);assert.equal(q.input.parentNode===compose,true);assert.equal(q.input.value,draft);
     assert.deepEqual([q.input.selectionStart,q.input.selectionEnd,q.input.selectionDirection,q.input.scrollTop],[2,5,'backward',17]);
-    files.focus();const before=row.children.slice();q.context.workspaceDictationOrderControls();assert.deepEqual(row.children,before,'Settled desk controls do not move');assert.equal(q.doc.activeElement,files);
+    files.focus();const before=row.children.slice();q.context.workspaceDictationOrderControls();assert.deepEqual(row.children,before,'Settled desk controls do not move');assert.equal(q.doc.activeElement===files,true);
    }
   }
  }
- deskAttachmentOrderProof();assert.throws(()=>deskAttachmentOrderProof(s=>s.replace('if(!stage&&!active){','if(false){')),assert.AssertionError,'Stage ordering must not replace the desk idle row');count++;
+ deskAttachmentOrderProof();assert.throws(()=>deskAttachmentOrderProof(s=>s.replace('recipient===address&&model.parentNode===address?address:row','row')),assert.AssertionError,'Motet idle Files cannot move after the scope group');assert.throws(()=>deskAttachmentOrderProof(s=>s.replace('if(!stage&&!active){','if(false){')),assert.AssertionError,'Stage ordering must not replace the desk idle row');count++;
  console.log('ok workspace attachments controller: '+count+' behavior groups, canonical fixture and causal send guards');
 })().catch(error=>{console.error(error);process.exitCode=1});
 module.exports={harness,Node,sourceFunction,html,controller,extendedBindings};

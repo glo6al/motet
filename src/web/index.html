@@ -9755,7 +9755,7 @@ function workspaceDictationSendNotice(){
   else if(typeof OF!=='undefined'&&OF.busy)reason='Motet is answering another request.';
   return reason?'You can dictate a draft here, but Send is unavailable. '+reason:'';
 }
-function workspaceDictationPlacesFiles(){return !!(WORKSPACE&&workspaceDictationInit.current?.view)}
+function workspaceDictationPlacesFiles(){return !!(WORKSPACE&&workspaceDictationInit.current?.view&&ofEl.classList.contains('dictation-active'))}
 function workspaceDictationCloseHiddenPopups(){
   if(!ofEl.classList.contains('dictation-active'))return;
   const hidden=trigger=>!!trigger&&!trigger.getClientRects().length;
@@ -9771,13 +9771,14 @@ function workspaceDictationOrderControls(){
   const stage=WORKSPACE&&(ofEl.dataset.workspaceComposer==='desktop'||ofEl.dataset.workspaceComposer==='narrow')&&!ofEl.classList.contains('docked')&&!document.body.classList.contains('stepped')&&!document.body.classList.contains('workspace-officer-desk');
   if(!stage&&(!mic||mic.parentNode!==row))return;
   const compose=$('#ofCompose'),active=ofEl.classList.contains('dictation-active');
-  const controls=['.workspace-attachments-plus','.workspace-attachments-files'].map(selector=>row.querySelector(selector)).filter(node=>node&&node.parentNode===row);
+  const address=$('#ofAddress'),controls=['.workspace-attachments-plus','.workspace-attachments-files'].map(selector=>row.querySelector(selector)).filter(node=>node&&(node.parentNode===row||node.parentNode===address&&address.parentNode===row));
   if(!stage&&!active){
-    const recipient=[$('#workspaceStationToolbar'),$('#ofAddress')].find(node=>node?.parentNode===row),plus=controls[0]?.classList.contains('workspace-attachments-plus')?controls[0]:null,files=controls.find(node=>node.classList.contains('workspace-attachments-files'));
-    if(!recipient||((!plus||plus.nextSibling===recipient)&&(!files||recipient.nextSibling===files)))return;
+    const recipient=[$('#workspaceStationToolbar'),address].find(node=>node?.parentNode===row),plus=controls[0]?.classList.contains('workspace-attachments-plus')?controls[0]:null,files=controls.find(node=>node.classList.contains('workspace-attachments-files')),model=$('#ofModelPicker');
+    const filesHost=recipient===address&&model.parentNode===address?address:row;
+    if(!recipient||((!plus||plus.nextSibling===recipient)&&(!files||files.parentNode===filesHost&&(filesHost===address?files.nextSibling===model:recipient.nextSibling===files))))return;
     const held=document.activeElement,heldControl=controls.includes(held),identity=heldControl?workspaceDictationTarget():null;
     if(plus&&plus.nextSibling!==recipient)row.insertBefore(plus,recipient);
-    if(files&&recipient.nextSibling!==files)row.insertBefore(files,recipient.nextSibling);
+    if(files&&(files.parentNode!==filesHost||(filesHost===address?files.nextSibling!==model:recipient.nextSibling!==files)))filesHost.insertBefore(files,filesHost===address?model:recipient.nextSibling);
     if(heldControl&&held.isConnected&&identity===workspaceDictationTarget()&&document.activeElement!==held)held.focus({preventScroll:true});
     return;
   }
