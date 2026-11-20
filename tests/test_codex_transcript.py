@@ -12,6 +12,7 @@ from unittest.mock import patch, Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import codex_transcript as c
 import officer_messaging as m
+import peer_admin
 import peer_bridge
 import peer_lifecycle
 import peer_progress
@@ -812,13 +813,79 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(saved['state'], 'expired')
         self.assertEqual(saved['error'], m.CODEX_REPLY_EXPIRED)
 
-    def test_peer_retention_cutoff_still_prunes_content_without_false_completion(self):
+    def test_peer_retention_prune_holds_bound_attempt_through_late_end(self):
         self.retain_previous_worker_binding()
+        cutoff = self.row['created'] + m.RETENTION
+        with patch.object(m.time, 'time', return_value=cutoff):
+            self.store.tick()
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'running')
+        with patch.object(m.time, 'time', return_value=cutoff + 1), patch.object(self.store, '_poll') as poll:
+            self.store.tick()
+            poll.assert_not_called()
+        self.assert_retention_hold()
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional late answer.'))
+        with patch.object(m.time, 'time', return_value=cutoff + 3600), patch.object(self.store, '_poll') as poll, patch.object(m.subprocess, 'Popen') as launch:
+            self.store.tick()
+            poll.assert_not_called()
+            launch.assert_not_called()
+            self.assert_retention_hold()
+            result = self.public_result(2)
+            self.assertEqual((result['state'], result['reply']), ('expired', ''))
+            self.assertTrue(peer_admin.inspect(self.store, {'transport_id': self.rid})['eligible'])
+        stale = dict(self.row, state='answered', settled=True, reply='Fictional stale reply.')
+        with self.store.db:
+            peer_lifecycle.reconcile(self.store.db, stale)
+        self.assert_retention_hold()
+        self.store._save(dict(stale))
+        self.assert_retention_hold()
+        retired = peer_admin.retire(self.store, {'transport_id': self.rid, 'agent': self.row['agent'],
+                                                 'confirm': peer_admin.CONFIRM})
+        self.assertEqual((retired['status'], retired['provider_outcome']), ('retired', 'unknown'))
+
+    def assert_retention_hold(self):
+        self.assertIsNone(self.store.db.execute('SELECT data FROM requests WHERE id=?', (self.rid,)).fetchone())
+        execution = peer_lifecycle.get(self.store.db, self.rid)
+        self.assertEqual((execution['execution'], execution['capture']), ('uncertain', 'withheld'))
+        self.assertEqual(execution['evidence']['bound_turn'], 'bound')
+        self.assertEqual(execution['evidence']['codex_retention_hold'],
+                         'Content retention passed before an end was observed.')
+        self.assertIn('requires recovery', peer_lifecycle.capacity_error(self.store.db, self.row['agent'], time.time(), m.TTL))
+
+    def test_peer_retention_holds_bound_attempt_when_bulk_prunes_invalid_payload(self):
+        self.retain_previous_worker_binding()
+        self.store.db.execute('UPDATE requests SET data=? WHERE id=?', ('{}', self.rid))
+        self.store.db.commit()
+        self.assertEqual(self.store._rows(), [])
         with patch.object(m.time, 'time', return_value=self.row['created'] + m.RETENTION + 1):
             self.store.tick()
-        self.assertFalse(any(row['request_id'] == self.rid for row in self.store._rows()))
-        self.assertNotIn(peer_lifecycle.get(self.store.db, self.rid)['execution'], peer_lifecycle.TERMINAL)
-        self.assertEqual(self.public_result(2)['state'], 'expired')
+        self.assert_retention_hold()
+
+    def test_peer_retention_repairs_already_absent_bound_payload(self):
+        self.retain_previous_worker_binding()
+        self.store.db.execute('DELETE FROM requests WHERE id=?', (self.rid,))
+        self.store.db.commit()
+        with patch.object(m.time, 'time', return_value=self.row['created'] + m.RETENTION + 1):
+            self.store.tick()
+        self.assert_retention_hold()
+
+    def test_peer_retention_does_not_mutate_protected_alias(self):
+        self.retain_previous_worker_binding()
+        marker = json.dumps({'attachment_owner_version': 1})
+        self.store.db.execute('UPDATE requests SET data=? WHERE id=?', (marker, self.rid))
+        self.store.db.commit()
+        before = peer_lifecycle.get(self.store.db, self.rid)
+        with patch.object(m.time, 'time', return_value=self.row['created'] + m.RETENTION + 1):
+            self.store.tick()
+        self.assertEqual(self.store.db.execute('SELECT data FROM requests WHERE id=?', (self.rid,)).fetchone(), (marker,))
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid), before)
+
+    def test_peer_retention_pruned_launched_unbound_attempt_remains_reserved(self):
+        self.admit()
+        with patch.object(m.time, 'time', return_value=self.row['created'] + m.RETENTION + 1):
+            self.store.tick()
+        self.assertIsNone(self.store.db.execute('SELECT data FROM requests WHERE id=?', (self.rid,)).fetchone())
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'submitted')
 
     def test_previous_worker_unfollowed_successor_tracks_to_exact_end(self):
         self.retain_previous_worker_binding()

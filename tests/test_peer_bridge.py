@@ -392,8 +392,8 @@ class PeerTests(unittest.TestCase):
         self.assertTrue(self.bridge.list_peers(self.a)[0]['reachable'])
         self.assertEqual(self.send()['state'], 'sending')
 
-    def test_old_uncertain_transports_keep_global_capacity_until_retirement(self):
-        targets = [self.b] + [self.enroll('Target ' + str(i)) for i in range(5)]
+    def test_old_uncertain_transports_release_shared_slots_but_keep_recipient_fences(self):
+        targets = [self.b] + [self.enroll('Target ' + str(i)) for i in range(7)]
         for target in targets[:4]:
             self.send(target=target)
         with self.assertRaises(p.PeerError):
@@ -404,19 +404,21 @@ class PeerTests(unittest.TestCase):
             self.store.db.execute('UPDATE peer_requests SET created=? WHERE transport_id=?', (row['created'], row['request_id']))
             self.store._save(row)
         self.store.db.commit()
-        with self.assertRaisesRegex(p.PeerError, 'requires recovery'):
-            self.send(target=targets[0])
-        with self.assertRaisesRegex(p.PeerError, 'Four peer deliveries'):
-            self.send(target=targets[4])
+        for target in targets[:4]:
+            with self.assertRaisesRegex(p.PeerError, 'requires recovery'):
+                self.send(target=target)
+        self.assertEqual(self.send(target=targets[4])['state'], 'sending')
+        self.assertEqual(self.send(target=targets[5])['state'], 'sending')
         target_agent = 'x:' + targets[0]['session']
         retired = next(row for row in self.store._rows() if row['agent'] == target_agent)
         with self.store.lock, self.store.db:
             outcome = peer_lifecycle.retire(self.store.db, retired['request_id'], peer_lifecycle.RETIRE_REASON,
                                             expected_agent=target_agent)
         self.assertEqual(outcome['evidence']['owner_retirement']['provider_outcome'], 'unknown')
-        self.assertEqual(self.send(target=targets[4])['state'], 'sending')
+        self.assertEqual(self.send(target=targets[0])['state'], 'sending')
+        self.assertEqual(self.send(target=targets[6])['state'], 'sending')
         with self.assertRaisesRegex(p.PeerError, 'Four peer deliveries'):
-            self.send(target=targets[5])
+            self.send(target=targets[7])
 
     def test_legacy_expiry_is_rechecked_after_slow_preflight(self):
         self.send()

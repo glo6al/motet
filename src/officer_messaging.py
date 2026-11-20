@@ -412,6 +412,13 @@ class MessagingStore:
             raise OwnerGuardError('A protected owner request needs recovery before ordinary writeback.')
         if proof is not None and not self._ordinary_row(row):
             proof.eligible = False
+        if row.get('origin') == 'peer' and row.get('runtime') == 'codex':
+            previous = peer_lifecycle.get(self.db, row['request_id'])
+            reason = peer_lifecycle.CODEX_RETENTION_HOLD
+            if previous and previous['evidence'].get('codex_retention_hold') == reason:
+                # A poll detached before pruning cannot restore content or revise the hold.
+                row.update(state='unknown', error=reason, reply='', candidate_reply='')
+                return
         # Reconcile the original receipts before suppressing a stale public
         # payload. A pruned terminal attempt must never regain its content.
         terminal = peer_lifecycle.project_terminal(self.db, row['request_id'], dict(row))
@@ -1077,7 +1084,35 @@ class MessagingStore:
                                           (now - RETENTION,))
         if proof is not None and (shared_removed.rowcount != 0 or preview_removed.rowcount != 0):
             proof.eligible = False
+        self._hold_pruned_codex(now - RETENTION, proof)
         return [row for row in rows if now - row['created'] <= RETENTION]
+
+    def _hold_pruned_codex(self, cutoff, proof):
+        clear = self._unreserved('e.request_id')
+        records = self.db.execute(f'''SELECT e.request_id,e.agent,e.created,e.evidence
+            FROM peer_execution AS e INDEXED BY peer_execution_active_created
+            WHERE e.execution='running' AND e.capture<>'captured' AND e.agent GLOB 'x:*' AND e.created < ?
+                AND e.execution NOT IN ('completed','dropped','retired')
+                AND NOT EXISTS (SELECT 1 FROM requests WHERE id=e.request_id) AND {clear}''', (cutoff,)).fetchall()
+        for ident, agent, created, raw in records:
+            meta = peer_lifecycle.exact_admission(self.db, ident)
+            if (not meta or meta[:2] != (agent, created) or not self._timestamp(meta[2])
+                    or meta[2] < created or not valid_uuid(ident) or not valid_uuid(agent[2:])):
+                continue
+            try:
+                evidence = json.loads(raw)
+                turn = evidence.get('bound_turn') if isinstance(evidence, dict) else None
+                if (not isinstance(turn, str) or not 0 < len(turn) <= 128 or any(ord(ch) < 32 for ch in turn)
+                        or evidence.get('launched') is not True):
+                    continue
+                turn.encode('utf-8')
+            except (ValueError, TypeError, RecursionError):
+                continue
+            evidence['codex_retention_hold'] = peer_lifecycle.CODEX_RETENTION_HOLD
+            self.db.execute("UPDATE peer_execution SET execution='uncertain',capture='withheld',evidence=? WHERE request_id=?",
+                            (json.dumps(evidence, sort_keys=True), ident))
+            if proof is not None:
+                proof.eligible = False
 
     def _send(self, row, *, observations=None):
         if row.get('transport') == claude_mod.TRANSPORT:
