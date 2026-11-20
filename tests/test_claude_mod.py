@@ -560,6 +560,33 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(record['execution'], 'uncertain')
         self.assertIsNone(peer_lifecycle.hold_episode(record))
 
+    def test_shared_mod_put_without_live_observation_does_not_date_hold(self):
+        tid, _, client = self.shared_progress_request()
+        claim = self.global_poll(client)[1]['claim']
+        self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+        self.assertEqual(peer_lifecycle.get(self.store.db, tid)['execution'], 'running')
+        with self.store.lock, self.store.db:
+            row = next(row for row in self.store.mods.rows() if row['request_id'] == tid)
+            self.store.mods.put(dict(row, state='unknown'))
+        record = peer_lifecycle.get(self.store.db, tid)
+        self.assertEqual(record['execution'], 'uncertain')
+        self.assertIsNone(peer_lifecycle.hold_episode(record))
+
+    def test_shared_mod_live_unknown_receipt_dates_its_first_genuine_hold(self):
+        tid, _, client = self.shared_progress_request()
+        claim = self.global_poll(client)[1]['claim']
+        self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+        observed = peer_lifecycle.get(self.store.db, tid)['created'] + 10
+        with patch.object(peer_lifecycle, 'time', wraps=time) as clock:
+            clock.time.return_value = observed
+            status, result = self.progress_event(claim, client, 'unknown')
+        self.assertEqual(status, 200, result)
+        record = peer_lifecycle.get(self.store.db, tid)
+        self.assertEqual(record['execution'], 'uncertain')
+        episode = peer_lifecycle.hold_episode(record)
+        self.assertIsNotNone(episode)
+        self.assertEqual((episode['since'], episode['due_at']), (observed, observed + 300))
+
     def test_pruned_shared_mod_unknown_receipt_dates_its_first_genuine_hold(self):
         tid, _, client = self.shared_progress_request()
         claim = self.global_poll(client)[1]['claim']

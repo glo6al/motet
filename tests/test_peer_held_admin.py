@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import test_peer_admin as fixtures
+import test_shared_bridge as shared_fixtures
 from test_peer_admin import uid
 import peer_admin as admin
 import peer_bridge
@@ -52,8 +53,9 @@ class HeldAdminTests(unittest.TestCase):
         self.store._save(dict(self.row, request_id=tid, agent='x:' + native, bridge_version=1))
         return tid
 
-    def retire(self, item, agent=None):
-        return self.http(RETIRE, json.dumps(dict(item['selector'], agent=agent or item['agent'], confirm=admin.CONFIRM)))
+    def retire(self, item, agent=None, **preconditions):
+        return self.http(RETIRE, json.dumps(dict(item['selector'], agent=agent or item['agent'],
+                                                 confirm=admin.CONFIRM, **preconditions)))
 
     def test_authentication_route_and_bounded_json(self):
         for headers in ({'X-Live-Room-Key': ''}, {'X-Live-Room-Key': 'fictional-peer-key'},
@@ -71,7 +73,7 @@ class HeldAdminTests(unittest.TestCase):
         self.assertEqual(self.http(HELD, ' ' * (admin.MAX_BODY + 1))[0], 413)
         self.assertEqual(self.http(HELD, '{}', method='GET')[0], 400)
 
-    def test_held_open_and_exclusions_are_private_and_read_only(self):
+    def test_genuine_holds_exclude_healthy_work_at_every_age_and_remain_private(self):
         db = self.store.db
         held, held_tid, _ = self.add_shared(name='Fictional hold')
         active, active_tid, _ = self.add_shared(state='awaiting_reply', name='Fictional open')
@@ -93,8 +95,8 @@ class HeldAdminTests(unittest.TestCase):
                        (inbox, uid(), 'c'*64, 'a'*64, inbox_alias, 100000, 200000, 'queued', None, None, None))
         with self.store.lock, db:
             lifecycle.retire(db, retired_tid, lifecycle.RETIRE_REASON)
-        self.assertEqual({item['selector'].get('request_id') for item in self.held()['items']
-                          if item['group'] == 'open'}, set())
+        self.assertFalse({active, submitted} & {item['selector'].get('request_id')
+                                                for item in self.held()['items']})
         self.clock.return_value = self.created + peer_bridge.TTL
         before = db.total_changes
         db.execute('PRAGMA query_only=ON')
@@ -105,22 +107,18 @@ class HeldAdminTests(unittest.TestCase):
             db.execute('PRAGMA query_only=OFF')
         self.assertEqual(db.total_changes, before)
         items = {next(iter(item['selector'].values())): item for item in result['items']}
-        self.assertEqual(set(items), {self.cid, held, active, submitted, pruned, legacy_tid})
-        self.assertFalse({finished, dropped, retired, inbox, never_launched} & items.keys())
+        self.assertEqual(set(items), {self.cid, held, pruned, legacy_tid})
+        self.assertFalse({active, submitted, finished, dropped, retired, inbox, never_launched} & items.keys())
         self.assertEqual(items[held]['name'], 'Fictional hold')
         self.assertEqual(items[legacy_tid]['selector'], {'transport_id': legacy_tid})
         self.assertEqual(items[legacy_tid]['name'], 'Fictional legacy')
-        self.assertEqual(items[submitted]['name'], 'Codex')
         self.assertEqual(items[pruned]['reason_code'], 'codex_retention')
+        self.assertEqual(items[pruned]['reason'], 'The message was kept for a day and no end was seen.')
         for key in (held, pruned, legacy_tid):
             self.assertEqual(items[key]['group'], 'held')
             self.assertIsNone(items[key]['held_since'])
             self.assertIsNone(items[key]['episode_id'])
             self.assertIsNone(items[key]['notice_due_at'])
-        for key in (active, submitted):
-            self.assertEqual(items[key]['group'], 'open')
-            self.assertIsNone(items[key]['held_since'])
-            self.assertEqual(items[key]['reason'], 'No end recorded; work may continue.')
         self.assertTrue(all(item['clearable'] for item in items.values()))
         for sentinel in ('PRIVATE', '/fictional/', held_tid, active_tid):
             self.assertNotIn(sentinel, json.dumps(result))
@@ -175,17 +173,18 @@ class HeldAdminTests(unittest.TestCase):
         for sentinel in ('PRIVATE', 'wrong-turn', tid_id, invalid_id):
             self.assertNotIn(sentinel, json.dumps(result))
 
-    def test_keyset_pagination_spans_groups_and_survives_anchor_retirement(self):
+    def test_keyset_pagination_excludes_healthy_work_and_survives_anchor_retirement(self):
         self.clock.return_value = self.created + peer_bridge.TTL
-        for index in range(52):
-            self.add_shared(state='awaiting_reply' if index % 2 else 'unknown')
+        for _ in range(52):
+            self.add_shared()
+            self.add_shared(state='awaiting_reply')
         self.add_legacy()
         first = self.held()
         self.assertEqual(len(first['items']), 50)
         self.assertTrue(first['next_cursor'])
-        self.assertEqual({item['group'] for item in first['items']}, {'held', 'open'})
+        self.assertEqual({item['group'] for item in first['items']}, {'held'})
         anchor = first['items'][-1]
-        self.assertEqual(self.retire(anchor)[0], 200)
+        self.assertEqual(self.retire(anchor, require_hold=True)[0], 200)
         second = self.held({'cursor': first['next_cursor']})
         self.assertEqual(len(second['items']), 4)
         self.assertIsNone(second['next_cursor'])
@@ -206,7 +205,8 @@ class HeldAdminTests(unittest.TestCase):
         self.assertIsNone(orphan['selector'])
         self.assertIsNone(orphan['held_since'])
         self.assertFalse(orphan['clearable'])
-        self.assertEqual(orphan['unavailable_reason'], admin.UNAVAILABLE)
+        self.assertEqual(orphan['unavailable_reason'], 'Motet could not match this hold to a chat.')
+        self.assertEqual(orphan['reason'], orphan['unavailable_reason'])
         self.assertNotIn(self.tid, json.dumps(orphan))
         self.assertNotIn(self.cid, json.dumps(orphan))
 
@@ -226,6 +226,122 @@ class HeldAdminTests(unittest.TestCase):
         second = self.held({'cursor': first['next_cursor']})
         self.assertEqual(second['items'], [orphan])
         self.assertIsNone(second['next_cursor'])
+
+    def test_settings_clear_rejects_recovered_running_work_but_unflagged_clear_still_works(self):
+        item, = self.held()['items']
+        self.clock.return_value = self.created + peer_bridge.TTL
+        self.store._save(dict(self.row, state='awaiting_reply'))
+        self.assertEqual(self.held()['items'], [])
+        before = lifecycle.get(self.store.db, self.tid)
+        self.assertEqual(before['execution'], 'running')
+        for value in (False, 1, 'true', None):
+            self.assertEqual(self.retire(item, require_hold=value)[0], 400)
+        self.assertEqual(self.retire(item, require_hold=True)[0], 409)
+        self.assertEqual(lifecycle.get(self.store.db, self.tid), before)
+        self.assertEqual(lifecycle.blockers(self.store.db, self.agent), [(self.tid, 'running', self.created)])
+        self.assertEqual(self.retire(item)[0], 200)  # Existing explicit owner policy.
+
+    def test_settings_clear_refuses_both_directions_of_a_stale_hold(self):
+        db = self.store.db
+        item, = self.held()['items']
+        self.clock.return_value = self.created + peer_bridge.TTL
+        for before, payload in (('uncertain', 'awaiting_reply'), ('running', 'unknown')):
+            with self.subTest(ledger=before, payload=payload):
+                stored = json.dumps(dict(self.row, state=payload))
+                with db:
+                    db.execute('UPDATE peer_execution SET execution=? WHERE request_id=?', (before, self.tid))
+                    db.execute('UPDATE requests SET data=? WHERE id=?', (stored, self.tid))
+                original = lifecycle.get(db, self.tid)
+                self.assertEqual(self.retire(item, require_hold=True)[0], 409)
+                self.assertEqual(lifecycle.get(db, self.tid), original)
+                self.assertEqual(db.execute('SELECT data FROM requests WHERE id=?', (self.tid,)).fetchone(), (stored,))
+
+    def test_damaged_pruned_hold_cannot_be_cleared_from_settings(self):
+        db = self.store.db
+        item, = self.held()['items']
+        self.assertTrue(item['clearable'])
+        with db:
+            evidence = lifecycle.get(db, self.tid)['evidence']
+            del evidence['launched']
+            db.execute('UPDATE peer_execution SET evidence=? WHERE request_id=?', (json.dumps(evidence), self.tid))
+            db.execute('DELETE FROM requests WHERE id=?', (self.tid,))
+        self.assert_unverifiable_settings_hold(item, self.tid)
+
+    def test_held_claude_project_drift_cannot_be_reconciled_into_settings_clear(self):
+        db = self.store.db
+        target = 'c:' + uid()
+        snapshot = dict(self.snapshot, agent_id=target, provider='claude')
+        row = dict(self.row, agent=target, runtime='claude', transport='claude_mod', bound_turn='',
+                   mod_project='/fictional/original', target_project='/fictional/original',
+                   mod_enrollment=uid(), mod_attempt_id=uid(), mod_generation=uid())
+        with db:
+            db.execute('UPDATE shared_bridge_requests SET target=?,target_snapshot=? WHERE client_id=?',
+                       (target, json.dumps(snapshot), self.cid))
+            db.execute('DELETE FROM peer_execution WHERE request_id=?', (self.tid,))
+            self.store._save(row, commit=False)
+        item, = self.held()['items']
+        self.assertTrue(item['clearable'])
+        with db:
+            db.execute('UPDATE requests SET data=? WHERE id=?', (json.dumps(dict(
+                row, mod_project='/fictional/drifted', target_project='/fictional/drifted')), self.tid))
+        self.assert_unverifiable_settings_hold(item, self.tid)
+
+    def assert_unverifiable_settings_hold(self, item, tid):
+        db = self.store.db
+        unavailable, = self.held()['items']
+        self.assertEqual((unavailable['group'], unavailable['clearable']), ('unavailable', False))
+        prior = lifecycle.get(db, tid)
+        body = db.execute('SELECT data FROM requests WHERE id=?', (tid,)).fetchone()
+        changes = db.total_changes
+        selector = item['selector']
+        legacy = self.http('/bridge-admin/v1/inspect', json.dumps(selector))
+        self.assertEqual(legacy[0], 200)
+        self.assertTrue(legacy[1]['eligible'])  # The default owner/CLI contract stays unchanged.
+        self.assertEqual(self.http('/bridge-admin/v1/inspect', json.dumps(dict(selector, require_hold=False)))[0], 400)
+        status, details = self.http('/bridge-admin/v1/inspect', json.dumps(dict(selector, require_hold=True)))
+        self.assertEqual(status, 200, details)
+        self.assertFalse(details['eligible'])
+        self.assertEqual(self.retire(item, require_hold=True)[0], 409)
+        self.assertEqual(db.total_changes, changes)
+        self.assertEqual(lifecycle.get(db, tid), prior)
+        self.assertEqual(db.execute('SELECT data FROM requests WHERE id=?', (tid,)).fetchone(), body)
+
+    def test_settings_clear_rolls_back_if_reconciliation_changes_the_hold(self):
+        db = self.store.db
+        item, = self.held()['items']
+        prior = lifecycle.get(db, self.tid)
+        reconcile = lifecycle.reconcile
+
+        def invalidate(*args, **kwargs):
+            reconcile(*args, **kwargs)
+            evidence = dict(prior['evidence'])
+            del evidence['launched']
+            db.execute('UPDATE peer_execution SET evidence=? WHERE request_id=?',
+                       (json.dumps(evidence), self.tid))
+
+        with patch.object(lifecycle, 'reconcile', side_effect=invalidate):
+            self.assertEqual(self.retire(item, require_hold=True)[0], 409)
+        self.assertEqual(lifecycle.get(db, self.tid), prior)
+
+    def test_authorized_codex_queue_interval_is_not_a_hold(self):
+        bridge = shared_fixtures.SharedTests()
+        bridge.setUp()
+        self.addCleanup(bridge.tearDown)
+        sent = bridge.send()
+        pending = bridge.row(sent['request_id'])
+        self.clock.return_value = pending['created'] + 1
+        with patch.object(fixtures.server, 'MESSAGING', bridge.store):
+            self.assertEqual(self.held()['items'], [])
+            self.assertTrue(bridge.store.shared.authorize(pending))
+            record = lifecycle.get(bridge.store.db, pending['request_id'])
+            self.assertEqual((record['execution'], record['capture']), ('reserved', 'pending'))
+            self.assertTrue(bridge.row(sent['request_id'])['launched'])
+            self.assertEqual(self.held()['items'], [])
+            with bridge.store.db:
+                bridge.store.db.execute('DELETE FROM requests WHERE id=?', (pending['request_id'],))
+            unavailable, = self.held()['items']
+            self.assertEqual(unavailable['group'], 'unavailable')
+            self.assertFalse(unavailable['clearable'])
 
     def test_exact_clear_rechecks_current_evidence_after_listing(self):
         item, = self.held()['items']

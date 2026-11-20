@@ -15,7 +15,8 @@ MAX_BODY = 4096
 HELD_PAGE_SIZE = 50
 MAX_TIME = 253402300799
 CONFIRM = 'retire_unknown_without_resend'
-UNAVAILABLE = 'Motet could not verify the original request record. Clear is unavailable.'
+UNAVAILABLE = 'Motet could not match this hold to a chat.'
+_STALE_HOLD = 'Motet could not verify that this chat is still on hold.'
 _HELD_CURSOR_SOURCES = {
     0: ('peer_execution', 'request_id', 'request_id'),
     1: ('peer_requests', 'transport_id', 'transport_id'),
@@ -33,6 +34,15 @@ def _selector(data, fields):
     if not fields <= keys or selectors not in ({'transport_id'}, {'request_id'}):
         raise peer_bridge.PeerError(400, 'Expected one exact Bridge request or transport identifier.')
     return selectors.pop()
+
+
+def _hold_selector(data, fields):
+    require_hold = 'require_hold' in data
+    if require_hold:
+        if data['require_hold'] is not True:
+            raise peer_bridge.PeerError(400, 'The hold precondition must be true.')
+        fields = fields | {'require_hold'}
+    return _selector(data, fields), require_hold
 
 
 def _shared_admission(db, request_id):
@@ -125,11 +135,18 @@ def _payload(transport_id, raw, meta, revision):
 
 
 def inspect(store, data):
-    selector = _selector(data, set())
+    selector, require_hold = _hold_selector(data, set())
     with store.lock:
         tid, meta, record, raw, revision = _selection(store, selector, data[selector])
-        row = _payload(tid, raw, meta, revision) if raw and (revision or _candidate(meta, record)) else None
-        eligible = _eligible(meta, record, row, time.time())
+        try:
+            row = _payload(tid, raw, meta, revision) if raw and (require_hold or revision or _candidate(meta, record)) else None
+        except peer_bridge.PeerError:
+            if not require_hold:
+                raise
+            eligible = False
+        else:
+            eligible = (_eligible(meta, record, row, time.time())
+                        and (not require_hold or _verified_hold(meta, record, row)))
         return dict({selector: data[selector]}, transport_id=tid, agent=meta[0],
                     execution=record['execution'] if record else ('uncertain' if meta[2] is not None else 'reserved'),
                     capture=record['capture'] if record else 'pending',
@@ -211,6 +228,16 @@ def _payload_agrees(row, execution, evidence):
     return all(row.get(key) in (None, '') or evidence.get(key) in (None, '', row[key]) for key in receipt_fields)
 
 
+def _verified_hold(meta, record, row):
+    if (not record or record['execution'] != 'uncertain'
+            or record['capture'] not in ('pending', 'withheld', 'unusable')
+            or _time(meta[1]) is None or _time(meta[2]) is None):
+        return False
+    evidence = record['evidence']
+    return (isinstance(evidence, dict) and evidence.get('launched') is True
+            and (row is None or _payload_agrees(row, 'uncertain', evidence)))
+
+
 def _held_item(store, candidate, now):
     version, _, identifier, transport, agent, created, launched, snapshot, label = candidate
     selector_key = 'request_id' if version == 2 else 'transport_id'
@@ -234,28 +261,31 @@ def _held_item(store, candidate, now):
         execution, capture = record['execution'], record['capture']
         if execution in lifecycle.TERMINAL:
             return None
-        if (execution not in ('uncertain', 'submitted', 'running') or evidence.get('launched') is not True
-                or capture not in ('pending', 'withheld', 'unusable')):
-            return item
-        if row is not None and not _payload_agrees(row, execution, evidence):
+        # Codex authorizes the launch before its worker saves the queue outcome.
+        if (provider == 'codex' and execution == 'reserved' and capture == 'pending'
+                and row is not None and row['state'] == 'sending'
+                and not row.get('bound_turn') and not evidence.get('bound_turn')
+                and 'launched' not in evidence and _payload_agrees(row, execution, evidence)):
+            return None
+        if execution in ('submitted', 'running'):
+            healthy = (evidence.get('launched') is True and capture in ('pending', 'withheld', 'unusable')
+                       and (row is None or _payload_agrees(row, execution, evidence)))
+            return None if healthy else item
+        if not _verified_hold(meta, record, row):
             return item
         name = json.loads(snapshot).get('name') if version == 2 else label
         eligible = _eligible(meta, record, row, now)
     except (peer_bridge.PeerError, ValueError, TypeError, KeyError, RecursionError):
         return item
-    item.update(name=_display_name(name, provider), clearable=eligible, unavailable_reason=None)
-    if execution == 'uncertain':
-        item.update(group='held', reason_code='completion_unverified',
-                    reason='Delivery or completion could not be verified.')
-        if provider == 'codex' and evidence.get('codex_retention_hold') == lifecycle.CODEX_RETENTION_HOLD:
-            item.update(reason_code='codex_retention', reason='Content retention passed before an end was observed.')
-        episode = lifecycle.hold_episode(record)
-        if episode and episode['since'] >= launched:
-            item.update(held_since=episode['since'], episode_id=episode['episode_id'], notice_due_at=episode['due_at'])
-        return item
-    if eligible and now >= created + peer_bridge.TTL:
-        return dict(item, group='open', reason_code='no_end_observed', reason='No end recorded; work may continue.')
-    return None
+    item.update(name=_display_name(name, provider), clearable=eligible, unavailable_reason=None,
+                group='held', reason_code='completion_unverified',
+                reason='Delivery or completion could not be verified.')
+    if provider == 'codex' and evidence.get('codex_retention_hold') == lifecycle.CODEX_RETENTION_HOLD:
+        item.update(reason_code='codex_retention', reason='The message was kept for a day and no end was seen.')
+    episode = lifecycle.hold_episode(record)
+    if episode and episode['since'] >= launched:
+        item.update(held_since=episode['since'], episode_id=episode['episode_id'], notice_due_at=episode['due_at'])
+    return item
 
 
 def held(store, data):
@@ -283,7 +313,7 @@ def held(store, data):
 def retire(store, data):
     if data.get('confirm') != CONFIRM or not isinstance(data.get('agent'), str):
         raise peer_bridge.PeerError(400, 'Exact owner retirement confirmation is required.')
-    selector = _selector(data, {'agent', 'confirm'})
+    selector, require_hold = _hold_selector(data, {'agent', 'confirm'})
     with peer_bridge.transaction(store.db, store.lock):
         db = store.db
         tid, meta, record, raw, revision = _selection(store, selector, data[selector])
@@ -298,9 +328,13 @@ def retire(store, data):
                 # Check both the preexisting ledger and any newer retained evidence.
                 # A rejected decision rolls back reconciliation with the rest of the transaction.
                 previous = record
+                if require_hold and not _verified_hold(meta, previous, row):
+                    raise peer_bridge.PeerError(409, _STALE_HOLD)
                 if row is not None:
                     lifecycle.reconcile(db, row, meta)
                     record = lifecycle.get(db, tid)
+                if require_hold and not _verified_hold(meta, record, row):
+                    raise peer_bridge.PeerError(409, _STALE_HOLD)
                 now = time.time()
                 if not (_eligible(meta, previous, row, now) and _eligible(meta, record, row, now)):
                     raise peer_bridge.PeerError(409, 'This attempt is outside the online retirement policy.')

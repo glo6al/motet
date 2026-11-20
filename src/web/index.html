@@ -889,11 +889,14 @@ html.workspace #workspaceNewChatDialog .workspace-nc-recover{border:1px solid #c
 #workspaceControlsBody #workspaceHeldChats h4{margin:16px 0 2px;font:600 14.5px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
 #workspaceControlsBody #workspaceHeldChats p{margin:0 0 6px;font-size:13.5px;line-height:1.45;color:var(--ws-mute)}
 #workspaceHeldChats .workspace-held-row{align-items:start}
-.workspace-held-name,.workspace-held-copy{display:flex;flex-direction:column;min-width:0;overflow-wrap:anywhere}
-.workspace-held-name small,.workspace-held-detail{font-size:12.5px;color:var(--ws-mute)}
-.workspace-held-detail:not([hidden]){display:block;margin-top:2px}
+.workspace-held-name,.workspace-held-copy{display:flex;min-width:0;overflow-wrap:anywhere}
+.workspace-held-name{align-items:baseline;gap:6px}
+.workspace-held-name small{flex-shrink:0;font-size:12.5px;color:rgb(102,99,93)}
+.workspace-held-copy{flex-direction:column}
+.workspace-held-detail{font-size:12.5px;color:var(--ws-mute)}
+.workspace-held-detail:not([hidden]){display:block;margin-top:4px}
 .workspace-held-empty{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
-#workspaceHeldChats button.workspace-held-action,#workspaceHeldRetry{border:1px solid rgb(214,211,204);border-radius:8px;background:#fff;color:var(--ws-ink);font:600 13px/1.4 system-ui;padding:5px 10px}
+#workspaceHeldChats button.workspace-held-action,#workspaceHeldRetry{border:1px solid rgb(214,211,204);border-radius:8px;background:#fff;color:var(--ws-ink);font:600 13px/1.4 system-ui;padding:6px 12px}
 #workspaceHeldChats button.workspace-held-action:hover:not(:disabled),#workspaceHeldRetry:hover:not(:disabled){background:var(--ws-hover)}
 #workspaceHeldChats button.workspace-held-action:disabled,#workspaceHeldRetry:disabled{opacity:.55;cursor:default}
 html.workspace #workspaceHeldChats .workspace-held-row:focus-visible{outline:1px solid rgb(28,27,25);outline-offset:2px}
@@ -945,6 +948,7 @@ html.workspace #workspaceHeldChats .workspace-held-row:focus-visible{outline:1px
 .workspace-notification-title>span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .workspace-notification-title time{flex:none;margin-left:auto;white-space:nowrap;font-size:12px;color:var(--ws-mute)}
 .workspace-notification-detail{max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ws-mute);font-size:13px}
+#workspaceBellHeld .workspace-notification-detail{white-space:normal;text-overflow:clip}
 .workspace-notification-source{font-size:12px;color:var(--ws-mute)}
 .workspace-bell .workspace-notification-dismiss{grid-column:3;grid-row:1;width:24px;min-height:24px;padding:0;text-align:center;color:var(--ws-mute)}
 .workspace-notification-actions{grid-column:2/4;display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:3px}
@@ -8044,10 +8048,11 @@ function workspaceSettingsStatus(){if(!WS.controls?.open||WS.section!=='officer'
 const HELD_CHAT_UUID=/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const HELD_CHAT_DISMISSED='motetHeldChatDismissed:';
 const HELD_CHAT_UNCONFIRMED='motetHeldChatUnconfirmed:';
+const HELD_CHAT_UNMATCHED='Motet could not match this hold to a chat.';
 
 function workspaceHeldChatItem(value){
   if(!value||typeof value.item_id!=='string'||!/^[0-9a-f]{64}$/.test(value.item_id)
-      ||!['held','open','unavailable'].includes(value.group))throw Error('Invalid hold list');
+      ||!['held','unavailable'].includes(value.group))throw Error('Invalid hold list');
   let selector=null,field=null;
   if(value.selector&&typeof value.selector==='object'){
     const fields=Object.keys(value.selector);
@@ -8117,6 +8122,7 @@ function createWorkspaceHeldChats({owner,request,time,storage,pendingStorage,cha
             ||page.checked_at<=0)throw Error('Invalid hold list');
         checked=page.checked_at;
         for(const value of page.items){
+          if(value?.group==='open')continue;
           const item=workspaceHeldChatItem(value),target=item.field&&item.field+':'+item.selector[item.field];
           const previous=next.get(item.id)||selectors.get(target);
           if(previous){
@@ -8143,16 +8149,18 @@ function createWorkspaceHeldChats({owner,request,time,storage,pendingStorage,cha
   }
   async function inspect(ticket,item){
     try{
-      const value=await request(ticket.key,'inspect',item.selector);
+      const value=await request(ticket.key,'inspect',{...item.selector,require_hold:true});
       if(!current(ticket)||!exact(value,item))return;
       if(value.execution==='retired')results.set(item.id,'cleared');
       else if(value.execution==='completed')
         results.set(item.id,value.capture==='withheld'?'withheld':'finished');
       else if(value.execution==='dropped')results.set(item.id,'closed');
-      else if(value.eligible===true&&['uncertain','running','submitted'].includes(value.execution))
-        results.set(item.id,'still');
-      else if(value.eligible===false&&['uncertain','running','submitted','reserved'].includes(value.execution))
-        results.set(item.id,'closed');
+      else if(['running','submitted','reserved'].includes(value.execution))items.delete(item.id);
+      else if(value.execution==='uncertain'&&value.eligible===true)results.set(item.id,'still');
+      else if(value.execution==='uncertain'&&value.eligible===false){
+        items.set(item.id,{...item,group:'unavailable',clearable:false,held_since:null,
+          episode:null,notice_due_at:null,reason:HELD_CHAT_UNMATCHED,unavailable:HELD_CHAT_UNMATCHED});
+      }
       else return;
       remember(pendingStorage,unconfirmed,HELD_CHAT_UNCONFIRMED,item.id,false);
     }catch(err){/* Keep the exact check available without repeating the write. */}
@@ -8168,7 +8176,7 @@ function createWorkspaceHeldChats({owner,request,time,storage,pendingStorage,cha
       if(action==='retire'){
         try{
           const value=await request(ticket.key,'retire',{
-            ...item.selector,agent:item.agent,confirm:'retire_unknown_without_resend'
+            ...item.selector,agent:item.agent,confirm:'retire_unknown_without_resend',require_hold:true
           });
           if(!current(ticket))return;
           if(exact(value,item)&&['retired','already_retired'].includes(value.status)&&value.provider_outcome==='unknown'){
@@ -8216,13 +8224,17 @@ function workspaceHeldChatsDemo(){
   };
   const rows=[item(1,'Elara','codex','held'),
     item(2,'Robin','claude','unavailable',{selector:null,agent:null,clearable:false,held_since:null,episode_id:null,
-      reason:'Motet could not confirm the reply.',unavailable_reason:'Motet could not match this hold to a chat.'}),
-    item(3,'Juniper','claude','open',{held_since:null,episode_id:null,notice_due_at:null})];
+      reason:HELD_CHAT_UNMATCHED,unavailable_reason:HELD_CHAT_UNMATCHED})];
   const retired=new Set();
   return async(_key,action,body)=>{
     if(action==='held')return {items:rows.filter(row=>!retired.has(row.item_id)),next_cursor:null,checked_at:Date.now()/1000};
     const row=rows.find(row=>row.selector&&row.selector.request_id===body.request_id);
-    if(!row)throw Error('Demo row unavailable');
+    if(!row||body.require_hold!==true)throw Error('Demo row unavailable');
+    if(action==='inspect'){
+      const done=retired.has(row.item_id);
+      return {...row.selector,agent:row.agent,execution:done?'retired':'uncertain',capture:'pending',
+        eligible:!done&&row.clearable};
+    }
     if(action==='retire'&&body.agent===row.agent&&body.confirm==='retire_unknown_without_resend'){
       retired.add(row.item_id);
       return {...row.selector,agent:row.agent,status:'retired',provider_outcome:'unknown'};
@@ -8253,82 +8265,79 @@ function workspaceHeldChatsSettingsPaint(controller){
   const host=$('#workspaceHeldChats'),view=controller.snapshot();
   const previous=document.activeElement,focusId=host.contains(previous)?previous.closest('[data-held-chat]')?.dataset.heldChat:null;
   const pane=host.parentElement;
-  const groups=[...view.items.values()];
-  const held=groups.filter(item=>item.group!=='open');
-  const open=groups.filter(item=>item.group==='open');
-  $('#workspaceHeldSection').hidden=!held.length;
-  $('#workspaceStillOpenSection').hidden=!open.length;
+  const rows=[...view.items.values()],list=$('#workspaceHeldRows');
+  $('#workspaceHeldSection').hidden=!rows.length;
   const status=$('#workspaceHeldStatus'),retry=$('#workspaceHeldRetry');
   status.hidden=!view.stale&&(!view.reading||view.now!==null);
-  txt(status,view.stale?(groups.length?'Could not refresh these chats. The list may be out of date.':'Could not check chats on hold.'):'Checking chats…');
+  txt(status,view.stale?(rows.length?'Could not refresh these chats. The list may be out of date.':'Could not check chats on hold.'):'Checking chats…');
   retry.hidden=!view.stale;
   retry.disabled=view.reading;
-  for(const [rows,list] of [[held,$('#workspaceHeldRows')],[open,$('#workspaceStillOpenRows')]]){
-    const existing=new Map([...list.children].map(row=>[row.dataset.heldChat,row]));
-    const wanted=new Set(rows.map(item=>item.id));
-    for(const [id,old] of existing)if(!wanted.has(id))old.remove();
-    for(let position=0;position<rows.length;position++){
-      const item=rows[position],action=controller.mode(item),result=view.results.get(item.id),working=view.active?.id===item.id;
-      const holdTime=item.held_since===null||view.now===null?'Hold time unavailable':
-        'On hold '+Math.max(0,Math.floor((view.now-item.held_since)/60))+' min';
-      const disabled=!!view.active||view.reading||view.stale||view.inFlight.has(item.id);
-      const signature=JSON.stringify([item,action,result,working,holdTime,disabled]);
-      let row=existing.get(item.id);
-      if(!row){
-        row=wncEl('div','workspace-nc-row workspace-held-row');
-        row.dataset.heldChat=item.id;row.tabIndex=-1;
-        row._heldStatus=wncEl('span','workspace-held-result');
-        row._heldStatus.setAttribute('role','status');
-        row.append(row._heldStatus);
-      }
-      row._heldItem=item;
-      if(row._heldSignature!==signature){
-        row._heldSignature=signature;
-        const name=wncEl('div','workspace-held-name');
-        name.append(wncEl('b','',item.name),wncEl('small','',item.provider));
-        const copy=wncEl('span','workspace-held-copy'),detail=wncEl('span','workspace-held-detail');
-        let label=item.group==='open'?'No end recorded; work may continue.':holdTime+' · '+item.reason;
-        let consequence='Clearing lets new messages through. It does not stop '+item.name+', and a late answer to the earlier message is not shown.';
-        let control;
-        if(result&&result!=='still'){
-          const outcome={
-            cleared:['Cleared. '+item.name+' takes new messages again. If its earlier answer arrives, it is not shown.','Cleared'],
-            withheld:['Finished; reply withheld.','Finished'],
-            finished:['Finished.','Finished'],
-            closed:['The state changed. Clearing is unavailable.','Changed']
-          }[result];
-          label=outcome[0];consequence='';
-          control=wncEl('em','workspace-held-action',outcome[1]);
-          if(result==='cleared')control.dataset.status='ready';
-        }else if(action==='unavailable'){
-          consequence=(item.unavailable||'Motet could not verify this hold.')+' New messages to '+item.name+' may keep waiting.';
-          control=wncEl('em','workspace-held-action',"Can't clear here");
-        }else{
-          if(action==='inspect')consequence='Motet could not confirm the clear. Check this chat before trying again.';
-          if(result==='still')consequence='This chat was still eligible to clear when Motet checked. '+consequence;
-          control=wncEl('button','workspace-held-action',working?(view.active.action==='inspect'?'Checking…':'Clearing…'):action==='inspect'?'Check status':'Clear');
-          control.type='button';
-          control.disabled=disabled;
-          control.setAttribute('aria-label',(action==='inspect'?'Check status of ':'Clear ')+item.name);
-          control.onclick=()=>controller.act(row._heldItem,action);
-        }
-        detail.textContent=consequence;detail.hidden=!consequence;
-        const status=row._heldStatus;
-        status.classList.toggle('workspace-held-copy',!!result&&result!=='still');
-        status.classList.toggle('workspace-held-empty',!result||result==='still');
-        if(result&&result!=='still'){
-          row.prepend(name);row.append(control);
-          for(const child of [...row.children])if(child!==name&&child!==status&&child!==control)child.remove();
-          status.textContent=label;
-        }else{
-          status.textContent='';
-          copy.append(wncEl('span','',label),detail);
-          row.prepend(name,copy);row.append(control);
-          for(const child of [...row.children])if(child!==name&&child!==copy&&child!==status&&child!==control)child.remove();
-        }
-      }
-      if(list.children[position]!==row)list.insertBefore(row,list.children[position]||null);
+  const existing=new Map([...list.children].map(row=>[row.dataset.heldChat,row]));
+  const wanted=new Set(rows.map(item=>item.id));
+  for(const [id,old] of existing)if(!wanted.has(id))old.remove();
+  for(let position=0;position<rows.length;position++){
+    const item=rows[position],action=controller.mode(item),result=view.results.get(item.id),working=view.active?.id===item.id;
+    const holdTime=item.held_since===null||view.now===null?'Hold time unavailable':
+      'On hold '+Math.max(0,Math.floor((view.now-item.held_since)/60))+' min';
+    const disabled=!!view.active||view.reading||view.stale||view.inFlight.has(item.id);
+    const signature=JSON.stringify([item,action,result,working,holdTime,disabled]);
+    let row=existing.get(item.id);
+    if(!row){
+      row=wncEl('div','workspace-nc-row workspace-held-row');
+      row.dataset.heldChat=item.id;row.tabIndex=-1;
+      row._heldStatus=wncEl('span','workspace-held-result');
+      row._heldStatus.setAttribute('role','status');
+      row.append(row._heldStatus);
     }
+    row._heldItem=item;
+    if(row._heldSignature!==signature){
+      row._heldSignature=signature;
+      const name=wncEl('div','workspace-held-name');
+      name.append(wncEl('b','',item.name),wncEl('small','',item.provider));
+      const copy=wncEl('span','workspace-held-copy'),detail=wncEl('span','workspace-held-detail');
+      let label=holdTime+' · '+item.reason;
+      let consequence='Clearing lets new messages through. It does not stop '+item.name+', and a late answer to the earlier message is not shown.';
+      let control;
+      if(result&&result!=='still'){
+        const outcome={
+          cleared:['Cleared. '+item.name+' takes new messages again. If its earlier answer arrives, it is not shown.','Cleared'],
+          withheld:['Finished; reply withheld.','Finished'],
+          finished:['Finished.','Finished'],
+          closed:['The state changed. Clearing is unavailable.','Changed']
+        }[result];
+        label=outcome[0];consequence='';
+        control=wncEl('em','workspace-held-action',outcome[1]);
+        if(result==='cleared')control.dataset.status='ready';
+      }else if(action==='unavailable'){
+        const explanation=item.unavailable||HELD_CHAT_UNMATCHED;
+        if(item.reason===explanation)label=holdTime;
+        consequence=explanation+' New messages to '+item.name+' may keep waiting.';
+        control=wncEl('em','workspace-held-action','Can’t clear here');
+      }else{
+        if(action==='inspect')consequence='Motet could not confirm the clear. Check this chat before trying again.';
+        if(result==='still')consequence='This chat was still eligible to clear when Motet checked. '+consequence;
+        control=wncEl('button','workspace-held-action',working?(view.active.action==='inspect'?'Checking…':'Clearing…'):action==='inspect'?'Check status':'Clear');
+        control.type='button';
+        control.disabled=disabled;
+        control.setAttribute('aria-label',(action==='inspect'?'Check status of ':'Clear ')+item.name);
+        control.onclick=()=>controller.act(row._heldItem,action);
+      }
+      detail.textContent=consequence;detail.hidden=!consequence;
+      const status=row._heldStatus;
+      status.classList.toggle('workspace-held-copy',!!result&&result!=='still');
+      status.classList.toggle('workspace-held-empty',!result||result==='still');
+      if(result&&result!=='still'){
+        row.prepend(name);row.append(control);
+        for(const child of [...row.children])if(child!==name&&child!==status&&child!==control)child.remove();
+        status.textContent=label;
+      }else{
+        status.textContent='';
+        copy.append(wncEl('span','',label),detail);
+        row.prepend(name,copy);row.append(control);
+        for(const child of [...row.children])if(child!==name&&child!==copy&&child!==status&&child!==control)child.remove();
+      }
+    }
+    if(list.children[position]!==row)list.insertBefore(row,list.children[position]||null);
   }
   if(focusId&&WS.controls.open&&!pane.hidden&&(document.activeElement===document.body||previous.disabled||previous.dataset.heldChat&&previous._heldHadButton)){
     const row=workspaceHeldChatsFocus(focusId),button=row?.querySelector('button:not(:disabled)');
@@ -8349,7 +8358,7 @@ function workspaceHeldChatsBellPaint(controller){
     const main=wncEl('button','workspace-notification-main'),dismiss=wncEl('button','workspace-notification-dismiss','×');
     main.type=dismiss.type='button';
     const title=wncEl('span','workspace-notification-title');
-    title.append(wncEl('b','',item.name),wncEl('span','','· Chat on hold'),wncEl('time','',clock(item.notice_due_at)));
+    title.append(wncEl('b','',item.name),wncEl('span','','Chat on hold'),wncEl('time','',clock(item.notice_due_at)));
     main.append(title,wncEl('span','workspace-notification-detail','On hold 5 min. New messages to it are waiting.'),
       wncEl('span','workspace-notification-source','Clear it in Settings › Connections'));
     main.onclick=()=>workspaceHeldChatsOpen(item.id);
@@ -8447,7 +8456,7 @@ function workspaceInit(){
   const overview=document.createElement('button');overview.id='workspaceOverview';overview.type='button';overview.innerHTML='<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h16M4 12h16M4 18h16"/></svg>';overview.setAttribute('aria-label','Overview');overview.title='Overview';overview.setAttribute('aria-controls','deskFacts');overview.onclick=()=>workspaceOverviewToggle();top.insertBefore(overview,top.querySelector('#workspaceBell'));
   const menu=document.createElement('dialog');menu.id='workspaceAgentMenu';menu.className='workspace-bell';menu.setAttribute('aria-label','Agent actions');menu.setAttribute('aria-modal','false');
   const backdrop=document.createElement('div');backdrop.id='workspaceDeskBackdrop';document.body.append(backdrop);
-  const controls=document.createElement('dialog');controls.id='workspaceControlsDialog';controls.className='workspace-dialog';controls.setAttribute('aria-label','Settings');controls.innerHTML='<header><h2>Settings</h2><button type="button" data-close aria-label="Close Settings" title="Close Settings">×</button></header><div class="workspace-settings-grid"><nav aria-label="Settings sections"><button type="button" data-settings="general">General</button><button type="button" data-settings="rules">Watch rules</button><button type="button" data-settings="officer">Motet</button><button type="button" data-settings="connections">Connections</button><button type="button" data-settings="alerts">Alerts</button></nav><div id="workspaceControlsBody"><section data-settings-pane="general"><h3>General</h3><div id="workspaceSettingsGeneral"><div class="workspace-setting-row"><div><b>Connection</b></div><p class="workspace-health"></p></div><div class="workspace-setting-row"><div><b>Notify me</b><p id="workspaceNotifyDescription"></p></div><div id="workspaceNotifySlot"></div></div><div class="workspace-setting-row"><div><b>Answer prompts here</b><p id="workspaceAnswerDescription"></p></div><div id="workspaceAnswerSlot"></div></div><div class="workspace-setting-row"><div><label for="workspaceAutoDismiss">Dismiss idle agents automatically</label><p>Only after a recorded turn end; pinned and waiting agents stay.</p></div><select id="workspaceAutoDismiss"><option value="0">Never</option><option value="5">5 min</option><option value="10">10 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></div><div class="workspace-setting-row"><div><b>Theme</b></div><div id="workspaceThemeSlot"></div></div><div class="workspace-setting-row"><div><b>Gestures and keys</b><div id="workspaceHelpDescription"></div></div><div id="workspaceHelpSlot"></div></div></div></section><section data-settings-pane="rules" hidden><h3>Watch rules</h3><p>Rules decide what the stage flags. They never stop an agent.</p><div id="workspaceSettingsRules"></div></section><section data-settings-pane="officer" hidden><h3>Motet</h3><div class="workspace-setting-row"><div><b>Availability</b><p>This is Motet’s reported status, not a connection check.</p></div><span id="workspaceOfficerStatus"></span></div><div class="workspace-setting-row"><div><b>Model</b><p>Applies to the next Motet question.</p></div><div id="workspaceSettingsModel"></div></div><div class="workspace-setting-row"><div><b>Memory</b><p id="workspaceMemoryIntro">Keep saved activity available to Motet. Earlier activity is not imported.</p></div><div id="workspaceSettingsMemory"></div></div><p id="workspaceMemoryState" role="status" hidden></p><button type="button" id="workspaceMemoryRetry" hidden>Retry</button><div id="workspaceMemoryHost"></div></section><section data-settings-pane="connections" hidden><h3>Connections</h3><p id="workspaceConnectionState"></p><div id="workspaceHeldChats"><p id="workspaceHeldStatus" role="status" hidden></p><button type="button" id="workspaceHeldRetry" hidden>Refresh chats</button><section id="workspaceHeldSection" aria-labelledby="workspaceHeldTitle" hidden><h4 id="workspaceHeldTitle">Chats on hold</h4><p>Motet sent these chats a message and could not confirm the reply. New messages to a chat wait until it is cleared.</p><div id="workspaceHeldRows"></div></section><section id="workspaceStillOpenSection" aria-labelledby="workspaceStillOpenTitle" hidden><h4 id="workspaceStillOpenTitle">Still open</h4><div id="workspaceStillOpenRows"></div></section></div><div id="workspaceSettingsConnections"></div></section><section data-settings-pane="alerts" hidden><h3>Alerts</h3><p id="workspaceSettingsAlertEmpty">No recent alert.</p><p>Pattern matching can miss things.</p><div id="workspaceSettingsAlerts"></div></section></div></div>';
+  const controls=document.createElement('dialog');controls.id='workspaceControlsDialog';controls.className='workspace-dialog';controls.setAttribute('aria-label','Settings');controls.innerHTML='<header><h2>Settings</h2><button type="button" data-close aria-label="Close Settings" title="Close Settings">×</button></header><div class="workspace-settings-grid"><nav aria-label="Settings sections"><button type="button" data-settings="general">General</button><button type="button" data-settings="rules">Watch rules</button><button type="button" data-settings="officer">Motet</button><button type="button" data-settings="connections">Connections</button><button type="button" data-settings="alerts">Alerts</button></nav><div id="workspaceControlsBody"><section data-settings-pane="general"><h3>General</h3><div id="workspaceSettingsGeneral"><div class="workspace-setting-row"><div><b>Connection</b></div><p class="workspace-health"></p></div><div class="workspace-setting-row"><div><b>Notify me</b><p id="workspaceNotifyDescription"></p></div><div id="workspaceNotifySlot"></div></div><div class="workspace-setting-row"><div><b>Answer prompts here</b><p id="workspaceAnswerDescription"></p></div><div id="workspaceAnswerSlot"></div></div><div class="workspace-setting-row"><div><label for="workspaceAutoDismiss">Dismiss idle agents automatically</label><p>Only after a recorded turn end; pinned and waiting agents stay.</p></div><select id="workspaceAutoDismiss"><option value="0">Never</option><option value="5">5 min</option><option value="10">10 min</option><option value="30">30 min</option><option value="60">1 hour</option></select></div><div class="workspace-setting-row"><div><b>Theme</b></div><div id="workspaceThemeSlot"></div></div><div class="workspace-setting-row"><div><b>Gestures and keys</b><div id="workspaceHelpDescription"></div></div><div id="workspaceHelpSlot"></div></div></div></section><section data-settings-pane="rules" hidden><h3>Watch rules</h3><p>Rules decide what the stage flags. They never stop an agent.</p><div id="workspaceSettingsRules"></div></section><section data-settings-pane="officer" hidden><h3>Motet</h3><div class="workspace-setting-row"><div><b>Availability</b><p>This is Motet’s reported status, not a connection check.</p></div><span id="workspaceOfficerStatus"></span></div><div class="workspace-setting-row"><div><b>Model</b><p>Applies to the next Motet question.</p></div><div id="workspaceSettingsModel"></div></div><div class="workspace-setting-row"><div><b>Memory</b><p id="workspaceMemoryIntro">Keep saved activity available to Motet. Earlier activity is not imported.</p></div><div id="workspaceSettingsMemory"></div></div><p id="workspaceMemoryState" role="status" hidden></p><button type="button" id="workspaceMemoryRetry" hidden>Retry</button><div id="workspaceMemoryHost"></div></section><section data-settings-pane="connections" hidden><h3>Connections</h3><p id="workspaceConnectionState"></p><div id="workspaceHeldChats"><p id="workspaceHeldStatus" role="status" hidden></p><button type="button" id="workspaceHeldRetry" hidden>Refresh chats</button><section id="workspaceHeldSection" aria-labelledby="workspaceHeldTitle" hidden><h4 id="workspaceHeldTitle">Chats on hold</h4><p>Motet sent these chats a message and could not confirm the reply. New messages to a chat wait until it is cleared.</p><div id="workspaceHeldRows"></div></section></div><div id="workspaceSettingsConnections"></div></section><section data-settings-pane="alerts" hidden><h3>Alerts</h3><p id="workspaceSettingsAlertEmpty">No recent alert.</p><p>Pattern matching can miss things.</p><div id="workspaceSettingsAlerts"></div></section></div></div>';
   const idleSelect=controls.querySelector('#workspaceAutoDismiss');idleSelect.value=String(idleMinutes);idleSelect.onchange=()=>{const n=Number(idleSelect.value);idleMinutes=IDLE_CHOICES.includes(n)?n:0;try{store.setItem('liveRoomAutoDismiss',String(idleMinutes))}catch(err){}};
   const idleChoices=document.createElement('div');idleChoices.id='workspaceIdleChoices';idleChoices.setAttribute('role','group');idleChoices.setAttribute('aria-label','Dismiss idle agents automatically');for(const option of idleSelect.options){const b=document.createElement('button');b.type='button';b.textContent=option.textContent;b.dataset.value=option.value;b.onclick=()=>{idleSelect.value=b.dataset.value;idleSelect.dispatchEvent(new Event('change',{bubbles:true}));paintIdleChoices()};idleChoices.append(b)}const paintIdleChoices=()=>{for(const b of idleChoices.children){b.disabled=idleSelect.disabled;b.setAttribute('aria-pressed',String(b.dataset.value===idleSelect.value))}};idleSelect.addEventListener('change',paintIdleChoices);idleSelect.after(idleChoices);paintIdleChoices();
   const tryLabel=document.createElement('label');tryLabel.className='workspace-watch-try-label';tryLabel.htmlFor='watchTry';tryLabel.textContent='Try one';$('#watchTry').before(tryLabel);
