@@ -11,6 +11,9 @@ import peer_lifecycle
 import peer_progress
 
 
+OWNER_CLEAR = ' If that turn has stopped, the owner can clear this request.'
+
+
 @unittest.skipIf(os.name == 'nt', 'POSIX private state')
 class ProjectionTests(unittest.TestCase):
     setUp = fixtures.SharedTests.setUp
@@ -42,11 +45,17 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(submitted['phase'], 'unavailable')
         self.assertEqual(submitted['summary'], 'Sent. Not confirmed as accepted by the app.')
         self.observe(row, 'accepted', 5)
+        for age, suffix in ((900, ''), (901, OWNER_CLEAR)):
+            with self.subTest(age=age), patch.object(peer_bridge.time, 'time', return_value=row['created'] + age):
+                accepted = self.bridge.result(rid)['progress']
+                self.assertEqual(accepted['summary'], f"Accepted by the app at {accepted['accepted_at']} (14 minutes ago). "
+                                 f'Start not observed.{suffix}')
         with patch.object(peer_bridge.time, 'time', return_value=row['created'] + 1205):
             accepted = self.bridge.result(rid)['progress']
             busy = self.bridge._recipient_capacity(row['request_id'], row['agent'], 'submitted')
         self.assertEqual(accepted['phase'], 'accepted')
-        self.assertEqual(accepted['summary'], f"Accepted by the app at {accepted['accepted_at']} (20 minutes ago). Start not observed.")
+        self.assertEqual(accepted['summary'], f"Accepted by the app at {accepted['accepted_at']} (20 minutes ago). "
+                         f'Start not observed.{OWNER_CLEAR}')
         self.assertEqual(busy, f'Busy with request ({rid}). Accepted 20 minutes ago, start not observed. The new request was not accepted.')
         row.update(bound_turn='fictional-turn', state='awaiting_reply')
         self.store._save(row)
@@ -73,16 +82,23 @@ class ProjectionTests(unittest.TestCase):
                               (rid, agent, json.dumps(snapshot), 'c' * 64, tid, self.credential['credential_id'],
                                created, created, 'Fictional preview'))
         self.store._save(row)
-        self.assertEqual(self.bridge.result(rid)['progress']['summary'],
-                         'Handed to the Claude plugin. Not confirmed as submitted.')
+        for age, suffix in ((900, ''), (901, OWNER_CLEAR)):
+            with self.subTest(age=age), patch.object(peer_bridge.time, 'time', return_value=created + age):
+                progress = self.bridge.result(rid)['progress']
+                self.assertIsNone(progress['claim_issued_at'])
+                self.assertEqual(progress['summary'], 'Handed to the Claude plugin. Not confirmed as submitted.' + suffix)
+                self.assertEqual(self.bridge._recipient_capacity(tid, agent, 'submitted'),
+                                 f'Busy with request ({rid}). The new request was not accepted.')
         self.observe(row, 'claim_issued', 1)
         with patch.object(peer_bridge.time, 'time', return_value=created + 1201):
             claim = self.bridge.result(rid)['progress']
             busy = self.bridge._recipient_capacity(tid, agent, 'submitted')
         self.assertEqual(claim['phase'], 'claim_issued')
         self.assertIsNone(claim['accepted_at'])
-        self.assertEqual(claim['summary'], f"Handed to the Claude plugin at {claim['claim_issued_at']} (20 minutes ago). Not confirmed as submitted.")
-        self.assertEqual(busy, f'Busy with request ({rid}). Accepted 20 minutes ago, start not observed. The new request was not accepted.')
+        self.assertEqual(claim['summary'], f"Handed to the Claude plugin at {claim['claim_issued_at']} (20 minutes ago). "
+                         f'Not confirmed as submitted.{OWNER_CLEAR}')
+        self.assertEqual(busy, f'Busy with request ({rid}). Handed to the Claude plugin 20 minutes ago, '
+                         'start not observed. The new request was not accepted.')
         row.update(mod_turn='fictional-turn', state='awaiting_reply')
         self.store._save(row)
         self.observe(row, 'started', 2)

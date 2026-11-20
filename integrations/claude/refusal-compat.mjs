@@ -41,7 +41,9 @@ try{
   assert.match(result.content[1].text,/This attempt was not accepted/);assert.doesNotMatch(result.content[1].text,/Acceptance is not confirmed/);assert.equal(sends,before+1);
  }
  // Pin the frozen adapter's old limit: an oversized signed error remains uncertain.
- selected='x'.repeat(201);const before=sends;
+ const refusal=' The new request was not accepted.';
+ selected='x'.repeat(201-refusal.length)+refusal;
+ assert.equal(Array.from(selected).length,201);const before=sends;
  const tooLong=await client.callTool({name:'send_message',arguments:{agent_id:'x:'+randomUUID(),identity_revision:'d'.repeat(64),text:'Fictional boundary check.'}});
  assert.match(tooLong.content[1].text,/Acceptance is not confirmed/);assert.equal(sends,before+1);
  console.log('Legacy adapter confirmed '+reasons.length+' compact refusals without retries.');

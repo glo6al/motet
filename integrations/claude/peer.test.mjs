@@ -20,6 +20,7 @@ function observedProgress(provider='codex'){
  return {version:1,provider,phase:'started',claim_issued_at:null,accepted_at:acceptedAt,started_at:startedAt,
    last_checked_at:provider==='codex'?acceptedAt:null,ended_at:null,summary:'Start observed. No end observed. Café 😀',held_reason:null};
 }
+const discoveryDiagnostic='Motet inbox discovery timed out. Only the four native peer tools are available for this connection.\n';
 async function readRequestText(req){
  const chunks=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
  return Buffer.concat(chunks).toString('utf8');
@@ -41,7 +42,7 @@ async function fixture(){
  const file=path.join(config,credential.credential_id+'.json');
  const native=randomUUID(),agent='x:'+native,target={agent_id:agent,name:'Worker',provider:'codex',project_id:'c'.repeat(64),project_label:'Example / Project',identity_revision:'d'.repeat(64)};
  const busyRequestId=randomUUID();
- const busyReason=`Busy with request ${busyRequestId}. Start observed 2024-02-29T23:59:59+00:00 (5 hours ago); no end observed. Last checked 2024-03-01T00:00:00+00:00 (4 hours ago). The new request was not accepted; nothing was resent. Check the earlier request at a meaningful task checkpoint.`;
+ const busyReason=`Busy with request (${busyRequestId}). Start observed 5 hours ago, no end observed. The new request was not accepted.`;
  let mode='normal';const seen=[],run=randomUUID(),sockets=new Set();
  const server=http.createServer(async(req,res)=>{
   const raw=await readRequestText(req);seen.push({path:req.url,raw,headers:req.headers,socket:req.socket});
@@ -54,13 +55,20 @@ async function fixture(){
   assert.equal(req.url,'/bridge/v2/rpc');const p=JSON.parse(raw),n=req.headers['x-watch-nonce'];
   assert.equal(req.headers['x-watch-bridge'],credential.credential_id);assert.equal(req.headers['x-watch-run'],run);assert.equal(req.headers['x-watch-signature'],hmac(credential.secret,['watch-bridge-request-v2',String(credential.port),'POST','/bridge/v2/rpc',req.headers['x-watch-time'],n,run,hash(raw)]));
   if(mode==='hang-rpc')return;
-  if(mode==='loss'){req.socket.destroy();return}
+  if(mode==='loss'){
+   // A response cut short by a graceful close rejects from the socket's close
+   // event. The client's close listener runs before the rejection continuation,
+   // pinning closed=true without the discovery deadline firing.
+   res.writeHead(200,{'Content-Length':128,Connection:'close'});
+   res.end('{"result":');return;
+  }
   const record={origin:'peer',request_id:mode==='mismatched'?randomUUID():p.params.request_id,agent_id:p.params.agent_id||agent,state:'queued',reply:'<untrusted>',error:'',created_at:Date.now()/1000,target:{...target,agent_id:p.params.agent_id||agent},duplicate:false,text_preview:'Please inspect',secret:'SHOULD NOT DISPLAY'};
   if(mode==='progress')record.progress={...observedProgress(),private_attempt:'SHOULD NOT DISPLAY',native:{secret:'SHOULD NOT DISPLAY'}};
   const result=p.method==='list_inboxes'?{inboxes:[]}:p.method==='list_agents'?{agents:[{...target,native_id:native,capability:'unavailable',reason:'No transport',last_seen:Date.now()/1000,supported_transport:'codex_queue',secret:'SHOULD NOT DISPLAY'}],next_cursor:null,directory:{complete:false,reasons:['Scan bounded'],refreshed_at:Date.now()/1000}}:p.method==='list_requests'?{requests:[{...record,request_id:randomUUID()}],next_cursor:null}:record;
   if(mode==='claude_mod'&&p.method==='list_agents')Object.assign(result.agents[0],{agent_id:'c:'+native,provider:'claude',capability:'reachable',reason:'',supported_transport:'claude_mod'});
-  const status=mode==='message-too-long'?400:mode==='reject409'||mode==='reject-long'||mode==='reject-control'?409:['reject429','not-accepted','busy-progress'].includes(mode)?429:mode==='error500'?500:200;
-  const reason=mode==='message-too-long'?'Message too long for this Claude plugin: 4500 envelope characters; maximum is 4000. Reload the updated Motet plugin or reduce the message. Nothing was sent.':mode==='not-accepted'?'Four peer deliveries are active. The new request was not accepted.':mode==='busy-progress'?busyReason:mode==='reject-long'?'x'.repeat(513):mode==='reject-control'?'Invalid\nreason':status===409?'Answer your incoming peer request first.':status===429?'Peer delivery capacity is full.':'Peer service failed.';
+  const unsupportedDiscovery=mode==='legacy-discovery'&&p.method==='list_inboxes';
+  const status=unsupportedDiscovery||mode==='message-too-long'?400:mode==='reject409'||mode==='reject-long'||mode==='reject-control'?409:['reject429','not-accepted','busy-progress'].includes(mode)?429:mode==='error500'?500:200;
+  const reason=unsupportedDiscovery?'Unsupported fixture method.':mode==='message-too-long'?'Message too long for this Claude plugin: 4500 envelope characters; maximum is 4000. Reload the updated Motet plugin or reduce the message. Nothing was sent.':mode==='not-accepted'?'Four peer deliveries are active. The new request was not accepted.':mode==='busy-progress'?busyReason:mode==='reject-long'?'x'.repeat(513):mode==='reject-control'?'Invalid\nreason':status===409?'Answer your incoming peer request first.':status===429?'Peer delivery capacity is full.':'Peer service failed.';
   const body=mode==='huge'?'x'.repeat(65537):JSON.stringify(status===200?{result}:{error:reason}),signature=hmac(credential.secret,['watch-bridge-response-v2',String(credential.port),run,n,String(status),hash(body)]);
   res.writeHead(status,{'Content-Length':Buffer.byteLength(body),'X-Watch-Signature':mode==='altered'?'b'.repeat(64):signature});res.end(body);
  });
@@ -185,15 +193,16 @@ test('native progress rejects malformed evidence and forged providers',()=>{
  for(const value of malformed)assert.throws(()=>safeResult('get_reply',{...codex,progress:value}));
  assert.throws(()=>safeResult('list_requests',{requests:[{...codex,progress:{...valid,provider:'claude'}}],next_cursor:null}));
 });
-test('adapter sensitivity: server proof and signed response protections are required',async()=>{
+test('adapter sensitivity: authentication and timeout classification are required',async()=>{
  const original=await fs.readFile(path.join(here,'peer.mjs'),'utf8');
- for(const [name,from,to] of [
+ for(const [name,from,to,pattern='real signed HTTP',expectedFailure=/Missing expected rejection/] of [
   ['proof',"!equal(proof.proof,mac(key,['watch-bridge-server-v2',String(d.port),d.credential_id,nonce,proof.run_id]))",'false'],
-  ['response',"!equal(response.headers['x-watch-signature'],mac(key,['watch-bridge-response-v2',String(d.port),proof.run_id,nonce,String(response.status),digest(response.body)]))",'false']
+  ['response',"!equal(response.headers['x-watch-signature'],mac(key,['watch-bridge-response-v2',String(d.port),proof.run_id,nonce,String(response.status),digest(response.body)]))",'false'],
+  ['timeout-classification','if(deadlineReached)','if(deadlineReached||closed)','startup discovery stays silent',/Motet inbox discovery timed out/]
  ]){
   assert.ok(original.includes(from));const dir=await fs.mkdtemp(path.join(here,'.peer-mutation-')),target=path.join(dir,'peer.mjs');try{
    await fs.copyFile(path.join(here,'inbox.mjs'),path.join(dir,'inbox.mjs'));
-   await fs.writeFile(target,original.replace(from,to));const result=await new Promise(resolve=>{const env={...process.env,WATCH_PEER_TEST_SCRIPT:target};delete env.NODE_TEST_CONTEXT;const child=spawn(process.execPath,['--test','--test-name-pattern','real signed HTTP',path.join(here,'peer.test.mjs')],{env,stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);child.on('exit',code=>resolve({code,output}))});assert.notEqual(result.code,0,name+' mutation must fail');assert.match(result.output,/Missing expected rejection/);
+   await fs.writeFile(target,original.replace(from,to));const result=await new Promise(resolve=>{const env={...process.env,WATCH_PEER_TEST_SCRIPT:target};delete env.NODE_TEST_CONTEXT;const child=spawn(process.execPath,['--test','--test-name-pattern',pattern,path.join(here,'peer.test.mjs')],{env,stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);child.on('exit',code=>resolve({code,output}))});assert.notEqual(result.code,0,name+' mutation must fail');assert.match(result.output,expectedFailure);if(name==='timeout-classification')assert.match(result.output,/not ok \d+ - loss/);
   }finally{await fs.rm(dir,{recursive:true,force:true})}
  }
 });
@@ -201,14 +210,17 @@ test('adapter sensitivity: server proof and signed response protections are requ
 test('peer HTTP has a total ten-second deadline without a redispatch',{timeout:12000},async()=>{
  const f=await fixture();try{f.setMode('hang');const started=Date.now();await assert.rejects(new PeerClient(f.credential).call('list_requests',{}),/No request was retried/);assert.ok(Date.now()-started>=9500);assert.ok(Date.now()-started<11500);assert.equal(f.seen.length,1);assert.equal(f.seen[0].path,'/bridge/v2/challenge');}finally{await f.close()}
 });
-test('silent startup discovery closes its socket promptly and leaves exactly four native tools',{timeout:25000},async t=>{
+test('silent startup discovery diagnoses once on stderr, cancels its socket, and exposes exactly four native tools',{timeout:25000},async t=>{
  for(const [mode,expected] of [['hang',['/bridge/v2/challenge']],['hang-rpc',['/bridge/v2/challenge','/bridge/v2/rpc']]]){
   await t.test(mode,async()=>{
    const f=await fixture(),client=new Client({name:'silent discovery fixture',version:'1'});
+   const transport=new StdioClientTransport({command:process.execPath,args:[script,'--credential',f.file],cwd:here,stderr:'pipe'});
+   let stderr='';
+   transport.stderr.setEncoding('utf8').on('data',chunk=>{stderr+=chunk});
    try{
     f.setMode(mode);
     const started=performance.now();
-    await client.connect(new StdioClientTransport({command:process.execPath,args:[script,'--credential',f.file],cwd:here,stderr:'pipe'}));
+    await client.connect(transport);
     const elapsed=performance.now()-started;
     assert.ok(elapsed<3000,`startup took ${Math.round(elapsed)}ms`);
     assert.deepEqual(f.seen.map(request=>request.path),expected,'one discovery attempt without a retry');
@@ -223,6 +235,27 @@ test('silent startup discovery closes its socket promptly and leaves exactly fou
     f.setMode('normal');
     assert.equal((await client.callTool({name:'list_agents',arguments:{}})).isError,undefined);
    }finally{await client.close();await f.close()}
+   assert.equal(stderr,discoveryDiagnostic,'exactly one static line with no request or credential data');
+  });
+ }
+});
+test('startup discovery stays silent on an empty inbox and non-deadline failures',async t=>{
+ for(const mode of ['normal','legacy-discovery','squatter','loss']){
+  await t.test(mode,async()=>{
+   const f=await fixture(),client=new Client({name:'fallback discovery fixture',version:'1'});
+   const transport=new StdioClientTransport({command:process.execPath,args:[script,'--credential',f.file],cwd:here,stderr:'pipe'});
+   let stderr='';
+   transport.stderr.setEncoding('utf8').on('data',chunk=>{stderr+=chunk});
+   try{
+    f.setMode(mode);
+    await client.connect(transport);
+    assert.equal(client.getInstructions(),nativeInstructions);
+    assert.deepEqual((await client.listTools()).tools.map(tool=>tool.name),['list_agents','send_message','get_reply','list_requests']);
+    assert.deepEqual(f.seen.map(request=>request.path),mode==='squatter'?['/bridge/v2/challenge']:['/bridge/v2/challenge','/bridge/v2/rpc']);
+    f.setMode('normal');
+    assert.equal((await client.callTool({name:'list_agents',arguments:{}})).isError,undefined);
+   }finally{await client.close();await f.close()}
+   assert.equal(stderr,'');
   });
  }
 });
@@ -302,14 +335,14 @@ test('explicit signed capacity rejection does not suggest an unconfirmed accepta
   assert.doesNotMatch(result.content[1].text,/Acceptance is not confirmed/);
   assert.equal(f.seen.length-before,2,'one challenge and one RPC, no retry');
   f.setMode('busy-progress');
-  assert.ok(f.busyReason.length>200&&f.busyReason.length<=512);
+  assert.ok(Array.from(f.busyReason).length<=200);
   const busyBefore=f.seen.length;
   const busy=await client.callTool({name:'send_message',arguments:{agent_id:f.target.agent_id,identity_revision:f.target.identity_revision,text:'Fictional busy check'}});
   assert.equal(busy.isError,true);
   assert.equal(busy.content[0].text,'Peer request rejected (429): '+f.busyReason);
   assert.match(busy.content[0].text,new RegExp(f.busyRequestId));
   assert.match(busy.content[1].text,/This attempt was not accepted/);
-  assert.equal(f.seen.length-busyBefore,2,'a long busy result still has one transport attempt');
+  assert.equal(f.seen.length-busyBefore,2,'a busy result has one transport attempt');
   f.setMode('loss');
   const lost=await client.callTool({name:'send_message',arguments:{agent_id:f.target.agent_id,identity_revision:f.target.identity_revision,text:'Fictional uncertain check'}});
   assert.match(lost.content[1].text,/Acceptance is not confirmed/);

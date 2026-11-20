@@ -147,7 +147,8 @@ async function flush($, state, retryRequest = null) {
         let hash = Object.keys(request.rejections || {}).length ? await fingerprint(receipt) : null;
         const rejection = request.rejections?.[hash];
         const held = rejection?.count >= MAX_RECEIPT_REJECTIONS;
-        const retryAt = Math.max(rejection?.retry_at ?? 0, state.transientReceiptRetries.get(value) ?? 0);
+        const deferral = state.transientReceiptRetries.get(value);
+        const retryAt = Math.max(rejection?.retry_at ?? 0, deferral?.retry_at ?? 0);
         if (retryRequest ? !held : held || (retryAt && await $.clock.now() < retryAt)) {
           index += 1;
           continue;
@@ -171,7 +172,11 @@ async function flush($, state, retryRequest = null) {
           if (error.status === 503 || (requestError && error.code === '')) {
             // Older bridges used untyped 400 even for storage faults. Defer
             // this event without charging its durable rejection budget.
-            state.transientReceiptRetries.set(value, (await $.clock.now()) + REJECTED_RECEIPT_RETRY_MS);
+            const now = await $.clock.now();
+            state.transientReceiptRetries.set(value, {
+              first_deferred_at:held ? undefined : (deferral?.first_deferred_at ?? now),
+              retry_at:now + REJECTED_RECEIPT_RETRY_MS
+            });
             index += 1;
             continue;
           }
@@ -183,6 +188,8 @@ async function flush($, state, retryRequest = null) {
           await save($, state, () => {
             request.rejections ??= {};
             request.rejections[hash] = {count:Math.min((rejection?.count || 0) + 1, MAX_RECEIPT_REJECTIONS), retry_at};
+            // Keep the existing cooldown. The owner status follows the typed classification.
+            if (deferral) delete deferral.first_deferred_at;
           });
           index += 1;
           continue;
@@ -193,7 +200,10 @@ async function flush($, state, retryRequest = null) {
         await save($, state, () => {
           if (data.mode === 'derived') data.acknowledged[hash] = true;
           if (request.rejections) delete request.rejections[hash];
-          if (request.events[index] === value) request.events.splice(index, 1);
+          if (request.events[index] === value) {
+            request.events.splice(index, 1);
+            state.transientReceiptRetries.delete(value);
+          }
         });
       }
     }
@@ -290,8 +300,8 @@ async function recoverReceipts($, state) {
       if (data.acknowledged[hash]) continue;
       // Old clients acknowledged the original property order.
       if (value.kind === 'completed' && content !== JSON.stringify(value) && data.acknowledged[await fingerprint(value)]) continue;
-      const alreadyRetained = current.events.some(item => JSON.stringify(canonicalReceipt(item)) === content);
-      if (!alreadyRetained) {
+      const retainedEvent = current.events.find(item => JSON.stringify(canonicalReceipt(item)) === content);
+      if (!retainedEvent) {
         if ((current.execution_completed || current.completed) && !['answered','completed','dropped'].includes(value.kind)) continue;
         current.events.push(copy(receipt));
       }
@@ -300,6 +310,8 @@ async function recoverReceipts($, state) {
           rejection.count === previous.count && rejection.retry_at > previous.retry_at)) {
         current.rejections ??= {};
         current.rejections[hash] = copy(rejection);
+        const deferral = retainedEvent && state.transientReceiptRetries.get(retainedEvent);
+        if (deferral && rejection.count >= MAX_RECEIPT_REJECTIONS) delete deferral.first_deferred_at;
       }
     }
     if (!current.execution_completed && !current.completed && current !== state.flight && !['dropped','unknown'].includes(record.phase)) {
@@ -754,7 +766,14 @@ export function register(on) {
   on('command.run',async($,e,next)=>{
     if (TRANSITIONS.has(e.command)) {invalidateEligibility(state); suspend($,state); return next(e);}
     const owner = ['composer','bridge'].includes(e.origin?.kind);
-    if (e.command === 'watch-status') {await readSurfaces($,state); return {text:JSON.stringify(publicStatus(state,owner))};}
+    if (e.command === 'watch-status') {
+      await readSurfaces($,state);
+      let now = null;
+      if (owner) {
+        try {now = await $.clock.now();} catch { /* A missing age does not change connection state. */ }
+      }
+      return {text:JSON.stringify(publicStatus(state,owner,now))};
+    }
     if (!['watch-connect','watch-disconnect','watch-setup','watch-retry-receipts'].includes(e.command)) return next(e);
     if (!owner) return {text:'Motet connection commands require direct owner input.'};
     if (e.command === 'watch-retry-receipts') return retryHeldReceipts($,state,e.args.trim());

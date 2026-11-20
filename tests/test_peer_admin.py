@@ -170,6 +170,38 @@ class AdminTests(unittest.TestCase):
             self.assertEqual(error.exception.status, 409)
         self.assertEqual(life.get(db, self.tid)['execution'], 'uncertain')
 
+    def test_public_selector_cannot_inspect_or_retire_an_owner_desk_id(self):
+        owner_id = uid()
+        owner = dict(request_id=owner_id, agent=self.agent, origin='owner', runtime='codex',
+                     state='awaiting_reply', created=self.created, launched=True, bound_turn='owner-turn')
+        self.store._save(owner)
+        db = self.store.db
+        saved = db.execute('SELECT data FROM requests WHERE id=?', (owner_id,)).fetchone()
+        self.assertIsNotNone(saved)
+        public = {'request_id': owner_id}
+        apply = dict(public, agent=self.agent, confirm=admin.CONFIRM)
+        for operation, body in ((admin.inspect, public), (admin.retire, apply)):
+            with self.assertRaises(peer_bridge.PeerError) as error:
+                operation(self.store, body)
+            self.assertEqual(error.exception.status, 404)
+        self.assertEqual(db.execute('SELECT data FROM requests WHERE id=?', (owner_id,)).fetchone(), saved)
+        self.assertIsNone(life.get(db, owner_id))
+
+    def test_public_selector_cannot_retire_a_healthy_attempt_at_sixty_seconds(self):
+        self.store._save(dict(self.row, state='awaiting_reply'))
+        self.clock.return_value = self.created + 60
+        db = self.store.db
+        before = life.get(db, self.tid)
+        saved = db.execute('SELECT data FROM requests WHERE id=?', (self.tid,)).fetchone()
+        public = {'request_id': self.cid}
+        view = admin.inspect(self.store, public)
+        self.assertEqual((view['transport_id'], view['execution'], view['eligible']), (self.tid, 'running', False))
+        with self.assertRaises(peer_bridge.PeerError) as error:
+            admin.retire(self.store, dict(public, agent=self.agent, confirm=admin.CONFIRM))
+        self.assertEqual(error.exception.status, 409)
+        self.assertEqual(life.get(db, self.tid), before)
+        self.assertEqual(db.execute('SELECT data FROM requests WHERE id=?', (self.tid,)).fetchone(), saved)
+
     def test_public_id_retirement_rechecks_completion_after_inspection(self):
         public = {'request_id': self.cid}
         self.assertTrue(admin.inspect(self.store, public)['eligible'])

@@ -154,8 +154,6 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_peer_progress_projection.py
         if: ${{ !cancelled() }}
-      - run: python tests/test_peer_refusal_compatibility.py
-        if: ${{ !cancelled() }}
       - run: python tests/test_peer_admin.py
         if: ${{ !cancelled() }}
       - run: python tests/test_watch_bridge_clear.py
@@ -205,6 +203,8 @@ jobs:
       - run: python tests/test_watch_claude.py
         if: ${{ !cancelled() }}
       - run: npm --prefix integrations/claude ci --ignore-scripts --no-audit --no-fund
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+      - run: python tests/test_peer_refusal_compatibility.py -v
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: npm --prefix integrations/claude test
         if: ${{ !cancelled() && runner.os != 'Windows' }}

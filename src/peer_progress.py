@@ -152,7 +152,10 @@ def busy_detail(progress, now):
     if phase == 'started':
         return (f'Start observed {elapsed}, no end observed.' if elapsed else
                 'Start recorded, time unavailable, no end observed.')
-    return f'Accepted {elapsed}, start not observed.' if elapsed else ''
+    if not elapsed:
+        return ''
+    prefix = 'Handed to the Claude plugin' if phase == 'claim_issued' else 'Accepted'
+    return f'{prefix} {elapsed}, start not observed.'
 
 
 def public_progress(db, transport_id, *, target, created, row, expired, now):
@@ -207,8 +210,6 @@ def public_progress(db, transport_id, *, target, created, row, expired, now):
         summary = (f'Start observed at {_when(started, now)}.' if started is not None else
                    'Start recorded; start time unavailable.')
         summary += ' No end observed.'
-        if _timestamp(now) and now - created > 900:
-            summary += ' If that turn has stopped, the owner can clear this request.'
     elif execution == 'submitted' and dates['accepted_at'] is not None:
         phase = 'accepted'
         summary = f'Accepted by the app at {_when(dates["accepted_at"], now)}. Start not observed.'
@@ -229,6 +230,8 @@ def public_progress(db, transport_id, *, target, created, row, expired, now):
         phase, summary = 'waiting_dispatch', 'Waiting to be sent.'
     else:
         phase, summary = 'unavailable', 'Sent. Not confirmed as accepted by the app.'
+    if phase in ('started', 'accepted', 'claim_issued') and _timestamp(now) and now - created > 900:
+        summary += ' If that turn has stopped, the owner can clear this request.'
     return {'version': _VERSION, 'provider': provider, 'phase': phase,
             **{key: _iso(value) for key, value in dates.items()}, 'summary': summary, 'held_reason': reason}
 

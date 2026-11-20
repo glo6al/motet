@@ -27,7 +27,9 @@ export const MAX_MESSAGE_CHARACTERS=16000;
 const MAX_RPC_BYTES=262144;
 const RPC_DEADLINE_MS=10000, STARTUP_DISCOVERY_DEADLINE_MS=1500;
 class MessageLengthError extends Error {}
-const fail=()=>new Error('Peer operation could not be confirmed. No request was retried.');
+class PeerDeadlineError extends Error {}
+const OPERATION_FAILED='Peer operation could not be confirmed. No request was retried.';
+const fail=()=>new Error(OPERATION_FAILED);
 class PeerReplyError extends Error{
   constructor(status,reason,inbox=false){
     super(status<500?'Peer request rejected ('+status+'): '+reason:'Peer server error ('+status+'): '+reason+' Delivery may be uncertain; check '+(inbox?'list_inbox_requests or get_inbox_reply':'list_requests or get_reply')+' before sending again.');
@@ -66,8 +68,9 @@ export class PeerClient{
     // Agent is deliberately single-use: it must never reconnect after server proof.
     const agent=new http.Agent({keepAlive:true,maxSockets:1,maxFreeSockets:1});
     const controller=new AbortController();
-    let provenSocket=null,closed=false;
+    let provenSocket=null,closed=false,deadlineReached=false;
     const timer=setTimeout(()=>{
+      deadlineReached=true;
       closed=true;
       controller.abort();
       agent.destroy();
@@ -120,7 +123,11 @@ export class PeerClient{
       }
       if((method==='send_message'||method==='get_reply')&&(result.request_id!==params.request_id||(method==='send_message'&&(result.agent_id!==params.agent_id||result.target.identity_revision!==params.identity_revision))))throw fail();
       return result;
-    }catch(error){if(error instanceof PeerReplyError)throw error;throw fail()}finally{clearTimeout(timer);agent.destroy()}
+    }catch(error){
+      if(error instanceof PeerReplyError)throw error;
+      if(deadlineReached)throw new PeerDeadlineError(OPERATION_FAILED);
+      throw fail();
+    }finally{clearTimeout(timer);agent.destroy()}
   }
 }
 function textField(value,max){if(typeof value!=='string'||Array.from(value).length>max)throw fail();return value}
@@ -213,7 +220,13 @@ export const nativeInstructions=instructions.split('\n').filter(line=>!line.star
   .replace('Optional shared pull inboxes also accept requests for Antigravity; they never send to or wake a native Antigravity chat.','These native tools never send to or wake a native Antigravity chat.')
   .replace('do not call send_message or send_inbox_message;','do not call send_message;');
 export async function discoverInboxes(client){
-  try{return (await client.call('list_inboxes',{},STARTUP_DISCOVERY_DEADLINE_MS)).inboxes;}catch{return [];}
+  try{return (await client.call('list_inboxes',{},STARTUP_DISCOVERY_DEADLINE_MS)).inboxes;}
+  catch(error){
+    if(error instanceof PeerDeadlineError){
+      console.error('Motet inbox discovery timed out. Only the four native peer tools are available for this connection.');
+    }
+    return [];
+  }
 }
 export async function main(){
   if(![4,6].includes(process.argv.length)||process.argv[2]!=='--credential'||(process.argv.length===6&&process.argv[4]!=='--inbox-credential'))throw fail();
@@ -243,7 +256,7 @@ export async function main(){
       const result=await client.call(params.name,args);
       return {content:[{type:'text',text:JSON.stringify({origin:'peer',untrusted_peer_data:result})}]};
     }catch(error){
-      const content=[{type:'text',text:(error instanceof PeerReplyError||error instanceof MessageLengthError)?error.message:'Peer operation could not be confirmed. No request was retried.'}];
+      const content=[{type:'text',text:(error instanceof PeerReplyError||error instanceof MessageLengthError)?error.message:OPERATION_FAILED}];
       if(inboxMethod(params.name)&&typeof params.arguments?.request_id==='string'&&validRequestId(params.arguments.request_id))requestId=params.arguments.request_id;
       if(requestId&&inboxMethod(params.name))content.push({type:'text',text:'Inbox request ID: '+requestId+'. Use get_inbox_reply or list_inbox_requests to check. Keep the original claim token private for claim recovery; never begin or repeat work merely because a response was lost. Nothing was retried.'});
       else if(requestId)content.push({type:'text',text:'Request ID: '+requestId+(error instanceof PeerReplyError&&error.notAccepted
