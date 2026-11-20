@@ -68,7 +68,7 @@ async function inspect(browser,root,expected) {
       await page.setViewportSize({width:1600,height:900});
       await page.waitForFunction(() => !document.getAnimations().some(a => a.constructor.name === 'CSSTransition' && a.transitionProperty === 'transform'));
       confirmedHero = await page.evaluate(() => {
-        const agent=A['c:demo-cleo'],request=need(agent),box=agent.el.getBoundingClientRect(),room=document.querySelector('#room').getBoundingClientRect();
+        const agent=A['c:demo-ada'],request=need(agent),box=agent.el.getBoundingClientRect(),room=document.querySelector('#room').getBoundingClientRect();
         return {name:agent.name,confirmed:request?.sure===true,project:projLabel(proj(agent.id)),viewport:[innerWidth,innerHeight],
           box:{x:box.x,y:box.y,width:box.width,height:box.height},
           fullyInside:box.left>=room.left&&box.right<=room.right&&box.top>=room.top&&box.bottom<=room.bottom};
@@ -101,6 +101,16 @@ async function inspect(browser,root,expected) {
       }
       return samples.slice(4);
     });
+    if(expected === 22) {
+      const evidence = await page.evaluate(() => {
+        const permission=Object.values(A['c:demo-ada'].perms)[0],answer=ofDemoAnswer('Who is waiting on me?');
+        return {text:answer.text,permission:permission.seq,citation:answer.cites.find(c=>c.aid==='c:demo-ada')?.n,
+          narration:A['c:demo-ada'].story.filter(row=>row.t==='say').map(row=>row.text).join('\n')};
+      });
+      assert.equal(evidence.citation,evidence.permission,'waiting answer cites the held request after later Ada ticks');
+      assert.match(evidence.text,/Ada/);assert.doesNotMatch(evidence.text,/Cleo.*wants permission/);
+      assert.doesNotMatch(evidence.narration,/Thirteen passing|13 passing|all 13/, 'held approval cannot narrate the approved verification');
+    }
     assert.deepEqual(await page.evaluate(()=>window.__demoEffects),[],'no effects during benchmark');
     assert.deepEqual(requests,[],'no outbound requests during benchmark');
     return {expected,cast,confirmedHero,effects,requests,errors,samples:performance};

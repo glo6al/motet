@@ -36,7 +36,7 @@ Motet is an agent of its own. It follows what each of your agents records, so yo
 
 Motet acts only when you ask. It does not yet act by itself; that is the biggest thing it does not do yet. See [where it is going](#where-motet-is-and-where-it-is-going). A question you send this way is queued for the agent and does not interrupt it. Questions and cues through Motet use your own Anthropic API key.
 
-<p align="center"><img src="docs/media/workspace-motet.png" width="1000" alt="Motet's desk in Workspace. Asked Who is waiting on me?, Motet answers with a short list: Cleo wants permission to run a command, and Esme probably asked a question. Under the answer are a link to two pieces of recorded evidence and the note Scripted demo answer, no live agents contacted. A panel on the right lists Watch, Actions, Evidence and Memory."></p>
+<p align="center"><img src="docs/media/workspace-motet.png" width="1000" alt="Motet's desk in Workspace. Asked Who is waiting on me?, Motet answers with a short list: Ada wants permission to update the pricing snapshots, and Esme probably asked a question. Under the answer are a link to two pieces of recorded evidence and the note Scripted demo answer, no live agents contacted. A panel on the right lists Watch, Actions, Evidence and Memory."></p>
 <p align="center"><sub><b>Motet's desk.</b> Ask about the stage and read the answer with the recorded evidence behind it. In the demo the answers are scripted and say so.</sub></p>
 
 ## The bridge
@@ -61,7 +61,7 @@ When you want to look for yourself, every agent is in view.
 - **Bring a player in.** Message an agent from its desk, hand it a PDF or a picture, or start a fresh Codex chat in a project's folder, including a folder you add yourself.
 - **Catch the wrong note.** A command that looks like a deploy, a push, a delete or a send is flagged as it happens. You choose the words it listens for.
 
-<p align="center"><img src="docs/media/workspace-desk.png" width="1000" alt="Ada's desk in Workspace. The chain of command shows Ada and her fictional children. The conversation on the left contains your pricing request, a folded run of steps, Ada's rounding update and an edit in progress. The Changes panel on the right shows two recorded edits to one file as red and green excerpts."></p>
+<p align="center"><img src="docs/media/workspace-desk.png" width="1000" alt="Ada's desk in Workspace. The chain of command shows Ada and her fictional children. The conversation on the left contains your pricing request, a folded run of steps, Ada's rounding update and an approval card asking to update the pricing snapshots. The Changes panel on the right shows two recorded edits to one file as red and green excerpts, with the latest edit still in progress."></p>
 <p align="center"><sub><b>A desk.</b> The conversation, with the work it produced beside it. Fictional demo data.</sub></p>
 
 ## Bring the subscriptions you already have
