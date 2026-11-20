@@ -272,13 +272,3 @@ def observe(store, row, observation):
     if observation not in _FIELDS:
         return False
     return _store_observation(store, row, observation)
-
-
-def migrate_retained(store):
-    """Boot-only per-row migration; no payload scan or historical date inference."""
-    with store.lock:
-        rows = store.db.execute('''SELECT p.request_id,p.agent,p.created FROM peer_execution p
-            JOIN shared_bridge_requests r ON r.transport_id=p.request_id''').fetchall()
-    for request_id, agent, created in rows:
-        ensure(store, dict(request_id=request_id, agent=agent, created=created,
-                           origin='peer', bridge_version=2))

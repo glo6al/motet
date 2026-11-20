@@ -197,7 +197,6 @@ class MessagingStore:
                         row.update(state='unknown', error='Motet restarted during sending. Delivery is unknown; it will not resend.')
                     self._save(row)
             self._reconcile_fulfillments()
-            peer_progress.migrate_retained(self)
             self.db.commit()
             self.peers = peer_bridge.PeerBridge(self)
             self.shared = peer_bridge.SharedBridge(self)

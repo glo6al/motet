@@ -311,6 +311,78 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(self.public_result(2)['state'], 'unknown')
         self.assertIsNone(peer_progress.load(self.store.db, self.rid)['accepted_at'])
 
+    def bind_progress_turn(self):
+        self.admit()
+        self.store._peer_progress_clock = lambda: self.row['created'] + 10
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.store.tick()
+        prior = peer_progress.load(self.store.db, self.rid)
+        self.assertEqual(prior['last_checked_at'], self.row['created'] + 10)
+        self.store._peer_progress_clock = lambda: self.row['created'] + 20
+        return prior
+
+    def test_progress_check_waits_for_unread_transcript_bytes(self):
+        prior = self.bind_progress_turn()
+        start = self.old.stat().st_size
+        self.append(self.old, 'event_msg', dict(type='token_count'))
+        boundary = self.old.stat().st_size
+        self.append(self.old, 'event_msg', dict(type='token_count'))
+        with patch.object(m, 'MAX_READ', boundary - start):
+            self.store.tick()
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(saved['bound_turn'], 'bound')
+        self.assertEqual(saved['cursor'], boundary)
+        self.assertLess(saved['cursor'], self.old.stat().st_size)
+        self.assertEqual(peer_progress.load(self.store.db, self.rid), prior)
+
+        self.store.tick()
+        verified = peer_progress.load(self.store.db, self.rid)
+        self.assertEqual(verified['last_checked_at'], self.row['created'] + 20)
+
+    def test_progress_check_does_not_advance_across_unresolved_gap(self):
+        prior = self.bind_progress_turn()
+        with self.old.open('ab') as source:
+            source.write(b'{unreadable complete record}\n')
+        self.store.tick()
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(saved['bound_turn'], 'bound')
+        self.assertEqual(saved['cursor'], self.old.stat().st_size)
+        self.assertTrue(saved.get('codex_gap_needs_envelope'))
+        self.assertFalse(saved.get('codex_discard_record'))
+        self.assertEqual(peer_progress.load(self.store.db, self.rid), prior)
+
+    def test_progress_check_does_not_advance_during_oversized_record_discard(self):
+        prior = self.bind_progress_turn()
+        with self.old.open('ab') as source:
+            source.write(b'{"type":"compacted","payload":{"opaque":"' + b'x' * 600)
+        with patch.object(m, 'MAX_LINE', 200), patch.object(m, 'MAX_READ', 400):
+            self.store.tick()
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(saved['bound_turn'], 'bound')
+        self.assertLess(saved['cursor'], self.old.stat().st_size)
+        self.assertTrue(saved.get('codex_gap_needs_envelope'))
+        self.assertEqual(saved.get('codex_discard_record'), list(c.segment_key(saved)))
+        self.assertEqual(peer_progress.load(self.store.db, self.rid), prior)
+
+    def test_progress_discards_observations_when_conflict_holds_row_in_same_poll(self):
+        self.admit()
+        prior = peer_progress.load(self.store.db, self.rid)
+        self.store._peer_progress_clock = lambda: self.row['created'] + 10
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='original'))
+        self.message(self.old, 'original', self.row['envelope'])
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='conflict'))
+        self.message(self.old, 'conflict', self.row['envelope'])
+        self.store.tick()
+
+        saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(saved['bound_turn'], 'original')
+        self.assertEqual(saved['state'], 'unknown')
+        self.assertTrue(saved.get('tracking_stopped'))
+        self.assertFalse(saved.get('settled'))
+        self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'uncertain')
+        self.assertEqual(peer_progress.load(self.store.db, self.rid), prior)
+
     def test_progress_bad_clock_cannot_undo_exact_completion(self):
         self.admit()
         self.store._peer_progress_clock = lambda: self.row['created'] + 10
