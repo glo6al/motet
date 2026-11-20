@@ -217,7 +217,13 @@ jobs:
       - run: python tests/test_peer_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
+      - run: python tests/test_codex_proven_end_integration.py -v
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: python tests/test_claude_peer_integration.py
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
+      - run: python tests/test_claude_proven_end_integration.py -v
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
       - run: python tests/test_peer_reply_integration.py

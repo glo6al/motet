@@ -134,6 +134,37 @@ class ProjectionTests(unittest.TestCase):
         self.assertNotIn('progress', fallback)
         self.assertNotIn('/fictional/private', json.dumps(fallback))
 
+    def test_completed_withheld_is_finished_not_a_hold_in_both_public_reads(self):
+        for record_time in (False, True):
+            with self.subTest(record_time=record_time):
+                sent, row = self.codex(state='awaiting_reply', bound='fictional-turn')
+                row.update(state='unknown', settled=True, tracking_stopped=True,
+                           capture_disposition='withheld', reply='', candidate_reply='', final='')
+                self.store._save(row)
+                if record_time:
+                    self.observe(row, 'ended', 1)
+                before = self.store.db.total_changes
+                with patch.object(peer_bridge.time, 'time', return_value=row['created'] + 5):
+                    current = self.bridge.result(sent['request_id'])
+                    listed = next(item for item in self.bridge.list_requests()['requests']
+                                  if item['request_id'] == sent['request_id'])
+                self.assertEqual(self.store.db.total_changes, before)
+                self.assertEqual((current['state'], current['reply']), ('unknown', ''))
+                self.assertEqual(listed.get('reply', ''), '')
+                self.assertEqual(listed['progress'], current['progress'])
+                progress = current['progress']
+                self.assertEqual(progress['phase'], 'ended')
+                self.assertIsNone(progress['held_reason'])
+                self.assertTrue(progress['summary'].startswith('Finished; reply withheld. '))
+                self.assertNotIn('clear', progress['summary'])
+                self.assertNotIn('success', progress['summary'])
+                self.assertEqual(progress['ended_at'] is not None, record_time)
+                if not record_time:
+                    self.assertIn('End recorded; end time unavailable.', progress['summary'])
+                record = peer_lifecycle.get(self.store.db, row['request_id'])
+                self.assertEqual((record['execution'], record['capture']), ('completed', 'withheld'))
+                self.assertEqual(peer_lifecycle.blockers(self.store.db, row['agent']), [])
+
     def test_protected_payloads_and_misdirected_targets_omit_progress(self):
         sent, row = self.codex(state='awaiting_reply', bound='fictional-turn')
         rid = sent['request_id']

@@ -191,7 +191,7 @@ def public_progress(db, transport_id, *, target, created, row, expired, now):
         phase = 'ended'
         summary = f'End observed at {_when(ended, now)}.' if ended is not None else 'End recorded; end time unavailable.'
         if capture == 'withheld':
-            summary += ' Reply withheld.'
+            summary = 'Finished; reply withheld. ' + summary
         elif (expired or row is None or capture == 'unusable'
               or row.get('state') == 'unknown' and row.get('tracking_stopped')):
             summary += ' Reply unavailable.'
