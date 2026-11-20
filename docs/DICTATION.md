@@ -303,15 +303,15 @@ words may be missing, including when Stop was acknowledged but final events
 did not arrive. A closure acknowledgement does not prove the final words were
 received. A late cleanup warning does not replace this explanation or a newer
 status, and never alters a subsequently edited draft. When Lock prevents
-cleanup, the page keeps the routine locked-stage ending reason; it does not bypass the
-locked API boundary. The next take waits for cleanup and checks readiness
-before asking for the microphone. This is a bounded recovery attempt, not a
-guarantee that the helper is idle at the deadline: already admitted native
-work can outlive an HTTP request. A lost Start reply can also leave the page
-without a session ID to cancel. Readiness
-checks prevent another take while the helper reports occupied; the helper's
-existing inactivity expiry provides recovery after requests stop. An
-unconfirmed Stop may lose final words that were not yet visible.
+cleanup, the page keeps the routine locked-stage ending reason; it does not
+bypass the locked API boundary. The next take waits for cleanup and checks
+readiness before asking for the microphone. This is a bounded recovery
+attempt, not a guarantee that the helper is idle at the deadline: already
+admitted native work can outlive an HTTP request. A lost Start reply can also
+leave the page without a session ID to cancel. Readiness checks prevent
+another take while the helper reports occupied; the helper's existing
+inactivity expiry provides recovery after requests stop. An unconfirmed Stop
+may lose final words that were not yet visible.
 
 Use Cmd+Z or Ctrl+Z to undo manual corrections, and Cmd+Shift+Z, Ctrl+Shift+Z or
 Ctrl+Y to redo them. Recognition updates do not become manual Undo entries, so

@@ -212,16 +212,17 @@
     }
     function rememberCleanup(current) {
       if (current && current.cancelScheduled) current.cleanupFeedback = {
-        operation, target: target(), text: textarea.value, feedback: feedbackVersion, status: statusVersion
+        target: target(), text: textarea.value, feedback: feedbackVersion, status: statusVersion
       };
     }
     function cleanupWarning(current, error) {
       const stamp = current.cleanupFeedback;
-      if (destroyed || take || composing || !stamp || operation !== stamp.operation || target() !== stamp.target
+      if (destroyed || composing || !stamp || target() !== stamp.target
           || current.target !== stamp.target || textarea.value !== stamp.text || feedbackVersion !== stamp.feedback
           || statusVersion !== stamp.status || [COPY.control_unconfirmed,COPY.finalize_unconfirmed].includes(detail.message)) return;
-      // Lock intentionally revokes adapter access; keep its explicit context reason.
-      if (detail.reason === 'locked' && error && error.code === 'unavailable' && !canUse()) return;
+      // Only the adapter can attest that Lock refused this request locally.
+      if (detail.reason === 'locked' && error && error.code === 'unavailable' && !canUse()
+          && options.isLocalRefusal && options.isLocalRefusal(error) === true) return;
       setState('idle', { code: 'control_unconfirmed', reason: 'cleanup_unconfirmed',
         message: COPY.control_unconfirmed, announcement: COPY.control_unconfirmed });
     }

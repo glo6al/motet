@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import sqlite3
+import socket
 from pathlib import Path
 import sys
 import tempfile
@@ -66,6 +67,62 @@ class ClaudeModTests(unittest.TestCase):
         conn.close()
         try: return status, json.loads(raw)
         except ValueError: return status, raw.decode()
+
+    def test_mod_close_is_advertised_before_socket_eof(self):
+        self.enroll()
+        payload = json.dumps(dict(generation=self.generation, native_id=self.sid,
+                                  project=self.project, accept=False)).encode()
+        for token, success in ((self.token, True), ('fictional-invalid-token', False)):
+            with self.subTest(success=success):
+                with socket.create_connection(('127.0.0.1', server.PORT), timeout=3) as transport:
+                    transport.sendall((f'POST /claude-mod/poll HTTP/1.1\r\nHost: 127.0.0.1:{server.PORT}\r\n'
+                        f'Authorization: Bearer {token}\r\nContent-Type: application/json\r\n'
+                        f'Content-Length: {len(payload)}\r\n\r\n').encode() + payload)
+                    response = http.client.HTTPResponse(transport)
+                    response.begin()
+                    self.assertEqual(response.status == 200, success)
+                    self.assertEqual(response.getheader('Connection'), 'close')
+                    self.assertTrue(response.will_close)
+                    response.read()
+                    self.assertEqual(transport.recv(1), b'', 'server closed the advertised connection')
+
+    def test_owner_keep_alive_and_explicit_client_close_remain_truthful(self):
+        conn = http.client.HTTPConnection('127.0.0.1', server.PORT, timeout=3)
+        try:
+            first_socket = None
+            for number in range(3):
+                headers = {'X-Live-Room-Key': server.KEY, 'Content-Type': 'application/json'}
+                if number == 2:
+                    headers['Connection'] = 'close'
+                conn.request('POST', '/claude-mod-setup-status', '{}', headers)
+                active_socket = conn.sock
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.will_close, number == 2)
+                if number == 2:
+                    self.assertEqual(response.getheader('Connection'), 'close')
+                else:
+                    self.assertNotEqual(response.getheader('Connection'), 'close')
+                response.read()
+                if number == 0:
+                    first_socket = active_socket
+                else:
+                    self.assertIs(active_socket, first_socket, 'ordinary owner reads reuse the connection')
+        finally:
+            conn.close()
+
+    def test_existing_explicit_close_header_is_not_duplicated(self):
+        with patch.object(server, 'ATTACHMENTS', None):
+            conn = http.client.HTTPConnection('127.0.0.1', server.PORT, timeout=3)
+            try:
+                conn.request('GET', '/api/attachments/status', headers={'X-Live-Room-Key': server.KEY})
+                response = conn.getresponse()
+                self.assertGreaterEqual(response.status, 400)
+                self.assertEqual(response.headers.get_all('Connection'), ['close'])
+                self.assertTrue(response.will_close)
+                response.read()
+            finally:
+                conn.close()
 
     def enroll(self):
         status, pair = self.http('/claude-mod-pair', {'agent': self.aid}, owner=True)
