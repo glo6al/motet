@@ -203,3 +203,82 @@ def record(db, transport_id, observation, *, agent, created, binding, fresh, clo
     updated = dict(progress, **{field: now})
     _write(db, transport_id, snapshot, updated)
     return updated
+
+
+def _store_observation(store, row, observation=None):
+    """Optional metadata savepoint; callers supply already verified source facts.
+
+    The store's normal namespace classifier remains authoritative. A progress
+    failure is isolated from an outer lifecycle transaction where SQLite permits
+    that; if SQLite aborted that entire transaction, never conceal the failure.
+    """
+    if (row.get('origin') != 'peer' or row.get('bridge_version') != 2
+            or not isinstance(row.get('request_id'), str)):
+        return False
+    import sqlite3
+    with store.lock:
+        db = store.db
+        outer = db.in_transaction
+        try:
+            if store._attachment_reserved(row['request_id']):
+                return False
+        except Exception:
+            if outer and not db.in_transaction:
+                raise
+            return False  # Optional metadata cannot weaken an unavailable fence.
+        point = 'peer_progress_' + uuid.uuid4().hex
+        try:
+            db.execute('SAVEPOINT ' + point)
+        except sqlite3.Error:
+            if outer and not db.in_transaction:
+                raise
+            return False
+        try:
+            current = _snapshot(db, row['request_id'])
+            if (row.get('agent'), row.get('created')) != current[:2]:
+                raise ProgressError('The progress caller does not match the exact admission.')
+            if observation is None:
+                migrate(db, row['request_id'])
+            else:
+                keys = _binding_fields(current[0], observation, current[-2])
+                binding = {key: row.get(key) for key in keys}
+                record(db, row['request_id'], observation, agent=row['agent'], created=row['created'],
+                       binding=binding, fresh=True,
+                       clock=getattr(store, '_peer_progress_clock', None) or time.time)
+            db.execute('RELEASE SAVEPOINT ' + point)
+            return True
+        except (ProgressError, sqlite3.Error):
+            if not db.in_transaction:
+                if outer:
+                    raise  # The surrounding lifecycle commit must not claim success.
+                return False
+            db.execute('ROLLBACK TO SAVEPOINT ' + point)
+            db.execute('RELEASE SAVEPOINT ' + point)
+            return False
+        except BaseException:
+            if db.in_transaction:
+                db.execute('ROLLBACK TO SAVEPOINT ' + point)
+                db.execute('RELEASE SAVEPOINT ' + point)
+            raise
+
+
+def ensure(store, row):
+    """Initialize nulls only, within the guarded store write boundary."""
+    return _store_observation(store, row)
+
+
+def observe(store, row, observation):
+    """Called only by fresh verified provider callbacks, never reads or replay."""
+    if observation not in _FIELDS:
+        return False
+    return _store_observation(store, row, observation)
+
+
+def migrate_retained(store):
+    """Boot-only per-row migration; no payload scan or historical date inference."""
+    with store.lock:
+        rows = store.db.execute('''SELECT p.request_id,p.agent,p.created FROM peer_execution p
+            JOIN shared_bridge_requests r ON r.transport_id=p.request_id''').fetchall()
+    for request_id, agent, created in rows:
+        ensure(store, dict(request_id=request_id, agent=agent, created=created,
+                           origin='peer', bridge_version=2))

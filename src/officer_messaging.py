@@ -27,6 +27,7 @@ import claude_mod
 import peer_bridge
 import peer_inbox
 import peer_lifecycle
+import peer_progress
 import codex_transcript
 
 CLI = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
@@ -196,6 +197,7 @@ class MessagingStore:
                         row.update(state='unknown', error='Motet restarted during sending. Delivery is unknown; it will not resend.')
                     self._save(row)
             self._reconcile_fulfillments()
+            peer_progress.migrate_retained(self)
             self.db.commit()
             self.peers = peer_bridge.PeerBridge(self)
             self.shared = peer_bridge.SharedBridge(self)
@@ -386,15 +388,16 @@ class MessagingStore:
             except Exception:
                 pass  # History failure never changes delivery or triggers a retry.
 
-    def _save(self, row, *, commit=True, ordinary_proof=None):
+    def _save(self, row, *, commit=True, ordinary_proof=None, observations=()):
         runtime = self._native_owner_runtime
+        progress = {'observations': observations} if observations else {}
         if commit and runtime is not None and not self.db.in_transaction:
             with runtime.ledger.ordinary_writer() as proof:
-                self._write_request(row, proof)
+                self._write_request(row, proof, **progress)
             self._history_outcome(row)
             return
         try:
-            self._write_request(row, ordinary_proof)
+            self._write_request(row, ordinary_proof, **progress)
             if commit:
                 self.db.commit()
                 self._history_outcome(row)
@@ -405,7 +408,7 @@ class MessagingStore:
     def _ordinary_row(self, row):
         return row.get('origin') != 'peer' and not peer_lifecycle.metadata(self.db, row['request_id'])
 
-    def _write_request(self, row, proof):
+    def _write_request(self, row, proof, observations=()):
         if self._attachment_reserved(row['request_id']):
             raise OwnerGuardError('A protected owner request needs recovery before ordinary writeback.')
         if proof is not None and not self._ordinary_row(row):
@@ -425,6 +428,10 @@ class MessagingStore:
                     WHERE NOT EXISTS (SELECT 1 FROM requests WHERE id=? AND data=?)''',
                                         (identity, payload, identity, payload))
                 proof.record(write)
+            if row.get('origin') == 'peer' and row.get('bridge_version') == 2:
+                peer_progress.ensure(self, row)
+                for kind in observations:
+                    peer_progress.observe(self, row, kind)
 
     def probe(self):
         if sys.platform != 'darwin':
@@ -1063,14 +1070,14 @@ class MessagingStore:
             proof.eligible = False
         return [row for row in rows if now - row['created'] <= RETENTION]
 
-    def _send(self, row):
+    def _send(self, row, *, observations=None):
         if row.get('transport') == claude_mod.TRANSPORT:
             return 'unknown', 'Official-mod requests are dispatched only by their atomic claim.'
         if row.get('runtime') == 'claude':
             return self._send_claude(row)
-        return self._queue_codex(row, outgoing_message(row))
+        return self._queue_codex(row, outgoing_message(row), observations=observations)
 
-    def _queue_codex(self, row, message):
+    def _queue_codex(self, row, message, *, observations=None):
         try:
             st = self._metadata(row['path'], row['agent'][2:])
             if (st.st_ino, st.st_dev) != (row['inode'], row['device']) or st.st_size < row['cursor']:
@@ -1097,6 +1104,8 @@ class MessagingStore:
             return 'unknown', 'Sending could not be confirmed after launch. Motet will not resend.'
         if code:
             return 'unknown', 'Codex returned an error after launch. Delivery is unknown; Motet will not resend.'
+        if observations is not None and type(code) is int and code == 0:
+            observations.append('accepted')
         return 'queued', ''
 
     def _apply_claude(self, row, record):
@@ -1341,7 +1350,7 @@ class MessagingStore:
             # The exact immutable turn ended. A gap or abort leaves no safe
             # reply to capture, even if this event includes answer text.
             self._withhold_codex_peer_end(row, interrupted=kind != 'task_complete')
-            return
+            return 'ended'
         if typ == 'event_msg' and kind == 'task_started':
             row['current_turn'] = p.get('turn_id') if isinstance(p.get('turn_id'), str) else ''
             if row.get('codex_gap_needs_envelope'):
@@ -1418,10 +1427,13 @@ class MessagingStore:
                     if (turn not in row.get('peer_turn_starts', []) or turn in row.get('peer_foreign_turns', [])
                             or row.get('peer_context_overflow') or row.get('bound_turn') == turn):
                         row['peer_mixed_input'] = True
-                if row['bound_turn'] != turn:
+                new_binding = row['bound_turn'] != turn
+                if new_binding:
                     row['final'], row['final_turn'] = '', ''
                 row['bound_turn'] = turn
                 row['state'] = 'awaiting_reply'
+                if new_binding and row.get('origin') == 'peer':
+                    return 'started'
             elif p.get('role') == 'assistant' and p.get('phase') == 'final_answer' and turn and turn == row['bound_turn']:
                 row['final'], row['final_turn'] = text[:16000], turn
         elif typ == 'event_msg' and kind == 'task_complete' and p.get('turn_id') and p['turn_id'] == row['bound_turn']:
@@ -1434,11 +1446,11 @@ class MessagingStore:
                 markers = [line for line in answer.splitlines() if 'WATCH_REPLY' in line] if isinstance(answer, str) else []
                 if markers != [marker]:
                     row.update(state='unknown', reply='', tracking_stopped=True, error='Peer reply has missing or ambiguous correlation markers.')
-                    return
+                    return 'ended'
                 row.update(state='quarantined', complete_offset=codex_transcript.segment(row)['cursor'],
                            complete_segment=list(codex_transcript.segment_key(row)), quarantined_at=time.time(),
                            candidate_reply='\n'.join(line for line in answer.splitlines() if line != marker).strip()[:16000], error='')
-                return
+                return 'ended'
             if isinstance(answer, str) and marker in answer.splitlines():
                 row.update(state='answered', reply='\n'.join(line for line in answer.splitlines() if line != marker).strip()[:16000], error='')
 
@@ -1454,6 +1466,7 @@ class MessagingStore:
         if row.get('runtime') == 'claude':
             return self._poll_claude(row)
         peer = row.get('origin') == 'peer' and row.get('runtime') == 'codex'
+        observations = []
         if peer and row.get('bound_turn') and not row.get('settled'):
             current = codex_transcript.segment(row)
             checkpoint = [current.get(key) for key in ('device', 'inode', 'cursor')]
@@ -1488,7 +1501,9 @@ class MessagingStore:
                 try:
                     event = json.loads(raw)
                     if isinstance(event, dict):
-                        self._consume(row, event)
+                        kind = self._consume(row, event)
+                        if kind:
+                            observations.append(kind)
                     elif row.get('origin') == 'peer':
                         self._codex_gap(row)
                 except (ValueError, TypeError):
@@ -1512,12 +1527,23 @@ class MessagingStore:
             row.update(state='unknown', error=str(error))
         except (OSError, MessagingError):
             row['error'] = 'The transcript is unavailable; Motet will keep checking for a reply.'
+        else:
+            if row.get('tracking_stopped') and not row.get('settled'):
+                observations.clear()
+            elif (peer and row.get('bound_turn') and not row.get('codex_gap_needs_envelope')
+                  and not row.get('codex_discard_record')
+                  and (current['cursor'] >= st.st_size or 'ended' in observations)):
+                if 'ended' in observations:
+                    observations.insert(-1, 'checked')
+                else:
+                    observations.append('checked')
         finally:
             if peer and row.get('bound_turn'):
                 current = codex_transcript.segment(row)
                 row['codex_peer_terminal_checked'] = [current.get(key) for key in ('device', 'inode', 'cursor')]
         if row['state'] in ('queued', 'awaiting_reply') and time.time() - row['created'] > TTL:
             row.update(state='expired', error=CODEX_REPLY_EXPIRED)
+        return observations
 
     def _worker_current(self, row):
         # A detached worker selection is never sufficient to launch a protected
@@ -1558,6 +1584,7 @@ class MessagingStore:
             if self.stop.is_set():
                 break
             peer = row.get('origin') == 'peer'
+            observations = [] if peer and row.get('bridge_version') == 2 and row.get('runtime') == 'codex' else None
             was_answered = row['state'] == 'answered'
             try:
                 if not self._worker_current(row):
@@ -1576,7 +1603,10 @@ class MessagingStore:
                             self._save(row)
                     if not self._worker_current(row):
                         continue
-                    row['state'], row['error'] = self._send(row)
+                    if observations is None:
+                        row['state'], row['error'] = self._send(row)
+                    else:
+                        row['state'], row['error'] = self._send(row, observations=observations)
                 elif row['state'] == 'sending' and row['launched']:
                     # A post-launch persistence failure cannot authorize a second send.
                     row.update(state='unknown', error='Delivery outcome could not be persisted. Motet will not resend.')
@@ -1584,7 +1614,9 @@ class MessagingStore:
                     with self.lock:
                         if self._attachment_reserved(row['request_id']):
                             continue
-                    self._poll(row)
+                    observed = self._poll(row)
+                    if observations is not None and observed:
+                        observations.extend(observed)
             except (sqlite3.OperationalError, OwnerGuardError):
                 with self.lock:
                     self.db.rollback()
@@ -1607,7 +1639,7 @@ class MessagingStore:
                     # Codex candidates are private until all owner cursors catch up.
                     if not was_answered and row['state'] == 'answered':
                         self.peers.owner_warning(row)
-                    self._save(row)
+                    self._save(row, observations=observations or ())
                 except (sqlite3.OperationalError, OwnerGuardError):
                     self.db.rollback()
         with self.lock:

@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import claude_mod as mod
 import officer_messaging as messaging
+import peer_lifecycle
 import server
 
 
@@ -191,6 +192,7 @@ class ClaudeModTests(unittest.TestCase):
         row = self.row(payload['request_id'])
         self.assertEqual((row['state'],row['reply']),('answered','Fictional completion.'))
         self.assertIsNone(self.poll()[1]['claim'])
+        self.assertIsNone(peer_lifecycle.get(self.store.db, payload['request_id']))
 
     def test_tick_never_dispatches_polls_or_overwrites_mod_rows(self):
         self.enroll();payload,_=self.request()
@@ -429,6 +431,125 @@ class ClaudeModTests(unittest.TestCase):
     def global_poll(self, client, accept=True):
         return self.http('/claude-mod/poll', dict(generation=self.generation,native_id=self.sid,
             project=self.project,accept=accept,client_id=client),token=self.token)
+
+    def shared_progress_request(self):
+        import chat_directory
+        import peer_bridge
+        root = self.base/'claude'/'fictional'
+        root.mkdir(parents=True)
+        (root/(self.sid+'.jsonl')).write_text(json.dumps(dict(type='custom-title', customTitle='Fictional',
+            sessionId=self.sid, cwd=self.project))+'\n')
+        codex = self.base/'codex'
+        (codex/'sessions').mkdir(parents=True)
+        directory = chat_directory.ChatDirectory(str(codex), str(root.parent), policy={'history_days':'all'},
+            codex_sessions=str(codex/'sessions'), live_snapshot=lambda: server.shared_directory_snapshot(self.store))
+        self.store.shared.directory = directory
+        with self.store.lock:
+            service = peer_bridge.initialize_service(self.store.db, {'history_days':'all'})
+            credential = peer_bridge.service_credential(self.store.db, service['credential_id'])
+        status, setup = self.http('/claude-mod-setup', {'peer_receive':True}, owner=True)
+        self.assertEqual(status, 200, setup)
+        status, grant = self.http('/claude-mod/setup', {'code':setup['pair_code']})
+        self.assertEqual(status, 200, grant)
+        status, registration, body = self.register_global(grant, peer_protocol=1, lifecycle_protocol=2)
+        self.assertEqual(status, 200, registration)
+        for _ in range(30):
+            if directory.refresh(force=True)['complete']:
+                break
+        target = directory.list_agents()['agents'][0]
+        sent = self.store.shared.send(credential, target['agent_id'], target['identity_revision'],
+                                      'Report fictional progress.', uid(), 'Fictional requester')
+        tid = self.store.db.execute('SELECT transport_id FROM shared_bridge_requests WHERE client_id=?',
+                                    (sent['request_id'],)).fetchone()[0]
+        return tid, sent['request_id'], body['client_id']
+
+    def progress_event(self, claim, client, kind, **extra):
+        return self.http('/claude-mod/event', dict(generation=self.generation, native_id=self.sid,
+            client_id=client, request_id=claim['request_id'], attempt_id=claim['attempt_id'],
+            kind=kind, **extra), token=self.token)
+
+    def test_shared_mod_progress_tracks_claim_start_and_exact_end_only(self):
+        tid, request_id, client = self.shared_progress_request()
+        observed = time.time() + 60
+        with patch.object(self.store, '_peer_progress_clock', lambda: observed, create=True):
+            status, poll = self.global_poll(client)
+            self.assertEqual(status, 200, poll)
+            claim = poll['claim']
+            self.assertEqual(claim['request_id'], tid)
+            def progress():
+                return peer_lifecycle.get(self.store.db, tid)['evidence']['progress']
+            reserved = dict(version=1, claim_issued_at=observed, accepted_at=None, started_at=None,
+                            last_checked_at=None, ended_at=None)
+            self.assertEqual(progress(), reserved)
+            observed += 1
+            self.assertEqual(self.global_poll(client, accept=False)[0], 200)
+            self.assertEqual(self.progress_event(claim, client, 'submitted')[0], 200)
+            self.assertEqual(progress(), reserved)
+            observed += 1
+            self.assertEqual(self.progress_event(dict(claim, attempt_id=uid()), client, 'started', turn_id='fictional-turn')[0], 409)
+            self.assertEqual(progress(), reserved)
+            self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+            started = dict(reserved, started_at=observed, last_checked_at=observed)
+            self.assertEqual(progress(), started)
+            observed += 1
+            self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+            self.assertEqual(progress(), started)
+            completed = dict(turn_id='fictional-turn', outcome='answered', answer='WATCH_REPLY '+tid+'\nFictional reply.',
+                             event_id=uid(), occurred_at=1)
+            self.assertEqual(self.progress_event(claim, client, 'completed', **completed)[0], 200)
+            ended = dict(started, last_checked_at=observed, ended_at=observed)
+            self.assertEqual(progress(), ended)
+            observed += 1
+            self.assertEqual(self.progress_event(claim, client, 'completed', **completed)[0], 200)
+            self.assertEqual(progress(), ended)
+            self.assertEqual(self.store.shared.result(request_id)['reply'], 'Fictional reply.')
+
+    def test_shared_mod_old_replays_and_bad_clock_do_not_invent_progress(self):
+        tid, request_id, client = self.shared_progress_request()
+        status, poll = self.global_poll(client)
+        self.assertEqual(status, 200, poll)
+        claim = poll['claim']
+        turn = 'fictional-old-turn'
+        self.assertEqual(self.progress_event(claim, client, 'started', turn_id=turn)[0], 200)
+        with self.store.lock, self.store.db:
+            old = peer_lifecycle.get(self.store.db, tid)['evidence']
+            old.pop('progress', None)
+            self.store.db.execute('UPDATE peer_execution SET evidence=? WHERE request_id=?', (json.dumps(old), tid))
+        with patch.object(self.store, '_peer_progress_clock', lambda: time.time()+60, create=True):
+            self.assertEqual(self.progress_event(claim, client, 'started', turn_id=turn)[0], 200)
+        empty = dict(version=1, claim_issued_at=None, accepted_at=None, started_at=None,
+                     last_checked_at=None, ended_at=None)
+        self.assertEqual(peer_lifecycle.get(self.store.db, tid)['evidence']['progress'], empty)
+        completed = dict(turn_id=turn, outcome='answered', answer='WATCH_REPLY '+tid+'\nFictional reply.',
+                         event_id=uid(), occurred_at=1)
+        with patch.object(self.store, '_peer_progress_clock', lambda: float('nan'), create=True):
+            self.assertEqual(self.progress_event(claim, client, 'completed', **completed)[0], 200)
+        self.assertEqual(self.store.shared.result(request_id)['reply'], 'Fictional reply.')
+        self.assertEqual(peer_lifecycle.get(self.store.db, tid)['execution'], 'completed')
+        with patch.object(self.store, '_peer_progress_clock', lambda: time.time()+60, create=True):
+            self.assertEqual(self.progress_event(claim, client, 'completed', **completed)[0], 200)
+        self.assertEqual(peer_lifecycle.get(self.store.db, tid)['evidence']['progress'], empty)
+
+    def test_mod_pruned_payload_completion_settles_without_new_progress_or_body(self):
+        tid, _, client = self.shared_progress_request()
+        observed = time.time() + 60
+        with patch.object(self.store, '_peer_progress_clock', lambda: observed, create=True):
+            status, poll = self.global_poll(client)
+            self.assertEqual(status, 200, poll)
+            claim = poll['claim']
+            self.assertEqual(self.progress_event(claim, client, 'started', turn_id='fictional-turn')[0], 200)
+            previous = peer_lifecycle.get(self.store.db, tid)['evidence']['progress']
+            with self.store.lock:
+                self.store._prune(self.store._rows(), observed + messaging.RETENTION)
+            self.assertIsNone(self.store.db.execute('SELECT data FROM requests WHERE id=?', (tid,)).fetchone())
+            observed += 1
+            completed = dict(turn_id='fictional-turn', outcome='answered', answer='WATCH_REPLY '+tid+'\nFictional late reply.',
+                             event_id=uid(), occurred_at=1)
+            self.assertEqual(self.progress_event(claim, client, 'completed', **completed)[0], 200)
+            settled = peer_lifecycle.get(self.store.db, tid)
+            self.assertEqual(settled['execution'], 'completed')
+            self.assertEqual(settled['evidence']['progress'], previous)
+            self.assertIsNone(self.store.db.execute('SELECT data FROM requests WHERE id=?', (tid,)).fetchone())
 
     def test_global_setup_auth_single_use_status_and_secret_classes(self):
         for path in ('/claude-mod-setup','/claude-mod-setup-status','/claude-mod-revoke'):

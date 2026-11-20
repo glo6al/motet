@@ -14,6 +14,7 @@ import codex_transcript as c
 import officer_messaging as m
 import peer_bridge
 import peer_lifecycle
+import peer_progress
 from peer_recovery import directory_hash
 
 
@@ -249,6 +250,88 @@ class TranscriptTests(unittest.TestCase):
     def public_result(self, version):
         return (self.store.shared.result(self.client_id) if version == 2
                 else self.store.peers.result(self.sender_id, self.client_id))
+
+    def queue_for_progress(self, returncode):
+        self.admit()
+        self.row.update(state='sending', launched=False)
+        self.store.db.execute('UPDATE shared_bridge_requests SET launched=NULL WHERE transport_id=?', (self.rid,))
+        self.store._save(self.row)
+        self.store._peer_progress_clock = lambda: self.row['created'] + 10
+
+        def authorize(row):
+            row['launched'] = True
+            self.store.db.execute('UPDATE shared_bridge_requests SET launched=? WHERE transport_id=?',
+                                  (row['created'], self.rid))
+            self.store.db.commit()
+
+        with patch.object(self.store.shared, 'authorize', side_effect=authorize), patch.object(m.subprocess, 'Popen') as launch:
+            launch.return_value.wait.return_value = returncode
+            self.store.tick()
+            launch.assert_called_once()
+
+    def test_progress_observes_queue_binding_exact_end_and_successful_check(self):
+        self.queue_for_progress(0)
+        base = self.row['created']
+        accepted = peer_progress.load(self.store.db, self.rid)
+        self.assertEqual(accepted['accepted_at'], base + 10)
+        self.assertIsNone(accepted['claim_issued_at'])
+        self.assertIsNone(accepted['started_at'])
+        self.assertIsNone(accepted['last_checked_at'])
+
+        self.store._peer_progress_clock = lambda: base + 20
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='foreign'))
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='foreign'))
+        self.store.tick()
+        self.assertEqual(peer_progress.load(self.store.db, self.rid), accepted)
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.store.tick()
+        started = peer_progress.load(self.store.db, self.rid)
+        self.assertEqual(started['started_at'], base + 20)
+        self.assertEqual(started['last_checked_at'], base + 20)
+        self.assertIsNone(started['ended_at'])
+
+        self.store._peer_progress_clock = lambda: base + 30
+        held = self.root / 'temporarily-moved'
+        self.old.rename(held)
+        self.store.tick()
+        self.assertEqual(peer_progress.load(self.store.db, self.rid), started)
+        held.rename(self.old)
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional answer.'))
+        self.store.tick()
+        ended = peer_progress.load(self.store.db, self.rid)
+        self.assertEqual(ended['ended_at'], base + 30)
+        self.assertEqual(ended['last_checked_at'], base + 30)
+        self.assertEqual(ended['started_at'], base + 20)
+        self.assertEqual(self.public_result(2)['reply'], 'Fictional answer.')
+
+    def test_progress_rejects_queue_error_as_native_acceptance(self):
+        self.queue_for_progress(1)
+        self.assertEqual(self.public_result(2)['state'], 'unknown')
+        self.assertIsNone(peer_progress.load(self.store.db, self.rid)['accepted_at'])
+
+    def test_progress_bad_clock_cannot_undo_exact_completion(self):
+        self.admit()
+        self.store._peer_progress_clock = lambda: self.row['created'] + 10
+        self.append(self.old, 'event_msg', dict(type='task_started', turn_id='bound'))
+        self.message(self.old, 'bound', self.row['envelope'])
+        self.store.tick()
+        prior = peer_progress.load(self.store.db, self.rid)
+        self.store._peer_progress_clock = lambda: float('nan')
+        self.append(self.old, 'event_msg', dict(type='turn_aborted', turn_id='bound'))
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False)
+        self.assertEqual(peer_progress.load(self.store.db, self.rid), prior)
+
+    def test_progress_does_not_date_a_recovered_historical_abort(self):
+        self.retain_previous_worker_binding(dict(type='turn_aborted', turn_id='bound'))
+        prior = peer_progress.load(self.store.db, self.rid)
+        self.assertTrue(all(value is None for key, value in prior.items() if key != 'version'))
+        self.store._peer_progress_clock = lambda: self.row['created'] + 10
+        self.store.tick()
+        self.assert_durable_peer_end(gap=False)
+        self.assertEqual(peer_progress.load(self.store.db, self.rid), prior)
 
     def assert_withheld_completion(self):
         self.assertTrue(self.row.get('settled'))
