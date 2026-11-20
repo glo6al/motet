@@ -732,6 +732,13 @@ class TranscriptTests(unittest.TestCase):
         self.assertIn('will keep checking', after['error'])
         if origin == 'peer':
             self.assertEqual(peer_lifecycle.get(self.store.db, self.rid)['execution'], 'running')
+        # An empty successful read repairs this diagnostic before any state change.
+        with patch.object(m.subprocess, 'Popen') as launch:
+            self.store.tick()
+            launch.assert_not_called()
+        recovered = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual((recovered['state'], recovered['bound_turn']), ('awaiting_reply', 'bound'))
+        self.assertEqual(recovered.get('error'), '')
         self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
                     last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional recovered answer.'))
         with patch.object(m.subprocess, 'Popen') as launch:
@@ -739,6 +746,17 @@ class TranscriptTests(unittest.TestCase):
             launch.assert_not_called()
         result = next(row for row in self.store._rows() if row['request_id'] == self.rid)
         self.assertEqual((result['state'], result['reply']), ('answered', 'Fictional recovered answer.'))
+
+    def test_successful_read_preserves_an_unrelated_diagnostic(self):
+        self.retain_previous_worker_binding()
+        self.store.tick()
+        row = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        row['error'] = 'Fictional diagnostic that is not a temporary-read warning.'
+        self.store._save(row)
+        self.store.tick()
+        after = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        self.assertEqual(after['state'], 'awaiting_reply')
+        self.assertEqual(after['error'], row['error'])
 
     def test_live_owner_missing_source_keeps_awaiting_then_answers(self):
         self.live_tracking_survives_temporary_source('owner')
