@@ -3927,7 +3927,8 @@ require('./test_attachments_relay.js');
 require('./test_attachments_officer_direct.js');
 require('./test_attachments_history_time.js');
 require('./test_officer_documents_page.js');
-require('./test_officer_documents_page_http.js');
+// The real owner HTTP/storage suite runs in its own workflow step. It must
+// not seed durable files while unrelated asynchronous page suites run here.
 
 /* Stored owner-message time travels through actual merge, card, paint and order paths. */
 function ownerTimestampHarness(code=messageCode,storage=new Map(),workspace=false){

@@ -6,6 +6,7 @@
 const assert = require('node:assert/strict');
 const {spawn, spawnSync} = require('node:child_process');
 const {webcrypto} = require('node:crypto');
+const {EventEmitter} = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -50,33 +51,135 @@ function auditFailure(stage,s) {
   return error;
 }
 
+const OWNER_STDERR_LIMIT = 10000;
+const ownerNow = () => performance.now();
+
+function ownerFixtureError(reason,args,started,now,readStderr) {
+  const elapsed = Math.max(0,Math.round(now()-started));
+  const stderr = readStderr().slice(-OWNER_STDERR_LIMIT).trim() || '<empty>';
+  return Error(`Disposable owner HTTP ${reason} after ${elapsed} ms. args=${JSON.stringify(args)} stderr=${stderr}`);
+}
+
+function waitForOwnerReady(child,args,{now=ownerNow,started=now(),readStderr=()=>'',startupMs=10000,
+  setTimer=setTimeout,clearTimer=clearTimeout}={}) {
+  return new Promise((resolve,reject)=>{
+    let stdout='';
+    const settle=(reason,origin)=>{
+      clearTimer(timer);
+      child.off('error',onError);
+      child.off('close',onClose);
+      child.stdout.off('data',onStdout);
+      if(reason)reject(ownerFixtureError(reason,args,started,now,readStderr));
+      else resolve(origin);
+    };
+    const onError=error=>settle(`startup spawn failed (${error.message})`);
+    // Unlike exit, close follows the last bytes from the child pipes.
+    const onClose=(code,signal)=>settle(`startup closed (code=${code}, signal=${signal})`);
+    const onStdout=bytes=>{
+      stdout+=bytes;
+      const match=stdout.match(/OFFLINE fixture URL: (http:\/\/127\.0\.0\.1:\d+)\//);
+      if(match)settle(null,match[1]);
+      else stdout=stdout.slice(-1024);
+    };
+    const timer=setTimer(()=>settle('startup timed out'),Math.max(0,startupMs-(now()-started)));
+    child.on('error',onError);
+    child.on('close',onClose);
+    child.stdout.on('data',onStdout);
+  });
+}
+
 async function ownerFixture(run,args=[]) {
-  const child=spawn('python3',[path.join(__dirname,'officer_document_live_fixture.py'),'--model',context.modelId,...args],
-    {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:['ignore','pipe','pipe']});
-  let stdout='',stderr='';
-  child.stderr.on('data',b=>{stderr=(stderr+b).slice(-10000);});
-  const exited=new Promise(resolve=>child.once('exit',resolve));
+  const variant=['--model',context.modelId,'--trace-startup',...args];
+  const started=ownerNow();
+  let child;
   try {
-    const origin=await new Promise((resolve,reject)=>{
-      const timer=setTimeout(()=>reject(Error('Disposable owner HTTP startup timed out')),10000);
-      child.once('error',e=>{clearTimeout(timer);reject(e);});
-      child.once('exit',code=>{clearTimeout(timer);reject(Error('Disposable owner HTTP exited '+code+' '+stderr));});
-      child.stdout.on('data',b=>{
-        stdout+=b;const match=stdout.match(/http:\/\/127\.0\.0\.1:\d+\//);
-        if(match){clearTimeout(timer);resolve(match[0].slice(0,-1));}
-      });
-    });
+    child=spawn('python3',[path.join(__dirname,'officer_document_live_fixture.py'),...variant],
+      {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:['ignore','pipe','pipe']});
+  } catch(error) {
+    throw ownerFixtureError(`startup spawn failed (${error.message})`,variant,started,ownerNow,()=>'');
+  }
+  let stderr='',childError,primaryFailed=false,cleanupTimer;
+  const readStderr=()=>stderr;
+  const appendStderr=bytes=>{stderr=(stderr+bytes).slice(-OWNER_STDERR_LIMIT);};
+  child.stderr.on('data',appendStderr);
+  // Keep child errors handled during teardown after the readiness listener is removed.
+  const onChildError=error=>{childError=error;};
+  child.on('error',onChildError);
+  const closed=new Promise(resolve=>child.once('close',resolve));
+  try {
+    const origin=await waitForOwnerReady(child,variant,{started,readStderr});
     assert.equal(new URL(origin).hostname,'127.0.0.1');
     await run(origin);
+  } catch(error) {
+    primaryFailed=true;
+    throw error;
   } finally {
-    if(child.exitCode===null&&child.signalCode===null)child.kill('SIGINT');
-    let timer;
     try {
-      await Promise.race([exited,new Promise((_,reject)=>{timer=setTimeout(()=>{
-        child.kill('SIGKILL');reject(Error('Disposable owner HTTP cleanup timed out: '+stderr));
+      if(child.pid&&child.exitCode===null&&child.signalCode===null)child.kill('SIGINT');
+      await Promise.race([closed,new Promise((_,reject)=>{cleanupTimer=setTimeout(()=>{
+        child.kill('SIGKILL');
+        const reason=childError?`cleanup timed out (${childError.message})`:'cleanup timed out';
+        reject(ownerFixtureError(reason,variant,started,ownerNow,readStderr));
       },5000);})]);
-    } finally {clearTimeout(timer);}
+    } catch(error) {
+      if(!primaryFailed)throw error;
+    } finally {
+      clearTimeout(cleanupTimer);
+      child.stderr.off('data',appendStderr);
+      child.off('error',onChildError);
+    }
   }
+}
+
+async function ownerStartupChecks() {
+  const args=['--seed-file','--seed-count','51','--trace-startup'];
+  function fake() {
+    const child=new EventEmitter();
+    child.stdout=new EventEmitter();
+    const started=120;
+    let wall=started,stderr='',deadline;
+    const timers=new Map();
+    const pending=waitForOwnerReady(child,args,{started,now:()=>wall,readStderr:()=>stderr,
+      setTimer:(callback,delay)=>{deadline=delay;timers.set('startup',callback);return 'startup';},
+      clearTimer:id=>timers.delete(id)});
+    assert.equal(deadline,10000);
+    return {child,pending,setTime:elapsed=>{wall=started+elapsed;},setStderr:tail=>{stderr=tail;},
+      timeout:()=>timers.get('startup')(),assertClean:()=>{
+        assert.equal(timers.size,0);
+        assert.equal(child.listenerCount('error'),0);
+        assert.equal(child.listenerCount('close'),0);
+        assert.equal(child.stdout.listenerCount('data'),0);
+      }};
+  }
+
+  const timeout=fake();
+  timeout.setTime(10007);
+  timeout.setStderr('omitted prefix '+ 'x'.repeat(10000)+'stderr tail');
+  timeout.timeout();
+  await assert.rejects(timeout.pending,error=>error.message.includes('startup timed out after 10007 ms')&&
+    error.message.includes(JSON.stringify(args))&&error.message.endsWith('stderr tail')&&!error.message.includes('omitted prefix'));
+  timeout.assertClean();
+
+  const early=fake();
+  early.setTime(42);
+  early.child.emit('exit',3);
+  early.setStderr('late stderr drained');
+  early.child.emit('close',3,null);
+  await assert.rejects(early.pending,/startup closed \(code=3, signal=null\) after 42 ms.*late stderr drained/);
+  early.assertClean();
+
+  const missing=fake();
+  missing.setTime(19);
+  missing.child.emit('error',Error('spawn python3 ENOENT'));
+  await assert.rejects(missing.pending,/startup spawn failed \(spawn python3 ENOENT\) after 19 ms.*stderr=<empty>/);
+  missing.assertClean();
+
+  const ready=fake();
+  ready.child.stdout.emit('data',Buffer.from('OFFLINE fixture URL: http://127.0.'));
+  ready.child.stdout.emit('data',Buffer.from('0.1:42017/#fictional\n'));
+  assert.equal(await ready.pending,'http://127.0.0.1:42017');
+  ready.assertClean();
+  console.log('ok fixture startup diagnostics and listener cleanup');
 }
 
 async function coupled(factory,scenario,options={}) {
@@ -685,6 +788,7 @@ async function killed(label,factory,scenario,expected) {
 }
 
 async function run() {
+  await ownerStartupChecks();
   await firstUpload(createOfficerDocumentsClient);console.log('ok actual first-upload callbacks and final DTO');
   await readFailure(createOfficerDocumentsClient);console.log('ok actual File-read failure / GET refresh / local removal');
   await lostCreate(createOfficerDocumentsClient,false);console.log('ok unacknowledged create / authoritative empty GET / no retry');
@@ -785,6 +889,5 @@ with TemporaryDirectory() as folder:
   assert.equal(result.status, 0, result.stderr);
   console.log('ok native Windows refuses private attachment storage before creating files');
 } else {
-  // Let the aggregate's synchronous work finish before timing real startup.
   setImmediate(() => run().catch(error => { console.error(error); process.exitCode = 1; }));
 }

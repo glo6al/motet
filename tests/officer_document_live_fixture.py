@@ -96,7 +96,7 @@ def main():
     parser.add_argument('--browser-fault', choices=BROWSER_FAULTS, default='none')
     parser.add_argument('--management-fault', choices=('none', 'unreadable-once'), default='none')
     parser.add_argument('--upload-fault', choices=('none', 'interrupted-once'), default='none')
-    parser.add_argument('--trace-startup', action='store_true', help='Print a traceback if startup stalls')
+    parser.add_argument('--trace-startup', action='store_true', help='Print a traceback if startup takes five seconds')
     args = parser.parse_args()
     if args.seed_count != 1 and not (args.seed_file or args.reading_off):
         parser.error('--seed-count requires --seed-file or --reading-off')
@@ -122,7 +122,9 @@ def main():
                           'uploadFault': args.upload_fault, 'clock': 'advancing-fictional', **extra_metadata}))
         return
     if args.trace_startup:
-        faulthandler.dump_traceback_later(10)
+        # Emit before the consumer's ten-second deadline, so even a stalled
+        # import, filesystem operation or seed leaves evidence in its stderr.
+        faulthandler.dump_traceback_later(5)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
     import server
     import officer_documents as documents

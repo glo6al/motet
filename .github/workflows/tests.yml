@@ -353,6 +353,9 @@ jobs:
       - run: node tests/test_page.js      # the page's path helpers, outside a browser
         if: ${{ !cancelled() }}
         timeout-minutes: 7
+      - run: node tests/test_officer_documents_page_http.js
+        if: ${{ !cancelled() }}
+        timeout-minutes: 7
       - name: Check desktop stage message-box ownership
         if: ${{ !cancelled() }}
         timeout-minutes: 5
