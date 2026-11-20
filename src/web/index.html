@@ -1968,6 +1968,18 @@ html.workspace #workspacePanelEvidence .workspace-document-body li:has(>.box){li
 html.workspace body.stepped #workspaceTop #workspacePanels button[aria-pressed=true]{background:#eae8e3;color:#1c1b19}
 html.workspace #officer{--watch-ink:#1c1b19;--watch-muted:#66635d;--ink:#1c1b19;--mute:#66635d;--add:#17753a;--del:#b3261e}
 html.workspace #officer #ofLog{--watch-ink:#1c1b19;--watch-muted:#66635d;color:#1c1b19}
+html.workspace #officer #ofLog>.of.control{align-self:stretch;max-width:100%;border:0;background:transparent;padding:0;box-shadow:none}
+html.workspace #officer #ofLog .workspace-control-line{display:block;color:#66635d;font:12.5px/1.4 system-ui;overflow-wrap:anywhere}
+html.workspace #officer #ofLog .workspace-control-line[data-warning=true]{color:rgb(184,67,10)}
+html.workspace #officer #ofLog .workspace-control-instruction{margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere;color:#1c1b19;font:14px/1.5 system-ui}
+html.workspace #officer #ofLog .workspace-watch-question small.workspace-relay-status{font:12.5px/1.4 system-ui;color:#66635d;text-align:right;align-self:flex-end}
+html.workspace #officer #ofLog .workspace-watch-question small.workspace-relay-status[data-warning=true]{color:rgb(184,67,10)}
+html.workspace #officer #ofLog .workspace-relay-status button{border:0;background:none;box-shadow:none;color:inherit;padding:0;font:inherit;letter-spacing:0;text-transform:none;cursor:pointer}
+html.workspace #officer #ofLog .workspace-relay-status .message-check{margin-left:6px;text-decoration:underline}
+html.workspace #officer #ofLog .workspace-relay-status button:focus-visible{outline:1px solid #888;outline-offset:2px}
+html.workspace #officer #ofLog .workspace-relay-answer{align-self:stretch;max-width:100%;border:0;background:none;padding:0;box-shadow:none}
+html.workspace #officer .workspace-relay-unseen{position:relative}
+html.workspace #officer .workspace-relay-unseen::after{content:'';position:absolute;top:3px;right:3px;width:5px;height:5px;border-radius:50%;background:#66635d}
 html.workspace #officer #ofLog :is(.workspace-source,.workspace-source-text,.workspace-watch-answer,.workspace-watch-question,.source.you p,.message .draft){color:#1c1b19}
 html.workspace #officer #ofLog :is(.workspace-source-summary,.workspace-more,.workspace-run-header,.workspace-message-meta,.workspace-step,.workspace-step-icon,.workspace-step-arrow,.workspace-step-delta,.workspace-watch-question small,.workspace-watch-answer>small,.source.you>b,.source.you>small,.message>b){color:#66635d}
 html.workspace #officer #ofLog .workspace-step-plus{color:#17753a}
@@ -3017,14 +3029,14 @@ try{KEY=DEMO?'':(localStorage.getItem('liveRoomKey')||'')}catch(err){}
 function takeKey(){const h=new URLSearchParams(location.hash.slice(1)), k=h.get('k'), p=h.get('p'); if(!k&&!p) return false;
   history.replaceState(null,'',location.pathname+location.search);
   if(DEMO) return false;                          /* a credential in a demo window's address is dropped, never claimed or kept */
-  const keep=v=>{if(v!==KEY){if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');workspaceAppIconsReset();KEY=v;if(typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire()}try{localStorage.setItem('liveRoomKey',v)}catch(err){}};   /* retire private UI before checking a different key */
+  const keep=v=>{if(v!==KEY){if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');workspaceAppIconsReset();KEY=v;if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();if(typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire()}try{localStorage.setItem('liveRoomKey',v)}catch(err){}};   /* retire private UI before checking a different key */
   if(k){keep(k); return true}
   /* an unlock link carries a one-time code, traded here for the key */
-  if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');claiming=true;                                   /* nothing else checks or connects until this settles */
+  if(typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('keychanged');claiming=true;if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();                                   /* nothing else checks or connects until this settles */
   if(typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire();
   fetch('/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:p})}).then(r=>r.ok?r.text():Promise.reject())
     .then(v=>{keep(v)}).catch(()=>{if(!KEY) txt($('#lockMsg'),'That unlock link has expired or was already used. Press Unlock again.')})
-    .finally(()=>{claiming=false; start()});
+    .finally(()=>{claiming=false;if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();start()});
   return false}
 takeKey();
 addEventListener('hashchange',()=>{if(takeKey())start()});
@@ -4965,7 +4977,7 @@ const here=()=>{if(APPROVE&&KEY&&connected&&!DEMO&&document.visibilityState==='v
 $('#appr').onclick=()=>{if(DEMO){APPROVE=!APPROVE; render(); return} APPROVE=!APPROVE; try{sessionStorage.setItem('liveRoomApprove',APPROVE?'1':'0')}catch(err){} here(); render()};
 // Fence the client's authenticated state before closing the desk. Desk teardown
 // can repaint the Officer, so set the lock before it can reconnect.
-function lock(on){if(on&&typeof workspaceAppIconsReset==='function')workspaceAppIconsReset();if(on&&typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('locked');if(on&&typeof workspaceOfficerMotionCancel==='function')workspaceOfficerMotionCancel();if(on&&typeof workspaceCancelDeskReturn==='function')workspaceCancelDeskReturn();if(on&&typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire();if(on&&typeof workspaceLiveDocumentsInvalidate==='function')workspaceLiveDocumentsInvalidate('lock');if(on&&typeof workspaceManagedReset==='function')workspaceManagedReset('lock');locked=on;if(on&&typeof workspaceOfficerDeskClose==='function')workspaceOfficerDeskClose(false);if(on&&typeof idleFenceReset==='function')idleFenceReset();if(on&&$('#workspaceControlsDialog')&&typeof workspaceSettingsLock==='function')workspaceSettingsLock();hid($('#lock'),!on);nativeSync();if(!on&&typeof workspaceLiveDocumentsController==='function')workspaceLiveDocumentsController.current?.sync();if(typeof workspaceDictationRefresh==='function')workspaceDictationRefresh();}
+function lock(on){if(on&&typeof workspaceAppIconsReset==='function')workspaceAppIconsReset();if(on&&typeof workspaceDictationContextChanging==='function')workspaceDictationContextChanging('locked');if(on&&typeof workspaceOfficerMotionCancel==='function')workspaceOfficerMotionCancel();if(on&&typeof workspaceCancelDeskReturn==='function')workspaceCancelDeskReturn();if(on&&typeof workspaceNativeAttachments==='function')workspaceNativeAttachments.current?.retire();if(on&&typeof workspaceLiveDocumentsInvalidate==='function')workspaceLiveDocumentsInvalidate('lock');if(on&&typeof workspaceManagedReset==='function')workspaceManagedReset('lock');locked=on;if(typeof workspaceQuietRelayOwnerChanged==='function')workspaceQuietRelayOwnerChanged();if(on&&typeof workspaceOfficerDeskClose==='function')workspaceOfficerDeskClose(false);if(on&&typeof idleFenceReset==='function')idleFenceReset();if(on&&$('#workspaceControlsDialog')&&typeof workspaceSettingsLock==='function')workspaceSettingsLock();hid($('#lock'),!on);nativeSync();if(!on&&typeof workspaceLiveDocumentsController==='function')workspaceLiveDocumentsController.current?.sync();if(typeof workspaceDictationRefresh==='function')workspaceDictationRefresh();}
 /* native observation reader: private focused state, never LOG or message transport */
 function createNativeReader({request,paint,clock=()=>Date.now()/1000,later=setTimeout,cancel=clearTimeout}){
   const state={agent:null,key:null,epoch:0,snapshot:null,note:'',busy:false,timer:null,abort:null};
@@ -5284,7 +5296,7 @@ function cuEnvelopeMatch(it,agent,records){
 function cuDirectReason(id,a){return !a?'This station is no longer available.':a.observed?'This agent’s conversation stays in ChatGPT; direct messaging is unavailable.':!['x:','c:'].includes(String(id).slice(0,2))||a.runtime!==(String(id).startsWith('c:')?'Claude':'Codex')||(String(id).startsWith('c:')&&a.sub)?'Direct messaging is unavailable for this station. A verified connection is required for local Codex chats and parent Claude sessions.':''}
 function cuDraftKey(station,recipient,scope){return JSON.stringify([recipient==='watch'&&scope==='room'?'room':station||'room',recipient,recipient==='watch'?scope:'station'])}
 function cuVisible(context,station){return station?context?.scope==='station'&&context.agent===station:!context||context.scope==='room'}
-function cuLaneVisible(row,recipient,target,scope){if(row.global)return true;if(row.kind==='source'||row.kind==='step'||row.kind==='message'||row.kind==='agent')return recipient==='agent'&&row.context?.agent===target;if(recipient!=='watch')return false;if(row.kind==='control')return scope==='room'||row.context?.agent===target;return cuVisible(row.context,scope==='station'?target:null)}
+function cuLaneVisible(row,recipient,target,scope){if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&row.quietRelay&&workspaceQuietRelayCurrent(row.quietRelay))return false;if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&row.kind==='control')return recipient==='agent'&&typeof target==='string'&&!!target&&row.context?.agent===target;if(row.global)return true;if(row.kind==='source'||row.kind==='step'||row.kind==='message'||row.kind==='agent')return recipient==='agent'&&row.context?.agent===target;if(recipient!=='watch')return false;if(row.kind==='control')return scope==='room'||row.context?.agent===target;return cuVisible(row.context,scope==='station'?target:null)}
 function cuQueueReady(cap,agent,key,epoch,now){return !!cap&&cap.agent===agent&&cap.key===key&&cap.epoch===epoch&&cap.expires>now&&cap.status==='ready'&&cap.queue?.available===true}
 function cuMeta(value){return value&&typeof value.id==='string'&&/^turn:[a-zA-Z0-9:-]{1,100}$/.test(value.id)&&typeof value.ts==='number'&&Number.isFinite(value.ts)&&value.ts>0?{id:value.id,ts:value.ts}:null}
 /* Native notice IDs use the emitting server boot; legacy observations stay object-local. */
@@ -5352,12 +5364,13 @@ function cuPaint(follow=false,scrollSnapshot){
   const nativeRows=typeof workspaceConversationRows==='function'&&typeof WORKSPACE!=='undefined'&&WORKSPACE&&focus?workspaceConversationRows():[...CU.nodes.values()].sort((a,b)=>(a.ts||0)-(b.ts||0));
   const fileRows=typeof workspaceNativeAttachments==='function'?workspaceNativeAttachments.current?.conversationRows?.()||[]:[];
   const conversation=fileRows.length?[...nativeRows,...fileRows].sort((a,b)=>(a.ts||0)-(b.ts||0)):nativeRows;
-  const rows=typeof workspaceLiveDocumentsConversation==='function'?workspaceLiveDocumentsConversation(conversation):conversation;const queueAgent=typeof WORKSPACE!=='undefined'&&WORKSPACE&&focus&&OFUI.docked&&OFUI.recipient==='agent'&&typeof A!=='undefined'?A[cuTarget()]:null,queuePending=queueAgent&&typeof cuPendingRows==='function'&&typeof OFM!=='undefined'?new Set(cuPendingRows(queueAgent.id,queueAgent,OFM.records,new Map()).filter(x=>x.event&&x.eventId===cuQueueRowId(queueAgent.id,x.event)).map(x=>x.event)):null;let at=ofLog.firstElementChild;
+  const supplied=typeof workspaceLiveDocumentsConversation==='function'?workspaceLiveDocumentsConversation(conversation):conversation,rows=typeof workspaceQuietRelayRows==='function'?workspaceQuietRelayRows(supplied):supplied;const queueAgent=typeof WORKSPACE!=='undefined'&&WORKSPACE&&focus&&OFUI.docked&&OFUI.recipient==='agent'&&typeof A!=='undefined'?A[cuTarget()]:null,queuePending=queueAgent&&typeof cuPendingRows==='function'&&typeof OFM!=='undefined'?new Set(cuPendingRows(queueAgent.id,queueAgent,OFM.records,new Map()).filter(x=>x.event&&x.eventId===cuQueueRowId(queueAgent.id,x.event)).map(x=>x.event)):null;let at=ofLog.firstElementChild;
   for(const r of rows){while(at&&(at.dataset?.wodDayMarker||at.dataset?.workspaceRunHeader||at.dataset?.workspaceStepFold))at=at.nextElementSibling;if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&r.kind==='message'&&r.workspaceMessageId&&r.workspaceMessagePresentation!==!!(focus&&OFUI.docked)){const record=OFM.records.get(r.workspaceMessageId);if(record?.el===r.el)ofMessagePaint(record,true)}r.workspaceQueueSuppressed=!!(queuePending&&r.kind==='source'&&r.sourceType==='queue'&&r.queueEvent&&r.queueEvent.n==null&&r.queueOwner===workspaceNewToken(queueAgent)&&queueAgent.q.includes(r.queueEvent)&&queuePending.has(r.queueEvent));if(r.workspaceQueueSuppressed&&r.el.contains(document.activeElement)){const id='queue:'+cuQueueRowId(queueAgent.id,r.queueEvent),match=[...$('#pendingQueueList').children].find(n=>n.dataset.pendingId===id);(match?.querySelector('summary')||ofIn).focus({preventScroll:true})}const show=!r.workspaceQueueSuppressed&&cuLaneVisible(r,OFUI.recipient,cuTarget(),ofCurrent().context.scope)&&(r.kind!=='step'||!!(focus&&OFUI.docked));r.el.hidden=!show;if(r.el!==at)ofLog.insertBefore(r.el,at);at=r.el.nextElementSibling}
   ofLog.dataset.a=cuTarget()||'';
   if(typeof workspaceOfficerSources==='function')workspaceOfficerSources(rows);if(typeof workspaceNewPaint==='function')workspaceNewPaint(rows);if(typeof workspaceOfficerMarkNotices==='function')workspaceOfficerMarkNotices(rows);if(typeof workspaceRunHeaders==='function')workspaceRunHeaders(rows);if(typeof workspaceStepFoldsPaint==='function')workspaceStepFoldsPaint(rows);if(typeof workspaceWodDayPaint==='function')workspaceWodDayPaint(rows);
   if(bottom)ofLog.scrollTop=ofLog.scrollHeight;else if(anchor?.isConnected&&!anchor.hidden&&!anchor.classList?.contains('workspace-step-fold-hidden'))ofLog.scrollTop=top+anchor.getBoundingClientRect().top-offset;else ofLog.scrollTop=top;
   }finally{finishAttachments?.();finishDocuments?.()}
+  if(typeof workspaceQuietRelaySeen==='function')workspaceQuietRelaySeen();
 }
 function cuPendingPaint(){
   const host=$('#pendingQueue'),list=$('#pendingQueueList'),target=cuTarget(),rows=OFUI.recipient==='agent'?cuPendingRows(target,A[target],OFM.records,new Map()):[];
@@ -5403,6 +5416,7 @@ function ofOpenContext(context){
   OFUI.recipient='watch';OFUI.scope=context.scope;OFUI.epoch++;cuDraftRestore();ofContextPaint();ofToggle(true);
 }
 function ofReplyNotice(request){
+  if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&request?.quietRelay&&workspaceQuietRelayCurrent(request.quietRelay))return;
   if(!request?.history||request.noticeId&&CU.nodes.has(request.noticeId)||cuLaneVisible({kind:'watch',context:request.history},OFUI.recipient,cuTarget(),ofCurrent().context.scope))return;
   const id='reply-notice:'+ ++CU.serial,d=ofAdd('k','<button type="button" class="watch-reply-link">'+esc('View Motet update · '+ofLabel(request.history))+'</button>',{id,global:true,ts:Date.now()/1000});
   request.noticeId=id;d.querySelector('button').onclick=()=>{ofOpenContext(request.history);d.remove();CU.nodes.delete(id)};
@@ -5581,6 +5595,70 @@ function ofJump(aid,n){const a=A[aid]; if(!a){cuNotice('<span class="k">That age
     else cuNotice(`<span class="k">That entry is kept for ${esc(a.name||'this agent')} but is not drawn on its desk right now.</span>`)};
   land()}
 /* agent message helpers: display backend requests; replies never become Officer instructions. */
+/* Owner approval for browser linkage storage is pending. Live projections never enter model history. */
+const WORKSPACE_QUIET_RELAY_CACHE=false;
+var workspaceQuietRelayReady=true;
+const WQR={signature:null,generation:0,links:new Map(),live:new Set(),seen:new Set(),answered:new Set(),unseen:new Set(),snapshot:false};
+function workspaceQuietRelayOwnerChanged(){
+  if(!workspaceQuietRelayReady)return; // The initial hash key is accepted before Officer state is initialized.
+  const signature=JSON.stringify([typeof KEY==='undefined'?null:KEY,typeof locked!=='undefined'&&locked,typeof claiming!=='undefined'&&claiming]);
+  if(WQR.signature===signature)return;WQR.signature=signature;WQR.generation++;
+  for(const link of WQR.links.values()){link.status?.remove();if(link.answer){link.answer.el.remove();if(CU.nodes.get(link.answerId)===link.answer)CU.nodes.delete(link.answerId)}if(link.assistant.quietRelay===link)delete link.assistant.quietRelay;}
+  WQR.links.clear();WQR.live.clear();WQR.seen.clear();WQR.answered.clear();WQR.unseen.clear();WQR.snapshot=false;
+  OFM.polling=false;OFM.pollTicket=null;if(OF.sendTicket){OF.sendTicket=null;OF.busy=false;OF.pending=null}workspaceQuietRelayAttention();
+}
+function workspaceQuietRelayTicket(){workspaceQuietRelayOwnerChanged();return {key:typeof KEY==='undefined'?null:KEY,generation:WQR.generation};}
+function workspaceQuietRelayOwned(ticket){workspaceQuietRelayOwnerChanged();return ticket.key===(typeof KEY==='undefined'?null:KEY)&&ticket.generation===WQR.generation&&!(typeof locked!=='undefined'&&locked)&&!(typeof claiming!=='undefined'&&claiming);}
+function workspaceQuietRelayCurrent(link){return workspaceQuietRelayOwned(link.owner)&&CU.nodes.get(link.userId)===link.user&&CU.nodes.get(link.assistantId)===link.assistant&&link.user.el===link.userEl&&link.assistant.el===link.assistantEl;}
+function workspaceQuietRelayVisible(link){
+  if(!workspaceQuietRelayCurrent(link)||typeof WORKSPACE==='undefined'||!WORKSPACE||typeof STEADY!=='undefined'&&STEADY||OFUI.recipient!=='watch'||!cuVisible(link.scope,ofCurrent().context.scope==='station'?cuTarget():null)||ofEl.classList.contains('fold'))return false;
+  const answer=link.answer?.el;if(!answer||answer.hidden||!answer.isConnected||!ofLog.contains(answer)||!answer.getClientRects().length||answer.closest?.('[hidden],[inert]'))return false;
+  const style=getComputedStyle(answer);if(style.visibility!=='visible'||style.display==='none')return false;
+  const a=answer.getBoundingClientRect(),p=ofLog.getBoundingClientRect();if(![a.left,a.right,a.top,a.bottom,p.left,p.right,p.top,p.bottom,innerWidth,innerHeight].every(Number.isFinite)||a.right<=a.left||a.bottom<=a.top||p.right<=p.left||p.bottom<=p.top||Math.min(a.right,p.right,innerWidth)<=Math.max(a.left,p.left,0)||Math.min(a.bottom,p.bottom,innerHeight)<=Math.max(a.top,p.top,0))return false;
+  if(typeof workspaceOfficerHistoryActive==='function'&&workspaceOfficerHistoryActive()||typeof workspaceOfficerCovered==='function'&&workspaceOfficerCovered())return false;
+  if(typeof document!=='undefined'&&document.visibilityState!==undefined&&document.visibilityState!=='visible'||typeof workspaceForeground==='function'&&workspaceForeground()||typeof agDialogForeground==='function'&&agDialogForeground()||typeof deckForeground==='function'&&deckForeground()||ofLog.getClientRects&& !ofLog.getClientRects().length||ofLog.closest?.('[inert]'))return false;
+  if(typeof workspaceOfficerDeskActive==='function'&&workspaceOfficerDeskActive())return !(WOD.mobile&&WOD.panelOpen);
+  if(OFUI.docked)return true;
+  return typeof WSO!=='undefined'&&WSO.active&&WSO.historyOpen&&!WSO.activating;
+}
+function workspaceQuietRelayAttention(){
+  if(typeof WORKSPACE==='undefined'||!WORKSPACE||typeof WSO==='undefined')return;
+  const dot=WQR.unseen.size>0&&!WSO.historyOpen&&WSO.active&&!(typeof locked!=='undefined'&&locked)&&!(typeof claiming!=='undefined'&&claiming);
+  for(const button of [WSO.desktop?.toggle,WSO.narrow?.toggle])if(button){button.classList.toggle('workspace-relay-unseen',dot);const label=WSO.historyOpen?'Close the conversation':'Open the conversation';button.setAttribute('aria-label',label+(dot?' · new agent answer':''));}
+}
+function workspaceQuietRelaySeen(){
+  for(const [id,link] of WQR.links)if(link.reply!==null&&workspaceQuietRelayVisible(link)){WQR.seen.add(id);WQR.unseen.delete(id)}workspaceQuietRelayAttention();
+}
+function workspaceQuietRelaySnapshot(rows){
+  if(typeof WORKSPACE==='undefined'||!WORKSPACE||WQR.snapshot)return;
+  for(const r of rows)if(r?.state==='answered'&&typeof r.request_id==='string'&&!WQR.live.has(r.request_id)){WQR.seen.add(r.request_id);WQR.answered.add(r.request_id)}WQR.snapshot=true;
+}
+function workspaceQuietRelayRecord(record,{restored=false}={}){
+  if(typeof WORKSPACE==='undefined'||!WORKSPACE)return false;
+  if(restored&&record.state==='answered'&&!WQR.live.has(record.request_id)){WQR.seen.add(record.request_id);WQR.answered.add(record.request_id)}
+  const link=WQR.links.get(record.request_id);if(!link||!workspaceQuietRelayCurrent(link)||record.agent!==link.agent||record.question!==link.question)return false;
+  if(record.state==='answered'&&typeof record.reply==='string'&&record.reply.length){link.reply=record.reply;if(!WQR.answered.has(record.request_id)){WQR.answered.add(record.request_id);if(!WQR.seen.has(record.request_id))WQR.unseen.add(record.request_id)}}
+  const name=link.name,answered=link.reply!==null,failed=!answered&&(record.state==='failed'||record.state==='not_sent'),unknown=record.state==='unknown'||!['sending','queued','awaiting_reply','answered','expired','failed','not_sent'].includes(record.state);
+  const before=failed?'Could not reach ':'Asked ',after=answered||record.state==='answered'?'':failed?(record.error?' · '+String(record.error):''):unknown?' · not confirmed':record.state==='expired'?' · no answer':' · waiting';
+  const markup=esc(before)+'<button type="button" class="workspace-relay-agent">'+esc(name)+'</button>'+esc(after)+(record.delivery_warning?' · '+esc(record.delivery_warning):'')+(!answered&&unknown?' <button type="button" class="message-check">Check status</button>':'');
+  if(link.status.innerHTML!==markup)link.status.innerHTML=markup;link.status.dataset.warning=String(!answered&&failed);
+  link.status.querySelector('.workspace-relay-agent').onclick=()=>{if(workspaceQuietRelayCurrent(link)&&typeof A!=='undefined'&&A[link.agent]){setFocus(link.agent);if(typeof cuSelectRecipient==='function'&&OFUI.recipient!=='agent')cuSelectRecipient('agent');if(typeof deskReveal==='function')deskReveal('conversation')}};
+  const check=link.status.querySelector('.message-check');if(check)check.onclick=()=>{if(workspaceQuietRelayCurrent(link))return ofMessagePoll()};
+  if(answered){if(!link.answer){const el=document.createElement('div');el.className='of workspace-relay-answer';link.answer={el,kind:'quiet-relay',context:link.scope,ts:link.user.ts};CU.nodes.set(link.answerId,link.answer)}const body='<div class="workspace-watch-answer"><small>'+esc(name)+'</small><div class="workspace-watch-body">'+ofParas(link.reply)+'</div></div>';if(link.answer.el.innerHTML!==body)link.answer.el.innerHTML=body;}
+  workspaceQuietRelayAttention();return true;
+}
+function workspaceQuietRelayLink(packet,request,assistantEl){
+  if(typeof WORKSPACE==='undefined'||!WORKSPACE||!request?.ownerTicket||!workspaceQuietRelayOwned(request.ownerTicket)||!request.dispatchId||packet.request_id!==request.dispatchId||!Array.isArray(packet.messages)||packet.messages.length!==1||packet.controls?.length)return false;
+  const value=packet.messages[0],id=request.dispatchId,record=OFM.records.get(id),userId=request.userUI?.id,assistantId=request.replyUI?.id,user=CU.nodes.get(userId),assistant=CU.nodes.get(assistantId),scope=request.history;
+  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)||value?.request_id!==id||!record||record.agent!==value.agent||record.question!==value.question||typeof value.agent!=='string'||!value.agent||typeof value.question!=='string'||!value.question||!['sending','queued','awaiting_reply','answered','expired','failed','unknown','not_sent'].includes(value.state)||!ofContextValid(scope)||!user||!assistant||user!==request.userRow||user.el!==request.userEl||user===assistant||assistant.el!==assistantEl||!user.el.querySelector('.workspace-watch-question')||JSON.stringify(user.context)!==JSON.stringify(scope)||JSON.stringify(assistant.context)!==JSON.stringify(scope)||WQR.links.has(id))return false;
+  const status=document.createElement('small');status.className='workspace-relay-status';status.setAttribute('role','status');const link={owner:request.ownerTicket,userId,assistantId,user,assistant,userEl:user.el,assistantEl,scope:Object.freeze({...scope}),agent:value.agent,question:value.question,name:record.name||value.agent,status,reply:null,answer:null,answerId:'quiet-relay:'+id};
+  WQR.links.set(id,link);assistant.quietRelay=link;request.quietRelay=link;user.el.querySelector('.workspace-watch-question').append(status);workspaceQuietRelayRecord(record);cuPaint();return true;
+}
+function workspaceQuietRelayRows(rows){
+  if(typeof WORKSPACE==='undefined'||!WORKSPACE)return rows;const groups=new Map();for(const link of WQR.links.values())if(workspaceQuietRelayCurrent(link)&&link.answer)groups.set(link.user,link.answer);
+  const projected=[];for(const row of rows){if(row.kind==='quiet-relay')continue;projected.push(row);const answer=groups.get(row);if(answer&&rows.includes(answer))projected.push(answer)}return projected;
+}
+if(typeof WORKSPACE!=='undefined'&&WORKSPACE)ofLog.addEventListener('scroll',workspaceQuietRelaySeen,{passive:true});
 const OFM={records:new Map(),controls:new Map(),polling:false,available:null,reason:'',notice:null};
 function ofMessageFulfillment(v){
   if(!v||v.state!=='fulfilled'||v.intent!=='pause'||v.via!=='interrupt'||typeof v.control_request_id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v.control_request_id)) return null;
@@ -5606,14 +5684,16 @@ function ofMessagePaint(r,reconcile=false){
 }
 function ofMessageMerge(rows,{restored=false}={}){
   if(DEMO) return;
+  const follow=nearEnd(ofLog);let projected=false;
   for(const v of rows){if(!v||typeof v.request_id!=='string'||typeof v.agent!=='string'||typeof v.question!=='string') continue;
     let r=OFM.records.get(v.request_id);
     if(!r){r={request_id:v.request_id,agent:v.agent,name:String(v.name||v.agent),question:v.question,created:typeof v.created==='number'&&Number.isFinite(v.created)&&v.created>0?v.created:0}; OFM.records.set(v.request_id,r)}
     if(r.agent!==v.agent||r.question!==v.question)continue;
     if(!(typeof r.created==='number'&&Number.isFinite(r.created)&&r.created>0)&&typeof v.created==='number'&&Number.isFinite(v.created)&&v.created>0)r.created=v.created;
     if(restored&&v.notice_dismissed===true)r.noticeDismissed=true;
-    Object.assign(r,{state:v.state,reply:v.reply,error:v.error,delivery_warning:typeof v.delivery_warning==='string'?v.delivery_warning:'',fulfillment:ofMessageFulfillment(v.fulfillment)}); ofMessagePaint(r);
+    Object.assign(r,{state:v.state,reply:v.reply,error:v.error,delivery_warning:typeof v.delivery_warning==='string'?v.delivery_warning:'',fulfillment:ofMessageFulfillment(v.fulfillment)}); ofMessagePaint(r);projected=workspaceQuietRelayRecord(r,{restored})||projected;
   }
+  if(projected)cuPaint(follow);
   ofMessageSave();
 }
 function ofControlPublic(v){
@@ -5626,6 +5706,12 @@ function ofControlSave(){if(DEMO) return; try{store.setItem('liveRoomControls',J
 function ofControlPaint(r){
   const follow=nearEnd(ofLog);
   if(!r.el) r.el=cuCard(r,'control');
+  if(typeof WORKSPACE!=='undefined'&&WORKSPACE){
+    const steer=r.action==='steer',action=steer?'Steer':'Interrupt',uncertain=r.unavailable||r.restoredPending||r.state==='unknown',time=typeof r.created==='number'&&Number.isFinite(r.created)&&r.created>0?clock(r.created):'time not recorded';
+    const status=uncertain?action+' not confirmed · do not repeat it':r.state==='sending'?(steer?'Steering':'Interrupting')+' · not confirmed yet':r.state==='failed'?action+' failed'+(r.error?' · '+r.error:''):r.state==='acknowledged'?'Steer accepted · not confirmed that it was acted on':r.state==='no_op'?'Nothing was running to interrupt · '+time:'You interrupted this turn · '+time;
+    const markup='<small class="workspace-control-line" data-warning="'+String(!!uncertain||r.state==='failed')+'" role="status">'+esc(status)+'</small>'+(steer&&r.instruction?'<div class="workspace-control-instruction">'+esc(r.instruction)+'</div>':'');
+    if(r.painted!==markup){r.el.innerHTML=markup;r.painted=markup}cuPaint(follow);return;
+  }
   const labels={sending:'Control pending; outcome is not yet confirmed. Do not repeat it.',interrupted:'Recorded outcome: the targeted turn was interrupted. This does not mean the agent remains paused.',acknowledged:'Recorded outcome: steer acknowledged; execution is not confirmed.',no_op:'Recorded outcome: no interruption occurred (no-op).',failed:'Recorded outcome: control failed. No automatic retry.',unknown:'Control outcome is unknown. Do not repeat it.'};
   const status=r.unavailable?'Control outcome is uncertain; this record is no longer available from the server. Do not repeat it.':r.restoredPending?'Control outcome is uncertain after reload; waiting for server status. Do not repeat it.':labels[r.state];
   const markup=`<b>${r.action==='interrupt'?'Interrupt':'Steer'} · ${esc(r.name||r.agent)}</b><div class="k message-id">${esc(r.agent)}</div>${r.instruction?`<div class="draft">${esc(r.instruction)}</div>`:''}<p class="k" role="status">${esc(status)}${r.error?' · '+esc(r.error):''}</p><p class="k">Historical control record; it does not guarantee the agent’s current state.</p>`;
@@ -5646,15 +5732,17 @@ function ofControlMerge(rows,{snapshot=false,restored=false}={}){
 async function ofMessagePoll(){
   if(DEMO||!KEY||claiming||!OF.loaded||OFM.polling) return;
   if(!connected){ofMessageNotice('Stage connection is offline. Message/control status will refresh when it reconnects.'); return}
-  OFM.polling=true;
+  const owner=workspaceQuietRelayTicket(),ticket={};OFM.pollTicket=ticket;OFM.polling=true;
   try{
     const res=await fetch('/agent-messages',{headers:{'X-Live-Room-Key':KEY},cache:'no-store',signal:AbortSignal.timeout(10000)});
+    if(!workspaceQuietRelayOwned(owner))return;
     if(!res.ok) throw new Error(res.status===401||res.status===403?'Message status requires an unlocked stage.':'Message status unavailable ('+res.status+').');
-    const v=await res.json(); if(!Array.isArray(v.requests)) throw new Error('Message status response was not valid.');
+    const v=await res.json();if(!workspaceQuietRelayOwned(owner))return;if(!Array.isArray(v.requests)) throw new Error('Message status response was not valid.');
+    workspaceQuietRelaySnapshot(v.requests);
     OFM.available=v.available; OFM.reason=String(v.reason||''); ofMessageMerge(v.requests); if(Array.isArray(v.controls)) ofControlMerge(v.controls,{snapshot:true});
     ofMessageNotice(v.available===false?'Agent messaging unavailable: '+(OFM.reason||'transport is not ready'):'');
-  }catch(err){ofMessageNotice((err.message||'Could not reach message status.')+' Message/control status is uncertain; do not repeat the request. Nothing was resent.')}
-  finally{OFM.polling=false}
+  }catch(err){if(workspaceQuietRelayOwned(owner))ofMessageNotice((err.message||'Could not reach message status.')+' Message/control status is uncertain; do not repeat the request. Nothing was resent.')}
+  finally{if(OFM.pollTicket===ticket){OFM.pollTicket=null;OFM.polling=false}}
 }
 function ofMessageLoad(){
   if(DEMO) return;
@@ -5723,20 +5811,21 @@ async function ofSendOrdinary(suggestion=null){
   if(typeof workspaceDictationBeforeSend==='function')workspaceDictationBeforeSend();
   if(typeof workspaceOfficerHistoryActive==='function'&&workspaceOfficerHistoryActive())return;
   if(typeof workspaceOfficerUnavailable==='function'&&workspaceOfficerUnavailable())return;const q=(suggestion??ofIn.value).trim();if(!q||OF.busy)return;if([...q].length>4000){ofAdd('k','Question is too long; nothing was sent.',{context:ofCurrent().history});if(typeof workspaceOfficerShowHistory==='function')workspaceOfficerShowHistory();return;}
+  const ownerTicket=typeof workspaceQuietRelayTicket==='function'?workspaceQuietRelayTicket():null,owned=()=>!ownerTicket||workspaceQuietRelayOwned(ownerTicket),sendTicket={};
   ofDay();const request=suggestion===null?ofCurrent():ofSnapshot('room',null,A,OFUI.epoch),requestKey=typeof KEY==='undefined'?null:KEY,turn={role:'user',content:q,context:request.history,ui:cuTurnMeta()};
-  OF.turns.push(turn);ofAdd('you',(typeof workspaceWatchOn==='function'&&workspaceWatchOn()?workspaceWatchMarkup('user',request.history,turn.ui.ts,esc(q)):ofAttributed(request.history,'<b>You → Motet</b><p>'+esc(q)+'</p>')),{...turn.ui,context:request.history});if(suggestion===null){ofIn.value='';cuDraftSave();}OF.busy=true;OF.pending=request;ofContextPaint();ofStatus('thinking…');if(typeof workspaceOfficerShowHistory==='function')workspaceOfficerShowHistory();
+  OF.turns.push(turn);ofAdd('you',(typeof workspaceWatchOn==='function'&&workspaceWatchOn()?workspaceWatchMarkup('user',request.history,turn.ui.ts,esc(q)):ofAttributed(request.history,'<b>You → Motet</b><p>'+esc(q)+'</p>')),{...turn.ui,context:request.history});if(suggestion===null){ofIn.value='';cuDraftSave();}OF.busy=true;OF.sendTicket=sendTicket;OF.pending=request;request.ownerTicket=ownerTicket;request.userUI=turn.ui;request.userRow=typeof CU!=='undefined'?CU.nodes?.get(turn.ui.id):null;request.userEl=request.userRow?.el;ofContextPaint();ofStatus('thinking…');if(typeof workspaceOfficerShowHistory==='function')workspaceOfficerShowHistory();
   const remove=()=>{const i=OF.turns.indexOf(turn);if(i>=0)OF.turns.splice(i,1)};
   try{
     if(DEMO){await new Promise(r=>setTimeout(r,700));ofShow(ofDemoAnswer(q,request),request);ofAdd('k','Scripted demo answer · no live agents contacted.',{context:request.history,ts:Date.now()/1000});remove();return}
-    const request_id=globalThis.crypto?.randomUUID?.();
+    const request_id=globalThis.crypto?.randomUUID?.();request.dispatchId=request_id;if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&request_id&&ownerTicket)WQR.live.add(request_id);
     request.evidenceEpoch=OFE.eraseEpoch;
     const res=await post('/ask',{turns:ofRequestHistory(OF.turns.filter(t=>cuVisible(t.context,request.context.scope==='station'?request.context.agent:null))),context:request.context,...(request_id?{request_id}:{})});
-    if(!res.ok){const t=await res.text();ofSave();ofAdd('of',ofAttributed(request.history,`<p class="k">${esc(t||('Motet could not answer ('+res.status+').'))}</p>`),{context:request.history,ts:Date.now()/1000});if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&res.status===503){if(requestKey===KEY&&request.epoch===OFUI.epoch&&OFUI.recipient==='watch')workspaceOfficerReportOff(t||'Motet could not answer (503).',requestKey)}else ofStatus(res.status===503?'off':'listening');return}
-    const answer=await res.json();if(answer&&((answer.historical!==undefined&&answer.historical!==false)||(answer.read_only!==undefined&&answer.read_only!==false))){remove();if(requestKey===KEY&&!locked&&!claiming)workspaceOfficerHistoricalPacket(answer);ofSave();return}if(answer.error){ofSave();ofAdd('of',ofAttributed(request.history,`<p class="k">${esc(answer.error)}</p>`),{context:request.history,ts:Date.now()/1000});return}
-    const r=await ofAcceptEvidence(answer,request.evidenceEpoch);if(!r){ofSave();return}
+    if(!owned())return;if(!res.ok){const t=await res.text();if(!owned())return;ofSave();ofAdd('of',ofAttributed(request.history,`<p class="k">${esc(t||('Motet could not answer ('+res.status+').'))}</p>`),{context:request.history,ts:Date.now()/1000});if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&res.status===503){if(requestKey===KEY&&request.epoch===OFUI.epoch&&OFUI.recipient==='watch')workspaceOfficerReportOff(t||'Motet could not answer (503).',requestKey)}else ofStatus(res.status===503?'off':'listening');return}
+    const answer=await res.json();if(!owned())return;if(answer&&((answer.historical!==undefined&&answer.historical!==false)||(answer.read_only!==undefined&&answer.read_only!==false))){remove();if(requestKey===KEY&&!locked&&!claiming)workspaceOfficerHistoricalPacket(answer);ofSave();return}if(answer.error){ofSave();ofAdd('of',ofAttributed(request.history,`<p class="k">${esc(answer.error)}</p>`),{context:request.history,ts:Date.now()/1000});return}
+    const r=await ofAcceptEvidence(answer,request.evidenceEpoch);if(!owned())return;if(!r){ofSave();return}
     request.replyUI=cuTurnMeta();OF.turns.push({role:'assistant',content:String(r.text||'').slice(0,12000),context:request.history,ui:request.replyUI,...(r.receipt&&ofReceipt(r.receipt)?{receipt:ofReceipt(r.receipt)}:{}),...(ofVerification(r.verification)?{verification:r.verification}:{}),...(ofWarnings(r.warnings).length?{warnings:ofWarnings(r.warnings)}:{})});OF.turns=OF.turns.slice(-40);ofShow(r,request);ofSave();
-  }catch(err){/* workspace reachability notice */ const workspaceFailure=typeof WORKSPACE!=='undefined'&&WORKSPACE;ofSave();ofAdd('of',ofAttributed(request.history,workspaceFailure?'<p class="k workspace-unreachable"><b>Motet could not be reached.</b> <span>If you asked it to message or control an agent, check message/control status. Do not repeat the request while its outcome is uncertain.</span></p>':'<p class="k">Motet could not be reached. If you asked it to message or control an agent, check message/control status. Do not repeat the request while its outcome is uncertain.</p>'),{context:request.history,ts:Date.now()/1000});if(workspaceFailure&&requestKey===KEY&&request.epoch===OFUI.epoch&&OFUI.recipient==='watch')ofStatus('could not be reached')}
-  finally{OF.busy=false;OF.pending=null;ofContextPaint();ofReplyNotice(request);if(ofSt.textContent==='thinking…')ofStatus(DEMO?'demo · scripted answers':'listening')}
+  }catch(err){if(!owned())return;/* workspace reachability notice */ const workspaceFailure=typeof WORKSPACE!=='undefined'&&WORKSPACE;ofSave();ofAdd('of',ofAttributed(request.history,workspaceFailure?'<p class="k workspace-unreachable"><b>Motet could not be reached.</b> <span>If you asked it to message or control an agent, check message/control status. Do not repeat the request while its outcome is uncertain.</span></p>':'<p class="k">Motet could not be reached. If you asked it to message or control an agent, check message/control status. Do not repeat the request while its outcome is uncertain.</p>'),{context:request.history,ts:Date.now()/1000});if(workspaceFailure&&requestKey===KEY&&request.epoch===OFUI.epoch&&OFUI.recipient==='watch')ofStatus('could not be reached')}
+  finally{if(OF.sendTicket===sendTicket&&owned()){OF.sendTicket=null;OF.busy=false;OF.pending=null;ofContextPaint();ofReplyNotice(request);if(ofSt.textContent==='thinking…')ofStatus(DEMO?'demo · scripted answers':'listening')}}
 }
 /* officer evidence acceptance: navigation is separate from committed erasure */
 const OFE={identity:null,generation:null,revision:0,eraseEpoch:0,retired:[],filtered:new WeakMap()};
@@ -5759,6 +5848,7 @@ function ofShow(r,request){
   const seen=new Set(),cites=(r.cites||[]).filter(c=>{const key=c.ref||(deckCitation(c)?'deck:'+c.event_id:c?.n!=null?'live:'+c.n:null);return key&&!seen.has(key)&&seen.add(key)}).slice(0,100);
   const replyTime=request?.replyUI?.ts||Date.now()/1000,body=ofParas(r.text)+ofWarningMarkup(r.warnings)+(cites.length?`<details><summary>Recorded evidence · ${cites.length}</summary><div class="cites">${cites.map(ofCite).join('')}</div></details>`:'');
   const d=ofAdd('of',typeof workspaceWatchOn==='function'&&workspaceWatchOn()?workspaceWatchMarkup('assistant',request?.history,replyTime,body):ofAttributed(request?.history,'<b>Motet</b>'+body),{...request?.replyUI,context:request?.history,ts:replyTime});
+  if(typeof workspaceQuietRelayLink==='function')workspaceQuietRelayLink(r,request,d);
   if(typeof workspaceOfficerDeskActive==='function'&&workspaceOfficerDeskActive()&&typeof r.model==='string'&&r.model.trim()){const label=d.querySelector?.('.workspace-watch-answer>small');if(label)label.append(document.createTextNode(' · Selected model: '+[...r.model].slice(0,120).join('')))}
   d.querySelectorAll('.cites button[data-n]').forEach(b=>b.onclick=()=>ofJump(b.dataset.a,+b.dataset.n));
   d.querySelectorAll('.cites button[data-deck]').forEach(b=>b.onclick=()=>deckEvidence(b.dataset.deck,b));
@@ -5801,7 +5891,7 @@ function ofDemoAnswer(q,request){      /* the demo's Officer: four scripted answ
     return {text:`## Shift report · ${clock(nowS)}\n| Agent | Project | Last recorded | When |\n|---|---|---|---|\n${rows}\n\n## Waiting on you\n${list}${quote}`,cites,actions}}
   return {text:'In this demo I answer four questions from a script: **What did I miss?**, **Anything stuck?**, **Who is waiting on me?**, and a request to **draft a Watch rule**. Outside the demo, ask anything about what the logs record.',cites,actions}
 }
-function ofToggle(on){const motion=typeof workspaceOfficerMotionBefore==='function'?workspaceOfficerMotionBefore(on):null;if(typeof workspaceOfficerHistoryIntent==='function')workspaceOfficerHistoryIntent(on);if(!on&&typeof officerModelClose==='function')officerModelClose(false);if(OFUI.docked){if(on){ofTab('officer');ofInit();ofIn.focus()}return}ofEl.classList.toggle('fold',!on);$('#ofB').setAttribute('aria-expanded',String(on));if(on){ofInit();ofContextPaint();if(!OF.busy&&!(typeof workspaceOfficerUnavailable==='function'&&workspaceOfficerUnavailable()))ofStatus(DEMO?'demo · scripted answers':'listening');ofIn.focus()}else{$('#ofSuggestions').open=false;$('#ofB').focus();OFUI.epoch++}if(typeof workspaceOfficerHistoryPaint==='function')workspaceOfficerHistoryPaint();if(typeof workspaceOfficerMotionAfter==='function')workspaceOfficerMotionAfter(motion,on)}
+function ofToggle(on){const motion=typeof workspaceOfficerMotionBefore==='function'?workspaceOfficerMotionBefore(on):null;if(typeof workspaceOfficerHistoryIntent==='function')workspaceOfficerHistoryIntent(on);if(!on&&typeof officerModelClose==='function')officerModelClose(false);if(OFUI.docked){if(on){ofTab('officer');ofInit();ofIn.focus()}return}ofEl.classList.toggle('fold',!on);$('#ofB').setAttribute('aria-expanded',String(on));if(on){ofInit();ofContextPaint();if(!OF.busy&&!(typeof workspaceOfficerUnavailable==='function'&&workspaceOfficerUnavailable()))ofStatus(DEMO?'demo · scripted answers':'listening');ofIn.focus()}else{$('#ofSuggestions').open=false;$('#ofB').focus();OFUI.epoch++}if(typeof workspaceOfficerHistoryPaint==='function')workspaceOfficerHistoryPaint();if(typeof workspaceOfficerMotionAfter==='function')workspaceOfficerMotionAfter(motion,on);if(on&&!(typeof WSO!=='undefined'&&WSO.activating)&&typeof workspaceQuietRelaySeen==='function')workspaceQuietRelaySeen()}
 setInterval(()=>{ofMessagePoll();if(OFUI.recipient==='agent'&&String(cuTarget()).startsWith('c:'))ofContextPaint()},3000);
 $('#ofB').onclick=()=>{if(typeof workspaceOfficerToggleHistory==='function'&&workspaceOfficerToggleHistory())return;ofToggle(ofEl.classList.contains('fold'))}; $('#ofSend').onclick=cuSend;
 $('#ofQuick').onclick=ev=>{const b=ev.target.closest('[data-q]');if(b&&typeof workspaceDictationBeforeSend==='function')workspaceDictationBeforeSend(); if(b&&typeof workspaceLiveDocumentsSuggest==='function'&&workspaceLiveDocumentsSuggest(b.dataset.q))return;if(b&&typeof workspaceAttachmentsInterceptSuggestion==='function'&&workspaceAttachmentsInterceptSuggestion(b.dataset.q))return;if(b&&!OF.busy&&!(typeof workspaceOfficerUnavailable==='function'&&workspaceOfficerUnavailable())){$('#ofSuggestions').open=false;if(OFUI.recipient!=='watch'){cuDraftSave();OFUI.recipient='watch';OFUI.epoch++;cuDraftRestore();ofContextPaint()}ofIn.value=b.dataset.q; ofSend()}};      /* the three questions you ask most, one tap each */
@@ -7881,8 +7971,8 @@ if(WORKSPACE)workspaceInit();
 const WSR={toolbar:null,trigger:null,popover:null,anchors:new Map(),oldWatchLabel:null};
 const WSO={header:null,popover:null,trigger:null,anchors:new Map(),active:false,activating:false,pointer:null,oldControls:null,oldSendLabel:null,oldSendTitle:null,oldInputHeight:'',oldInputOverflow:'',oldInputRows:2,oldModelAriaDisabled:null,oldMenuStyle:null,oldCaretHidden:null,oldSuggestionLabel:null,oldSuggestionsOpen:false,inlineSuggestions:false,historyOpen:false,oldWatchLabel:null,desktop:null};
 function workspaceOfficerSetBlocked(blocked){if(WSO.active)$('#sendHint').dataset.workspaceBlocked=String(!!blocked)}
-function workspaceOfficerHistoryPaint(){if(!WSO.active)return;ofEl.dataset.workspaceHistory=String(WSO.historyOpen);$('#ofB').setAttribute('aria-expanded',String(WSO.historyOpen));if(typeof workspaceOfficerDesktopHistoryPaint==='function')workspaceOfficerDesktopHistoryPaint();if(typeof workspaceOfficerNarrowHistoryPaint==='function')workspaceOfficerNarrowHistoryPaint()}
-function workspaceOfficerHistoryIntent(on){if(!WSO.active||WSO.activating)return;WSO.historyOpen=!!on;workspaceOfficerHistoryPaint()}
+function workspaceOfficerHistoryPaint(){if(!WSO.active)return;ofEl.dataset.workspaceHistory=String(WSO.historyOpen);$('#ofB').setAttribute('aria-expanded',String(WSO.historyOpen));if(typeof workspaceOfficerDesktopHistoryPaint==='function')workspaceOfficerDesktopHistoryPaint();if(typeof workspaceOfficerNarrowHistoryPaint==='function')workspaceOfficerNarrowHistoryPaint();if(typeof workspaceQuietRelayAttention==='function')workspaceQuietRelayAttention()}
+function workspaceOfficerHistoryIntent(on){if(!WSO.active||WSO.activating)return;WSO.historyOpen=!!on;workspaceOfficerHistoryPaint();if(on&&typeof workspaceQuietRelaySeen==='function')workspaceQuietRelaySeen()}
 function workspaceOfficerToggleHistory(){if(!WSO.active)return false;ofToggle(!WSO.historyOpen);return true}
 /* Workspace tool lines have their own identity; they never enter message envelope matching. */
 const WSP={agent:null,mode:null,selected:null,serial:0,ids:new WeakMap()};
@@ -8116,7 +8206,7 @@ function workspaceSeenOnlyPaint(row,a){if(!row)return;let view=row.workspaceSeen
 function workspacePanelTabAlign(nav,custom){if(!custom)return;const chosen=[...nav.children].find(b=>b.getAttribute('aria-pressed')==='true'),width=nav.clientWidth;if(!chosen||!width)return;const key=chosen.dataset.panel+':'+width;if(nav.dataset.workspaceAligned===key)return;nav.dataset.workspaceAligned=key;const left=chosen.offsetLeft,right=left+chosen.offsetWidth;if(left<nav.scrollLeft)nav.scrollLeft=left;else if(right>nav.scrollLeft+width)nav.scrollLeft=right-width}
 /* End workspace review helpers. */
 
-function workspaceOfficerShowHistory(){if(!WSO.active)return;if(ofEl.classList.contains('fold'))ofToggle(true);else{const motion=typeof workspaceOfficerMotionBefore==='function'?workspaceOfficerMotionBefore(true):null;WSO.historyOpen=true;workspaceOfficerHistoryPaint();if(typeof workspaceOfficerMotionAfter==='function')workspaceOfficerMotionAfter(motion,true)}}
+function workspaceOfficerShowHistory(){if(!WSO.active)return;if(ofEl.classList.contains('fold'))ofToggle(true);else{const motion=typeof workspaceOfficerMotionBefore==='function'?workspaceOfficerMotionBefore(true):null;WSO.historyOpen=true;workspaceOfficerHistoryPaint();if(typeof workspaceOfficerMotionAfter==='function')workspaceOfficerMotionAfter(motion,true)}if(typeof workspaceQuietRelaySeen==='function')workspaceQuietRelaySeen()}
 function workspaceOfficerRegisterWelcome(el){if(WORKSPACE)el.dataset.workspaceWelcome='true'}
 function workspaceOfficerMarkNotices(rows){if(!WSO.active)return;for(const r of rows)r.el.dataset.workspaceGlobalNotice=String(!!r.global&&!!r.el.textContent?.trim());const content=rows.some(r=>!r.el.hidden&&r.el.dataset.workspaceWelcome!=='true'&&!!r.el.textContent?.trim());for(const r of rows)if(r.el.dataset.workspaceWelcome==='true'&&!r.el.hidden)r.el.hidden=content}
 function workspaceStationUserMarkup(by,content,legacy){return '<p>'+esc(content)+'</p><small>'+esc(by)+' · Recorded log'+esc(legacy)+'</small>'}
@@ -8152,7 +8242,7 @@ function workspaceOfficerNarrowHistoryPaint(){
   const narrow=WSO.narrow;if(!narrow)return;const open=!!WSO.historyOpen;
   narrow.toggle.setAttribute('aria-expanded',String(open));
   narrow.toggle.setAttribute('aria-label',open?'Close the conversation':'Open the conversation');
-  narrow.toggle.title=open?'Close the conversation':'Open the conversation';
+  narrow.toggle.title=open?'Close the conversation':'Open the conversation';if(typeof workspaceQuietRelayAttention==='function')workspaceQuietRelayAttention();
 }
 function workspaceOfficerNarrowRestore(){
   const narrow=WSO.narrow;if(!narrow)return;
@@ -8184,7 +8274,7 @@ function workspaceOfficerDesktopHistoryPaint(){
   const open=!!WSO.historyOpen;
   desktop.toggle.setAttribute('aria-expanded',String(open));
   desktop.toggle.setAttribute('aria-label',open?'Close the conversation':'Open the conversation');
-  desktop.toggle.title=open?'Close the conversation':'Open the conversation';
+  desktop.toggle.title=open?'Close the conversation':'Open the conversation';if(typeof workspaceQuietRelayAttention==='function')workspaceQuietRelayAttention();
   if(desktop.prompts.parentNode!==ofEl||ofEl.firstElementChild!==desktop.prompts)ofEl.prepend(desktop.prompts);
   const hidden=open||$('#ofSuggestions').hidden;
   if(hidden&&desktop.prompts.contains(document.activeElement))desktop.toggle.focus({preventScroll:true});
