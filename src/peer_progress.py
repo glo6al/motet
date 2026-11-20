@@ -175,14 +175,20 @@ def public_progress(db, transport_id, *, target, created, row, expired, now):
             summary += ' Reply unavailable.'
         elif capture == 'pending':
             summary += ' Reply verification is pending.'
+    elif execution == 'uncertain' or row is not None and (row.get('state') in ('unknown', 'expired') or row.get('tracking_stopped')):
+        phase = 'held'
+        retained_hold = evidence.get('codex_retention_hold') == peer_lifecycle.CODEX_RETENTION_HOLD
+        reason = (peer_lifecycle.CODEX_RETENTION_HOLD + ' Recipient recovery is required.' if retained_hold else
+                  'Delivery or completion could not be verified. Recipient recovery is required.')
+        summary = reason
+        if evidence.get(turn):
+            summary += (' Start observed at ' + _when(started, now) + '.' if started is not None else
+                        ' Start recorded; start time unavailable.')
+            summary += ' No end observed yet.'
     elif (expired or row is None) and execution != 'running':
         phase = 'unavailable'
         summary = ('The request is past the content retention window. No end was verified.' if expired else
                    'The request record is unavailable. No end was verified.')
-    elif execution == 'uncertain' or row is not None and (row.get('state') in ('unknown', 'expired') or row.get('tracking_stopped')):
-        phase = 'held'
-        reason = 'Delivery or completion could not be verified. Recipient recovery is required.'
-        summary = reason
     elif execution == 'running':
         phase = 'started'
         summary = (f'Start observed at {_when(started, now)}.' if started is not None else

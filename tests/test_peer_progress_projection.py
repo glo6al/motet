@@ -115,6 +115,28 @@ class ProjectionTests(unittest.TestCase):
                               (json.dumps(target), rid))
         self.assertNotIn('progress', self.bridge.result(rid))
 
+    def test_pruned_open_codex_reports_recovery_and_observed_start_age(self):
+        sent, row = self.codex(state='awaiting_reply', bound='fictional-turn')
+        self.observe(row, 'started', 1)
+        now = row['created'] + peer_bridge.RETENTION + 3600
+        with patch.object(peer_bridge.time, 'time', return_value=now):
+            self.store._prune(self.store._rows(), now)
+            before = self.store.db.total_changes
+            result = self.bridge.result(sent['request_id'])
+            busy = self.bridge._recipient_capacity(row['request_id'], row['agent'], 'uncertain')
+            self.assertEqual(self.store.db.total_changes, before)
+        self.assertEqual((result['state'], result['reply']), ('expired', ''))
+        self.assertEqual(result['progress']['phase'], 'held')
+        self.assertIn(peer_lifecycle.CODEX_RETENTION_HOLD, result['error'])
+        self.assertIn('recovery is required', result['error'])
+        self.assertIn('Start observed', busy)
+        self.assertIn('(1 day ago)', busy)
+        self.assertIn(sent['request_id'], busy)
+        self.assertNotIn(row['request_id'], busy)
+        self.assertLessEqual(len(busy), 512)
+        self.assertIn('requires recovery', busy)
+        self.assertNotIn('running', busy)
+
     def test_busy_names_public_request_and_preserves_not_accepted_suffix(self):
         sent, row = self.codex(state='awaiting_reply', bound='fictional-turn')
         self.observe(row, 'started', 1)

@@ -1008,7 +1008,7 @@ class SharedBridge:
                     if row is not None and not peer_lifecycle.valid_payload(transport_id, row, admission):
                         return message + suffix
                     progress = self._public_progress(transport_id, target, json.loads(item[1]), item[2], row, expired, now)
-                    if progress and progress['phase'] in ('started', 'accepted', 'claim_issued'):
+                    if progress and progress['phase'] in ('started', 'accepted', 'claim_issued', 'held'):
                         room = 512 - len(message) - len(suffix) - 2
                         message += '. ' + progress['summary'][:room].rstrip(' .')
         except (PeerError, ValueError, TypeError, sqlite3.Error, RecursionError):
@@ -1068,8 +1068,12 @@ class SharedBridge:
             result.update(state='unknown', reply='', error='The reply exceeds the safe response size.')
         if progress_allowed:
             progress = self._public_progress(item[2], item[0], snapshot, item[3], progress_row, expired, now)
-            if progress and len(json.dumps(dict(result, progress=progress), ensure_ascii=False).encode('utf-8')) <= 60000:
-                result['progress'] = progress
+            if progress:
+                candidate = dict(result, progress=progress)
+                if expired and progress['phase'] == 'held':
+                    candidate['error'] = progress['held_reason']
+                if len(json.dumps(candidate, ensure_ascii=False).encode('utf-8')) <= 60000:
+                    result = candidate
         return result
 
     def list_requests(self, cursor=None):

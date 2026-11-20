@@ -380,7 +380,7 @@ def capacity_error(db, agent, now, ttl, *, describe_recipient=None):
         return 'This recipient has an active request (' + tid + '). The new request was not accepted.'
     count = db.execute("SELECT COUNT(*) FROM (SELECT 1 FROM peer_execution WHERE execution NOT IN ('completed','dropped','retired') AND created>? LIMIT 4)", (now - ttl,)).fetchone()[0]
     if count >= 4:
-        return 'Four peer deliveries are active. The new request was not accepted.'
+        return 'Four peer deliveries were started in the last 15 minutes. Try again shortly. The new request was not accepted.'
     return None
 
 
