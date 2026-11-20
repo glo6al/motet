@@ -1977,18 +1977,20 @@ html.workspace #workspacePanelEvidence .workspace-document-body li:has(>.box){li
 html.workspace body.stepped #workspaceTop #workspacePanels button[aria-pressed=true]{background:#eae8e3;color:#1c1b19}
 html.workspace #officer{--watch-ink:#1c1b19;--watch-muted:#66635d;--ink:#1c1b19;--mute:#66635d;--add:#17753a;--del:#b3261e}
 html.workspace #officer #ofLog{--watch-ink:#1c1b19;--watch-muted:#66635d;color:#1c1b19}
-html.workspace #officer #ofLog>.of.control{align-self:stretch;max-width:100%;border:0;background:transparent;padding:0;box-shadow:none}
-html.workspace #officer #ofLog .workspace-control-line{display:block;color:#66635d;font:12.5px/1.4 system-ui;overflow-wrap:anywhere}
+html.workspace #officer #ofLog>.of.control{align-self:stretch;max-width:100%;border:0;background:transparent;padding:0;box-shadow:none;margin:14px 0 6px}
+html.workspace #officer #ofLog .workspace-control-line{display:block;color:#66635d;font:13px/18.85px system-ui;overflow-wrap:anywhere}
 html.workspace #officer #ofLog .workspace-control-line[data-warning=true]{color:rgb(184,67,10)}
-html.workspace #officer #ofLog .workspace-control-instruction{margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere;color:#1c1b19;font:14px/1.5 system-ui}
+html.workspace #officer #ofLog .workspace-control-instruction{margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere;color:#1c1b19;font:13px/18.85px system-ui}
 html.workspace #officer #ofLog .workspace-watch-question small.workspace-relay-status{font:12.5px/1.4 system-ui;color:#66635d;text-align:right;align-self:flex-end}
 html.workspace #officer #ofLog .workspace-watch-question small.workspace-relay-status[data-warning=true]{color:rgb(184,67,10)}
 html.workspace #officer #ofLog .workspace-relay-status button{border:0;background:none;box-shadow:none;color:inherit;padding:0;font:inherit;letter-spacing:0;text-transform:none;cursor:pointer}
-html.workspace #officer #ofLog .workspace-relay-status .message-check{margin-left:6px;text-decoration:underline}
+html.workspace #officer #ofLog .workspace-relay-status .message-check{border:1px solid #c9c6be;border-radius:6px;padding:1px 8px;margin-left:8px;font:13px/normal system-ui;text-decoration:none}
+html.workspace #officer #ofLog .workspace-relay-status .message-check:hover{background:#f6f6f4}
+html.workspace #officer #ofLog .workspace-relay-status .message-check:focus-visible{outline:1px solid #1c1b19;outline-offset:2px}
 html.workspace #officer #ofLog .workspace-relay-status button:focus-visible{outline:1px solid #888;outline-offset:2px}
-html.workspace #officer #ofLog .workspace-relay-answer{align-self:stretch;max-width:100%;border:0;background:none;padding:0;box-shadow:none}
+html.workspace #officer #ofLog .workspace-relay-answer{border:0;background:none;padding:0;box-shadow:none}
 html.workspace #officer .workspace-relay-unseen{position:relative}
-html.workspace #officer .workspace-relay-unseen::after{content:'';position:absolute;top:3px;right:3px;width:5px;height:5px;border-radius:50%;background:#66635d}
+html.workspace #officer .workspace-relay-unseen::after{content:'';position:absolute;top:3px;right:3px;width:7px;height:7px;border-radius:50%;background:#1c1b19}
 html.workspace #officer #ofLog :is(.workspace-source,.workspace-source-text,.workspace-watch-answer,.workspace-watch-question,.source.you p,.message .draft){color:#1c1b19}
 html.workspace #officer #ofLog :is(.workspace-source-summary,.workspace-more,.workspace-run-header,.workspace-message-meta,.workspace-step,.workspace-step-icon,.workspace-step-arrow,.workspace-step-delta,.workspace-watch-question small,.workspace-watch-answer>small,.source.you>b,.source.you>small,.message>b){color:#66635d}
 html.workspace #officer #ofLog .workspace-step-plus{color:#17753a}
@@ -5605,7 +5607,7 @@ function ofJump(aid,n){const a=A[aid]; if(!a){cuNotice('<span class="k">That age
   land()}
 /* agent message helpers: display backend requests; replies never become Officer instructions. */
 /* Owner approval for browser linkage storage is pending. Live projections never enter model history. */
-const WORKSPACE_QUIET_RELAY_CACHE=false;
+const WORKSPACE_QUIET_RELAY_CACHE=false; // Inert declaration: gates nothing yet; no linkage serializer or persistence path exists.
 var workspaceQuietRelayReady=true;
 const WQR={signature:null,generation:0,links:new Map(),live:new Set(),seen:new Set(),answered:new Set(),unseen:new Set(),snapshot:false};
 function workspaceQuietRelayOwnerChanged(){
@@ -5614,13 +5616,13 @@ function workspaceQuietRelayOwnerChanged(){
   if(WQR.signature===signature)return;WQR.signature=signature;WQR.generation++;
   for(const link of WQR.links.values()){link.status?.remove();if(link.answer){link.answer.el.remove();if(CU.nodes.get(link.answerId)===link.answer)CU.nodes.delete(link.answerId)}if(link.assistant.quietRelay===link)delete link.assistant.quietRelay;}
   WQR.links.clear();WQR.live.clear();WQR.seen.clear();WQR.answered.clear();WQR.unseen.clear();WQR.snapshot=false;
-  OFM.polling=false;OFM.pollTicket=null;if(OF.sendTicket){OF.sendTicket=null;OF.busy=false;OF.pending=null}workspaceQuietRelayAttention();
+  workspaceQuietRelayAttention();
 }
 function workspaceQuietRelayTicket(){workspaceQuietRelayOwnerChanged();return {key:typeof KEY==='undefined'?null:KEY,generation:WQR.generation};}
 function workspaceQuietRelayOwned(ticket){workspaceQuietRelayOwnerChanged();return ticket.key===(typeof KEY==='undefined'?null:KEY)&&ticket.generation===WQR.generation&&!(typeof locked!=='undefined'&&locked)&&!(typeof claiming!=='undefined'&&claiming);}
 function workspaceQuietRelayCurrent(link){return workspaceQuietRelayOwned(link.owner)&&CU.nodes.get(link.userId)===link.user&&CU.nodes.get(link.assistantId)===link.assistant&&link.user.el===link.userEl&&link.assistant.el===link.assistantEl;}
 function workspaceQuietRelayVisible(link){
-  if(!workspaceQuietRelayCurrent(link)||typeof WORKSPACE==='undefined'||!WORKSPACE||typeof STEADY!=='undefined'&&STEADY||OFUI.recipient!=='watch'||!cuVisible(link.scope,ofCurrent().context.scope==='station'?cuTarget():null)||ofEl.classList.contains('fold'))return false;
+  if(!workspaceQuietRelayCurrent(link)||typeof WORKSPACE==='undefined'||!WORKSPACE||OFUI.recipient!=='watch'||!cuVisible(link.scope,ofCurrent().context.scope==='station'?cuTarget():null)||ofEl.classList.contains('fold'))return false;
   const answer=link.answer?.el;if(!answer||answer.hidden||!answer.isConnected||!ofLog.contains(answer)||!answer.getClientRects().length||answer.closest?.('[hidden],[inert]'))return false;
   const style=getComputedStyle(answer);if(style.visibility!=='visible'||style.display==='none')return false;
   const a=answer.getBoundingClientRect(),p=ofLog.getBoundingClientRect();if(![a.left,a.right,a.top,a.bottom,p.left,p.right,p.top,p.bottom,innerWidth,innerHeight].every(Number.isFinite)||a.right<=a.left||a.bottom<=a.top||p.right<=p.left||p.bottom<=p.top||Math.min(a.right,p.right,innerWidth)<=Math.max(a.left,p.left,0)||Math.min(a.bottom,p.bottom,innerHeight)<=Math.max(a.top,p.top,0))return false;
@@ -5741,17 +5743,17 @@ function ofControlMerge(rows,{snapshot=false,restored=false}={}){
 async function ofMessagePoll(){
   if(DEMO||!KEY||claiming||!OF.loaded||OFM.polling) return;
   if(!connected){ofMessageNotice('Stage connection is offline. Message/control status will refresh when it reconnects.'); return}
-  const owner=workspaceQuietRelayTicket(),ticket={};OFM.pollTicket=ticket;OFM.polling=true;
+  const quietOwner=typeof WORKSPACE!=='undefined'&&WORKSPACE&&typeof workspaceQuietRelayTicket==='function'?workspaceQuietRelayTicket():null;
+  OFM.polling=true;
   try{
     const res=await fetch('/agent-messages',{headers:{'X-Live-Room-Key':KEY},cache:'no-store',signal:AbortSignal.timeout(10000)});
-    if(!workspaceQuietRelayOwned(owner))return;
     if(!res.ok) throw new Error(res.status===401||res.status===403?'Message status requires an unlocked stage.':'Message status unavailable ('+res.status+').');
-    const v=await res.json();if(!workspaceQuietRelayOwned(owner))return;if(!Array.isArray(v.requests)) throw new Error('Message status response was not valid.');
-    workspaceQuietRelaySnapshot(v.requests);
+    const v=await res.json(); if(!Array.isArray(v.requests)) throw new Error('Message status response was not valid.');
+    if(quietOwner&&workspaceQuietRelayOwned(quietOwner))workspaceQuietRelaySnapshot(v.requests);
     OFM.available=v.available; OFM.reason=String(v.reason||''); ofMessageMerge(v.requests); if(Array.isArray(v.controls)) ofControlMerge(v.controls,{snapshot:true});
     ofMessageNotice(v.available===false?'Agent messaging unavailable: '+(OFM.reason||'transport is not ready'):'');
-  }catch(err){if(workspaceQuietRelayOwned(owner))ofMessageNotice((err.message||'Could not reach message status.')+' Message/control status is uncertain; do not repeat the request. Nothing was resent.')}
-  finally{if(OFM.pollTicket===ticket){OFM.pollTicket=null;OFM.polling=false}}
+  }catch(err){ofMessageNotice((err.message||'Could not reach message status.')+' Message/control status is uncertain; do not repeat the request. Nothing was resent.')}
+  finally{OFM.polling=false}
 }
 function ofMessageLoad(){
   if(DEMO) return;
@@ -5820,21 +5822,21 @@ async function ofSendOrdinary(suggestion=null){
   if(typeof workspaceDictationBeforeSend==='function')workspaceDictationBeforeSend();
   if(typeof workspaceOfficerHistoryActive==='function'&&workspaceOfficerHistoryActive())return;
   if(typeof workspaceOfficerUnavailable==='function'&&workspaceOfficerUnavailable())return;const q=(suggestion??ofIn.value).trim();if(!q||OF.busy)return;if([...q].length>4000){ofAdd('k','Question is too long; nothing was sent.',{context:ofCurrent().history});if(typeof workspaceOfficerShowHistory==='function')workspaceOfficerShowHistory();return;}
-  const ownerTicket=typeof workspaceQuietRelayTicket==='function'?workspaceQuietRelayTicket():null,owned=()=>!ownerTicket||workspaceQuietRelayOwned(ownerTicket),sendTicket={};
+  const ownerTicket=typeof WORKSPACE!=='undefined'&&WORKSPACE&&typeof workspaceQuietRelayTicket==='function'?workspaceQuietRelayTicket():null;
   ofDay();const request=suggestion===null?ofCurrent():ofSnapshot('room',null,A,OFUI.epoch),requestKey=typeof KEY==='undefined'?null:KEY,turn={role:'user',content:q,context:request.history,ui:cuTurnMeta()};
-  OF.turns.push(turn);ofAdd('you',(typeof workspaceWatchOn==='function'&&workspaceWatchOn()?workspaceWatchMarkup('user',request.history,turn.ui.ts,esc(q)):ofAttributed(request.history,'<b>You → Motet</b><p>'+esc(q)+'</p>')),{...turn.ui,context:request.history});if(suggestion===null){ofIn.value='';cuDraftSave();}OF.busy=true;OF.sendTicket=sendTicket;OF.pending=request;request.ownerTicket=ownerTicket;request.userUI=turn.ui;request.userRow=typeof CU!=='undefined'?CU.nodes?.get(turn.ui.id):null;request.userEl=request.userRow?.el;ofContextPaint();ofStatus('thinking…');if(typeof workspaceOfficerShowHistory==='function')workspaceOfficerShowHistory();
+  OF.turns.push(turn);ofAdd('you',(typeof workspaceWatchOn==='function'&&workspaceWatchOn()?workspaceWatchMarkup('user',request.history,turn.ui.ts,esc(q)):ofAttributed(request.history,'<b>You → Motet</b><p>'+esc(q)+'</p>')),{...turn.ui,context:request.history});if(suggestion===null){ofIn.value='';cuDraftSave();}OF.busy=true;OF.pending=request;request.ownerTicket=ownerTicket;request.userUI=turn.ui;request.userRow=typeof CU!=='undefined'?CU.nodes?.get(turn.ui.id):null;request.userEl=request.userRow?.el;ofContextPaint();ofStatus('thinking…');if(typeof workspaceOfficerShowHistory==='function')workspaceOfficerShowHistory();
   const remove=()=>{const i=OF.turns.indexOf(turn);if(i>=0)OF.turns.splice(i,1)};
   try{
     if(DEMO){await new Promise(r=>setTimeout(r,700));ofShow(ofDemoAnswer(q,request),request);ofAdd('k','Scripted demo answer · no live agents contacted.',{context:request.history,ts:Date.now()/1000});remove();return}
-    const request_id=globalThis.crypto?.randomUUID?.();request.dispatchId=request_id;if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&request_id&&ownerTicket)WQR.live.add(request_id);
+    const request_id=globalThis.crypto?.randomUUID?.();request.dispatchId=request_id;if(ownerTicket&&request_id)WQR.live.add(request_id);
     request.evidenceEpoch=OFE.eraseEpoch;
     const res=await post('/ask',{turns:ofRequestHistory(OF.turns.filter(t=>cuVisible(t.context,request.context.scope==='station'?request.context.agent:null))),context:request.context,...(request_id?{request_id}:{})});
-    if(!owned())return;if(!res.ok){const t=await res.text();if(!owned())return;ofSave();ofAdd('of',ofAttributed(request.history,`<p class="k">${esc(t||('Motet could not answer ('+res.status+').'))}</p>`),{context:request.history,ts:Date.now()/1000});if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&res.status===503){if(requestKey===KEY&&request.epoch===OFUI.epoch&&OFUI.recipient==='watch')workspaceOfficerReportOff(t||'Motet could not answer (503).',requestKey)}else ofStatus(res.status===503?'off':'listening');return}
-    const answer=await res.json();if(!owned())return;if(answer&&((answer.historical!==undefined&&answer.historical!==false)||(answer.read_only!==undefined&&answer.read_only!==false))){remove();if(requestKey===KEY&&!locked&&!claiming)workspaceOfficerHistoricalPacket(answer);ofSave();return}if(answer.error){ofSave();ofAdd('of',ofAttributed(request.history,`<p class="k">${esc(answer.error)}</p>`),{context:request.history,ts:Date.now()/1000});return}
-    const r=await ofAcceptEvidence(answer,request.evidenceEpoch);if(!owned())return;if(!r){ofSave();return}
+    if(!res.ok){const t=await res.text();ofSave();ofAdd('of',ofAttributed(request.history,`<p class="k">${esc(t||('Motet could not answer ('+res.status+').'))}</p>`),{context:request.history,ts:Date.now()/1000});if(typeof WORKSPACE!=='undefined'&&WORKSPACE&&res.status===503){if(requestKey===KEY&&request.epoch===OFUI.epoch&&OFUI.recipient==='watch')workspaceOfficerReportOff(t||'Motet could not answer (503).',requestKey)}else ofStatus(res.status===503?'off':'listening');return}
+    const answer=await res.json();if(answer&&((answer.historical!==undefined&&answer.historical!==false)||(answer.read_only!==undefined&&answer.read_only!==false))){remove();if(requestKey===KEY&&!locked&&!claiming)workspaceOfficerHistoricalPacket(answer);ofSave();return}if(answer.error){ofSave();ofAdd('of',ofAttributed(request.history,`<p class="k">${esc(answer.error)}</p>`),{context:request.history,ts:Date.now()/1000});return}
+    const r=await ofAcceptEvidence(answer,request.evidenceEpoch);if(!r){ofSave();return}
     request.replyUI=cuTurnMeta();OF.turns.push({role:'assistant',content:String(r.text||'').slice(0,12000),context:request.history,ui:request.replyUI,...(r.receipt&&ofReceipt(r.receipt)?{receipt:ofReceipt(r.receipt)}:{}),...(ofVerification(r.verification)?{verification:r.verification}:{}),...(ofWarnings(r.warnings).length?{warnings:ofWarnings(r.warnings)}:{})});OF.turns=OF.turns.slice(-40);ofShow(r,request);ofSave();
-  }catch(err){if(!owned())return;/* workspace reachability notice */ const workspaceFailure=typeof WORKSPACE!=='undefined'&&WORKSPACE;ofSave();ofAdd('of',ofAttributed(request.history,workspaceFailure?'<p class="k workspace-unreachable"><b>Motet could not be reached.</b> <span>If you asked it to message or control an agent, check message/control status. Do not repeat the request while its outcome is uncertain.</span></p>':'<p class="k">Motet could not be reached. If you asked it to message or control an agent, check message/control status. Do not repeat the request while its outcome is uncertain.</p>'),{context:request.history,ts:Date.now()/1000});if(workspaceFailure&&requestKey===KEY&&request.epoch===OFUI.epoch&&OFUI.recipient==='watch')ofStatus('could not be reached')}
-  finally{if(OF.sendTicket===sendTicket&&owned()){OF.sendTicket=null;OF.busy=false;OF.pending=null;ofContextPaint();ofReplyNotice(request);if(ofSt.textContent==='thinking…')ofStatus(DEMO?'demo · scripted answers':'listening')}}
+  }catch(err){/* workspace reachability notice */ const workspaceFailure=typeof WORKSPACE!=='undefined'&&WORKSPACE;ofSave();ofAdd('of',ofAttributed(request.history,workspaceFailure?'<p class="k workspace-unreachable"><b>Motet could not be reached.</b> <span>If you asked it to message or control an agent, check message/control status. Do not repeat the request while its outcome is uncertain.</span></p>':'<p class="k">Motet could not be reached. If you asked it to message or control an agent, check message/control status. Do not repeat the request while its outcome is uncertain.</p>'),{context:request.history,ts:Date.now()/1000});if(workspaceFailure&&requestKey===KEY&&request.epoch===OFUI.epoch&&OFUI.recipient==='watch')ofStatus('could not be reached')}
+  finally{OF.busy=false;OF.pending=null;ofContextPaint();ofReplyNotice(request);if(ofSt.textContent==='thinking…')ofStatus(DEMO?'demo · scripted answers':'listening')}
 }
 /* officer evidence acceptance: navigation is separate from committed erasure */
 const OFE={identity:null,generation:null,revision:0,eraseEpoch:0,retired:[],filtered:new WeakMap()};
