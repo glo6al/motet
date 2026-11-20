@@ -3,6 +3,10 @@ from pathlib import Path
 import sys
 import sqlite3
 import threading
+import os
+import tempfile
+import uuid
+from unittest.mock import patch
 from types import SimpleNamespace
 import unittest
 
@@ -92,7 +96,7 @@ class StoreProgressTests(unittest.TestCase):
         self.assertFalse(progress.ensure(self.store, row))
         self.assertEqual(self.evidence(row), original)
 
-    def test_boot_migration_is_per_row_null_only_and_skips_protected_alias(self):
+    def test_lazy_migration_is_per_row_null_only_and_skips_protected_alias(self):
         _, first = self.fixture.admit(turn='fixture-first')
         _, protected = self.fixture.admit('claude', turn='fixture-protected')
         before = {r['request_id']: self.evidence(r) for r in (first, protected)}
@@ -100,7 +104,8 @@ class StoreProgressTests(unittest.TestCase):
         def no_clock():
             raise AssertionError('Migration must not observe a clock')
         self.store._peer_progress_clock = no_clock
-        progress.migrate_retained(self.store)
+        self.assertTrue(progress.ensure(self.store, first))
+        self.assertFalse(progress.ensure(self.store, protected))
         for row in (first, protected):
             after = self.evidence(row)
             self.assertEqual((after['execution'], after['capture']),
@@ -108,6 +113,35 @@ class StoreProgressTests(unittest.TestCase):
         self.assertEqual(progress.load(self.db, first['request_id']), EMPTY)
         self.assertIn('progress', self.evidence(first)['evidence'])
         self.assertEqual(self.evidence(protected), before[protected['request_id']])
+
+    @unittest.skipIf(os.name == 'nt', 'Private store startup requires POSIX')
+    def test_startup_does_not_migrate_the_permanent_ledger(self):
+        import officer_messaging
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state, sessions = root / 'state', root / 'sessions'
+            sessions.mkdir()
+            store = officer_messaging.MessagingStore(str(state), str(sessions))
+            try:
+                for _ in range(128):
+                    request, client, agent = str(uuid.uuid4()), str(uuid.uuid4()), 'x:' + str(uuid.uuid4())
+                    store.db.execute('INSERT INTO shared_bridge_requests VALUES (?,?,?,?,?,?,?,?,?)',
+                        (client, agent, '{}', 'fictional digest', request, 'fictional credential', CREATED, None, ''))
+                    store.db.execute('INSERT INTO peer_execution VALUES (?,?,?,?,?,?)',
+                        (request, agent, CREATED, 'dropped', 'withheld', '{"launched": false}'))
+                store.db.commit()
+            finally:
+                store.close()
+            with patch.object(progress, 'ensure', wraps=progress.ensure) as ensure:
+                reopened = officer_messaging.MessagingStore(str(state), str(sessions))
+                try:
+                    ensure.assert_not_called()
+                    retained = reopened.db.execute('SELECT evidence FROM peer_execution').fetchall()
+                    self.assertEqual(len(retained), 128)
+                    import json
+                    self.assertTrue(all('progress' not in json.loads(raw) for raw, in retained))
+                finally:
+                    reopened.close()
 
     def test_actor_or_clock_failure_does_not_replace_progress_or_original_binding(self):
         _, row = self.fixture.admit(turn='fixture-turn')
