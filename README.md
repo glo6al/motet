@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/workspace-room.png" width="1000" alt="The Motet stage in the Workspace interface. A sidebar lists fictional agents under three projects, each with the app it runs in and a time or the word ended; one has an orange dot because it needs you. On the stage, the agents' screens stand side by side on a light floor. Motet's question box sits at the bottom with three suggested questions.">
+  <img src="docs/media/workspace-room.png" width="1000" alt="The Motet stage in Workspace with 22 fictional agents. Large front monitors and smaller child monitors form several rows on a light floor, with project names below and edge stations partly outside the view. The sidebar groups agents by project. Motet's question box and three suggested questions sit at the bottom.">
 </p>
 
 You have several agents playing at once: Claude Code on one part, Codex on another, Cursor on a third. Each is good alone, but nobody is keeping them together. You find out an agent stopped to ask a question twenty minutes after it asked.
@@ -61,7 +61,7 @@ When you want to look for yourself, every agent is in view.
 - **Bring a player in.** Message an agent from its desk, hand it a PDF or a picture, or start a fresh Codex chat in a project's folder, including a folder you add yourself.
 - **Catch the wrong note.** A command that looks like a deploy, a push, a delete or a send is flagged as it happens. You choose the words it listens for.
 
-<p align="center"><img src="docs/media/workspace-desk.png" width="1000" alt="Ada's desk in Workspace. The conversation is on the left: your request, a folded run of steps, Ada's update and a command still running. The Changes panel on the right shows two recorded edits to one file as short red and green excerpts, each noting that only the recorded change text is shown."></p>
+<p align="center"><img src="docs/media/workspace-desk.png" width="1000" alt="Ada's desk in Workspace. The chain of command shows Ada and her fictional children. The conversation on the left contains your pricing request, a folded run of steps, Ada's rounding update and an edit in progress. The Changes panel on the right shows two recorded edits to one file as red and green excerpts."></p>
 <p align="center"><sub><b>A desk.</b> The conversation, with the work it produced beside it. Fictional demo data.</sub></p>
 
 ## Bring the subscriptions you already have
