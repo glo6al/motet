@@ -40,8 +40,25 @@ def _selection(store, transport_id):
     return meta, record, raw
 
 
-def _eligible(record):
-    return bool(record and record['execution'] == 'uncertain' and record['capture'] != 'captured')
+def _candidate(meta, record):
+    return meta[2] is not None and (
+        record is None or (record['execution'] in ('uncertain', 'running', 'submitted')
+                           and record['capture'] != 'captured'))
+
+
+def _eligible(meta, record, row, now):
+    if not _candidate(meta, record):
+        return False
+    if row is not None:
+        if (row['state'] not in ('sending', 'queued', 'awaiting_reply', 'unknown', 'expired')
+                or row.get('settled') or row.get('execution_outcome') in ('completed', 'dropped')
+                or row.get('capture_disposition') == 'captured'):
+            return False
+        if row['state'] in ('unknown', 'expired'):
+            return True
+    elif record and record['execution'] == 'uncertain':
+        return True
+    return record is not None and now >= meta[1] + peer_bridge.TTL
 
 
 def _payload(transport_id, raw, meta):
@@ -59,14 +76,8 @@ def inspect(store, data):
         raise peer_bridge.PeerError(400, 'Expected one exact transport identifier.')
     with store.lock:
         meta, record, raw = _selection(store, data['transport_id'])
-        eligible = meta[2] is not None and _eligible(record)
-        if eligible and raw:
-            row = _payload(data['transport_id'], raw, meta)
-            # Inspection never reconciles/writes. Conservatively exclude current
-            # retained evidence that reconciliation would classify as active or
-            # terminal; retirement independently rechecks inside its transaction.
-            eligible = (row['state'] in ('unknown', 'expired') and not row.get('settled')
-                        and row.get('execution_outcome') not in ('completed', 'dropped'))
+        row = _payload(data['transport_id'], raw, meta) if raw and _candidate(meta, record) else None
+        eligible = _eligible(meta, record, row, time.time())
         return dict(transport_id=data['transport_id'], agent=meta[0],
                     execution=record['execution'] if record else ('uncertain' if meta[2] is not None else 'reserved'),
                     capture=record['capture'] if record else 'pending',
@@ -83,15 +94,20 @@ def retire(store, data):
         if data['agent'] != meta[0]:
             raise peer_bridge.PeerError(409, 'Recipient identity does not match its admission.')
         if meta[2] is None:
-            raise peer_bridge.PeerError(409, 'Only a launched uncertain attempt can be retired online.')
-        if raw and (not record or record['execution'] != 'retired'):
-            row = _payload(data['transport_id'], raw, meta)
-            lifecycle.reconcile(db, row, meta)
-            record = lifecycle.get(db, data['transport_id'])
+            raise peer_bridge.PeerError(409, 'Only a launched attempt can be retired online.')
         already = bool(record and record['execution'] == 'retired')
-        if not already and not _eligible(record):
-            raise peer_bridge.PeerError(409, 'Only an exact uncertain attempt can be retired online.')
+        row = _payload(data['transport_id'], raw, meta) if raw and not already else None
         try:
+            if not already:
+                # Check both the preexisting ledger and any newer retained evidence.
+                # A rejected decision rolls back reconciliation with the rest of the transaction.
+                previous = record
+                if row is not None:
+                    lifecycle.reconcile(db, row, meta)
+                    record = lifecycle.get(db, data['transport_id'])
+                now = time.time()
+                if not (_eligible(meta, previous, row, now) and _eligible(meta, record, row, now)):
+                    raise peer_bridge.PeerError(409, 'This attempt is outside the online retirement policy.')
             lifecycle.retire(db, data['transport_id'], lifecycle.RETIRE_REASON,
                              expected_agent=data['agent'], source='online_owner_decision')
         except ValueError:

@@ -421,7 +421,7 @@ class PeerBridge:
             if not meta:
                 raise PeerError(409, 'Peer transport has no enrollment metadata.')
             sender, target = self._endpoint(meta[0]), self._endpoint(meta[1])
-        if time.time() - row['created'] > TTL:
+        if time.time() >= transport['created'] + TTL:
             raise PeerError(409, 'Peer delivery expired before launch.')
         self._preflight(sender, require_tail=False)
         current = self._preflight(target)
@@ -431,8 +431,12 @@ class PeerBridge:
             if (self._endpoint(sender['id']) != sender or self._endpoint(target['id']) != target
                     or not target['receive'] or sender['project'] != target['project']):
                 raise PeerError(403, 'Peer enrollment changed or receiving is disabled.')
+            fresh = transport_metadata(self.store.db, transport_ids=(row['request_id'],)).get(row['request_id'])
+            launched_at = time.time()
+            if not fresh or launched_at >= fresh['created'] + TTL:
+                raise PeerError(409, 'Peer delivery expired before launch.')
             row['launched'] = True
-            self.store.db.execute('UPDATE peer_requests SET launched=? WHERE transport_id=?', (time.time(), row['request_id']))
+            self.store.db.execute('UPDATE peer_requests SET launched=? WHERE transport_id=?', (launched_at, row['request_id']))
             self.store.db.execute('UPDATE requests SET data=? WHERE id=?', (json.dumps(row), row['request_id']))
         return True
 
@@ -1074,8 +1078,11 @@ class SharedBridge:
                and r.get('launched') and not r.get('settled') and not peer_lifecycle.is_terminal(db, r['request_id'])
                and r['state'] in ('queued', 'awaiting_reply', 'unknown', 'expired') for r in self.store.mods.rows()):
             raise PeerError(409, 'The Claude conversation already has an active Motet claim.')
+        launched_at = time.time()
+        if launched_at >= ledger[4] + TTL:
+            raise PeerError(409, 'Claude peer claim authorization changed.')
         db.execute('UPDATE shared_bridge_requests SET launched=? WHERE transport_id=?',
-                   (time.time(), row['request_id']))
+                   (launched_at, row['request_id']))
 
     def authorize(self, row):
         if row.get('runtime') == 'claude':
@@ -1086,7 +1093,7 @@ class SharedBridge:
             if not meta or meta['version'] != 2 or not item or meta['launched_at'] is not None:
                 raise PeerError(409, 'Shared transport authorization metadata is unavailable.')
             credential = service_credential(self.store.db, item[0])
-        if time.time() - row['created'] > TTL:
+        if time.time() >= meta['created'] + TTL:
             raise PeerError(409, 'Shared request expired before launch.')
         target = self._resolve(row['agent'], row['identity_revision'])
         if target['identity'] != row['target_identity'] or target['project'] != row['target_project']:
@@ -1100,8 +1107,11 @@ class SharedBridge:
             meta = transport_metadata(self.store.db, transport_ids=(row['request_id'],)).get(row['request_id'])
             if not meta or meta['launched_at'] is not None:
                 raise PeerError(409, 'Shared request is already authorized.')
+            launched_at = time.time()
+            if launched_at >= meta['created'] + TTL:
+                raise PeerError(409, 'Shared request expired before launch.')
             row['launched'] = True
-            self.store.db.execute('UPDATE shared_bridge_requests SET launched=? WHERE transport_id=?', (time.time(), row['request_id']))
+            self.store.db.execute('UPDATE shared_bridge_requests SET launched=? WHERE transport_id=?', (launched_at, row['request_id']))
             self.store.db.execute('UPDATE requests SET data=? WHERE id=?', (json.dumps(row), row['request_id']))
         return True
 
