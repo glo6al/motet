@@ -31,6 +31,50 @@ const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'web', 'index.htm
   }
   console.log('ok Workspace and Classic address selection and Unlock, including demo isolation');
 }
+/* Workspace focus color is scoped; Classic and non-focus blue signals retain their rules. */
+{
+ const assert=require('assert/strict');
+ const groups=[
+  '#workspaceSide button:focus-visible,#workspaceTop button:focus-visible,.workspace-dialog button:focus-visible,.workspace-bell button:focus-visible',
+  'html.workspace body.stepped #workspaceTop :is(#workspacePanels button,#workspaceOverview,#workspaceBell):focus-visible',
+  'html.workspace.workspace-attachments #officer .workspace-attachments-picker-choice:focus-visible',
+  ['plus','files','open','remove','link'].map(x=>'html.workspace.workspace-attachments #officer .workspace-attachments-'+x+':focus-visible').join(','),
+  ['lifecycle-button','check-status'].map(x=>'html.workspace.workspace-attachments #officer .workspace-attachments-'+x+':focus-visible').join(','),
+  'html.workspace.workspace-attachments #officer .workspace-attachments-pending-dismiss:focus-visible',
+  '.workspace-attachments-modal button:focus-visible,button.workspace-attachments-citation:focus-visible,button.workspace-attachments-sent-card:focus-visible',
+  '.workspace-attachments-expiry-input:focus-visible'
+ ];
+ const scoped=s=>s.startsWith('html.workspace')?s:s.split(',').map(x=>'html.workspace '+x).join(','),ink='outline:1px solid rgb(28,27,25);outline-offset:2px';
+ function focusChecks(source){
+  const rules=new Map();for(const m of source.slice(0,source.indexOf('</style>')).matchAll(/([^{}]+)\{([^{}]*)\}/g)){const selector=m[1].trim();rules.set(selector,(rules.has(selector)?rules.get(selector)+';':'')+m[2])}
+  for(const selector of groups)assert.equal(rules.get(scoped(selector)),ink,'Workspace ink focus '+selector);
+  for(const i of [0,6,7])assert.equal(rules.get(groups[i]),'outline:2px solid #2459d6;outline-offset:'+(i===0?'1':'2')+'px','Classic focus preserved '+i);
+  for(const selector of ['html.workspace.workspace-attachments #officer .workspace-attachments-drop-target','html.workspace.workspace-attachments #officer #ofLog:has(>.workspace-attachments-drop-target)','html.workspace.workspace-native-attachments #officer #ofLog:has(>.workspace-native-drop-target)'])assert(rules.get(selector).includes('outline:2px dashed #2459d6;outline-offset:-10px'),'drag highlight retained');
+  assert(rules.get('.workspace-spin').includes('border:2px solid #2459d6'),'blue activity retained');
+  assert.equal(rules.get('#workspaceNewChatDraft:focus'),'outline:none;border-color:var(--ws-ink);box-shadow:none','quiet field focus unchanged');
+ }
+ focusChecks(html);
+ for(const selector of groups){const target=scoped(selector)+'{'+ink+'}';assert(html.includes(target));assert.throws(()=>focusChecks(html.replace(target,scoped(selector)+'{outline:2px solid #2459d6;outline-offset:1px}')),{name:'AssertionError'},'each focus group has a causal assertion')}
+ for(const [from,to] of [['outline:2px dashed #2459d6','outline:1px solid rgb(28,27,25)'],['.workspace-spin{width:13px;height:13px;border:2px solid #2459d6','.workspace-spin{width:13px;height:13px;border:2px solid #1c1b19']]){assert(html.includes(from));assert.throws(()=>focusChecks(html.replace(from,to)),{name:'AssertionError'},'nonfocus signal protected')}
+ console.log('ok Workspace ink focus: eight scoped groups, Classic originals, quiet fields and nonfocus drag/activity; ten semantic mutants');
+}
+/* Execute the relationship-paint portion of desk(), without changing relation evidence. */
+{
+ const assert=require('assert/strict'),escape=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+ function relationshipChecks(source){
+  const start=source.indexOf('  /* chain of command:',source.indexOf('function desk(){')),end=source.indexOf('  for(const b of a.el.querySelectorAll',start);assert(start>0&&end>start);
+  const code=source.slice(start,end),helpers=source.split('\n').filter(l=>l.startsWith('function lineage(')||l.startsWith('function workspaceChainNote(')).join('\n');
+  const scenarios=[['recorded',{parent:'p'},null,'Related work','Chain of command'],['inferred',{parent:'p',soft:true},null,'Related work · inferred','Related work · inferred, not a chain of command'],['mixed',{parent:'p'},{id:'b',name:'Birch',parent:'a',soft:true},'Related work · partly inferred','Chain of command · partly inferred'],['guess',{maybe:{parent:'p',via:'script text'}},null,'Related work · a guess','Chain of command · a guess']];
+  for(const [kind,props,child,workspaceLabel,classicLabel] of scenarios)for(const WORKSPACE of [false,true]){
+   const a={id:'a',name:'Atlas',story:[],...props},A={a,p:{id:'p',name:'Parent',story:[]},...(child?{b:child}:{})},nodes=new Map(),node=s=>{if(!nodes.has(s))nodes.set(s,{textContent:'',innerHTML:'',hidden:false});return nodes.get(s)},before=JSON.stringify(A),ctx={a,A,WORKSPACE,order:Object.keys(A),now:0,$:node,hid:(n,v)=>n.hidden=v,txt:(n,v)=>n.textContent=v,put:(n,v)=>n.innerHTML=v,esc:escape,need:()=>null,stateOf:()=>({label:'Seen',busy:false})};
+   vm.runInNewContext(helpers+'\n'+code,ctx);assert.equal(node('#deskT .lbl').textContent,WORKSPACE?workspaceLabel:classicLabel,'actual desk label '+kind+'/'+WORKSPACE);assert.equal(JSON.stringify(A),before,'paint does not rewrite relationships');assert(node('#crumb').innerHTML.includes('data-go="a"'));if(kind==='guess')assert(node('#crumb').innerHTML.includes('a guess from a script'));if(kind==='inferred'||kind==='mixed')assert(node('#crumb').innerHTML.includes('inferred, not recorded'));if(!WORKSPACE)assert(!node('#crumb').innerHTML.includes('workspace-chain-note'),'Classic crumb presentation unchanged');
+  }
+ }
+ relationshipChecks(html);
+ for(const [from,to] of [["?'Related work · a guess'","?'Chain of command · a guess'"],["allSoft?'Related work · inferred':softAny","allSoft?'Related work':softAny"],["softAny?'Related work · partly inferred':'Related work'","softAny?'Related work':'Related work'"],["?'Chain of command · a guess':allSoft","?'Related work · a guess':allSoft"]]){assert(html.includes(from));assert.throws(()=>relationshipChecks(html.replace(from,to)),{name:'AssertionError'},'relationship wording/mode mutant')}
+ console.log('ok actual desk relationship labels: Workspace neutral qualifiers, Classic exact strings, unchanged relation data/crumbs; four semantic mutants');
+}
+
 const nativeOpenSource=html.split('\n').find(line=>line.startsWith('function nativeOpenAvailable('));
 {
   const start=html.indexOf('/* deck log helpers:'),end=html.indexOf('/* end deck log helpers */');
