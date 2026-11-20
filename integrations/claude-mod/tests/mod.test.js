@@ -1423,6 +1423,41 @@ test('a typed rejection replaces transient status while retaining the exact comp
   assert.equal(h.submissions.length,1);
 });
 
+for(const siblingDeferred of [false,true])test(`a held receipt recovered from another runtime clears its deferral, sibling deferred: ${siblingDeferred}`,async()=>{
+  const h=await lifecycleHarness({fetch:(url,body)=>
+    url.endsWith('/event') && (body.kind==='completed' || siblingDeferred && body.kind==='started')?
+      responseJSON({},503):null});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'merged-receipt-hold'});
+  if(siblingDeferred)await h.drive(async()=>(await status(h)).deferred_receipts.count===1,'defer the sibling start receipt');
+  else await h.waitAck('started');
+  await h.call('turn.complete',{turnId:'merged-receipt-hold',answer:ANSWER,isAborted:false,reason:'answer'});
+  const count=siblingDeferred?2:1;
+  await h.drive(async()=>(await status(h)).deferred_receipts.count===count,'defer the completion receipt');
+
+  const foreign=copy(h.ownData());
+  const record=foreign.requests[REQUEST];
+  const completed=record.events.find(event=>event.kind==='completed');
+  const hash=createHash('sha256').update(JSON.stringify(completed)).digest('hex');
+  record.rejections={[hash]:{count:2,retry_at:130000}};
+  const foreignKey='watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT;
+  h.storage.set(foreignKey,copy(foreign));
+
+  const before=h.calls.length;
+  h.setNow(130000);await h.tick();
+  const visible=await status(h);
+  assert.deepEqual(visible.receipt_recovery.held,[REQUEST]);
+  assert.deepEqual(visible.deferred_receipts,deferredReceipts(siblingDeferred?1:0,siblingDeferred?30000:null));
+  assert.deepEqual(h.ownData().requests[REQUEST].events,record.events);
+  assert.deepEqual(h.ownData().requests[REQUEST].rejections,record.rejections);
+  assert.deepEqual(h.storage.get(foreignKey),foreign);
+  assert(!h.stores.some(({key})=>key===foreignKey));
+  const next=h.calls.slice(before);
+  assert(next.some(call=>call.url.endsWith('/poll')));
+  assert.deepEqual(next.filter(call=>call.url.endsWith('/event')).map(call=>call.body.kind),siblingDeferred?['started']:[]);
+  assert.equal(h.submissions.length,1);
+});
+
 test('a conflicted receipt is reported only through conflict recovery',async()=>{
   const h=await lifecycleHarness({fetch:(url,body)=>
     url.endsWith('/event')&&body.kind==='completed'?responseJSON({},503):null});

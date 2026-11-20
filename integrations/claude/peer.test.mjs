@@ -48,7 +48,13 @@ async function fixture(){
   assert.equal(req.url,'/bridge/v2/rpc');const p=JSON.parse(raw),n=req.headers['x-watch-nonce'];
   assert.equal(req.headers['x-watch-bridge'],credential.credential_id);assert.equal(req.headers['x-watch-run'],run);assert.equal(req.headers['x-watch-signature'],hmac(credential.secret,['watch-bridge-request-v2',String(credential.port),'POST','/bridge/v2/rpc',req.headers['x-watch-time'],n,run,hash(raw)]));
   if(mode==='hang-rpc')return;
-  if(mode==='loss'){req.socket.destroy();return}
+  if(mode==='loss'){
+   // A response cut short by a graceful close rejects from the socket's close
+   // event. The client's close listener runs before the rejection continuation,
+   // pinning closed=true without the discovery deadline firing.
+   res.writeHead(200,{'Content-Length':128,Connection:'close'});
+   res.end('{"result":');return;
+  }
   const record={origin:'peer',request_id:mode==='mismatched'?randomUUID():p.params.request_id,agent_id:p.params.agent_id||agent,state:'queued',reply:'<untrusted>',error:'',created_at:Date.now()/1000,target:{...target,agent_id:p.params.agent_id||agent},duplicate:false,text_preview:'Please inspect',secret:'SHOULD NOT DISPLAY'};
   const result=p.method==='list_inboxes'?{inboxes:[]}:p.method==='list_agents'?{agents:[{...target,native_id:native,capability:'unavailable',reason:'No transport',last_seen:Date.now()/1000,supported_transport:'codex_queue',secret:'SHOULD NOT DISPLAY'}],next_cursor:null,directory:{complete:false,reasons:['Scan bounded'],refreshed_at:Date.now()/1000}}:p.method==='list_requests'?{requests:[{...record,request_id:randomUUID()}],next_cursor:null}:record;
   if(mode==='claude_mod'&&p.method==='list_agents')Object.assign(result.agents[0],{agent_id:'c:'+native,provider:'claude',capability:'reachable',reason:'',supported_transport:'claude_mod'});
@@ -137,15 +143,16 @@ test('directory preserves duplicate names across providers/projects and request 
  assert.equal(safeResult('send_message',row).duplicate,true);assert.equal(safeResult('send_message',row).target.name,'Same name');
  assert.equal(safeResult('list_requests',{requests:[row],next_cursor:null}).requests[0].reply,undefined);
 });
-test('adapter sensitivity: server proof and signed response protections are required',async()=>{
+test('adapter sensitivity: authentication and timeout classification are required',async()=>{
  const original=await fs.readFile(path.join(here,'peer.mjs'),'utf8');
- for(const [name,from,to] of [
+ for(const [name,from,to,pattern='real signed HTTP',expectedFailure=/Missing expected rejection/] of [
   ['proof',"!equal(proof.proof,mac(key,['watch-bridge-server-v2',String(d.port),d.credential_id,nonce,proof.run_id]))",'false'],
-  ['response',"!equal(response.headers['x-watch-signature'],mac(key,['watch-bridge-response-v2',String(d.port),proof.run_id,nonce,String(response.status),digest(response.body)]))",'false']
+  ['response',"!equal(response.headers['x-watch-signature'],mac(key,['watch-bridge-response-v2',String(d.port),proof.run_id,nonce,String(response.status),digest(response.body)]))",'false'],
+  ['timeout-classification','if(deadlineReached)','if(deadlineReached||closed)','startup discovery stays silent',/Motet inbox discovery timed out/]
  ]){
   assert.ok(original.includes(from));const dir=await fs.mkdtemp(path.join(here,'.peer-mutation-')),target=path.join(dir,'peer.mjs');try{
    await fs.copyFile(path.join(here,'inbox.mjs'),path.join(dir,'inbox.mjs'));
-   await fs.writeFile(target,original.replace(from,to));const result=await new Promise(resolve=>{const env={...process.env,WATCH_PEER_TEST_SCRIPT:target};delete env.NODE_TEST_CONTEXT;const child=spawn(process.execPath,['--test','--test-name-pattern','real signed HTTP',path.join(here,'peer.test.mjs')],{env,stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);child.on('exit',code=>resolve({code,output}))});assert.notEqual(result.code,0,name+' mutation must fail');assert.match(result.output,/Missing expected rejection/);
+   await fs.writeFile(target,original.replace(from,to));const result=await new Promise(resolve=>{const env={...process.env,WATCH_PEER_TEST_SCRIPT:target};delete env.NODE_TEST_CONTEXT;const child=spawn(process.execPath,['--test','--test-name-pattern',pattern,path.join(here,'peer.test.mjs')],{env,stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);child.on('exit',code=>resolve({code,output}))});assert.notEqual(result.code,0,name+' mutation must fail');assert.match(result.output,expectedFailure);if(name==='timeout-classification')assert.match(result.output,/not ok \d+ - loss/);
   }finally{await fs.rm(dir,{recursive:true,force:true})}
  }
 });

@@ -300,8 +300,8 @@ async function recoverReceipts($, state) {
       if (data.acknowledged[hash]) continue;
       // Old clients acknowledged the original property order.
       if (value.kind === 'completed' && content !== JSON.stringify(value) && data.acknowledged[await fingerprint(value)]) continue;
-      const alreadyRetained = current.events.some(item => JSON.stringify(canonicalReceipt(item)) === content);
-      if (!alreadyRetained) {
+      const retainedEvent = current.events.find(item => JSON.stringify(canonicalReceipt(item)) === content);
+      if (!retainedEvent) {
         if ((current.execution_completed || current.completed) && !['answered','completed','dropped'].includes(value.kind)) continue;
         current.events.push(copy(receipt));
       }
@@ -310,6 +310,8 @@ async function recoverReceipts($, state) {
           rejection.count === previous.count && rejection.retry_at > previous.retry_at)) {
         current.rejections ??= {};
         current.rejections[hash] = copy(rejection);
+        const deferral = retainedEvent && state.transientReceiptRetries.get(retainedEvent);
+        if (deferral && rejection.count >= MAX_RECEIPT_REJECTIONS) delete deferral.first_deferred_at;
       }
     }
     if (!current.execution_completed && !current.completed && current !== state.flight && !['dropped','unknown'].includes(record.phase)) {
