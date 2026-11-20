@@ -7181,7 +7181,9 @@ function createNewChatClient(o){
     if(op.code==='unknown_saved_folder')return name+' is no longer saved in Motet.';
     return name+' could not be verified. Nothing was removed.';
   }
-  api.savedFoldersState=()=>({loaded:savedLoaded,loading:!!savedLoading,complete:savedComplete,unreadableCount:savedUnreadable,status:[removalStatus(lastRemoval),savedStatus].filter(Boolean).join(' ')+(savedNotice&&api.inventoryFresh&&folder(savedNotice.displayPath)?.id===savedNotice.id&&folder(savedNotice.displayPath)?.revision===savedNotice.revision&&folder(savedNotice.displayPath).registered!==true?' This folder is still available through a connected app. Its chats remain on the stage.':''),folders:[...saved.values()].map(f=>({...f,displayName:savedName(f),operation:removals.get(f.id)?.state||'',operationRevision:removals.get(f.id)?.revision||''}))});
+  const savedFolderRestartText='Saved project folders are unavailable. Restart Motet before trying again.';
+  const savedFolderRestart=error=>error?.checkedError===true&&error.status===503&&error.code==='saved_folders_unavailable'&&error.message===savedFolderRestartText;
+  api.savedFoldersState=()=>({loaded:savedLoaded,loading:!!savedLoading,complete:savedComplete,unreadableCount:savedUnreadable,status:[removalStatus(lastRemoval),lastRemoval?.restartAdvice?savedFolderRestartText:savedStatus].filter(Boolean).join(' ')+(savedNotice&&api.inventoryFresh&&folder(savedNotice.displayPath)?.id===savedNotice.id&&folder(savedNotice.displayPath)?.revision===savedNotice.revision&&folder(savedNotice.displayPath).registered!==true?' This folder is still available through a connected app. Its chats remain on the stage.':''),folders:[...saved.values()].map(f=>({...f,displayName:savedName(f),operation:removals.get(f.id)?.state||'',operationRevision:removals.get(f.id)?.revision||''}))});
   api.refreshSavedFolders=function({deferContext=false}={}){
     api.sync();if(savedLoading){if(deferContext)savedLoading.deferContext=true;return savedLoading.promise}const e=epoch,k=owner,ticket={version:catalog,quiet:mutations.size===0,deferContext};
     if(!valid(e,k))return Promise.resolve(false);
@@ -7194,22 +7196,23 @@ function createNewChatClient(o){
       let negative=false;if(verified&&value.complete){for(const [id,old] of saved)if(!value.savedFolders.some(f=>f.id===id)){forgetCurrent(old);saved.delete(id);negative=true}}
       for(const f of value.savedFolders){saved.set(f.id,{...f,verified});if(verified)unregistered.delete(JSON.stringify([f.displayPath,f.revision]));}
       savedLoaded=true;savedComplete=verified&&value.complete;savedUnreadable=value.unreadableCount;
-      if(!verified)savedStatus='Saved project folders changed while this list was being checked. Refresh saved folders to check.';
+      if(!verified)savedStatus='Saved project folders changed while this list was being checked. Refresh the list to check.';
       else savedStatus=value.complete?'':'Some saved folders could not be read.'+(saved.size&&[...saved.values()].every(f=>f.verified)?' The ones shown can still be removed.':'');
+      if(verified)for(const op of removals.values())op.restartAdvice=false;
       if(verified&&value.complete)for(const op of removals.values()){if(op.state==='unknown'||op.code==='unknown_saved_folder')op.reconciled=saved.has(op.id)?'present':'absent';if(op.state==='refused'&&op.code==='saved_folder_changed')op.checked=true;}
       changed();if(negative&&!ticket.deferContext)void recoverContext(e,k);return verified;
-    }).catch(()=>{if(valid(e,k)&&savedLoading===ticket&&catalog===ticket.version){savedStatus='Saved project folders are unavailable. Refresh saved folders to check.';changed()}return false}).finally(()=>{if(valid(e,k)&&savedLoading===ticket){savedLoading=null;changed()}});
+    }).catch(error=>{if(valid(e,k)&&savedLoading===ticket&&catalog===ticket.version){savedStatus=savedFolderRestart(error)?savedFolderRestartText:'Saved project folders are unavailable. Refresh the list to check.';changed()}return false}).finally(()=>{if(valid(e,k)&&savedLoading===ticket){savedLoading=null;changed()}});
     changed();return ticket.promise;
   };
   api.removeSavedFolder=async(id,revision)=>{
-    api.sync();const f=saved.get(id);if(!hex.test(id)||!hex.test(revision)||!f?.verified||f.revision!==revision||removals.get(id)?.state==='pending')throw err('Refresh saved folders before removing this folder.');
+    api.sync();const f=saved.get(id);if(!hex.test(id)||!hex.test(revision)||!f?.verified||f.revision!==revision||removals.get(id)?.state==='pending')throw err('Refresh the list before removing this folder.');
     const name=savedName(f),e=epoch,k=owner,ticket=beginMutation(),op={id,revision,name,state:'pending'};removals.set(id,op);lastRemoval=op;savedNotice=null;savedStatus='';changed();
     let receipt=null,failure=null;try{receipt=await request('folders/'+id+'/remove',{revision},e,k);if(!exact(receipt,['schemaVersion','removed'])||!exact(receipt.removed,['id','revision'])||receipt.removed.id!==id||receipt.removed.revision!==revision)throw err('The removal receipt could not be checked.');}catch(error){failure=error}
     if(!valid(e,k))return {state:'stale'};
     const alone=settleMutation(ticket);
     if(removals.get(id)!==op)return {state:'stale'};
     if(!failure){op.state='removed';const current=saved.get(id);if(alone&&current?.revision===revision){saved.delete(id);forgetCurrent(f);savedNotice=f}}
-    else{const known=failure.checkedError&&(failure.status===404&&failure.code==='unknown_saved_folder'||failure.status===409&&['saved_folder_changed','unreadable_saved_folder'].includes(failure.code));op.state=known?'refused':'unknown';op.code=known?failure.code:'';if(known&&alone&&failure.status===404&&failure.code==='unknown_saved_folder'&&saved.get(id)?.revision===revision)forgetCurrent(f);}
+    else{const known=failure.checkedError&&(failure.status===404&&failure.code==='unknown_saved_folder'||failure.status===409&&['saved_folder_changed','unreadable_saved_folder'].includes(failure.code));op.state=known?'refused':'unknown';op.code=known?failure.code:'';op.restartAdvice=savedFolderRestart(failure);if(known&&alone&&failure.status===404&&failure.code==='unknown_saved_folder'&&saved.get(id)?.revision===revision)forgetCurrent(f);}
     savedRecoveryNeeded=true;changed();await recoverCatalog(e,k);return valid(e,k)?{state:op.state,id,revision}:{state:'stale'};
   };
   api.folderChoiceEpoch=()=>uuid.test(context?.folderChoiceEpoch||'')?context.folderChoiceEpoch:'';
@@ -7747,7 +7750,7 @@ function workspaceNewChatSavedFoldersPaint(host,pane,refreshOnOpen=false){
   const view=host._savedView,current=()=>host._savedView===view&&WNC.adapter===adapter&&(typeof KEY==='undefined'||KEY===key)&&workspaceNewChatReady()&&WS.controls===controls&&controls.open===true&&!pane.hidden&&(WS.section===undefined||WS.section==='connections');
   host._saved.hidden=false;
   host._savedRefresh.onclick=async()=>{if(!current()||host._savedRefresh.disabled)return;await adapter.refreshSavedFolders();if(current())workspaceNewChatSavedFoldersPaint(host,pane)};
-  const state=adapter.savedFoldersState();host._savedRefresh.disabled=state.loading;host._savedStatus.textContent=state.status||(!state.loaded?'Refresh saved folders to check the saved list.':state.complete&&!state.folders.length?'No project folders are saved in Motet.':'');
+  const state=adapter.savedFoldersState();host._savedRefresh.disabled=state.loading;host._savedStatus.textContent=state.status||(!state.loaded?'Refresh the list to check saved folders.':state.complete&&!state.folders.length?'No project folders are saved in Motet.':'');
   const ids=new Set(state.folders.map(f=>f.id));let focusRemoved=false,focusHeading=false;
   for(const [id,row] of host._savedRows)if(!ids.has(id)){if(current()&&(row.contains(document.activeElement)||host._savedFocus?.row===row&&host._savedFocus.view===view&&document.activeElement===document.body)){focusRemoved=true;focusHeading=!!host._savedFocus?.nonSuccess}if(host._savedFocus?.row===row)host._savedFocus=null;row.remove();host._savedRows.delete(id);if(host._savedConfirm?.id===id)host._savedConfirm=null;}
   let position=0;for(const f of state.folders){
