@@ -485,7 +485,8 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         self.assertEqual(self.status(selection, intent)['observation']['request']['reply'], {'state':'available', 'text':ANSWER})
 
     def test_real_status_and_history_are_read_only_while_terminal_mirror_lags(self):
-        runtime = self.start()
+        runtime = self.start(manual_maintenance=True)
+        self.assertIsInstance(runtime._worker, ManualWorker)
         session = self.register()
         selection = self.selection()
         intent = self.prepare(selection)
@@ -495,7 +496,7 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         turn = uid()
         event = dict(turn_id=turn, outcome='answered', event_id=uid(), occurred_at=4000,
                      answer='WATCH_REPLY ' + claim['request_id'] + '\n' + ANSWER)
-        with patch.object(runtime, 'native_checkpoint', None), patch.object(self.comp.mirror, 'reconcile',
+        with patch.object(self.comp.mirror, 'reconcile',
                  side_effect=AttachmentError('mirror_unavailable', 'Fictional mirror outage.', 503)) as failed:
             self.event(session, claim, 'completed', **event)
             self.assertEqual(failed.call_count, 1)
@@ -504,12 +505,10 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
             self.assertNotIn(ANSWER, json.dumps(self.attach('GET', '/native/requests?' + urlencode(self.context(selection)))))
             self.assertEqual((self.messaging.db.total_changes, self.attachments.store.db.total_changes), before)
             self.assertEqual(failed.call_count, 1)
-        deadline = time.monotonic() + 4
-        while time.monotonic() < deadline:
-            current = self.status(selection, intent)['observation']['request']
-            if current['reply']['state'] == 'available':
-                break
-            time.sleep(.05)
+        # Recovery is an explicit maintenance step, outside the read-only
+        # measurement above, rather than a race with a background checkpoint.
+        runtime.checkpoint()
+        current = self.status(selection, intent)['observation']['request']
         self.assertEqual(current['reply'], {'state': 'available', 'text': ANSWER})
         self.assertIsNone(self.poll(session))
 

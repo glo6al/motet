@@ -48,6 +48,8 @@ def handle_http(handler, service, owner_key, port):
                 raise NewChatError('invalid_request', 'GET requests cannot contain a body.', 400)
             if route == '/api/new-chat/context':
                 return reply(200, service.context())
+            if route == '/api/new-chat/folders':
+                return reply(200, service.saved_folders())
             match = re.fullmatch(r'/api/new-chat/folders/choose/([0-9a-f-]{36})', route)
             if match:
                 return reply(200, service.folder_choice_status(match[1]))
@@ -107,6 +109,9 @@ def handle_http(handler, service, owner_key, port):
                 raise ValueError()
         except (ValueError, UnicodeError, OSError, RecursionError):
             raise NewChatError('invalid_request', 'Invalid JSON request body.', 400) from None
+        match = re.fullmatch(r'/api/new-chat/folders/([0-9a-f]{64})/remove', route)
+        if match:
+            return reply(200, service.remove_saved_folder(match[1], data))
         if route == '/api/new-chat/folders/choose':
             forwarded = any(name.lower().startswith('x-forwarded-') or name.lower() in
                             ('forwarded', 'x-real-ip', 'via', 'cf-connecting-ip', 'true-client-ip',

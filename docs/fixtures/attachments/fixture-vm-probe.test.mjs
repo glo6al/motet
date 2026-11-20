@@ -52,6 +52,32 @@ test('ambient worker-looking environment and arguments cannot bypass supervision
   }
 });
 
+test('the initial watchdog kills and reaps a loop that never reports entry', {timeout: 20_000}, async () => {
+  let child, cleanupFired = false;
+  const cleanup = setTimeout(() => {
+    cleanupFired = true;
+    child?.kill('SIGKILL');
+  }, 10_000);
+  try {
+    await assert.rejects(supervisedVmProbe('while (true) {}', {}, {
+      onWorker(worker) { child = worker; },
+      defaultWatchdogMs: 100,
+    }), error => {
+      assert.equal(error.workerPid, child.pid);
+      assertReaped(error);
+      assert.equal(cleanupFired, false, 'the initial helper watchdog must kill the loop first');
+      assert.match(error.message, /Fixture VM watchdog expired/);
+      return true;
+    });
+  } finally {
+    clearTimeout(cleanup);
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+      await new Promise(resolve => child.once('close', resolve));
+    }
+  }
+});
+
 test('a synchronous infinite loop is killed and reaped by the external watchdog', {timeout: 20_000}, async () => {
   let child, entered = false, cleanupFired = false;
   // Independent cleanup still kills/reaps the child if the helper's timer is

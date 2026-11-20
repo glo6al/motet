@@ -120,6 +120,7 @@ We would rather name the gaps than let you find them.
 
 A chat has to qualify before Motet will send to it. When something isn't available, the button is off and says why. Steering is verified on one build of the Codex app; New chat and sending files on another. With one installed you get one group. Sending files also needs SQLite 3.45 or newer in the Python that runs Motet. The conditions are in [What works with what](docs/PROVIDER_SUPPORT.md). Use **Add project folder** on the Mac running Motet to choose a folder in the Mac's own folder window; adding one never starts a chat.
 
+- **Remove a saved project folder.** In Settings → Connections → Project folders, remove a folder you added to Motet. Motet forgets it; the folder itself and its chats are untouched. If a connected app still knows the folder, it stays available.
 - **A roomier message box.** On the desktop stage, quick questions sit above the box and one small arrow opens the conversation. At every stage width, the recipient stays at the top, your words have a full-width row of their own, and the model choice, microphone and Send sit underneath at the right. The model choice hides while you dictate.
 - **Optional local dictation.** A separate local helper and English model enable the microphone beside Send; typing works without them. See [local dictation](docs/DICTATION.md). The helper must be installed and enabled; page checks used generated audio plus an earlier real-microphone proof, and the native engine is verified only on Apple Silicon macOS.
 
@@ -134,7 +135,6 @@ A chat has to qualify before Motet will send to it. When something isn't availab
 
 **Designed, not built yet**
 
-- **Remove a project folder you added.** Today a folder you add to New chat stays saved; removing it from Motet, without touching the folder itself, comes next.
 - **Dictation on more devices.** Local desktop dictation is optional; phone capture and broader native-platform support need further work.
 - **A live browser at the desk.** A real page you will open and operate yourself beside an agent's conversation, kept apart from the record of the pages its tools fetched.
 - **Permission requests at phone width.** The same request cards on a phone-sized screen. Today a request can only be answered on the computer that runs Motet; answering from another device has to be proven safe first.

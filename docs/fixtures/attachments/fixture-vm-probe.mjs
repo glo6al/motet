@@ -19,9 +19,11 @@ export function supervisedVmProbe(source, sandbox = {}, observation = {}) {
       failure ||= error;
       child.kill('SIGKILL');
     };
-    let timer = setTimeout(() => stop(new Error('Fixture VM watchdog expired')), WATCHDOG_MS);
-    // Contract tests can observe/reap the real child independently. A shorter
-    // negative-test deadline starts only after code reports entry into its loop.
+    const defaultWatchdogMs = Number.isInteger(observation.defaultWatchdogMs) && observation.defaultWatchdogMs > 0
+      ? observation.defaultWatchdogMs : WATCHDOG_MS;
+    let timer = setTimeout(() => stop(new Error('Fixture VM watchdog expired')), defaultWatchdogMs);
+    // Contract tests can observe/reap the real child independently and shorten
+    // either the initial watchdog or the timer installed after loop entry.
     try { observation.onWorker?.(child); } catch (error) { stop(error); }
     const capture = chunk => {
       outputBytes += chunk.length;
