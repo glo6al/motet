@@ -9,6 +9,7 @@ import json
 import os
 import peer_bridge
 import peer_lifecycle
+import peer_progress
 import secrets
 import time
 import uuid
@@ -142,6 +143,7 @@ class ClaudeMod:
     def put(self, row):
         peer_lifecycle.reconcile(self.db, row)
         self.db.execute('INSERT OR REPLACE INTO requests VALUES (?,?)', (row['request_id'], json.dumps(row)))
+        peer_progress.ensure(self.store, row)
 
     def uncertain(self, enrollment, reason):
         for row in self.rows():
@@ -605,6 +607,7 @@ class ClaudeMod:
                 claim = dict(request_id=row['request_id'], attempt_id=attempt, native_id=entry['agent'][2:], generation=entry['generation'], envelope=row['envelope'], expires_at=row['created']+TTL, lifecycle_protocol=entry['lifecycle_protocol'])
                 if row.get('origin') == 'peer':
                     claim['origin'] = 'peer'
+                    peer_progress.observe(self.store, row, 'claim_issued')
                 break
         return dict(version=1, native_id=entry['agent'][2:], generation=entry['generation'], peer_protocol=entry['peer_protocol'], reply_notice_protocol=entry['reply_notice_protocol'], lifecycle_protocol=entry['lifecycle_protocol'], supported_lifecycle_protocol=2, peer_envelope_limit=entry['peer_envelope_limit'], supported_peer_envelope_limit=100000, claim=claim, requests=self.statuses(entry), recoverable_turns=self.recoverable_turns(entry))
 
@@ -705,6 +708,8 @@ class ClaudeMod:
             raise ReceiptError(409, 'A different Claude reply was already recorded.')
         before = lifecycle['execution'] if lifecycle else row.get('execution_outcome', row['state'])
         terminal = row.get('settled') or lifecycle and lifecycle['execution'] in peer_lifecycle.TERMINAL
+        fresh_end = kind in ('answered', 'completed') and not terminal
+        fresh_start = False
         withheld = row.get('capture_disposition') == 'withheld' or lifecycle and lifecycle['capture'] == 'withheld'
         fingerprint = ''
         if kind in ('answered', 'completed') and (row.get('execution_outcome') == 'dropped'
@@ -718,6 +723,7 @@ class ClaudeMod:
             if prior and (prior[0] != row['request_id'] or prior[1] != fingerprint):
                 raise ReceiptError(409, 'Claude completion event conflicts with its original receipt.')
             evidence = lifecycle['evidence'] if lifecycle else row
+            fresh_end = fresh_end and prior is None and not (evidence.get('completion_event_id') or evidence.get('answer_event_id'))
             for prefix in ('completion', 'answer'):
                 if evidence.get(prefix+'_event_id') == data['event_id'] and evidence.get(prefix+'_fingerprint') != fingerprint:
                     raise ReceiptError(409, 'Claude completion event conflicts with its retained acknowledgment.')
@@ -742,6 +748,7 @@ class ClaudeMod:
                                   'The turn completed, but no usable reply was retained. The execution slot is released.'))
         elif not terminal and row['state'] != 'answered':
             if kind == 'started' and row['state'] != 'failed':
+                fresh_start = not (row.get('mod_turn') or durable_turn)
                 row.update(state='awaiting_reply', mod_turn=turn, error='')
             elif kind == 'dropped' and (self.peer_row(row) or row['state'] not in ('awaiting_reply', 'expired')):
                 row.update(state='failed', execution_outcome='dropped', settled=True,
@@ -755,6 +762,9 @@ class ClaudeMod:
             peer_lifecycle.reconcile(self.db, row)
         else:
             self.put(row)
+            if fresh_start or fresh_end:
+                peer_progress.observe(self.store, row, 'started' if fresh_start else 'ended')
+                peer_progress.observe(self.store, row, 'checked')
         after = peer_lifecycle.get(self.db, row['request_id'])
         peer_lifecycle.record_event(self.db, row['request_id'], kind, outcome, before,
                                     after['execution'] if after else row.get('execution_outcome', row['state']),
