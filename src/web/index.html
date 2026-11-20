@@ -888,6 +888,7 @@ html.workspace #workspaceNewChatDialog .workspace-nc-recover{border:1px solid #c
 #workspaceNewChatSettings .workspace-nc-saved-path>span{display:flex;flex-direction:column;gap:4px;min-width:0}
 #workspaceNewChatSettings .workspace-nc-saved-path code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 #workspaceNewChatSettings .workspace-nc-remove{border:0;background:none;color:var(--ws-mute);font:inherit;font-size:13px;padding:6px;cursor:pointer;flex:none}
+#workspaceNewChatSettings .workspace-nc-heading button.workspace-nc-saved-refresh{border:0;background:none;box-shadow:none;color:var(--ws-mute);font:13px system-ui;padding:6px;cursor:pointer}
 #workspaceNewChatSettings .workspace-nc-confirm{margin-top:8px}
 #workspaceNewChatSettings .workspace-nc-confirm button{border:1px solid #c9c6be;border-radius:9px;background:#fff;color:var(--ws-ink);font:inherit;font-size:13px;padding:7px 10px;margin:2px 8px 2px 0;cursor:pointer}
 #workspaceNewChatSettings .workspace-nc-saved-row button:disabled{opacity:.5;cursor:default}
@@ -7125,7 +7126,7 @@ function createAttachmentsClient(o={}){
 function createNewChatClient(o){
   const base='/api/new-chat/',uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   let owner='',epoch=0,context=null,scope='',timer=0,active=null,busy=false,loading=null,recovered=false,projects=null,refreshTimer=null,launchEpoch=0;
-  let catalog=0,savedLoading=null,savedLoaded=false,savedComplete=false,savedUnreadable=0,savedStatus='',savedNotice=null;
+  let catalog=0,savedLoading=null,savedLoaded=false,savedComplete=false,savedUnreadable=0,savedStatus='',savedNotice=null,lastRemoval=null,recoveryJob=null,savedRecoveryNeeded=false;
   const mutations=new Set(),saved=new Map(),removals=new Map(),choices=new Map(),unregistered=new Set(),hex=/^[0-9a-f]{64}$/;
   const api={production:true,apps:{},host:null,waitMs:120000,answerMs:30000,managedPermissionTimeoutSeconds:null,inventoryFresh:false,inventoryReason:''};
   const valid=(e,k)=>e===epoch&&k===owner&&o.auth()===k&&!!k;
@@ -7149,7 +7150,7 @@ function createNewChatClient(o){
   }
   function clearStored(){if(scope)try{o.storage.removeItem(scope)}catch(_){}}
   function halt(){o.clearTimeout(timer);timer=0;}
-  function reset(){epoch++;launchEpoch++;halt();if(refreshTimer!==null)o.clearTimeout(refreshTimer);refreshTimer=null;projects=null;clearStored();active=null;context=null;scope='';busy=false;loading=null;recovered=false;owner='';catalog++;savedLoading=null;savedLoaded=false;savedComplete=false;savedUnreadable=0;savedStatus='';savedNotice=null;mutations.clear();saved.clear();removals.clear();choices.clear();unregistered.clear();api.apps={};api.host=null;api.inventoryFresh=false;api.inventoryReason='';api.managedPermissionTimeoutSeconds=null;if(o.authChanged)o.authChanged();}
+  function reset(){epoch++;launchEpoch++;halt();if(refreshTimer!==null)o.clearTimeout(refreshTimer);refreshTimer=null;projects=null;clearStored();active=null;context=null;scope='';busy=false;loading=null;recovered=false;owner='';catalog++;savedLoading=null;savedLoaded=false;savedComplete=false;savedUnreadable=0;savedStatus='';savedNotice=null;lastRemoval=null;recoveryJob=null;savedRecoveryNeeded=false;mutations.clear();saved.clear();removals.clear();choices.clear();unregistered.clear();api.apps={};api.host=null;api.inventoryFresh=false;api.inventoryReason='';api.managedPermissionTimeoutSeconds=null;if(o.authChanged)o.authChanged();}
   function folder(path){const matches=context?.folders.filter(f=>f.displayPath===path)||[];return matches.length===1?matches[0]:null;}
   const validFolder=f=>f&&typeof f.id==='string'&&!!f.id&&typeof f.revision==='string'&&!!f.revision&&typeof f.displayPath==='string'&&!!f.displayPath&&typeof f.label==='string'&&!!f.label&&(f.registered===undefined||typeof f.registered==='boolean');
   api.hasFolder=path=>!!folder(path);
@@ -7159,41 +7160,57 @@ function createNewChatClient(o){
   api.knownUnregistered=(path,revision)=>unregistered.has(JSON.stringify([path,revision]));
   const exact=(value,keys)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).sort().join(',')===[...keys].sort().join(',');
   const savedFolder=f=>exact(f,['id','revision','label','displayPath'])&&hex.test(f.id)&&hex.test(f.revision)&&typeof f.label==='string'&&!!f.label&&typeof f.displayPath==='string'&&!!f.displayPath;
-  function invalidateCatalog(){catalog++;loading=null;savedLoading=null;api.inventoryFresh=false;api.inventoryReason='Checking New chat availability…';savedComplete=false;for(const f of saved.values())f.verified=false;}
+  function invalidateCatalog(){catalog++;loading=null;savedLoading=null;recoveryJob=null;api.inventoryFresh=false;api.inventoryReason='Checking New chat availability…';savedComplete=false;for(const f of saved.values())f.verified=false;}
   function beginMutation(){invalidateCatalog();const ticket={version:catalog};mutations.add(ticket);changed();return ticket;}
   function settleMutation(ticket){const alone=mutations.has(ticket)&&catalog===ticket.version&&mutations.size===1;mutations.delete(ticket);invalidateCatalog();return alone;}
+  function recoverContext(e,k){return valid(e,k)&&!mutations.size?load():Promise.resolve(false);}
+  function recoverCatalog(e,k){
+    if(!valid(e,k)||mutations.size)return Promise.resolve(false);if(recoveryJob)return recoveryJob.promise;
+    const job={};recoveryJob=job;const list=savedRecoveryNeeded;savedRecoveryNeeded=false;
+    job.promise=Promise.resolve(list?api.refreshSavedFolders({deferContext:true}):true).then(()=>valid(e,k)&&recoveryJob===job&&!mutations.size?recoverContext(e,k):false).finally(()=>{if(recoveryJob===job)recoveryJob=null});return job.promise;
+  }
   function forgetCurrent(f){catalog++;loading=null;unregistered.add(JSON.stringify([f.displayPath,f.revision]));if(context)context={...context,folders:context.folders.filter(x=>x.id!==f.id||x.revision!==f.revision||x.registered!==true)};}
-  const unknownRemoval='Motet could not confirm whether this folder was removed. Refresh saved folders to check. Nothing will be removed again automatically.';
-  api.savedFoldersState=()=>({loaded:savedLoaded,loading:!!savedLoading,complete:savedComplete,unreadableCount:savedUnreadable,status:savedStatus+(savedNotice&&api.inventoryFresh&&folder(savedNotice.displayPath)&&folder(savedNotice.displayPath).registered!==true?' This folder is still available through a connected app. Its chats remain on the stage.':''),folders:[...saved.values()].map(f=>({...f,operation:removals.get(f.id)?.state||'',operationRevision:removals.get(f.id)?.revision||''}))});
-  api.refreshSavedFolders=function(){
-    api.sync();if(savedLoading)return savedLoading.promise;const e=epoch,k=owner,ticket={version:catalog,quiet:mutations.size===0};
+  function savedName(f){const peers=[...saved.values()].filter(x=>x.id!==f.id&&x.label===f.label);if(!peers.length)return f.label;const parts=p=>p.split('/').filter(Boolean),own=parts(f.displayPath);let n=1;while(n<own.length&&peers.some(x=>parts(x.displayPath).slice(-n).join('/')===own.slice(-n).join('/')))n++;return f.label+' ('+own.slice(-n).join('/')+')';}
+  function removalStatus(op){
+    if(!op)return '';const name=op.name;
+    if(op.state==='pending')return 'Removing '+name+' from Motet’s saved project folders…';
+    if(op.state==='removed')return 'Removed '+name+' from Motet’s saved project folders. The folder itself was not touched.';
+    if(op.reconciled)return name+(op.reconciled==='present'?' is still saved in Motet.':' is no longer saved in Motet.');
+    if(op.state==='unknown')return 'Motet could not confirm whether '+name+' was removed. Nothing will be removed again automatically.';
+    if(op.code==='saved_folder_changed')return name+' changed since this list was loaded, so nothing was removed.'+(op.checked?' The list is now up to date.':'');
+    if(op.code==='unknown_saved_folder')return name+' is no longer saved in Motet.';
+    return name+' could not be verified. Nothing was removed.';
+  }
+  api.savedFoldersState=()=>({loaded:savedLoaded,loading:!!savedLoading,complete:savedComplete,unreadableCount:savedUnreadable,status:[removalStatus(lastRemoval),savedStatus].filter(Boolean).join(' ')+(savedNotice&&api.inventoryFresh&&folder(savedNotice.displayPath)?.id===savedNotice.id&&folder(savedNotice.displayPath)?.revision===savedNotice.revision&&folder(savedNotice.displayPath).registered!==true?' This folder is still available through a connected app. Its chats remain on the stage.':''),folders:[...saved.values()].map(f=>({...f,displayName:savedName(f),operation:removals.get(f.id)?.state||'',operationRevision:removals.get(f.id)?.revision||''}))});
+  api.refreshSavedFolders=function({deferContext=false}={}){
+    api.sync();if(savedLoading){if(deferContext)savedLoading.deferContext=true;return savedLoading.promise}const e=epoch,k=owner,ticket={version:catalog,quiet:mutations.size===0,deferContext};
     if(!valid(e,k))return Promise.resolve(false);
-    savedComplete=false;for(const f of saved.values())f.verified=false;savedStatus='Checking saved project folders…';savedNotice=null;savedLoading=ticket;
+    savedComplete=false;for(const f of saved.values())f.verified=false;savedStatus=lastRemoval?'':'Checking saved project folders…';savedLoading=ticket;
     ticket.promise=Promise.resolve().then(async()=>{
       const value=await request('folders',undefined,e,k);
       if(!exact(value,['schemaVersion','savedFolders','complete','unreadableCount'])||!Array.isArray(value.savedFolders)||!value.savedFolders.every(savedFolder)||!Number.isSafeInteger(value.unreadableCount)||value.unreadableCount<0||typeof value.complete!=='boolean'||value.complete!==(value.unreadableCount===0)||new Set(value.savedFolders.map(f=>f.id)).size!==value.savedFolders.length||new Set(value.savedFolders.map(f=>f.displayPath)).size!==value.savedFolders.length)throw err('Saved project folders could not be checked.');
       if(!valid(e,k)||savedLoading!==ticket||catalog!==ticket.version)return false;
       const verified=ticket.quiet&&mutations.size===0;
-      if(verified&&value.complete){for(const [id,old] of saved)if(!value.savedFolders.some(f=>f.id===id)){if(removals.has(id))savedStatus='This folder is no longer saved in Motet.';forgetCurrent(old);saved.delete(id)}}
-      for(const f of value.savedFolders){saved.set(f.id,{...f,verified});if(verified&&unregistered.has(JSON.stringify([f.displayPath,f.revision]))&&context?.folders.some(x=>x.id===f.id&&x.revision===f.revision&&x.registered===true))unregistered.delete(JSON.stringify([f.displayPath,f.revision]));}
+      let negative=false;if(verified&&value.complete){for(const [id,old] of saved)if(!value.savedFolders.some(f=>f.id===id)){forgetCurrent(old);saved.delete(id);negative=true}}
+      for(const f of value.savedFolders){saved.set(f.id,{...f,verified});if(verified)unregistered.delete(JSON.stringify([f.displayPath,f.revision]));}
       savedLoaded=true;savedComplete=verified&&value.complete;savedUnreadable=value.unreadableCount;
       if(!verified)savedStatus='Saved project folders changed while this list was being checked. Refresh saved folders to check.';
-      else if([...removals.values()].some(op=>op.state==='unknown'&&saved.has(op.id)))savedStatus=unknownRemoval;
-      else if(savedStatus!=='This folder is no longer saved in Motet.')savedStatus=value.complete?'':'Some saved project folders could not be read. Only verified rows can be removed.';
-      changed();return verified;
+      else savedStatus=value.complete?'':'Some saved folders could not be read.'+(saved.size&&[...saved.values()].every(f=>f.verified)?' The ones shown can still be removed.':'');
+      if(verified&&value.complete)for(const op of removals.values()){if(op.state==='unknown'||op.code==='unknown_saved_folder')op.reconciled=saved.has(op.id)?'present':'absent';if(op.state==='refused'&&op.code==='saved_folder_changed')op.checked=true;}
+      changed();if(negative&&!ticket.deferContext)void recoverContext(e,k);return verified;
     }).catch(()=>{if(valid(e,k)&&savedLoading===ticket&&catalog===ticket.version){savedStatus='Saved project folders are unavailable. Refresh saved folders to check.';changed()}return false}).finally(()=>{if(valid(e,k)&&savedLoading===ticket){savedLoading=null;changed()}});
     changed();return ticket.promise;
   };
   api.removeSavedFolder=async(id,revision)=>{
     api.sync();const f=saved.get(id);if(!hex.test(id)||!hex.test(revision)||!f?.verified||f.revision!==revision||removals.get(id)?.state==='pending')throw err('Refresh saved folders before removing this folder.');
-    const e=epoch,k=owner,ticket=beginMutation(),op={id,revision,state:'pending'};removals.set(id,op);savedNotice=null;savedStatus='Removing '+f.label+' from Motet’s saved project folders…';changed();
+    const name=savedName(f),e=epoch,k=owner,ticket=beginMutation(),op={id,revision,name,state:'pending'};removals.set(id,op);lastRemoval=op;savedNotice=null;savedStatus='';changed();
     let receipt=null,failure=null;try{receipt=await request('folders/'+id+'/remove',{revision},e,k);if(!exact(receipt,['schemaVersion','removed'])||!exact(receipt.removed,['id','revision'])||receipt.removed.id!==id||receipt.removed.revision!==revision)throw err('The removal receipt could not be checked.');}catch(error){failure=error}
     if(!valid(e,k))return {state:'stale'};
     const alone=settleMutation(ticket);
     if(removals.get(id)!==op)return {state:'stale'};
-    if(!failure){op.state='removed';const current=saved.get(id);if(alone&&current?.revision===revision){saved.delete(id);forgetCurrent(f);savedNotice=f}savedStatus='Removed '+f.label+' from Motet’s saved project folders. The folder itself was not touched.'+(alone?'':' Refresh saved folders to check the current list.');}
-    else{const known=failure.checkedError&&(failure.status===404&&failure.code==='unknown_saved_folder'||failure.status===409&&['saved_folder_changed','unreadable_saved_folder'].includes(failure.code));op.state=known?'refused':'unknown';if(known&&alone&&failure.status===404&&failure.code==='unknown_saved_folder'&&saved.get(id)?.revision===revision)forgetCurrent(f);savedStatus=known?({unknown_saved_folder:'This folder is no longer saved in Motet.',saved_folder_changed:'This saved project folder changed. Refresh saved folders before removing it.',unreadable_saved_folder:'This saved project folder could not be verified. Nothing was removed.'}[failure.code]):unknownRemoval;}
-    changed();void load();return {state:op.state,id,revision};
+    if(!failure){op.state='removed';const current=saved.get(id);if(alone&&current?.revision===revision){saved.delete(id);forgetCurrent(f);savedNotice=f}}
+    else{const known=failure.checkedError&&(failure.status===404&&failure.code==='unknown_saved_folder'||failure.status===409&&['saved_folder_changed','unreadable_saved_folder'].includes(failure.code));op.state=known?'refused':'unknown';op.code=known?failure.code:'';if(known&&alone&&failure.status===404&&failure.code==='unknown_saved_folder'&&saved.get(id)?.revision===revision)forgetCurrent(f);}
+    savedRecoveryNeeded=true;changed();await recoverCatalog(e,k);return valid(e,k)?{state:op.state,id,revision}:{state:'stale'};
   };
   api.folderChoiceEpoch=()=>uuid.test(context?.folderChoiceEpoch||'')?context.folderChoiceEpoch:'';
   api.canChooseFolders=()=>context?.canChooseFolders===true&&!!api.folderChoiceEpoch();
@@ -7295,20 +7312,20 @@ function createNewChatClient(o){
   api.folderChoiceStatus=async(id,choiceEpoch=api.folderChoiceEpoch())=>{const e=epoch,k=owner;return savedChoice(await choiceRequest(id,'',undefined,choiceEpoch),e,k)};
   api.cancelFolderChoice=(id,choiceEpoch)=>choiceRequest(id,'/cancel',{epoch:choiceEpoch},choiceEpoch);
   api.folderChoiceCurrent=(id,f)=>{const choice=choices.get(id),current=folder(f.displayPath);return !!(choice?.accepted&&choice.fence===catalog&&!mutations.size&&api.inventoryFresh&&current?.registered===true&&current.id===f.id&&current.revision===f.revision)};
-  async function savedChoice(value,e,k){
+  async function savedChoice(value,e,k,recovery=null){
     if(value.state!=='saved')return value;
-    if(loading)await loading.promise;
+    if(!recovery&&loading)await loading.promise;
     if(!valid(e,k))throw err('Owner authentication changed.');
-    const refreshed=await load();
+    const refreshed=await (recovery||recoverContext(e,k));
     if(!valid(e,k))throw err('Owner authentication changed.');
     return {...value,folder:{...value.folder,availabilityChecked:refreshed===true&&api.folderChoiceCurrent(value.requestId,value.folder)}};
   }
   api.acceptFolderChoice=async(id,token,choiceEpoch=api.folderChoiceEpoch())=>{
     if(!uuid.test(token||''))throw err('The folder selection could not be checked.');
     const e=epoch,k=owner,choice=choices.get(id);if(choice?.accepted)throw err('This folder selection was already submitted. Check its status instead.');
-    if(choice)choice.accepted=true;const ticket=beginMutation();let value;
-    try{value=await choiceRequest(id,'/accept',{selectionToken:token},choiceEpoch)}finally{if(valid(e,k)){const alone=settleMutation(ticket);if(choice)choice.fence=alone?catalog:-1;changed()}}
-    return savedChoice(value,e,k);
+    if(choice)choice.accepted=true;const ticket=beginMutation();let value,recovery;
+    try{value=await choiceRequest(id,'/accept',{selectionToken:token},choiceEpoch)}finally{if(valid(e,k)){const alone=settleMutation(ticket);if(choice)choice.fence=alone?catalog:-1;recovery=recoverCatalog(e,k);changed()}}
+    return savedChoice(value,e,k,recovery);
   };
 
 
@@ -7718,7 +7735,7 @@ function workspaceNewChatSavedFoldersPaint(host,pane,refreshOnOpen=false){
   const adapter=WNC.adapter,key=typeof KEY==='undefined'?null:KEY,controls=WS.controls;
   if(!adapter?.savedFoldersState){if(host._saved)host._saved.hidden=true;return}
   if(!host._saved){
-    const section=wncEl('div',''),heading=wncEl('div','workspace-nc-heading'),title=wncEl('h4','','Project folders'),refresh=wncEl('button','','Refresh saved folders'),status=wncEl('p','',''),rows=wncEl('div','');
+    const section=wncEl('div',''),heading=wncEl('div','workspace-nc-heading'),title=wncEl('h4','','Project folders'),refresh=wncEl('button','workspace-nc-saved-refresh','Refresh'),status=wncEl('p','',''),rows=wncEl('div','');
     title.tabIndex=-1;refresh.type='button';status.setAttribute('role','status');section.id='workspaceSavedProjectFolders';heading.append(title,refresh);section.append(heading,wncEl('p','','Saved in Motet. Removing a saved folder does not touch the folder itself or its chats.'),status,rows);host.append(section);
     Object.assign(host,{_saved:section,_savedTitle:title,_savedRefresh:refresh,_savedStatus:status,_savedRowsHost:rows,_savedRows:new Map()});
     controls.addEventListener?.('close',()=>{host._savedView=null;host._savedConfirm=null;host._savedFocus=null});
@@ -7731,18 +7748,19 @@ function workspaceNewChatSavedFoldersPaint(host,pane,refreshOnOpen=false){
   host._saved.hidden=false;
   host._savedRefresh.onclick=async()=>{if(!current()||host._savedRefresh.disabled)return;await adapter.refreshSavedFolders();if(current())workspaceNewChatSavedFoldersPaint(host,pane)};
   const state=adapter.savedFoldersState();host._savedRefresh.disabled=state.loading;host._savedStatus.textContent=state.status||(!state.loaded?'Refresh saved folders to check the saved list.':state.complete&&!state.folders.length?'No project folders are saved in Motet.':'');
-  const ids=new Set(state.folders.map(f=>f.id));let focusRemoved=false;
-  for(const [id,row] of host._savedRows)if(!ids.has(id)){if(current()&&(row.contains(document.activeElement)||host._savedFocus?.row===row&&host._savedFocus.view===view&&document.activeElement===document.body))focusRemoved=true;if(host._savedFocus?.row===row)host._savedFocus=null;row.remove();host._savedRows.delete(id);if(host._savedConfirm?.id===id)host._savedConfirm=null;}
+  const ids=new Set(state.folders.map(f=>f.id));let focusRemoved=false,focusHeading=false;
+  for(const [id,row] of host._savedRows)if(!ids.has(id)){if(current()&&(row.contains(document.activeElement)||host._savedFocus?.row===row&&host._savedFocus.view===view&&document.activeElement===document.body)){focusRemoved=true;focusHeading=!!host._savedFocus?.nonSuccess}if(host._savedFocus?.row===row)host._savedFocus=null;row.remove();host._savedRows.delete(id);if(host._savedConfirm?.id===id)host._savedConfirm=null;}
   let position=0;for(const f of state.folders){
     let row=host._savedRows.get(f.id);if(!row){row=wncEl('div','workspace-nc-saved-row');row.dataset.savedFolderId=f.id;host._savedRows.set(f.id,row)}
-    if(host._savedFocus?.row===row&&host._savedFocus.revision!==f.revision)host._savedFocus=null;
+    if(host._savedFocus?.row===row&&host._savedFocus.revision!==f.revision){if(current()&&host._savedFocus.view===view&&(row.contains(document.activeElement)||document.activeElement===document.body)){focusRemoved=true;focusHeading=true}host._savedFocus=null;}
+    if(host._savedFocus?.row===row&&['unknown','refused'].includes(f.operation))host._savedFocus.nonSuccess=true;
     const confirmation=host._savedConfirm,confirming=confirmation?.view===view&&confirmation.id===f.id&&confirmation.revision===f.revision;
     if(confirmation?.id===f.id&&confirmation.revision!==f.revision)host._savedConfirm=null;
-    const sig=JSON.stringify([f.id,f.revision,f.label,f.displayPath,confirming]);
+    const name=f.displayName||f.label,sig=JSON.stringify([f.id,f.revision,name,f.displayPath,confirming]);
     if(row._savedSig!==sig){
-      row._savedSig=sig;row.textContent='';const path=wncEl('div','workspace-nc-saved-path'),name=wncEl('span','');name.append(wncEl('b','',f.label),wncPath(f.displayPath));path.append(name);row.append(path);
+      row._savedSig=sig;row.textContent='';const path=wncEl('div','workspace-nc-saved-path'),where=wncEl('span','');where.append(wncEl('b','',name),wncPath(f.displayPath));path.append(where);row.append(path);
       if(confirming){
-        const confirm=wncEl('div','workspace-nc-confirm'),cancel=wncEl('button','','Cancel'),remove=wncEl('button','','Remove');cancel.type=remove.type='button';remove.setAttribute('data-saved-confirm','');cancel.setAttribute('data-saved-cancel','');confirm.append(wncEl('p','','Remove '+f.label+' from Motet? The folder itself is not touched.'),cancel,remove);row.append(confirm);
+        const confirm=wncEl('div','workspace-nc-confirm'),cancel=wncEl('button','','Cancel'),remove=wncEl('button','','Remove');cancel.type=remove.type='button';remove.setAttribute('data-saved-confirm','');cancel.setAttribute('data-saved-cancel','');confirm.append(wncEl('p','','Remove '+name+' from Motet? The folder itself is not touched.'),cancel,remove);row.append(confirm);
         cancel.onclick=()=>{if(!current()||host._savedConfirm!==confirmation||confirmation.pending)return;host._savedConfirm=null;workspaceNewChatSavedFoldersPaint(host,pane);row.querySelector('[data-saved-remove]')?.focus()};
         remove.onclick=async()=>{
           if(!current()||host._savedConfirm!==confirmation||confirmation.pending)return;
@@ -7750,7 +7768,8 @@ function workspaceNewChatSavedFoldersPaint(host,pane,refreshOnOpen=false){
           if(row.contains(document.activeElement))host._savedFocus={row,view,revision:f.revision};confirmation.pending=true;remove.disabled=true;cancel.disabled=true;
           try{await adapter.removeSavedFolder(f.id,f.revision)}catch(_){}
           if(!current()||host._savedConfirm!==confirmation)return;
-          host._savedConfirm=null;workspaceNewChatSavedFoldersPaint(host,pane);if(host._savedFocus?.row===row)host._savedFocus=null;
+          const owned=host._savedFocus?.row===row&&host._savedFocus.view===view&&(row.contains(document.activeElement)||document.activeElement===document.body);
+          host._savedConfirm=null;workspaceNewChatSavedFoldersPaint(host,pane);if(owned&&current()){const next=row.querySelector('[data-saved-remove]');(next&&!next.disabled&&next.getClientRects().length?next:host._savedTitle).focus()}if(host._savedFocus?.row===row)host._savedFocus=null;
         };
       }else{
         const remove=wncEl('button','workspace-nc-remove','Remove');remove.type='button';remove.setAttribute('data-saved-remove','');path.append(remove);
@@ -7760,10 +7779,10 @@ function workspaceNewChatSavedFoldersPaint(host,pane,refreshOnOpen=false){
     }
     for(const b of row.querySelectorAll('button'))b.disabled=f.operation==='pending'||!!(confirming&&confirmation.pending)||!f.verified&&!b.hasAttribute('data-saved-cancel');
     const native=adapter.inventoryFresh===true&&adapter.hasFolder?.(f.displayPath)&&adapter.isRegistered?.(f.displayPath)===false;
-    row.querySelector('[data-saved-note]').textContent=!f.verified?'Refresh saved folders to verify this row before removing it.':native?'This folder is also available through a connected app. Removing its saved registration will not hide its chats.':'';
+    row.querySelector('[data-saved-note]').textContent=!f.verified?'Refresh the list before removing this one.':native?'This folder is also available through a connected app. Removing it from Motet’s saved folders will not hide its chats.':'';
     const at=host._savedRowsHost.children[position++];if(at!==row)host._savedRowsHost.insertBefore(row,at||null);
   }
-  if(focusRemoved&&current()){const next=[...host._savedRowsHost.querySelectorAll('[data-saved-remove]')].find(b=>!b.disabled&&b.getClientRects().length);(next||host._savedTitle).focus();}
+  if(focusRemoved&&current()){const next=!focusHeading&&[...host._savedRowsHost.querySelectorAll('[data-saved-remove]')].find(b=>!b.disabled&&b.getClientRects().length);(next||host._savedTitle).focus();}
   if(refreshOnOpen)adapter.refreshSavedFolders();
 }
 function workspaceNewChatSettingsPaint(refreshOnOpen=false){
@@ -7798,7 +7817,7 @@ function workspaceNewChatSettingsPaint(refreshOnOpen=false){
   const details=host._details;host.hidden=false;if(adapter?.savedFoldersState||host._saved)workspaceNewChatSavedFoldersPaint(host,pane,refreshOnOpen);if(!host._available){host._available=wncEl('div','');host.append(host._available)}const available=host._available;if(sig===WNC.settingsSig&&details.childElementCount)return;WNC.settingsSig=sig;details.textContent='';available.textContent='';
   details.append(wncEl('p','','Which apps Motet can ask to open a new chat in a project’s folder. A new chat is added to the stage only after its session is seen there.'));
   for(const a of apps){const presentation=workspaceNewChatAppPresentation(a,false,true),row=wncEl('div','workspace-nc-row'),tag=wncEl('em','',presentation.tag);tag.dataset.status=a.status;row.append(wncEl('b','',a.name),wncEl('span','',presentation.text),tag);details.append(row)}
-  available.append(wncEl('h4','',adapter?.savedFoldersState?'Available project folders':'Project folders'),wncEl('p','',adapter?.savedFoldersState?'Folders currently available for a new chat. Connected apps can keep a folder available independently of its saved registration.':'The folders recorded for each project. A new chat is asked to open in one of them.'));
+  available.append(wncEl('h4','',adapter?.savedFoldersState?'Available project folders':'Project folders'),wncEl('p','',adapter?.savedFoldersState?'Folders you can start a new chat in right now. A connected app can keep a folder here even when it is not saved in Motet.':'The folders recorded for each project. A new chat is asked to open in one of them.'));
   for(const k of keys){const folders=workspaceNewChatFolders(k),row=wncEl('div','workspace-nc-row'),name=document.createElement('b'),icon=workspaceFolder(),where=document.createElement('span');icon.style.color=workspaceProjectColour(projColour(k));name.append(icon,wncEl('span','',projLabel(k)));
     if(folders.length){where.append(wncPath(folders[0]));if(folders.length>1)where.append(' and '+(folders.length-1)+' more')}else where.textContent='No folder recorded';
     row.append(name,where,wncEl('em','',folders.length?'':'No new chats'));available.append(row)}
@@ -7916,7 +7935,7 @@ function workspaceMonitorPaint(a,S,now,at=false){if(!a.$.workspaceFooter)return;
 /* Stable Settings panes own the existing controls only while the modal is open. */
 function workspaceSettingsMove(el,parent){WS.settingsAnchors||=new Map();if(!WS.settingsAnchors.has(el)){const anchor=document.createComment('settings restore');el.before(anchor);WS.settingsAnchors.set(el,anchor)}parent.appendChild(el)}
 function workspaceSettingsRestore(el){const anchor=WS.settingsAnchors?.get(el);if(anchor){anchor.after(el);anchor.remove();WS.settingsAnchors.delete(el)}}
-function workspaceSettingsLock(){if(WS.controls?.open)workspaceClose(true);WS.subflow=null}
+function workspaceSettingsLock(){if(WS.controls?.open)workspaceClose(true);WS.subflow=null;if(typeof workspaceNewChatSettingsPaint==='function')workspaceNewChatSettingsPaint()}
 function workspaceSettingsRulesOwned(){return !!(WORKSPACE&&WS.controls?.open&&WS.section==='rules')}
 function workspaceSettingsModelOwned(){return !!(WORKSPACE&&WS.model&&WS.controls?.open&&WS.section==='officer')}
 function workspaceAlertOwner(){return !!(WORKSPACE&&(WS.bell?.contains($('#needs'))||WS.controls?.open&&WS.section==='alerts'&&$('#workspaceSettingsAlerts').contains($('#needs'))))}

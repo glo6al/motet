@@ -1,12 +1,17 @@
-"""Strict HTTP parsing without sockets, native processes, or owner credentials."""
+"""Strict HTTP parsing and loopback routes with fictional state and no native processes."""
+from contextlib import ExitStack
 from email.message import Message
+import http.client
 import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from new_chat_http import handle_http
@@ -363,6 +368,124 @@ class SavedFoldersServiceHttpTests(unittest.TestCase):
             self.assertEqual(self.call(path, body), (503, {'schemaVersion': 1, 'error': {
                 'code': 'saved_folders_unavailable',
                 'message': 'Saved project folders are unavailable. Refresh saved folders to check.'}}))
+
+
+@unittest.skipIf(os.name == 'nt', 'Saved folder management uses private POSIX storage.')
+class SavedFoldersSocketTests(unittest.TestCase):
+    def setUp(self):
+        import server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        self.folder = self.home / 'fictional-project'
+        self.folder.mkdir()
+        self.content = self.folder / 'keep.txt'
+        self.content.write_text('Fictional project content stays intact.')
+        self.service = NewChatService(self.home / 'private-state', {},
+            lambda: self.fail('Management routes must not read native inventory'), enabled=True, home=self.home)
+        self.addCleanup(self.service.close)
+        self.saved = self.service.register_folder({'path': str(self.folder)})['folder']
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for name in ('refresh', 'register', 'get', 'require_allowed'):
+            self.stack.enter_context(patch.object(self.service.inventory, name,
+                side_effect=AssertionError('Management routes must not inspect project folders')))
+        # The real Server deliberately binds without reverse DNS. Pin that
+        # boundary so this fixture cannot hang on machine-name resolution.
+        with patch.object(server.socket, 'getfqdn', side_effect=AssertionError('Unexpected DNS lookup')):
+            self.httpd = server.Server(('127.0.0.1', 0), server.H)
+        for name, value in (('NEW_CHAT', self.service), ('PORT', self.httpd.server_port),
+                            ('KEY', 'fictional-saved-folders-key'), ('HOME', str(self.home))):
+            self.stack.enter_context(patch.object(server, name, value))
+        self.thread = threading.Thread(target=lambda: self.httpd.serve_forever(poll_interval=.01), daemon=True)
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+
+    def stop_server(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(3)
+        self.assertFalse(self.thread.is_alive(), 'The fictional loopback server must stop')
+
+    def request(self, method, suffix, data=None, *, key='fictional-saved-folders-key', host=None, origin=None, raw=None):
+        connection = http.client.HTTPConnection('127.0.0.1', self.httpd.server_port, timeout=3)
+        headers = {'Host': host or '127.0.0.1:%d' % self.httpd.server_port, 'X-Live-Room-Key': key}
+        if origin is not None:
+            headers['Origin'] = origin
+        body = raw if raw is not None else json.dumps(data).encode() if data is not None else None
+        if body is not None:
+            headers['Content-Type'] = 'application/json'
+        try:
+            connection.request(method, PREFIX + suffix, body, headers)
+            response = connection.getresponse()
+            status, value = response.status, json.loads(response.read())
+            self.assertEqual(response.getheader('Cache-Control'), 'no-store')
+            self.assertEqual(response.getheader('Connection'), 'close')
+            return status, value
+        finally:
+            connection.close()
+
+    def test_real_owner_socket_routes_list_and_remove_only_stored_metadata(self):
+        with self.service.db:
+            self.service.db.execute('INSERT INTO registered_folders VALUES (?,?)', ('0' * 64, '{'))
+        expected = {key: self.saved[key] for key in ('id', 'revision', 'label', 'displayPath')}
+        self.assertEqual(self.request('GET', 'folders'), (200, {'schemaVersion': 1,
+            'savedFolders': [expected], 'complete': False, 'unreadableCount': 1}))
+        route = 'folders/' + self.saved['id'] + '/remove'
+        self.assertEqual(self.request('POST', route, {'revision': '0' * 64})[0], 409)
+        self.assertEqual(self.request('POST', route, {'revision': self.saved['revision']},
+            origin='http://127.0.0.1:%d' % self.httpd.server_port),
+            (200, {'schemaVersion': 1, 'removed': {'id': self.saved['id'], 'revision': self.saved['revision']}}))
+        self.assertEqual(self.request('GET', 'folders'), (200, {'schemaVersion': 1,
+            'savedFolders': [], 'complete': False, 'unreadableCount': 1}))
+        self.assertEqual(self.request('POST', route, {'revision': self.saved['revision']})[0], 404)
+        self.assertEqual(self.content.read_text(), 'Fictional project content stays intact.')
+        self.assertEqual((self.service.jobs, self.service.db.execute('SELECT count(*) FROM intents').fetchone()[0],
+                          self.service.db.execute('SELECT count(*) FROM attempts').fetchone()[0]), ({}, 0, 0))
+
+    def test_real_socket_auth_paths_and_body_fail_before_removal(self):
+        route = 'folders/' + self.saved['id'] + '/remove'
+        body = {'revision': self.saved['revision']}
+        for kwargs in ({'key': 'wrong'}, {'host': 'fictional.invalid'}, {'origin': 'https://fictional.invalid'}):
+            for method, path, data in (('GET', 'folders', None), ('POST', route, body)):
+                self.assertEqual(self.request(method, path, data, **kwargs)[0], 403)
+        for method, path, data in (('GET', 'folders/', None), ('POST', route + '/', body),
+                                   ('POST', 'folders', {'path': '/fictional/project'}),
+                                   ('GET', route, None)):
+            self.assertEqual(self.request(method, path, data)[0], 404)
+        self.assertEqual(self.request('POST', route, raw=b'{"revision":"a","revision":"b"}')[0], 400)
+        self.assertEqual(self.request('POST', route, raw=b'{')[0], 400)
+        self.assertEqual(len(self.request('GET', 'folders')[1]['savedFolders']), 1)
+        self.assertEqual(self.content.read_text(), 'Fictional project content stays intact.')
+        self.assertEqual(self.service.jobs, {})
+
+    def test_real_socket_quarantined_journal_is_unavailable_not_bad_request(self):
+        database = self.service.db
+        class Poison:
+            def __getattr__(self, name):
+                return getattr(database, name)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                raise sqlite3.OperationalError('Fictional COMMIT failure')
+            def rollback(self):
+                raise sqlite3.OperationalError('Fictional rollback failure')
+        self.service.db = Poison()
+        selection = {'provider': 'codex', 'folderId': self.saved['id'], 'folderRevision': self.saved['revision']}
+        for method, path, body in (
+                ('POST', 'folders/' + self.saved['id'] + '/remove', {'revision': self.saved['revision']}),
+                ('GET', 'folders', None), ('GET', 'context', None), ('GET', 'requests/' + NATIVE, None),
+                ('GET', 'attempts/' + NATIVE, None), ('POST', 'attempts/' + NATIVE + '/observe', {'action': 'stop'}),
+                ('POST', 'intents', selection), ('POST', 'attempts', dict(selection, requestId=NATIVE))):
+            self.assertEqual(self.request(method, path, body), (503, {'schemaVersion': 1, 'error': {
+                'code': 'saved_folders_unavailable',
+                'message': 'Saved project folders are unavailable. Refresh saved folders to check.'}}))
+        self.assertIsNone(self.service.db)
+        self.assertEqual(self.service.jobs, {})
+        self.assertEqual(self.content.read_text(), 'Fictional project content stays intact.')
+        reader = sqlite3.connect(self.service.root / 'journal.sqlite')
+        self.addCleanup(reader.close)
+        self.assertEqual(reader.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
 
 
 if __name__ == '__main__':

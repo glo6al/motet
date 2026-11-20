@@ -97,6 +97,7 @@ class NewChatService:
         self.closing, self.closed = False, False
         self._file_lock = None
         self.db = None
+        self._journal_unavailable = False
         self.root = Path(state_dir).resolve() / 'new-chat'
         try:
             self._storage()
@@ -174,6 +175,12 @@ class NewChatService:
             _error('demo_unavailable', MESSAGES['demo_unavailable'], 503)
         if not self.enabled:
             _error('disabled', MESSAGES['disabled'], 503)
+        self._journal_guard()
+
+    def _journal_guard(self):
+        if self._journal_unavailable:
+            _error('saved_folders_unavailable',
+                   'Saved project folders are unavailable. Refresh saved folders to check.', 503)
 
     def _adapter(self, row):
         adapter = self.adapters.get(row['provider'])
@@ -186,24 +193,26 @@ class NewChatService:
         return row.get('ownership', 'desktop') == 'watch_managed'
 
     def _capability(self, provider='codex'):
-        if self.demo or not self.enabled or self.closing:
-            code = 'demo_unavailable' if self.demo else 'disabled'
-            return Capability(False, code, MESSAGES[code])
-        try:
-            adapter = self.adapters.get(provider)
-            if adapter is None:
-                return Capability(False, 'provider_unavailable', MESSAGES['provider_unavailable'])
-            cap = adapter.preflight()
-            if (not isinstance(cap, Capability) or type(cap.available) is not bool
-                    or type(cap.supports_work) is not bool
-                    or type(cap.supports_blank) is not bool
-                    or cap.ownership not in ('desktop', 'watch_managed')
-                    or cap.ownership == 'watch_managed' and (provider != 'claude_code' or cap.supports_blank)
-                    or not _text(cap.version, 200) or cap.available and not cap.version):
-                raise ValueError()
-            return cap
-        except Exception:
-            return Capability(False, 'adapter_unavailable', MESSAGES['adapter_unavailable'])
+        with self.lock:
+            self._journal_guard()
+            if self.demo or not self.enabled or self.closing:
+                code = 'demo_unavailable' if self.demo else 'disabled'
+                return Capability(False, code, MESSAGES[code])
+            try:
+                adapter = self.adapters.get(provider)
+                if adapter is None:
+                    return Capability(False, 'provider_unavailable', MESSAGES['provider_unavailable'])
+                cap = adapter.preflight()
+                if (not isinstance(cap, Capability) or type(cap.available) is not bool
+                        or type(cap.supports_work) is not bool
+                        or type(cap.supports_blank) is not bool
+                        or cap.ownership not in ('desktop', 'watch_managed')
+                        or cap.ownership == 'watch_managed' and (provider != 'claude_code' or cap.supports_blank)
+                        or not _text(cap.version, 200) or cap.available and not cap.version):
+                    raise ValueError()
+                return cap
+            except Exception:
+                return Capability(False, 'adapter_unavailable', MESSAGES['adapter_unavailable'])
 
     def _decode_registered_folder(self, ident_bytes, raw_bytes):
         def unique(items):
@@ -223,6 +232,7 @@ class NewChatService:
     def _read_registered_folders(self):
         folders, unreadable = [], 0
         with self.lock:
+            self._journal_guard()
             # API writes already cap the row count. Bound individual transfers
             # too, so a damaged row cannot force an unbounded JSON allocation.
             rows = self.db.execute(_SAVED_FOLDER_ROWS + ' ORDER BY id')
@@ -254,9 +264,9 @@ class NewChatService:
         if (not identity(ident) or type(data) is not dict or set(data) != {'revision'}
                 or not identity(data['revision'])):
             _error('invalid_request', 'Invalid New chat request.', 400)
-        try:
-            with self.lock:
-                self._guard()
+        with self.lock:
+            self._guard()
+            try:
                 with self.db:
                     row = self.db.execute(_SAVED_FOLDER_ROWS + ' WHERE id=?', (ident,)).fetchone()
                     if row is None:
@@ -274,26 +284,43 @@ class NewChatService:
                     if deleted.rowcount != 1:
                         _error('saved_folder_changed',
                                'This saved project folder changed. Refresh saved folders before removing it.', 409)
-        except sqlite3.Error:
-            _error('saved_folders_unavailable',
-                   'Saved project folders are unavailable. Refresh saved folders to check.', 503)
+            except sqlite3.Error:
+                # Older sqlite3 context managers can leave a failed COMMIT's
+                # delete pending. Finish recovery before another caller enters.
+                try:
+                    if self.db.in_transaction:
+                        self.db.rollback()
+                    if self.db.in_transaction:
+                        raise sqlite3.DatabaseError('Journal rollback remained pending.')
+                except sqlite3.Error:
+                    self._journal_unavailable = True
+                    try:
+                        self.db.close()
+                    except sqlite3.Error:
+                        pass
+                    finally:
+                        self.db = None
+                _error('saved_folders_unavailable',
+                       'Saved project folders are unavailable. Refresh saved folders to check.', 503)
         return {'schemaVersion': 1, 'removed': {'id': folder.id, 'revision': folder.revision}}
 
     def register_folder(self, data):
         self._guard()
         if type(data) is not dict or set(data) != {'path'}:
             _error('invalid_request', 'Choose one project folder to add.', 400)
-        folder = self.inventory.register(data['path'])
-        with self.lock, self.db:
+        with self.lock:
             self._guard()
-            validate_folder(folder)
-            self.inventory.require_allowed(folder)
-            if (self.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0] >= self.inventory.maximum
-                    and not self.db.execute('SELECT 1 FROM registered_folders WHERE id=?', (folder.id,)).fetchone()):
-                _error('capacity', 'The saved project folder limit has been reached.', 429)
-            self.db.execute('INSERT OR REPLACE INTO registered_folders VALUES (?, ?)',
-                            (folder.id, json.dumps(asdict(folder), ensure_ascii=True)))
-        return {'schemaVersion': 1, 'folder': dict(public_folder(folder), registered=True)}
+            folder = self.inventory.register(data['path'])
+            with self.db:
+                self._guard()
+                validate_folder(folder)
+                self.inventory.require_allowed(folder)
+                if (self.db.execute('SELECT count(*) FROM registered_folders').fetchone()[0] >= self.inventory.maximum
+                        and not self.db.execute('SELECT 1 FROM registered_folders WHERE id=?', (folder.id,)).fetchone()):
+                    _error('capacity', 'The saved project folder limit has been reached.', 429)
+                self.db.execute('INSERT OR REPLACE INTO registered_folders VALUES (?, ?)',
+                                (folder.id, json.dumps(asdict(folder), ensure_ascii=True)))
+            return {'schemaVersion': 1, 'folder': dict(public_folder(folder), registered=True)}
 
     def _chooser(self):
         self._guard()
@@ -315,16 +342,20 @@ class NewChatService:
         return self._chooser().accept(ident, data, self.register_folder, self._guard)
 
     def _inventory(self, registered):
-        rows = self.inventory.refresh(registered)
-        with self.lock, self.db:
-            self.db.execute('DELETE FROM folders')
-            self.db.executemany('INSERT INTO folders VALUES (?, ?)',
-                                [(r['folder']['id'], json.dumps(r, ensure_ascii=True)) for r in self.inventory.snapshot()])
-        return rows
+        with self.lock:
+            self._journal_guard()
+            rows = self.inventory.refresh(registered)
+            with self.db:
+                self.db.execute('DELETE FROM folders')
+                self.db.executemany('INSERT INTO folders VALUES (?, ?)',
+                                    [(r['folder']['id'], json.dumps(r, ensure_ascii=True)) for r in self.inventory.snapshot()])
+            return rows
 
     def context(self):
-        with self.lock, self.db:
-            self._gc(self._now()[0])
+        with self.lock:
+            self._journal_guard()
+            with self.db:
+                self._gc(self._now()[0])
         # Disabled/demo context has no native reads, even through inventory.
         can_register = self.enabled and not self.demo and not self.closing
         registered = self._registered_folders() if can_register else []
@@ -341,13 +372,15 @@ class NewChatService:
                               'ownership': cap.ownership,
                               'supportsBlank': available and cap.supports_blank, 'supportsWork': available and cap.supports_work,
                               'unavailableReason': None if available else _reason(code)})
-        return {'schemaVersion': 1, 'fixture': False, 'host': dict(self.host),
-                'canChooseFolders': can_register and self.folder_chooser is not None,
-                'folderChoiceEpoch': self.folder_chooser.epoch if can_register and self.folder_chooser is not None else None,
-                'folders': [dict(public_folder(f), registered=True) if registered_revisions.get(f.id) == f.revision else public_folder(f)
-                            for f in folders], 'providers': providers,
-                'limits': {'observationWindowMs': WINDOW * 1000,
-                           'managedPermissionTimeoutSeconds': MANAGED_PERMISSION_TIMEOUT_SECONDS}}
+        with self.lock:
+            self._journal_guard()
+            return {'schemaVersion': 1, 'fixture': False, 'host': dict(self.host),
+                    'canChooseFolders': can_register and self.folder_chooser is not None,
+                    'folderChoiceEpoch': self.folder_chooser.epoch if can_register and self.folder_chooser is not None else None,
+                    'folders': [dict(public_folder(f), registered=True) if registered_revisions.get(f.id) == f.revision else public_folder(f)
+                                for f in folders], 'providers': providers,
+                    'limits': {'observationWindowMs': WINDOW * 1000,
+                               'managedPermissionTimeoutSeconds': MANAGED_PERMISSION_TIMEOUT_SECONDS}}
 
     @staticmethod
     def _selection(data, *, opening=False):
@@ -401,30 +434,32 @@ class NewChatService:
     def prepare(self, data):
         self._selection(data)
         self._guard()
-        cap = self._capability(data['provider'])
-        if not cap.available:
-            _error(_reason(cap.code)['code'], _reason(cap.code)['message'], 503)
-        if data.get('mode', 'blank') == 'work' and not cap.supports_work:
-            _error('work_unavailable', MESSAGES['work_unavailable'], 503)
-        if data.get('mode', 'blank') == 'blank' and not cap.supports_blank:
-            _error('blank_unavailable', 'Blank chat is unavailable for this provider.', 503)
-        folder = self.inventory.get(data['folderId'], data['folderRevision'], self._registered_folders())
-        now, _ = self._now()
-        ident = str(uuid.uuid4())
-        frozen = {'provider': data['provider'], 'mode': data.get('mode', 'blank'), 'folder': asdict(folder),
-                  'adapter_version': cap.version, 'ownership': cap.ownership}
-        with self.lock, self.db:
+        with self.lock:
             self._guard()
-            self._gc(now)
-            if self.db.execute('SELECT count(*) FROM intents WHERE attempt_id IS NULL').fetchone()[0] >= self.max_intents:
-                _error('capacity', 'Too many prepared New chat requests.', 429)
-            if self.db.execute('SELECT count(*) FROM intent_issues').fetchone()[0] >= self.intent_rate:
-                _error('rate_limited', 'New chat requests are arriving too quickly.', 429)
-            self.db.execute('INSERT INTO intents VALUES (?, ?, ?, ?, NULL)',
-                            (ident, now, now + INTENT_LIFE, json.dumps(frozen, ensure_ascii=True)))
-            self.db.execute('INSERT INTO intent_issues VALUES (?, ?)', (ident, now))
-        return {'schemaVersion': 1, 'requestId': ident, 'provider': data['provider'], 'mode': data.get('mode', 'blank'),
-                'folder': public_folder(folder), 'expiresAt': _iso(now + INTENT_LIFE), 'host': dict(self.host)}
+            cap = self._capability(data['provider'])
+            if not cap.available:
+                _error(_reason(cap.code)['code'], _reason(cap.code)['message'], 503)
+            if data.get('mode', 'blank') == 'work' and not cap.supports_work:
+                _error('work_unavailable', MESSAGES['work_unavailable'], 503)
+            if data.get('mode', 'blank') == 'blank' and not cap.supports_blank:
+                _error('blank_unavailable', 'Blank chat is unavailable for this provider.', 503)
+            folder = self.inventory.get(data['folderId'], data['folderRevision'], self._registered_folders())
+            now, _ = self._now()
+            ident = str(uuid.uuid4())
+            frozen = {'provider': data['provider'], 'mode': data.get('mode', 'blank'), 'folder': asdict(folder),
+                      'adapter_version': cap.version, 'ownership': cap.ownership}
+            with self.db:
+                self._guard()
+                self._gc(now)
+                if self.db.execute('SELECT count(*) FROM intents WHERE attempt_id IS NULL').fetchone()[0] >= self.max_intents:
+                    _error('capacity', 'Too many prepared New chat requests.', 429)
+                if self.db.execute('SELECT count(*) FROM intent_issues').fetchone()[0] >= self.intent_rate:
+                    _error('rate_limited', 'New chat requests are arriving too quickly.', 429)
+                self.db.execute('INSERT INTO intents VALUES (?, ?, ?, ?, NULL)',
+                                (ident, now, now + INTENT_LIFE, json.dumps(frozen, ensure_ascii=True)))
+                self.db.execute('INSERT INTO intent_issues VALUES (?, ?)', (ident, now))
+            return {'schemaVersion': 1, 'requestId': ident, 'provider': data['provider'], 'mode': data.get('mode', 'blank'),
+                    'folder': public_folder(folder), 'expiresAt': _iso(now + INTENT_LIFE), 'host': dict(self.host)}
 
     def _digest(self, data):
         return hmac.new(self.key, json.dumps(data, sort_keys=True, ensure_ascii=True,
@@ -493,82 +528,86 @@ class NewChatService:
             normalized.pop('draft', None)
         digest, now_mono = self._digest(normalized), self._now()
         now, mono = now_mono
-        with self.lock, self.db:
+        with self.lock:
             self._guard()
-            self._gc(now)
-            prior = self.db.execute('SELECT id, digest FROM attempts WHERE request_id=?', (data['requestId'],)).fetchone()
-            if prior is not None:
-                prior_row = self._load(prior[0])
-                legacy = dict(normalized)
-                legacy.pop('mode', None)
-                legacy_match = (prior_row.get('mode') is None and normalized['mode'] == 'blank'
-                                and hmac.compare_digest(prior[1], self._digest(legacy)))
-                if not hmac.compare_digest(prior[1], digest) and not legacy_match:
-                    _error('replay_conflict', 'This request was already used with a different selection or draft.', 409)
-                row = self._load(prior[0])
-                self._expire(row)
-                return 200, self._view(row)
-            intent = self.db.execute('SELECT data, expires, attempt_id FROM intents WHERE id=?', (data['requestId'],)).fetchone()
-            if intent is None or intent[1] <= now:
-                _error('intent_expired', 'Prepare a new folder review before opening a chat.', 409)
-            if intent[2] is not None:
-                _error('intent_spent', 'This request has already been used.', 409)
-            frozen = json.loads(intent[0])
-            folder = FrozenFolder(**frozen['folder'])
-            if (data['provider'] != frozen['provider'] or data['folderId'] != folder.id
-                    or data['folderRevision'] != folder.revision
-                    or data.get('mode', 'blank') != frozen.get('mode', 'blank')):
-                _error('intent_conflict', 'This request does not match the prepared folder review.', 409)
-            if self.db.execute('SELECT count(*) FROM attempts').fetchone()[0] >= self.max_attempts:
-                _error('capacity', 'The retained New chat request limit has been reached.', 429)
-            active = [json.loads(r[0]) for r in self.db.execute('SELECT data FROM attempts WHERE expires>?', (now,))]
-            for previous in active:
-                self._expire(previous)
-            active = [r for r in active if r['observation'] == 'active']
-            if len(active) >= self.max_active or len(self.jobs) >= self.max_active:
-                _error('capacity', 'Too many New chat requests are being observed.', 429)
-            if any(r['provider'] == data['provider'] and r['folder']['id'] == folder.id for r in active):
-                _error('folder_busy', 'A New chat request for this folder is already active.', 409)
-            # All preflight/selection checks precede the one durable claim.
-            self.inventory.get(folder.id, folder.revision, self._registered_folders())
-            cap = self._capability(frozen['provider'])
-            available = (cap.available and cap.version == frozen['adapter_version']
-                         and cap.ownership == frozen.get('ownership', 'desktop')
-                         and (cap.supports_blank if normalized['mode'] == 'blank' else cap.supports_work))
-            ident = str(uuid.uuid4())
-            row = {'id': ident, 'request_id': data['requestId'], 'provider': data['provider'],
-                   'folder': asdict(folder), 'adapter_version': frozen['adapter_version'],
-                   'ownership': frozen.get('ownership', 'desktop'), 'managed': None,
-                   'mode': data.get('mode', 'blank'),
-                   'execution': {'attempts': 0, 'outcome': 'not_attempted', 'turnId': None, 'reason': None,
-                                 'pending': available and data.get('mode', 'blank') == 'work'},
-                   'created': now, 'window_started': now, 'deadline': now + WINDOW,
-                   'generation': 0, 'observation': 'active' if available else 'complete',
-                   'state': 'waiting' if available else 'unavailable', 'phase': 'claimed' if available else 'unavailable',
-                   'creation_attempts': int(available), 'launch': 'unknown' if available else 'not_attempted',
-                   'creation': 'unknown' if available else 'not_attempted', 'native_id': None, 'identity': None,
-                   'ui_attempts': 0, 'ui': 'not_required' if frozen.get('ownership') == 'watch_managed' else 'not_attempted',
-                   'room_id': None, 'mismatch': None,
-                   'draft_provided': bool(data.get('draft')), 'draft_disposition': 'unverified' if data.get('draft') else 'not_provided',
-                   'reason': None if available else _reason(cap.code if not cap.available else
-                       'work_unavailable' if data.get('mode') == 'work' and not cap.supports_work else 'app_version_unsupported')}
-            self.db.execute('INSERT INTO attempts VALUES (?, ?, ?, ?, ?, ?)',
-                            (ident, data['requestId'], digest, now, now + RETENTION, json.dumps(row, ensure_ascii=True)))
-            self.db.execute('UPDATE intents SET attempt_id=? WHERE id=?', (ident, data['requestId']))
-            self.deadlines[ident] = mono + WINDOW
-            self.execution_deadlines[ident] = mono + WINDOW
-            self.gates[ident] = threading.RLock()
-            initial = self._view(row)
-            worker = None
-            if available:
-                worker = threading.Thread(target=self._dispatch, args=(ident, data.get('draft'), data.get('instruction')), daemon=True,
-                                          name='watch-new-chat-create')
-                # Commit before the worker can run, but reserve its capacity slot
-                # under this same lock. Stop cannot free an unregistered worker.
-                self.db.commit()
-                self.jobs[ident] = worker
+            with self.db:
+                self._gc(now)
+                prior = self.db.execute('SELECT id, digest FROM attempts WHERE request_id=?', (data['requestId'],)).fetchone()
+                if prior is not None:
+                    prior_row = self._load(prior[0])
+                    legacy = dict(normalized)
+                    legacy.pop('mode', None)
+                    legacy_match = (prior_row.get('mode') is None and normalized['mode'] == 'blank'
+                                    and hmac.compare_digest(prior[1], self._digest(legacy)))
+                    if not hmac.compare_digest(prior[1], digest) and not legacy_match:
+                        _error('replay_conflict', 'This request was already used with a different selection or draft.', 409)
+                    row = self._load(prior[0])
+                    self._expire(row)
+                    return 200, self._view(row)
+                intent = self.db.execute('SELECT data, expires, attempt_id FROM intents WHERE id=?', (data['requestId'],)).fetchone()
+                if intent is None or intent[1] <= now:
+                    _error('intent_expired', 'Prepare a new folder review before opening a chat.', 409)
+                if intent[2] is not None:
+                    _error('intent_spent', 'This request has already been used.', 409)
+                frozen = json.loads(intent[0])
+                folder = FrozenFolder(**frozen['folder'])
+                if (data['provider'] != frozen['provider'] or data['folderId'] != folder.id
+                        or data['folderRevision'] != folder.revision
+                        or data.get('mode', 'blank') != frozen.get('mode', 'blank')):
+                    _error('intent_conflict', 'This request does not match the prepared folder review.', 409)
+                if self.db.execute('SELECT count(*) FROM attempts').fetchone()[0] >= self.max_attempts:
+                    _error('capacity', 'The retained New chat request limit has been reached.', 429)
+                active = [json.loads(r[0]) for r in self.db.execute('SELECT data FROM attempts WHERE expires>?', (now,))]
+                for previous in active:
+                    self._expire(previous)
+                active = [r for r in active if r['observation'] == 'active']
+                if len(active) >= self.max_active or len(self.jobs) >= self.max_active:
+                    _error('capacity', 'Too many New chat requests are being observed.', 429)
+                if any(r['provider'] == data['provider'] and r['folder']['id'] == folder.id for r in active):
+                    _error('folder_busy', 'A New chat request for this folder is already active.', 409)
+                # All preflight/selection checks precede the one durable claim.
+                self.inventory.get(folder.id, folder.revision, self._registered_folders())
+                cap = self._capability(frozen['provider'])
+                available = (cap.available and cap.version == frozen['adapter_version']
+                             and cap.ownership == frozen.get('ownership', 'desktop')
+                             and (cap.supports_blank if normalized['mode'] == 'blank' else cap.supports_work))
+                ident = str(uuid.uuid4())
+                row = {'id': ident, 'request_id': data['requestId'], 'provider': data['provider'],
+                       'folder': asdict(folder), 'adapter_version': frozen['adapter_version'],
+                       'ownership': frozen.get('ownership', 'desktop'), 'managed': None,
+                       'mode': data.get('mode', 'blank'),
+                       'execution': {'attempts': 0, 'outcome': 'not_attempted', 'turnId': None, 'reason': None,
+                                     'pending': available and data.get('mode', 'blank') == 'work'},
+                       'created': now, 'window_started': now, 'deadline': now + WINDOW,
+                       'generation': 0, 'observation': 'active' if available else 'complete',
+                       'state': 'waiting' if available else 'unavailable', 'phase': 'claimed' if available else 'unavailable',
+                       'creation_attempts': int(available), 'launch': 'unknown' if available else 'not_attempted',
+                       'creation': 'unknown' if available else 'not_attempted', 'native_id': None, 'identity': None,
+                       'ui_attempts': 0, 'ui': 'not_required' if frozen.get('ownership') == 'watch_managed' else 'not_attempted',
+                       'room_id': None, 'mismatch': None,
+                       'draft_provided': bool(data.get('draft')), 'draft_disposition': 'unverified' if data.get('draft') else 'not_provided',
+                       'reason': None if available else _reason(cap.code if not cap.available else
+                           'work_unavailable' if data.get('mode') == 'work' and not cap.supports_work else 'app_version_unsupported')}
+                self.db.execute('INSERT INTO attempts VALUES (?, ?, ?, ?, ?, ?)',
+                                (ident, data['requestId'], digest, now, now + RETENTION, json.dumps(row, ensure_ascii=True)))
+                self.db.execute('UPDATE intents SET attempt_id=? WHERE id=?', (ident, data['requestId']))
+                self.deadlines[ident] = mono + WINDOW
+                self.execution_deadlines[ident] = mono + WINDOW
+                self.gates[ident] = threading.RLock()
+                initial = self._view(row)
+                worker = None
+                if available:
+                    worker = threading.Thread(target=self._dispatch, args=(ident, data.get('draft'), data.get('instruction')), daemon=True,
+                                              name='watch-new-chat-create')
+                    # Commit before the worker can run, but reserve its capacity slot
+                    # under this same lock. Stop cannot free an unregistered worker.
+                    self.db.commit()
+                    self.jobs[ident] = worker
         if available:
             with self.lock:
+                if self._journal_unavailable:
+                    self.jobs.pop(ident, None)
+                    self._journal_guard()
                 if self.closing:
                     self.jobs.pop(ident, None)
                     if not self.jobs:
@@ -659,7 +698,7 @@ class NewChatService:
             folder = validate_folder(FrozenFolder(**row['folder']))
             self.inventory.require_allowed(folder)
             with self.lock:
-                if self.closing:
+                if self.closing or self._journal_unavailable:
                     return
                 creation_started = True
             if self._managed(row):
@@ -901,27 +940,30 @@ class NewChatService:
     def request_status(self, request_id):
         if not canonical_uuid(request_id):
             _error('invalid_request', 'Invalid New chat identity.', 400)
-        with self.lock, self.db:
-            self._gc(self._now()[0])
-            previous = self.db.execute('SELECT id FROM attempts WHERE request_id=?', (request_id,)).fetchone()
-            if previous is not None:
-                row = self._load(previous[0])
-                self._expire(row)
-                self._refresh_execution(row)
-                return {'schemaVersion': 1, 'requestId': request_id, 'status': 'attempted', 'attempt': self._view(row)}
-            intent = self.db.execute('SELECT data, expires FROM intents WHERE id=?', (request_id,)).fetchone()
-            if intent is None:
-                _error('unknown_request', 'This New chat request is unknown or expired.', 404)
-            frozen = json.loads(intent[0])
-            return {'schemaVersion': 1, 'requestId': request_id, 'status': 'prepared', 'attempt': None,
-                    'mode': frozen.get('mode', 'blank'), 'provider': frozen['provider'],
-                    'folder': public_folder(FrozenFolder(**frozen['folder'])), 'expiresAt': _iso(intent[1]),
-                    'host': dict(self.host)}
+        with self.lock:
+            self._journal_guard()
+            with self.db:
+                self._gc(self._now()[0])
+                previous = self.db.execute('SELECT id FROM attempts WHERE request_id=?', (request_id,)).fetchone()
+                if previous is not None:
+                    row = self._load(previous[0])
+                    self._expire(row)
+                    self._refresh_execution(row)
+                    return {'schemaVersion': 1, 'requestId': request_id, 'status': 'attempted', 'attempt': self._view(row)}
+                intent = self.db.execute('SELECT data, expires FROM intents WHERE id=?', (request_id,)).fetchone()
+                if intent is None:
+                    _error('unknown_request', 'This New chat request is unknown or expired.', 404)
+                frozen = json.loads(intent[0])
+                return {'schemaVersion': 1, 'requestId': request_id, 'status': 'prepared', 'attempt': None,
+                        'mode': frozen.get('mode', 'blank'), 'provider': frozen['provider'],
+                        'folder': public_folder(FrozenFolder(**frozen['folder'])), 'expiresAt': _iso(intent[1]),
+                        'host': dict(self.host)}
 
     def status(self, ident):
         if not canonical_uuid(ident):
             _error('invalid_request', 'Invalid New chat identity.', 400)
         with self.lock:
+            self._journal_guard()
             with self.db:
                 self._gc(self._now()[0])
             with self.db:
@@ -934,26 +976,29 @@ class NewChatService:
         if not canonical_uuid(ident) or type(data) is not dict or data.keys() != {'action'} or data['action'] not in ('continue', 'stop'):
             _error('invalid_request', 'Invalid observation action.', 400)
         with self.lock:
+            self._journal_guard()
             self._load(ident)
             gate = self.gates.setdefault(ident, threading.RLock())
-        with gate, self.lock, self.db:
-            row = self._load(ident)
-            self._expire(row)
-            if data['action'] == 'stop':
-                if row['state'] in ('added', 'failed', 'mismatch', 'unavailable'):
-                    return self._view(row)
-                if row['observation'] != 'stopped':
-                    row.update(observation='stopped', generation=row['generation'] + 1)
-            else:
-                self._guard()
-                now, mono = self._now()
-                if row['state'] != 'timeout' or row['observation'] == 'stopped' or now + WINDOW > row['created'] + RETENTION:
-                    _error('observation_conflict', 'This request cannot continue observation.', 409)
-                row.update(observation='active', state='waiting', window_started=now, deadline=now + WINDOW,
-                           generation=row['generation'] + 1, reason=None)
-                self.deadlines[ident] = mono + WINDOW
-            self._save(row)
-            return self._view(row)
+        with gate, self.lock:
+            self._journal_guard()
+            with self.db:
+                row = self._load(ident)
+                self._expire(row)
+                if data['action'] == 'stop':
+                    if row['state'] in ('added', 'failed', 'mismatch', 'unavailable'):
+                        return self._view(row)
+                    if row['observation'] != 'stopped':
+                        row.update(observation='stopped', generation=row['generation'] + 1)
+                else:
+                    self._guard()
+                    now, mono = self._now()
+                    if row['state'] != 'timeout' or row['observation'] == 'stopped' or now + WINDOW > row['created'] + RETENTION:
+                        _error('observation_conflict', 'This request cannot continue observation.', 409)
+                    row.update(observation='active', state='waiting', window_started=now, deadline=now + WINDOW,
+                               generation=row['generation'] + 1, reason=None)
+                    self.deadlines[ident] = mono + WINDOW
+                self._save(row)
+                return self._view(row)
 
     def _recover(self):
         now, mono = self._now()
@@ -977,75 +1022,83 @@ class NewChatService:
         # identities are freshly checked by the watcher before any admission.
 
     def process_admissions(self, admit_callback):
-        with self.lock, self.db:
-            if self.closing:
+        with self.lock:
+            if self._journal_unavailable:
                 return
-            now, _ = self._now()
-            self._gc(now)
-            if not self.enabled or self.demo:
-                return
-            rows = [json.loads(r[0]) for r in self.db.execute('SELECT data FROM attempts WHERE expires>?', (now,))]
-            for row in rows:
-                self._expire(row)
-                self._refresh_execution(row)
+            with self.db:
+                if self.closing:
+                    return
+                now, _ = self._now()
+                self._gc(now)
+                if not self.enabled or self.demo:
+                    return
+                rows = [json.loads(r[0]) for r in self.db.execute('SELECT data FROM attempts WHERE expires>?', (now,))]
+                for row in rows:
+                    self._expire(row)
+                    self._refresh_execution(row)
         for row in rows:
             if row['observation'] != 'active' or not row['native_id']:
                 continue
-            try:
-                folder = validate_folder(FrozenFolder(**row['folder']))
-                self.inventory.require_allowed(folder)
-                value = self._adapter(row).verify_existing(row['native_id'], folder)
-                identity = self._checked_identity(value, row)
-            except Exception:
-                continue
             with self.lock:
+                if self._journal_unavailable:
+                    return
+                try:
+                    folder = validate_folder(FrozenFolder(**row['folder']))
+                    self.inventory.require_allowed(folder)
+                    value = self._adapter(row).verify_existing(row['native_id'], folder)
+                    identity = self._checked_identity(value, row)
+                except Exception:
+                    continue
                 gate = self.gates.setdefault(row['id'], threading.RLock())
             # Stop/timeout and final admission share this gate. A stopped
             # generation cannot insert a room monitor through this service.
-            with gate, self.lock, self.db:
-                current = self._load(row['id'])
-                self._expire(current)
-                if (current['observation'] != 'active' or current['generation'] != row['generation']
-                        or self.closing):
-                    continue
-                if not self._verified_row(current, identity):
+            with gate, self.lock:
+                if self._journal_unavailable:
+                    return
+                with self.db:
+                    current = self._load(row['id'])
+                    self._expire(current)
+                    if (current['observation'] != 'active' or current['generation'] != row['generation']
+                            or self.closing):
+                        continue
+                    if not self._verified_row(current, identity):
+                        self._save(current)
+                        continue
                     self._save(current)
-                    continue
-                self._save(current)
-                if not self._admission_ready(current):
+                    if not self._admission_ready(current):
+                        self._save(current)
+                        continue
+                    publication = {'granted': False}
+
+                    def permit():
+                        # The watcher calls this after its last file/index check,
+                        # immediately before its first room publication. Granting
+                        # is the linearization point, not the callback's return.
+                        if publication['granted']:
+                            return False
+                        fresh = self._load(row['id'])
+                        self._expire(fresh)
+                        if (fresh['observation'] != 'active' or fresh['generation'] != row['generation']
+                                or not self._admission_ready(fresh) or self.closing):
+                            return False
+                        publication['granted'] = True
+                        return True
+
+                    try:
+                        room_id = admit_callback(identity, folder, permit)
+                    except Exception:
+                        room_id = None
+                    if not publication['granted']:
+                        # permit() may have persisted expiry; never overwrite that
+                        # newer row with the pre-callback snapshot.
+                        continue
+                    prefix = {'codex': 'x:', 'claude_code': 'c:'}.get(current['provider'])
+                    if prefix is None or room_id != prefix + identity.native_id:
+                        current['reason'] = _reason('admission_unavailable')
+                    else:
+                        current.update(identity=asdict(identity), creation='verified', room_id=room_id,
+                                       state='added', observation='complete', phase='admitted', reason=None)
                     self._save(current)
-                    continue
-                publication = {'granted': False}
-
-                def permit():
-                    # The watcher calls this after its last file/index check,
-                    # immediately before its first room publication. Granting
-                    # is the linearization point, not the callback's return.
-                    if publication['granted']:
-                        return False
-                    fresh = self._load(row['id'])
-                    self._expire(fresh)
-                    if (fresh['observation'] != 'active' or fresh['generation'] != row['generation']
-                            or not self._admission_ready(fresh) or self.closing):
-                        return False
-                    publication['granted'] = True
-                    return True
-
-                try:
-                    room_id = admit_callback(identity, folder, permit)
-                except Exception:
-                    room_id = None
-                if not publication['granted']:
-                    # permit() may have persisted expiry; never overwrite that
-                    # newer row with the pre-callback snapshot.
-                    continue
-                prefix = {'codex': 'x:', 'claude_code': 'c:'}.get(current['provider'])
-                if prefix is None or room_id != prefix + identity.native_id:
-                    current['reason'] = _reason('admission_unavailable')
-                else:
-                    current.update(identity=asdict(identity), creation='verified', room_id=room_id,
-                                   state='added', observation='complete', phase='admitted', reason=None)
-                self._save(current)
 
     @classmethod
     def _admission_ready(cls, row):
