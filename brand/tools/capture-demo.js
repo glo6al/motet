@@ -188,6 +188,7 @@ async function capture(options) {
     await shot('workspace-room.png', path.join(options.output, 'workspace-room.png'));
     await page.evaluate(() => setFocus('c:demo-ada'));
     await page.locator('#workspacePanels [data-panel="changes"]').click();
+    await page.evaluate(() => { ofLog.scrollTop = 0; });
     await shot('workspace-desk.png', path.join(options.output, 'workspace-desk.png'));
     await page.setViewportSize({width: 390, height: 844});
     await page.evaluate(() => { if (DESK.open) deskCloseWork(); });

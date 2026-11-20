@@ -61,7 +61,7 @@ When you want to look for yourself, every agent is in view.
 - **Bring a player in.** Message an agent from its desk, hand it a PDF or a picture, or start a fresh Codex chat in a project's folder, including a folder you add yourself.
 - **Catch the wrong note.** A command that looks like a deploy, a push, a delete or a send is flagged as it happens. You choose the words it listens for.
 
-<p align="center"><img src="docs/media/workspace-desk.png" width="1000" alt="Ada's desk in Workspace. The chain of command shows Ada and her fictional children. The conversation on the left contains your pricing request, a folded run of steps, Ada's rounding update and an approval card asking to update the pricing snapshots. The Changes panel on the right shows two recorded edits to one file as red and green excerpts, with the latest edit still in progress."></p>
+<p align="center"><img src="docs/media/workspace-desk.png" width="1000" alt="Ada's desk in Workspace. The Related work row shows Ada and her fictional children. The conversation on the left contains your pricing request, a folded run of steps, Ada's rounding update and an approval card asking to update the pricing snapshots. The Changes panel on the right shows one recorded edit to the pricing file as a red and green excerpt."></p>
 <p align="center"><sub><b>A desk.</b> The conversation, with the work it produced beside it. Fictional demo data.</sub></p>
 
 ## Bring the subscriptions you already have

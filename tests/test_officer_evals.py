@@ -75,9 +75,9 @@ class OfficerEvidenceEvals(unittest.TestCase):
         self.assertEqual(names, ['Codex cloud', 'Bram', 'Ada', 'Cleo', 'Dov', 'Esme', 'Fen',
                                  'Gita', 'Hale', 'Ivo', 'Juna', 'Kian', 'Leda', 'Miro',
                                  'Neri', 'Orin', 'Pavo', 'Rhea', 'Suri', 'Tavi', 'Uma', 'Vero'])
-        self.assertEqual(len(self.seed['records']), 132)   # 22 agents, 109 sequenced events, one health record
+        self.assertEqual(len(self.seed['records']), 131)   # 22 agents, 108 sequenced events, one health record
         self.assertTrue(any(row.get('kind') == 'health' and row.get('idle_ready') is True for row in self.seed['records']))
-        self.assertEqual(max(row.get('seq', 0) for row in self.seed['records']), 109)
+        self.assertEqual(max(row.get('seq', 0) for row in self.seed['records']), 108)
         edit = next(row for row in self.seed['records'] if row.get('id') == 'a-seed' and row['kind'] == 'edit')
         for name in ('Leda', 'Miro'):
             report = next(row for row in self.seed['records']

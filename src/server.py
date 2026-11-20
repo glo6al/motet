@@ -2874,7 +2874,7 @@ class CloudExec:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Motet: a crew member that answers questions about the room, through the Anthropic API, from what
+# Motet answers questions about the stage through the Anthropic API, using what
 # this process already holds. The key is read from ~/.live-room/anthropic-key (a plain file only you can read), kept in
 # this process, printed nowhere and sent only in a request header to api.anthropic.com; the page talks to /ask, this
 # process talks to the API. The log-reading model has no messaging tool. A separate dispatcher interprets
@@ -5642,7 +5642,7 @@ class H(BaseHTTPRequestHandler):
     def permission(self, aid, d):
         """Hold Claude Code's PermissionRequest hook until you press Allow or Deny at that agent's desk.
         An empty reply means "no decision", after which Claude is expected to show its own prompt (not yet confirmed
-        against a real prompt; see README). An empty reply is what is sent at once when
+        against a real prompt; see docs/TRUST_BOUNDARY.md). An empty reply is what is sent at once when
         no visible room window has checked in recently, when too many prompts are already held, on timeout, and
         when the last visible window goes away while holding."""
         if claude_permission_ownership(aid, d.get('session_id'))['classification'] != 'unmanaged':
