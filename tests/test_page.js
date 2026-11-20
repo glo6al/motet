@@ -4172,7 +4172,7 @@ let quietProofDeadline;(async()=>{
   const assert=require('assert/strict'),start=html.indexOf('function demo(){'),end=html.indexOf('/* Workspace shell helpers:',start),demoSource=html.slice(start,end);
   const expected=['Ada','Bram','Cleo','Dov','Esme','Codex cloud','Fen','Gita','Hale','Ivo','Juna','Kian','Leda','Miro','Neri','Orin','Pavo','Rhea','Suri','Tavi','Uma','Vero'];
   function verify(source){
-    const events=[],intervals=[],forbidden=()=>{throw Error('demo attempted a live effect')},c={Date:class extends Date{static now(){return 1800000000000}},DSEQ:0,location:{search:'?demo'},document:{createElement:()=>({})},$:()=>({after(){}}),paintWatch(){},lock(){},handle:e=>events.push(e),setInterval:(f,ms)=>intervals.push({f,ms}),setTimeout:forbidden,fetch:forbidden,XMLHttpRequest:forbidden,WebSocket:forbidden,EventSource:forbidden,Notification:forbidden,navigator:new Proxy({},{get:forbidden})};
+    const events=[],intervals=[],forbidden=()=>{throw Error('demo attempted a live effect')},c={Date:class extends Date{static now(){return 1800000000000}},DSEQ:0,location:{search:'?demo'},SNAMES:{},document:{createElement:()=>({})},$:()=>({after(){}}),paintWatch(){},lock(){},handle:e=>events.push(e),setInterval:(f,ms)=>intervals.push({f,ms}),setTimeout:forbidden,fetch:forbidden,XMLHttpRequest:forbidden,WebSocket:forbidden,EventSource:forbidden,Notification:forbidden,navigator:new Proxy({},{get:forbidden})};
     vm.runInNewContext(source+';demo();',c);
     const agents=events.filter(e=>e.kind==='agent'),byId=new Map(agents.map(a=>[a.agent,a])),roots=agents.filter(a=>!a.parent),kids=agents.filter(a=>a.parent);
     assert.equal(agents.length,22);assert.equal(byId.size,22);assert.equal(roots.length,6);assert.equal(kids.length,16);
@@ -4183,7 +4183,7 @@ let quietProofDeadline;(async()=>{
     for(const a of kids){assert.equal(a.sub,true);assert.ok(byId.has(a.parent));assert.equal(a.cwd,byId.get(a.parent).cwd);const seen=new Set([a.agent]);let p=a.parent;while(p){assert.ok(!seen.has(p),'no ancestry cycle');seen.add(p);p=byId.get(p).parent;}}
     const counts=Object.fromEntries(roots.map(a=>[a.name,kids.filter(k=>k.parent===a.agent).length]));
     assert.deepEqual(counts,{ 'Codex cloud':0,Ada:6,Bram:4,Cleo:3,Esme:2,Fen:1 });
-    assert.deepEqual(roots.filter(a=>a.cwd.endsWith('/Orchard')).map(a=>a.name),['Codex cloud','Ada','Bram']);
+    assert.deepEqual(roots.filter(a=>a.cwd.endsWith('/Orchard')).map(a=>a.name),['Codex cloud','Bram','Ada']);
     assert.equal(Math.ceil(counts.Ada/2),3,'existing pair layout reaches a third child row');
     assert.deepEqual(Object.fromEntries(['Orchard','Lighthouse','Tidewater'].map(p=>[p,agents.filter(a=>a.cwd.endsWith('/'+p)).length])),{Orchard:13,Lighthouse:4,Tidewater:5});
     const added=kids.filter(a=>a.name!=='Dov'),results=added.map(a=>events.find(e=>e.agent===a.agent&&e.kind==='result').text);
@@ -4194,6 +4194,7 @@ let quietProofDeadline;(async()=>{
     const ended=new Set(events.filter(e=>e.kind==='turn_end').map(e=>e.agent));
     assert.deepEqual(agents.filter(a=>ended.has(a.agent)).map(a=>a.name).sort(),['Bram','Esme','Fen','Hale','Juna','Leda','Orin','Rhea','Suri','Uma']);
     assert.equal(agents.length-ended.size,12);assert.equal(agents.filter(a=>a.observed).length,1);
+    assert.equal(c.SNAMES.Lighthouse,'Review — Lighthouse');
     assert.equal(c.HEALTH.tails,21);assert.equal(events.filter(e=>e.kind==='health').at(-1).tails,21);
     assert.equal(events.filter(e=>e.error).length,1,'Cleo remains the sole recorded failure');
     assert.deepEqual(events.filter(e=>e.kind==='perm').map(e=>e.agent),['c:demo-cleo']);

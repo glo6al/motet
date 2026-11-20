@@ -5918,12 +5918,13 @@ function demo(){
   setInterval(()=>{HEALTH.at=now(); HEALTH.now=now(); HEALTH.scan=now()},3000);
   const tag=document.createElement('span'); tag.id='demoTag'; tag.textContent='DEMO · synthetic agents · nothing here is real'; $('#brand').after(tag);
   const P={orchard:'/Users/demo/Projects/Orchard',lighthouse:'/Users/demo/Projects/Lighthouse',tidewater:'/Users/demo/Projects/Tidewater'};
+  SNAMES.Lighthouse='Review — Lighthouse'; // A fictional display name; keep the build folder and history intact.
   const ag=(id,o)=>handle(Object.assign({kind:'agent',agent:id,ts:t,started:o.started||t},o));
   const ev=(id,o)=>handle(Object.assign({agent:id,ts:t,seq:++DSEQ},o));
   /* the fleet */
   ag('e:demo-dot',{name:'Codex cloud',runtime:'Codex cloud',cwd:P.orchard,observed:'the process list, sampled about once a second (a sample can take longer while a folder is being looked up): a shorter command can be missed; of more than four new commands at once the oldest four are examined and the rest the next sample, so a short-lived one among them can be missed; each command\'s folder from lsof; what a command changed is not recorded here'});
-  ag('c:demo-ada',{name:'Ada',runtime:'Claude',cwd:P.orchard,model:'claude-opus-5-5',branch:'pricing-table',goal:'Add the seasonal pricing table to the catalogue and wire it to checkout.',ctx:61000,ctxref:140000});
   ag('x:demo-bram',{name:'Bram',runtime:'Codex',cwd:P.orchard,model:'gpt-6-astra',branch:'pricing-table',goal:"Review Ada's pricing change before it ships. Read-only.",ctx:88000,ctxmax:258000});
+  ag('c:demo-ada',{name:'Ada',runtime:'Claude',cwd:P.orchard,model:'claude-opus-5-5',branch:'pricing-table',goal:'Add the seasonal pricing table to the catalogue and wire it to checkout.',ctx:61000,ctxref:140000});
   ag('c:demo-cleo',{name:'Cleo',runtime:'Claude',cwd:P.lighthouse,model:'claude-sonnet-5-5',branch:'main',goal:'Find out why the nightly build fails on arm64 and fix it.',ctx:120000,ctxref:140000});
   ag('c:demo-dov',{name:'Dov',runtime:'Claude',cwd:P.lighthouse,parent:'c:demo-cleo',sub:true,task:'log search',goal:'Search the build logs for the first arm64 failure and report the line.',ctx:14000});
   ag('x:demo-esme',{name:'Esme',runtime:'Codex',cwd:P.tidewater,model:'gpt-6-astra',branch:'sessions-migration',goal:'Migrate the sessions table to the new schema without downtime.',ctx:150000,ctxmax:258000});

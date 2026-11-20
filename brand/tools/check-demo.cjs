@@ -63,6 +63,20 @@ async function inspect(browser,root,expected) {
     await page.goto(host.origin+'/?ui=workspace&demo');
     await page.waitForFunction(n=>document.querySelectorAll('#world .st').length===n,expected);
     await page.evaluate(()=>document.fonts.ready);
+    let confirmedHero = null;
+    if(expected === 22) {
+      await page.setViewportSize({width:1600,height:900});
+      await page.waitForFunction(() => !document.getAnimations().some(a => a.constructor.name === 'CSSTransition' && a.transitionProperty === 'transform'));
+      confirmedHero = await page.evaluate(() => {
+        const agent=A['c:demo-cleo'],request=need(agent),box=agent.el.getBoundingClientRect(),room=document.querySelector('#room').getBoundingClientRect();
+        return {name:agent.name,confirmed:request?.sure===true,project:projLabel(proj(agent.id)),viewport:[innerWidth,innerHeight],
+          box:{x:box.x,y:box.y,width:box.width,height:box.height},
+          fullyInside:box.left>=room.left&&box.right<=room.right&&box.top>=room.top&&box.bottom<=room.bottom};
+      });
+      assert.equal(confirmedHero.confirmed,true,'hero station has a recorded request');
+      assert.equal(confirmedHero.fullyInside,true,'the confirmed request station must fit the hero');
+      await page.setViewportSize({width:1440,height:900});
+    }
     const cast=await page.evaluate(()=>order.map(id=>({id,name:A[id].name,parent:A[id].parent||null,sub:!!A[id].sub,observed:!!A[id].observed,state:stateOf(A[id],Date.now()/1000).label||A[id].turn})));
     assert.equal(cast.length,expected);
     // These call the same page handlers as the controls, including simulated
@@ -89,7 +103,7 @@ async function inspect(browser,root,expected) {
     });
     assert.deepEqual(await page.evaluate(()=>window.__demoEffects),[],'no effects during benchmark');
     assert.deepEqual(requests,[],'no outbound requests during benchmark');
-    return {expected,cast,effects,requests,errors,samples:performance};
+    return {expected,cast,confirmedHero,effects,requests,errors,samples:performance};
   } finally {if(context)await context.close().catch(()=>{});host.server.closeAllConnections();await new Promise(resolve=>host.server.close(resolve));servers.delete(host.server);}
 }
 (async()=>{
