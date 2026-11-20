@@ -194,11 +194,19 @@ with open(LAUNCHES,'a') as f:f.write(json.dumps(args)+'\\n')
                     # Queue acceptance happens first; an independent later Codex turn writes its answer.
                     self.append_codex_turn(transcript,late,launches=launches)
                     store.tick()
-                    answer = rpc(client_two,'get_reply',{'request_id':first['request_id']})
-                    self.assertEqual((answer['state'],answer['reply']),('answered','SIMULATED Codex reply'))
-                    retry = rpc(client_two,'send_message',first)
-                    self.assertTrue(retry.pop('duplicate'))
-                    self.assertEqual(retry,{k:v for k,v in answer.items() if k!='duplicate'})
+                    # Compare identity/reply/progress exactly at one projection
+                    # instant. Authentication, deadlines and native tracking
+                    # keep their real clocks; only the read-time prose is fixed.
+                    projection_now = time.time()
+                    project_progress = peer_bridge.peer_progress.public_progress
+                    def progress_at_fixed_time(*args, **kwargs):
+                        return project_progress(*args, **dict(kwargs, now=projection_now))
+                    with patch.object(peer_bridge.peer_progress, 'public_progress', side_effect=progress_at_fixed_time):
+                        answer = rpc(client_two,'get_reply',{'request_id':first['request_id']})
+                        self.assertEqual((answer['state'],answer['reply']),('answered','SIMULATED Codex reply'))
+                        retry = rpc(client_two,'send_message',first)
+                        self.assertTrue(retry.pop('duplicate'))
+                        self.assertEqual(retry,{k:v for k,v in answer.items() if k!='duplicate'})
                     sent = rpc(client_two,'list_requests')['requests']
                     self.assertEqual([r['request_id'] for r in sent],[first['request_id']])
                     self.assertNotIn('reply',sent[0])
@@ -232,11 +240,8 @@ with open(LAUNCHES,'a') as f:f.write(json.dumps(args)+'\\n')
                     store.available = store.codex_available = True
                     configure_directory(store)
                     server.MESSAGING = store
-                    restarted = rpc(client_two,'get_reply',{'request_id':first['request_id']})
-                    # The elapsed prose changes with the read clock; durable facts do not.
-                    for current in (answer, restarted):
-                        self.assertIsInstance(current['progress']['summary'], str)
-                    restarted['progress']['summary'] = answer['progress']['summary']
+                    with patch.object(peer_bridge.peer_progress, 'public_progress', side_effect=progress_at_fixed_time):
+                        restarted = rpc(client_two,'get_reply',{'request_id':first['request_id']})
                     self.assertEqual(restarted, answer)
                     store.tick()
                     self.assertEqual(store.snapshot()['requests'],[])
