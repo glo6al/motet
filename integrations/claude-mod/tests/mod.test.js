@@ -827,6 +827,7 @@ test('Desktop surface eligibility awaits inside the supervisor singleflight guar
 
 const sdk={surface:null,isInteractive:false};
 const status=async h=>JSON.parse((await h.command('watch-status')).text);
+const deferredReceipts=(count,oldest_age_ms)=>({count,oldest_age_ms,scope:'current_loaded_receipt_context'});
 const registrations=h=>h.calls.filter(c=>c.url.endsWith('/register'));
 const polls=h=>h.calls.filter(c=>c.url.endsWith('/poll'));
 
@@ -1193,7 +1194,21 @@ test('v2 completion retry uses one persisted event ID and survives reload withou
   await h.waitCall('/event',(b,c)=>b.kind==='completed'&&c.response?.status===503,{settled:true});
   const original=h.events().find(e=>e.kind==='completed');
   const receipt=runtimeRows(storage)[0][1].requests[REQUEST];assert.equal(lifecycleReceipt(receipt,REQUEST),true);assert.equal(receiptRecord(receipt,REQUEST),false);
-  fail=false;const reload=await lifecycleHarness({storage,claimed:false});await reload.tick();await reload.waitAck('completed');
+  await h.drive(async()=>(await status(h)).deferred_receipts?.count===1,'observe the original deferral');
+  h.setNow(101000);
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(1,1000));
+  const reload=await lifecycleHarness({storage,claimed:false,startup:sdk,surfaces:[],fetch:(url,body)=>
+    url.endsWith('/event')&&body.kind==='completed'&&fail?responseJSON({},503):null});
+  reload.setNow(200000);
+  assert.deepEqual((await status(reload)).deferred_receipts,deferredReceipts(0,null));
+  reload.setSurfaces(['desktop']);await reload.tick();
+  assert.deepEqual((await status(reload)).deferred_receipts,deferredReceipts(1,0));
+  const replayed=reload.calls.length;
+  reload.setNow(201000);await reload.tick();
+  assert(!reload.calls.slice(replayed).some(c=>c.body.kind==='completed'));
+  assert.deepEqual((await status(reload)).deferred_receipts,deferredReceipts(1,1000));
+  fail=false;reload.setNow(230000);await reload.tick();await reload.waitAck('completed',{since:replayed});
+  assert.deepEqual((await status(reload)).deferred_receipts,deferredReceipts(0,null));
   const recovered=reload.events().find(e=>e.kind==='completed');
   for(const key of ['event_id','occurred_at','turn_id','answer','outcome'])assert.equal(recovered[key],original[key]);
   assert.equal(reload.submissions.length,0);
@@ -1312,11 +1327,20 @@ for(const transientStatus of [400,409,503])test(`receipt recovers automatically 
   await h.waitCall('/event',(b,c)=>b.kind==='completed'&&c.response?.status===transientStatus,{settled:true});
   await h.drive(()=>h.calls.slice(before).some(c=>c.url.endsWith('/poll')),'heartbeat after first temporary failure');
   assert.equal(h.events().filter(e=>e.kind==='completed').length,1);
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(1,0));
+  for(const origin of [{kind:'plugin',name:'fictional'},{kind:'peer'}]){
+    assert.equal(JSON.parse((await h.command('watch-status','',origin)).text).deferred_receipts,null);
+  }
+  h.setNow(129999);await h.tick();
+  assert.equal(h.events().filter(e=>e.kind==='completed').length,1);
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(1,29999));
   const afterFirstFailure=h.calls.length;
   h.setNow(130000);
   await h.drive(()=>failures===2&&h.calls.slice(afterFirstFailure).some(c=>c.url.endsWith('/poll')),
     'heartbeat after the second temporary failure');
-  assert.equal((await status(h)).receipt_recovery,null);
+  const visible=await status(h);
+  assert.equal(visible.receipt_recovery,null);
+  assert.deepEqual(visible.deferred_receipts,deferredReceipts(1,30000));
   assert(h.ownData().requests[REQUEST].events.some(e=>e.kind==='completed'));
   h.setNow(160000);
   await h.drive(()=>h.calls.some(c=>c.body.kind==='completed'&&c.response?.ok),'automatic exact receipt retry');
@@ -1325,8 +1349,143 @@ for(const transientStatus of [400,409,503])test(`receipt recovers automatically 
   const completions=h.events().filter(e=>e.kind==='completed');
   assert.equal(completions.length,3);
   assert(completions.every(e=>e.event_id===completions[0].event_id&&e.answer===ANSWER));
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(0,null));
   assert.equal((await status(h)).receipt_recovery,null);
   assert.equal(h.submissions.length,1);
+});
+
+test('deferred receipt status counts events and preserves the oldest age while separately reporting held receipts',async()=>{
+  let serverReady=false;
+  const h=await lifecycleHarness({fetch:(url,body)=>{
+    if(!url.endsWith('/event')||serverReady)return null;
+    if(body.kind==='submitted')return responseJSON({error_code:'receipt_rejected'},409);
+    if(body.kind==='started'||body.kind==='completed')return responseJSON({},503);
+  }});
+  await h.tick();await h.waitSubmission();
+  await h.drive(()=>Object.values(h.ownData().requests[REQUEST]?.rejections || {}).some(r=>r.count===1),'first permanent rejection');
+  h.setNow(101000);
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'private-fictional-turn'});
+  await h.drive(async()=>(await status(h)).deferred_receipts?.count===1,'start receipt deferred');
+  h.setNow(103000);
+  await h.call('turn.complete',{turnId:'private-fictional-turn',answer:ANSWER,isAborted:false,reason:'answer'});
+  await h.drive(async()=>(await status(h)).deferred_receipts?.count===2,'completion receipt deferred');
+  h.setNow(130000);
+  await h.drive(async()=>(await status(h)).receipt_recovery?.held_count===1,'permanent rejection hold');
+  const visible=await status(h);
+  assert.deepEqual(visible.deferred_receipts,deferredReceipts(2,29000));
+  const now=h.$.clock.now;
+  h.$.clock.now=async()=>{throw Error('Fictional private clock error');};
+  try {
+    const unavailable=await status(h);
+    assert.deepEqual(unavailable.deferred_receipts,deferredReceipts(2,null));
+    assert.equal(unavailable.connected,true);
+    assert(!JSON.stringify(unavailable).includes('Fictional private clock error'));
+  }finally{h.$.clock.now=now;}
+  assert.deepEqual(visible.receipt_recovery.held,[REQUEST]);
+  assert.equal(visible.connected,true);
+  assert(!JSON.stringify(visible).includes('private-fictional-turn'));
+  assert(!JSON.stringify(visible).includes('Fictional progress.'));
+  assert(!JSON.stringify(visible).includes('/fictional/project'));
+  assert(!JSON.stringify(visible).includes(CONFIG.grant));
+  serverReady=true;h.setNow(131000);
+  await h.tick();await h.waitAck('started',{count:2});
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(1,28000));
+  h.setNow(133000);await h.tick();await h.waitAck('completed',{count:2});
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(0,null));
+  assert.equal((await status(h)).receipt_recovery.held_count,1);
+  assert.equal(h.submissions.length,1);
+});
+
+test('a typed rejection replaces transient status while retaining the exact completion',async()=>{
+  let rejection=responseJSON({},503);
+  const h=await lifecycleHarness({fetch:(url,body)=>url.endsWith('/event')&&body.kind==='completed'?rejection:null});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'receipt-classification'});
+  await h.waitAck('started');
+  await h.call('turn.complete',{turnId:'receipt-classification',answer:ANSWER,isAborted:false,reason:'answer'});
+  await h.drive(async()=>(await status(h)).deferred_receipts?.count===1,'initial temporary deferral');
+  const original=h.ownData().requests[REQUEST].events.find(e=>e.kind==='completed');
+
+  rejection=responseJSON({error_code:'invalid_request'},400);
+  h.setNow(130000);await h.tick();
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(0,null));
+  assert.equal((await status(h)).receipt_recovery,null);
+  rejection=responseJSON({error_code:'receipt_rejected'},409);
+  h.setNow(160000);await h.tick();
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(0,null));
+  assert.deepEqual((await status(h)).receipt_recovery.held,[REQUEST]);
+  assert.deepEqual(h.ownData().requests[REQUEST].events,[original]);
+
+  rejection=responseJSON({},503);
+  await h.command('watch-retry-receipts',REQUEST);
+  assert.deepEqual((await status(h)).deferred_receipts,deferredReceipts(0,null));
+  assert.deepEqual((await status(h)).receipt_recovery.held,[REQUEST]);
+  assert.equal(h.submissions.length,1);
+});
+
+for(const siblingDeferred of [false,true])test(`a held receipt recovered from another runtime clears its deferral, sibling deferred: ${siblingDeferred}`,async()=>{
+  const h=await lifecycleHarness({fetch:(url,body)=>
+    url.endsWith('/event') && (body.kind==='completed' || siblingDeferred && body.kind==='started')?
+      responseJSON({},503):null});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'merged-receipt-hold'});
+  if(siblingDeferred)await h.drive(async()=>(await status(h)).deferred_receipts.count===1,'defer the sibling start receipt');
+  else await h.waitAck('started');
+  await h.call('turn.complete',{turnId:'merged-receipt-hold',answer:ANSWER,isAborted:false,reason:'answer'});
+  const count=siblingDeferred?2:1;
+  await h.drive(async()=>(await status(h)).deferred_receipts.count===count,'defer the completion receipt');
+
+  const foreign=copy(h.ownData());
+  const record=foreign.requests[REQUEST];
+  const completed=record.events.find(event=>event.kind==='completed');
+  const hash=createHash('sha256').update(JSON.stringify(completed)).digest('hex');
+  record.rejections={[hash]:{count:2,retry_at:130000}};
+  const foreignKey='watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT;
+  h.storage.set(foreignKey,copy(foreign));
+
+  const before=h.calls.length;
+  h.setNow(130000);await h.tick();
+  const visible=await status(h);
+  assert.deepEqual(visible.receipt_recovery.held,[REQUEST]);
+  assert.deepEqual(visible.deferred_receipts,deferredReceipts(siblingDeferred?1:0,siblingDeferred?30000:null));
+  assert.deepEqual(h.ownData().requests[REQUEST].events,record.events);
+  assert.deepEqual(h.ownData().requests[REQUEST].rejections,record.rejections);
+  assert.deepEqual(h.storage.get(foreignKey),foreign);
+  assert(!h.stores.some(({key})=>key===foreignKey));
+  const next=h.calls.slice(before);
+  assert(next.some(call=>call.url.endsWith('/poll')));
+  assert.deepEqual(next.filter(call=>call.url.endsWith('/event')).map(call=>call.body.kind),siblingDeferred?['started']:[]);
+  assert.equal(h.submissions.length,1);
+});
+
+test('a conflicted receipt is reported only through conflict recovery',async()=>{
+  const h=await lifecycleHarness({fetch:(url,body)=>
+    url.endsWith('/event')&&body.kind==='completed'?responseJSON({},503):null});
+  await h.tick();await h.waitSubmission();
+  await h.call('turn.start',{text:PEER_ENVELOPE,turnId:'deferred-conflict'});
+  await h.waitAck('started');
+  await h.call('turn.complete',{turnId:'deferred-conflict',answer:ANSWER,isAborted:false,reason:'answer'});
+  await h.drive(async()=>(await status(h)).deferred_receipts?.count===1,'initial temporary deferral');
+  const foreign=copy(h.ownData());
+  foreign.requests[REQUEST].events.find(e=>e.kind==='completed').answer=ANSWER+' Competing body.';
+  h.storage.set('watch-owner-runtime-v3:'+NATIVE+':'+ATTEMPT,foreign);
+  h.setNow(130000);await h.tick();
+  const visible=await status(h);
+  assert.deepEqual(visible.receipt_recovery.conflicts,[REQUEST]);
+  assert.deepEqual(visible.deferred_receipts,deferredReceipts(0,null));
+  assert.equal(h.events().filter(e=>e.kind==='completed').length,1);
+  assert.equal(h.submissions.length,1);
+});
+
+test('receipt status remains readable for a partial manual enrollment',async()=>{
+  const data={native_id:NATIVE,project:'/fictional/project',port:8793,active:true,
+    token:'fictional-watch-service-token',requests:{[REQUEST]:{request_id:REQUEST,phase:'unknown'}}};
+  const h=await harness({storage:new Map([['watch-owner-v1:'+NATIVE,data]]),claimed:false});
+  await h.tick();
+  const visible=await status(h);
+  assert.equal(visible.connected,false);
+  assert.match(visible.error,/connection interrupted/);
+  assert.deepEqual(visible.deferred_receipts,deferredReceipts(0,null));
 });
 
 test('superseded foreign rejections do not hold completed history or clear real held evidence',async()=>{

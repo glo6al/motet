@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect or explicitly retire one uncertain Bridge attempt through its running owner server.
+"""Inspect or explicitly retire one unresolved Bridge attempt through its running owner server.
 
 No provider calls, direct database writes, retry, redirect, or offline fallback.
 """
@@ -80,16 +80,17 @@ def owner_request(port, key, route, data):
         connection.close()
 
 
-def safe_receipt(result, transport_id, expected_agent, apply):
+def safe_receipt(result, selector, identifier, expected_agent, apply):
     """Print only validated metadata; never trust a server to redact arbitrary text."""
-    if result.get('transport_id') != transport_id:
+    transport_id = result.get('transport_id')
+    if result.get(selector) != identifier or not canonical_id(transport_id):
         raise ValueError('Owner response did not identify the requested attempt.')
     agent = result.get('agent')
     if not isinstance(agent, str) or agent[:2] not in ('x:', 'c:') or not canonical_id(agent[2:]):
         raise ValueError('Owner response did not identify an exact recipient.')
     if expected_agent and agent != expected_agent:
         raise ValueError('Owner response recipient did not match.')
-    out = {'transport_id': transport_id, 'agent': agent}
+    out = {selector: identifier, 'transport_id': transport_id, 'agent': agent}
     if apply:
         if result.get('status') not in ('retired', 'already_retired') or result.get('provider_outcome') != 'unknown':
             raise ValueError('Owner response did not confirm retirement.')
@@ -108,23 +109,27 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', type=int, required=True, help='Running Motet port on 127.0.0.1')
     parser.add_argument('--state-dir', default=str(Path.home() / '.live-room'), help='Private owner state directory (key only; no database access)')
-    parser.add_argument('--transport-id', required=True, help='Full exact Bridge transport UUID, not a prefix or client ID')
+    selector = parser.add_mutually_exclusive_group(required=True)
+    selector.add_argument('--transport-id', help='Full exact Bridge transport UUID')
+    selector.add_argument('--request-id', help='Full public request UUID from a shared Motet request or busy refusal')
     parser.add_argument('--expected-agent', help='Exact x: or c: native recipient ID; required to apply')
-    parser.add_argument('--apply', action='store_true', help='Explicitly retire this uncertain attempt, keeping provider outcome unknown')
+    parser.add_argument('--apply', action='store_true', help='Explicitly retire this unresolved attempt, keeping provider outcome unknown')
     args = parser.parse_args(argv)
-    if not 1 <= args.port <= 65535 or not canonical_id(args.transport_id):
-        parser.error('Use a valid port and full canonical transport UUID.')
+    selector = 'request_id' if args.request_id is not None else 'transport_id'
+    identifier = getattr(args, selector)
+    if not 1 <= args.port <= 65535 or not canonical_id(identifier):
+        parser.error('Use a valid port and full canonical request or transport UUID.')
     if args.expected_agent and (args.expected_agent[:2] not in ('x:', 'c:') or not canonical_id(args.expected_agent[2:])):
         parser.error('Use the exact native recipient identifier.')
     if args.apply and not args.expected_agent:
         parser.error('--apply requires --expected-agent from inspection.')
     try:
         key = read_owner_key(args.state_dir)
-        data = {'transport_id': args.transport_id}
+        data = {selector: identifier}
         if args.apply:
             data.update(agent=args.expected_agent, confirm=CONFIRM)
         result = owner_request(args.port, key, 'retire' if args.apply else 'inspect', data)
-        print(json.dumps(safe_receipt(result, args.transport_id, args.expected_agent, args.apply), indent=2))
+        print(json.dumps(safe_receipt(result, selector, identifier, args.expected_agent, args.apply), indent=2))
     except (OSError, ValueError):
         # Exception strings from local I/O/network stacks can expose paths or headers.
         print('Bridge owner request could not be confirmed. No retry or offline fallback was attempted.'

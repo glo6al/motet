@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import peer_lifecycle
+import peer_progress
 import os
 import re
 import secrets
@@ -961,7 +962,9 @@ class SharedBridge:
                 raise PeerError(429, 'Shared request history is full; owner maintenance is required.')
             metadata = transport_metadata(db, since=now - RETENTION)
             recent = [meta for meta in metadata.values() if meta['created'] > now - RETENTION]
-            capacity = peer_lifecycle.capacity_error(db, target['agent_id'], now, TTL)
+            capacity = peer_lifecycle.capacity_error(
+                db, target['agent_id'], now, TTL,
+                describe_recipient=lambda tid, state: self._recipient_capacity(tid, target['agent_id'], state))
             if capacity:
                 raise PeerError(429, capacity)
             if (len(recent) + recent_count(db, int(now * 1000)) >= 100
@@ -973,14 +976,57 @@ class SharedBridge:
             peer_lifecycle.reconcile(db, row)
             return self.result(request_id)
 
+    def _public_progress(self, transport_id, agent, snapshot, created, row, expired, now):
+        if (not isinstance(snapshot, dict) or snapshot.get('agent_id') != agent
+                or not all(isinstance(snapshot.get(key), str) and HEX.fullmatch(snapshot[key])
+                           for key in ('project_id', 'identity_revision'))):
+            return None
+        try:
+            return peer_progress.public_progress(self.store.db, transport_id, target=snapshot, created=created,
+                                                 row=row, expired=expired, now=now)
+        except (peer_progress.ProgressError, sqlite3.Error):
+            return None  # A progress failure never invalidates a retained reply.
+
+    def _recipient_capacity(self, transport_id, target, state):
+        if state == 'uncertain':
+            message = 'Earlier delivery requires recovery for this recipient'
+            suffix = '. The new request was not accepted; nothing was resent.'
+        else:
+            message = 'This recipient has an active request'
+            suffix = '. The new request was not accepted.'
+        try:
+            item = self.store.db.execute('''SELECT client_id,target_snapshot,created FROM shared_bridge_requests
+                                             WHERE transport_id=? AND target=?''', (transport_id, target)).fetchone()
+            classification, raw = self.store._peer_payload(transport_id)
+            if item and valid_request_id(item[0]) and classification == 'clear':
+                admission = peer_lifecycle.exact_admission(self.store.db, transport_id)
+                if admission and admission[0] == target and admission[1] == item[2] and admission[3] == 2:
+                    message = f'{message} ({item[0]})' if state == 'uncertain' else f'Busy with request ({item[0]})'
+                    if state == 'uncertain':
+                        return message + suffix
+                    now = time.time()
+                    expired = now - item[2] > RETENTION
+                    row = json.loads(raw[0]) if raw and not expired else None
+                    if row is not None and not peer_lifecycle.valid_payload(transport_id, row, admission):
+                        return message + suffix
+                    progress = self._public_progress(transport_id, target, json.loads(item[1]), item[2], row, expired, now)
+                    if progress and (detail := peer_progress.busy_detail(progress, now)):
+                        message += '. ' + detail.removesuffix('.')
+        except (PeerError, ValueError, TypeError, sqlite3.Error, RecursionError):
+            pass  # Optional progress cannot change a capacity denial.
+        return message + suffix
+
     def result(self, request_id, *, duplicate=False, include_reply=True):
         item = self.store.db.execute('SELECT target,target_snapshot,transport_id,created,preview FROM shared_bridge_requests WHERE client_id=?', (request_id,)).fetchone()
         if not item:
             raise PeerError(404, 'Shared request not found.')
-        expired = time.time() - item[3] > RETENTION
+        now = time.time()
+        expired = now - item[3] > RETENTION
         payload_state, raw = self.store._peer_payload(item[2])
         # Target selection is immutable ledger metadata, independent of the
         # transport payload. A bad payload must not invalidate a whole inbox page.
+        progress_row = None
+        progress_allowed = False
         try:
             snapshot = json.loads(item[1])
             if not isinstance(snapshot, dict):
@@ -1003,9 +1049,15 @@ class SharedBridge:
                 raise ValueError()
             row.get('error', '').encode('utf-8')
             row.get('reply', '').encode('utf-8')
-        except (ValueError, TypeError, UnicodeError):
-            row = {'state': 'unknown', 'error': 'Shared transport record is unavailable.'}
-        _project_result_terminal(self.store, item[2], payload_state, row, 2)
+            progress_row = row if raw and not expired else None
+            progress_allowed = True
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            row = {'state': 'unknown', 'error': "Motet could not read this request's record."}
+        try:
+            _project_result_terminal(self.store, item[2], payload_state, row, 2)
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            progress_allowed = False
+            row = {'state': 'unknown', 'error': "Motet could not read this request's record."}
         state = 'awaiting_reply' if row['state'] == 'quarantined' else row['state']
         reply = row.get('reply', '') if include_reply and state == 'answered' else ''
         if not isinstance(reply, str) or len(reply) > 16000:
@@ -1015,6 +1067,14 @@ class SharedBridge:
                   'duplicate': duplicate, 'text_preview': '' if expired else item[4]}
         if len(json.dumps(result, ensure_ascii=False).encode('utf-8')) > 60000:
             result.update(state='unknown', reply='', error='The reply exceeds the safe response size.')
+        if progress_allowed:
+            progress = self._public_progress(item[2], item[0], snapshot, item[3], progress_row, expired, now)
+            if progress:
+                candidate = dict(result, progress=progress)
+                if expired and progress['phase'] == 'held':
+                    candidate['error'] = progress['held_reason']
+                if len(json.dumps(candidate, ensure_ascii=False).encode('utf-8')) <= 60000:
+                    result = candidate
         return result
 
     def list_requests(self, cursor=None):

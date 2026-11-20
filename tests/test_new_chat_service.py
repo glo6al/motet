@@ -432,7 +432,9 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual((failed.exception.status, failed.exception.code), (400, 'invalid_request'))
         with self.assertRaises(NewChatError) as failed:
             s.remove_saved_folder(saved['id'], {'revision': '0' * 64})
-        self.assertEqual((failed.exception.status, failed.exception.code), (409, 'saved_folder_changed'))
+        self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message),
+                         (409, 'saved_folder_changed',
+                          'This saved project folder changed. Refresh the list before removing it.'))
         self.assertEqual(s.db.execute('SELECT id,data FROM registered_folders').fetchall(), before)
         with s.db:
             s.db.execute('UPDATE registered_folders SET data=?', ('{',))
@@ -474,7 +476,9 @@ class ServiceTests(unittest.TestCase):
             with self.subTest(action=action), patch.object(s, 'db', DatabaseProbe(s.db, execute=interfere)):
                 with self.assertRaises(NewChatError) as failed:
                     s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
-                self.assertEqual((failed.exception.status, failed.exception.code), (409, 'saved_folder_changed'))
+                self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message),
+                                 (409, 'saved_folder_changed',
+                                  'This saved project folder changed. Refresh the list before removing it.'))
             remaining = s.db.execute('SELECT data FROM registered_folders').fetchone()
             self.assertEqual(remaining, (changed,) if action == 'replace' else (original.encode(),) if action == 'blob' else None)
 
@@ -482,7 +486,7 @@ class ServiceTests(unittest.TestCase):
         s = self.service()
         saved = s.register_folder({'path': str(self.folder)})['folder']
         unavailable = (503, 'saved_folders_unavailable',
-                       'Saved project folders are unavailable. Refresh saved folders to check.')
+                       'Saved project folders are unavailable. Refresh the list to check.')
         def broken(sql, *args):
             raise sqlite3.OperationalError('/fictional/private database failure')
         for operation in (lambda: s.saved_folders(), lambda: s.remove_saved_folder(saved['id'], {'revision': saved['revision']})):
@@ -531,8 +535,9 @@ class ServiceTests(unittest.TestCase):
                         s.db = Probe(database)
                     with self.assertRaises(NewChatError) as failed:
                         s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
-                    self.assertEqual((failed.exception.status, failed.exception.code),
-                                     (503, 'saved_folders_unavailable'))
+                    self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message),
+                                     (503, 'saved_folders_unavailable',
+                                      'Saved project folders are unavailable. Refresh the list to check.'))
                     self.assertFalse(database.in_transaction)
                     self.assertEqual(len(s.saved_folders()['savedFolders']), 1)
                     self.assertEqual(reader.execute('SELECT count(*) FROM registered_folders').fetchone()[0], 1)
@@ -580,7 +585,9 @@ class ServiceTests(unittest.TestCase):
         try:
             with self.assertRaises(NewChatError) as failed:
                 s.remove_saved_folder(saved['id'], {'revision': saved['revision']})
-            self.assertEqual((failed.exception.status, failed.exception.code), (503, 'saved_folders_unavailable'))
+            self.assertEqual((failed.exception.status, failed.exception.code, failed.exception.message),
+                             (503, 'saved_folders_unavailable',
+                              'Saved project folders are unavailable. Restart Motet before trying again.'))
             self.assertIsNone(s.db, 'even a failed close cannot leave a reusable dirty journal')
             self.assertEqual(s._file_lock, file_lock)
             os.fstat(file_lock)
@@ -596,8 +603,9 @@ class ServiceTests(unittest.TestCase):
                               lambda: s.observe(attempt['attemptId'], {'action': 'stop'})):
                 with self.assertRaises(NewChatError) as unavailable:
                     operation()
-                self.assertEqual((unavailable.exception.status, unavailable.exception.code),
-                                 (503, 'saved_folders_unavailable'))
+                self.assertEqual((unavailable.exception.status, unavailable.exception.code, unavailable.exception.message),
+                                 (503, 'saved_folders_unavailable',
+                                  'Saved project folders are unavailable. Restart Motet before trying again.'))
             s.process_admissions(lambda *args: self.fail('A poisoned journal cannot admit a native session'))
             self.assertEqual((self.adapter.preflights, self.adapter.verifies,
                               self.adapter.creates, self.adapter.opens), calls)

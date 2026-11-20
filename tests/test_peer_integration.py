@@ -232,7 +232,12 @@ with open(LAUNCHES,'a') as f:f.write(json.dumps(args)+'\\n')
                     store.available = store.codex_available = True
                     configure_directory(store)
                     server.MESSAGING = store
-                    self.assertEqual(rpc(client_two,'get_reply',{'request_id':first['request_id']}),answer)
+                    restarted = rpc(client_two,'get_reply',{'request_id':first['request_id']})
+                    # The elapsed prose changes with the read clock; durable facts do not.
+                    for current in (answer, restarted):
+                        self.assertIsInstance(current['progress']['summary'], str)
+                    restarted['progress']['summary'] = answer['progress']['summary']
+                    self.assertEqual(restarted, answer)
                     store.tick()
                     self.assertEqual(store.snapshot()['requests'],[])
                     self.assertEqual(len(launches.read_text().splitlines()),1)

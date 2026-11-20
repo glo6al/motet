@@ -200,6 +200,8 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(reply['state'], 'unknown')
         self.assertEqual(reply['reply'], '')
         self.assertEqual(reply['error'], 'Reply received but withheld because earlier owner-message tracking stopped before this turn could be isolated.')
+        self.assertIn('Reply unavailable.', reply['progress']['summary'])
+        self.assertNotIn('verification is pending', reply['progress']['summary'])
         row = self.row(rid)
         self.assertEqual(row['candidate_reply'], '')
         self.assertTrue(row['settled'])
@@ -207,7 +209,12 @@ class SharedTests(unittest.TestCase):
         self.assertLess(time.time() - row['quarantined_at'], p.TTL)
         self.assertEqual(self.bridge.list_requests()['requests'][0]['state'], 'unknown')
         self.assertEqual(self.tick().call_count, 0)
-        self.assertEqual(self.bridge.result(rid), reply)
+        reread = self.bridge.result(rid)
+        # Read-time elapsed prose may advance without changing the recorded facts.
+        if 'progress' in reply:
+            self.assertIsInstance(reread['progress']['summary'], str)
+            reread['progress']['summary'] = reply['progress']['summary']
+        self.assertEqual(reread, reply)
 
     def test_owner_barrier_preserves_catchup_and_existing_isolation_rules(self):
         cases = (

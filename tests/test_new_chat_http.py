@@ -367,7 +367,7 @@ class SavedFoldersServiceHttpTests(unittest.TestCase):
         for path, body in ((PREFIX + 'folders', None), (route, {'revision': self.saved['revision']})):
             self.assertEqual(self.call(path, body), (503, {'schemaVersion': 1, 'error': {
                 'code': 'saved_folders_unavailable',
-                'message': 'Saved project folders are unavailable. Refresh saved folders to check.'}}))
+                'message': 'Saved project folders are unavailable. Refresh the list to check.'}}))
 
 
 @unittest.skipIf(os.name == 'nt', 'Saved folder management uses private POSIX storage.')
@@ -479,7 +479,7 @@ class SavedFoldersSocketTests(unittest.TestCase):
                 ('POST', 'intents', selection), ('POST', 'attempts', dict(selection, requestId=NATIVE))):
             self.assertEqual(self.request(method, path, body), (503, {'schemaVersion': 1, 'error': {
                 'code': 'saved_folders_unavailable',
-                'message': 'Saved project folders are unavailable. Refresh saved folders to check.'}}))
+                'message': 'Saved project folders are unavailable. Restart Motet before trying again.'}}))
         self.assertIsNone(self.service.db)
         self.assertEqual(self.service.jobs, {})
         self.assertEqual(self.content.read_text(), 'Fictional project content stays intact.')
