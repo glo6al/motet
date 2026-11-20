@@ -305,6 +305,55 @@ class ClaudePeerBackendTests(unittest.TestCase):
         self.assertEqual(self.store.shared.result(sent['request_id'])['reply'], '')
         self.send()
 
+    def test_pruned_claude_claim_with_compatible_bound_turn_is_excluded_from_codex_hold(self):
+        import peer_lifecycle as life
+
+        self.enable_lifecycle()
+        sent = self.send()
+        public_id = sent['request_id']
+        claim = self.global_poll(self.body['client_id'])[1]['claim']
+        transport_id = claim['request_id']
+        turn_id = 'fictional-turn'
+        self.assertEqual(self.event(claim, 'started', turn_id=turn_id)[0], 200)
+
+        now = time.time()
+        with self.store.lock, self.store.db:
+            row = self.peer_row(public_id)
+            self.assertEqual(row['request_id'], transport_id)
+            self.assertEqual(row['agent'], self.aid)
+            self.assertEqual(row['mod_turn'], turn_id)
+            row['created'] = now - peer_bridge.RETENTION - 1
+            # The persisted payload schema allows both turn fields. Exercise that
+            # compatibility so the bound-turn check cannot mask a missing provider filter.
+            row['bound_turn'] = turn_id
+            self.store.db.execute('UPDATE shared_bridge_requests SET created=? WHERE client_id=?',
+                                  (row['created'], public_id))
+            self.store.mods.put(row)
+            before = life.get(self.store.db, transport_id)
+            self.assertEqual((before['execution'], before['capture']), ('running', 'pending'))
+            self.assertEqual(before['evidence']['bound_turn'], turn_id)
+            self.assertIs(before['evidence']['launched'], True)
+            self.store._prune(self.store._rows(), now)
+
+        retained = life.get(self.store.db, transport_id)
+        self.assertNotIn('codex_retention_hold', retained['evidence'], life.CODEX_RETENTION_HOLD)
+        self.assertEqual((retained['execution'], retained['capture']), ('running', 'pending'))
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM requests WHERE id=?', (transport_id,)).fetchone())
+        with self.assertRaisesRegex(peer_bridge.PeerError, 'Busy with request'):
+            self.send('Fictional follow-up.')
+
+        status, receipt = self.completion(claim, 'answered', turn_id=turn_id)
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual((receipt['request_id'], receipt['turn_id']), (transport_id, turn_id))
+        completed = life.get(self.store.db, transport_id)
+        self.assertEqual((completed['execution'], completed['capture']), ('completed', 'unusable'))
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM requests WHERE id=?', (transport_id,)).fetchone())
+        result = self.store.shared.result(public_id)
+        self.assertEqual((result['state'], result['text_preview'], result['reply']), ('expired', '', ''))
+        followup = self.send('Fictional follow-up.')
+        next_claim = self.global_poll(self.body['client_id'])[1]['claim']
+        self.assertEqual(next_claim['request_id'], self.peer_row(followup['request_id'])['request_id'])
+
     def test_dropped_execution_rejects_v1_and_v2_contradictory_answers(self):
         import peer_lifecycle
         self.enable_lifecycle(); sent = self.send()

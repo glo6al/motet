@@ -149,7 +149,8 @@ class LifecycleTests(unittest.TestCase):
             with self.subTest(age=age):
                 answer = life.capacity_error(self.db, fifth, original_created + age, 900)
                 if age < 900:
-                    self.assertIn('Four peer deliveries', answer)
+                    self.assertEqual(answer, 'Four peer deliveries from the last 15 minutes are still open. '
+                                     'Try again shortly. The new request was not accepted.')
                 else:
                     self.assertIsNone(answer)
                 for row in rows:

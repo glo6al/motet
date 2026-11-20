@@ -15,17 +15,57 @@ MAX_BODY = 4096
 CONFIRM = 'retire_unknown_without_resend'
 
 
-def _selection(store, transport_id):
-    db = store.db
+def _selector(data, fields):
+    keys = set(data)
+    selectors = keys - fields
+    if not fields <= keys or selectors not in ({'transport_id'}, {'request_id'}):
+        raise peer_bridge.PeerError(400, 'Expected one exact Bridge request or transport identifier.')
+    return selectors.pop()
+
+
+def _shared_admission(db, request_id):
+    from peer_inbox import excludes_native_id
+
+    if not peer_bridge.valid_request_id(request_id):
+        raise peer_bridge.PeerError(400, 'Use an exact shared Bridge request UUID.')
+    item = db.execute('''SELECT transport_id,target,created,launched,target_snapshot
+                        FROM shared_bridge_requests WHERE client_id=?''', (request_id,)).fetchone()
+    if not item:
+        raise peer_bridge.PeerError(404, 'Shared Bridge request not found.')
+    excludes_native_id(db, request_id)
+    transport_id, target, created, launched, snapshot = item
     if not peer_bridge.is_uuid(transport_id):
-        raise peer_bridge.PeerError(400, 'Use an exact canonical transport UUID.')
+        raise peer_bridge.PeerError(409, 'The original transport identity is unavailable.')
+    try:
+        snapshot = json.loads(snapshot)
+    except (ValueError, TypeError, RecursionError):
+        raise peer_bridge.PeerError(409, 'The original target snapshot is unavailable.') from None
+    provider = {'x:': 'codex', 'c:': 'claude'}.get(target[:2]) if isinstance(target, str) else None
+    if (not isinstance(snapshot, dict) or provider is None or
+            snapshot.get('agent_id') != target or snapshot.get('provider') != provider or
+            not all(isinstance(snapshot.get(key), str) and peer_bridge.HEX.fullmatch(snapshot[key])
+                    for key in ('identity_revision', 'project_id'))):
+        raise peer_bridge.PeerError(409, 'The original target snapshot conflicts with its admission.')
+    return transport_id, (target, created, launched, 2), snapshot['identity_revision']
+
+
+def _selection(store, selector, identifier):
+    db = store.db
+    admission, revision = None, None
+    if selector == 'request_id':
+        transport_id, admission, revision = _shared_admission(db, identifier)
+    else:
+        transport_id = identifier
+        if not peer_bridge.is_uuid(transport_id):
+            raise peer_bridge.PeerError(400, 'Use an exact canonical transport UUID.')
     count = sum(db.execute('SELECT COUNT(*) FROM ' + table + ' WHERE transport_id=?',
                            (transport_id,)).fetchone()[0]
                 for table in ('shared_bridge_requests', 'peer_requests'))
     if not count:
         raise peer_bridge.PeerError(404, 'Transport request not found.')
     meta = lifecycle.metadata(db, transport_id).get(transport_id)
-    if (count != 1 or not meta or not isinstance(meta[0], str) or meta[0][:2] not in ('x:', 'c:')
+    if (count != 1 or not meta or (admission is not None and admission != meta)
+            or not isinstance(meta[0], str) or meta[0][:2] not in ('x:', 'c:')
             or not peer_bridge.is_uuid(meta[0][2:])
             or type(meta[1]) not in (int, float) or not math.isfinite(meta[1])
             or meta[2] is not None and (type(meta[2]) not in (int, float)
@@ -37,7 +77,7 @@ def _selection(store, transport_id):
     payload_state, raw = store._peer_payload(transport_id)
     if payload_state != 'clear':
         raise peer_bridge.PeerError(409, 'Retirement conflicts with execution evidence.')
-    return meta, record, raw
+    return transport_id, meta, record, raw, revision
 
 
 def _candidate(meta, record):
@@ -61,42 +101,42 @@ def _eligible(meta, record, row, now):
     return record is not None and now >= meta[1] + peer_bridge.TTL
 
 
-def _payload(transport_id, raw, meta):
+def _payload(transport_id, raw, meta, revision):
     try:
         row = json.loads(raw[0])
     except (ValueError, TypeError):
         raise peer_bridge.PeerError(409, 'Retained execution evidence is malformed.') from None
-    if not lifecycle.valid_payload(transport_id, row, meta):
+    if (not lifecycle.valid_payload(transport_id, row, meta)
+            or revision is not None and row.get('identity_revision') != revision):
         raise peer_bridge.PeerError(409, 'Retained execution evidence is malformed.')
     return row
 
 
 def inspect(store, data):
-    if set(data) != {'transport_id'}:
-        raise peer_bridge.PeerError(400, 'Expected one exact transport identifier.')
+    selector = _selector(data, set())
     with store.lock:
-        meta, record, raw = _selection(store, data['transport_id'])
-        row = _payload(data['transport_id'], raw, meta) if raw and _candidate(meta, record) else None
+        tid, meta, record, raw, revision = _selection(store, selector, data[selector])
+        row = _payload(tid, raw, meta, revision) if raw and (revision or _candidate(meta, record)) else None
         eligible = _eligible(meta, record, row, time.time())
-        return dict(transport_id=data['transport_id'], agent=meta[0],
+        return dict({selector: data[selector]}, transport_id=tid, agent=meta[0],
                     execution=record['execution'] if record else ('uncertain' if meta[2] is not None else 'reserved'),
                     capture=record['capture'] if record else 'pending',
                     retained_payload=raw is not None, eligible=eligible)
 
 
 def retire(store, data):
-    if (set(data) != {'transport_id', 'agent', 'confirm'} or data['confirm'] != CONFIRM
-            or not isinstance(data['agent'], str)):
+    if data.get('confirm') != CONFIRM or not isinstance(data.get('agent'), str):
         raise peer_bridge.PeerError(400, 'Exact owner retirement confirmation is required.')
+    selector = _selector(data, {'agent', 'confirm'})
     with peer_bridge.transaction(store.db, store.lock):
         db = store.db
-        meta, record, raw = _selection(store, data['transport_id'])
+        tid, meta, record, raw, revision = _selection(store, selector, data[selector])
         if data['agent'] != meta[0]:
             raise peer_bridge.PeerError(409, 'Recipient identity does not match its admission.')
         if meta[2] is None:
             raise peer_bridge.PeerError(409, 'Only a launched attempt can be retired online.')
         already = bool(record and record['execution'] == 'retired')
-        row = _payload(data['transport_id'], raw, meta) if raw and not already else None
+        row = _payload(tid, raw, meta, revision) if raw and (revision or not already) else None
         try:
             if not already:
                 # Check both the preexisting ledger and any newer retained evidence.
@@ -104,15 +144,15 @@ def retire(store, data):
                 previous = record
                 if row is not None:
                     lifecycle.reconcile(db, row, meta)
-                    record = lifecycle.get(db, data['transport_id'])
+                    record = lifecycle.get(db, tid)
                 now = time.time()
                 if not (_eligible(meta, previous, row, now) and _eligible(meta, record, row, now)):
                     raise peer_bridge.PeerError(409, 'This attempt is outside the online retirement policy.')
-            lifecycle.retire(db, data['transport_id'], lifecycle.RETIRE_REASON,
+            lifecycle.retire(db, tid, lifecycle.RETIRE_REASON,
                              expected_agent=data['agent'], source='online_owner_decision')
         except ValueError:
             raise peer_bridge.PeerError(409, 'Retirement conflicts with execution evidence.') from None
-        return dict(transport_id=data['transport_id'], agent=meta[0],
+        return dict({selector: data[selector]}, transport_id=tid, agent=meta[0],
                     status='already_retired' if already else 'retired', provider_outcome='unknown',
                     message=lifecycle.RETIRE_MESSAGE)
 

@@ -278,11 +278,13 @@ test('reply guidance uses explicit task checkpoints without injected notices or 
  assert.match(instructions,/does not inject reply-ready notifications or automatically wake a finished chat/);
  assert.match(instructions,/Do not run a polling loop/);
  assert.match(instructions,/Legacy WATCH_PEER_REPLY notices are not new owner requests/);
- assert.match(nativeInstructions,/Busy means a prior open request.*Retain the earlier request ID.*get_reply at a meaningful task checkpoint/);
- assert.match(nativeInstructions,/Start observed with no end observed.*leaves current liveness unknown/);
- assert.match(nativeInstructions,/For Codex, “Motet last read its log” reports a successful read of the bound transcript/);
- assert.match(nativeInstructions,/Unknown or expired requests may have been dispatched/);
- assert.match(nativeInstructions,/24-hour retention limit from request creation/);
+ assert.match(nativeInstructions,/Busy means an earlier request to that recipient is still open/);
+ assert.match(nativeInstructions,/check get_reply at a meaningful checkpoint\. Do not resend/);
+ assert.match(nativeInstructions,/it does not say whether the turn is still running/);
+ assert.match(nativeInstructions,/If the start is much older than the task should take, tell the owner/);
+ assert.match(nativeInstructions,/Requests shown as unknown or expired may still have been delivered/);
+ assert.match(nativeInstructions,/Request and answer text are kept for 24 hours from the request's creation/);
+ assert.doesNotMatch(nativeInstructions,/Motet last read its log/);
  assert.doesNotMatch(instructions,/notice authorizes|event-driven get_reply/);
  assert.equal(validArgs('send_message',{agent_id:'c:'+randomUUID(),identity_revision:'a'.repeat(64),text:'Fictional',return_address:'guessed'}),false);
 });

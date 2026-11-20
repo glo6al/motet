@@ -1002,15 +1002,16 @@ class SharedBridge:
                 admission = peer_lifecycle.exact_admission(self.store.db, transport_id)
                 if admission and admission[0] == target and admission[1] == item[2] and admission[3] == 2:
                     message = f'{message} ({item[0]})' if state == 'uncertain' else f'Busy with request ({item[0]})'
+                    if state == 'uncertain':
+                        return message + suffix
                     now = time.time()
                     expired = now - item[2] > RETENTION
                     row = json.loads(raw[0]) if raw and not expired else None
                     if row is not None and not peer_lifecycle.valid_payload(transport_id, row, admission):
                         return message + suffix
                     progress = self._public_progress(transport_id, target, json.loads(item[1]), item[2], row, expired, now)
-                    if progress and progress['phase'] in ('started', 'accepted', 'claim_issued', 'held'):
-                        room = 512 - len(message) - len(suffix) - 2
-                        message += '. ' + progress['summary'][:room].rstrip(' .')
+                    if progress and (detail := peer_progress.busy_detail(progress, now)):
+                        message += '. ' + detail.removesuffix('.')
         except (PeerError, ValueError, TypeError, sqlite3.Error, RecursionError):
             pass  # Optional progress cannot change a capacity denial.
         return message + suffix
@@ -1051,12 +1052,12 @@ class SharedBridge:
             progress_row = row if raw and not expired else None
             progress_allowed = True
         except (ValueError, TypeError, UnicodeError, RecursionError):
-            row = {'state': 'unknown', 'error': 'Shared transport record is unavailable.'}
+            row = {'state': 'unknown', 'error': "Motet could not read this request's record."}
         try:
             _project_result_terminal(self.store, item[2], payload_state, row, 2)
         except (ValueError, TypeError, AttributeError, RecursionError):
             progress_allowed = False
-            row = {'state': 'unknown', 'error': 'Shared execution evidence is unavailable.'}
+            row = {'state': 'unknown', 'error': "Motet could not read this request's record."}
         state = 'awaiting_reply' if row['state'] == 'quarantined' else row['state']
         reply = row.get('reply', '') if include_reply and state == 'answered' else ''
         if not isinstance(reply, str) or len(reply) > 16000:

@@ -124,16 +124,35 @@ def _iso(value):
     return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=value)).isoformat(timespec='seconds')
 
 
-def _when(value, now):
-    stamp = _iso(value)
+def _elapsed(value, now):
     if not _timestamp(now) or now < value:
-        return stamp
+        return None
     seconds = int(now - value)
     for size, unit in ((86400, 'day'), (3600, 'hour'), (60, 'minute'), (1, 'second')):
         if seconds >= size:
             count = seconds // size
-            return f"{stamp} ({count} {unit}{'s' if count != 1 else ''} ago)"
-    return stamp + ' (just now)'
+            return f"{count} {unit}{'s' if count != 1 else ''} ago"
+    return 'just now'
+
+
+def _when(value, now):
+    stamp = _iso(value)
+    elapsed = _elapsed(value, now)
+    return f'{stamp} ({elapsed})' if elapsed else stamp
+
+
+def busy_detail(progress, now):
+    """Summarize validated open progress without ISO timestamps or other detail."""
+    phase = progress['phase']
+    field = {'started': 'started_at', 'accepted': 'accepted_at', 'claim_issued': 'claim_issued_at'}.get(phase)
+    if field is None:
+        return ''
+    stamp = progress[field]
+    elapsed = _elapsed(datetime.fromisoformat(stamp).timestamp(), now) if stamp is not None else None
+    if phase == 'started':
+        return (f'Start observed {elapsed}, no end observed.' if elapsed else
+                'Start recorded, time unavailable, no end observed.')
+    return f'Accepted {elapsed}, start not observed.' if elapsed else ''
 
 
 def public_progress(db, transport_id, *, target, created, row, expired, now):
@@ -158,13 +177,13 @@ def public_progress(db, transport_id, *, target, created, row, expired, now):
         dates['last_checked_at'] = None
     started = dates['started_at']
     ended = dates['ended_at']
-    checked = dates['last_checked_at']
     reason = None
     if execution == 'retired':
-        phase, summary = 'retired', 'The owner retired this request. The provider outcome is unknown.'
+        phase, summary = 'retired', 'The owner cleared this request. What the recipient did with it is unknown.'
     elif execution == 'dropped':
         phase = 'not_sent'
-        summary = 'Not sent.' if launched is None else 'The provider reported that the request did not start.'
+        summary = ('The Claude plugin reported that the request did not start.' if provider == 'claude' and launched is not None
+                   else 'Not sent.')
     elif execution == 'completed':
         phase = 'ended'
         summary = f'End observed at {_when(ended, now)}.' if ended is not None else 'End recorded; end time unavailable.'
@@ -174,46 +193,42 @@ def public_progress(db, transport_id, *, target, created, row, expired, now):
               or row.get('state') == 'unknown' and row.get('tracking_stopped')):
             summary += ' Reply unavailable.'
         elif capture == 'pending':
-            summary += ' Reply verification is pending.'
+            summary += ' Reply not verified yet.'
     elif execution == 'uncertain' or row is not None and (row.get('state') in ('unknown', 'expired') or row.get('tracking_stopped')):
         phase = 'held'
         retained_hold = evidence.get('codex_retention_hold') == peer_lifecycle.CODEX_RETENTION_HOLD
-        reason = (peer_lifecycle.CODEX_RETENTION_HOLD + ' Recipient recovery is required.' if retained_hold else
-                  'Delivery or completion could not be verified. Recipient recovery is required.')
+        reason = ('Motet stopped tracking this request at the 24-hour limit before an end was observed. '
+                  'The owner must clear it before the recipient can take another.' if retained_hold else
+                  'Delivery or completion could not be verified. The owner must clear this request '
+                  'before the recipient can take another.')
         summary = reason
-        if evidence.get(turn):
-            summary += (' Start observed at ' + _when(started, now) + '.' if started is not None else
-                        ' Start recorded; start time unavailable.')
-            summary += ' No end observed yet.'
-    elif (expired or row is None) and execution != 'running':
-        phase = 'unavailable'
-        summary = ('The request is past the content retention window. No end was verified.' if expired else
-                   'The request record is unavailable. No end was verified.')
     elif execution == 'running':
         phase = 'started'
         summary = (f'Start observed at {_when(started, now)}.' if started is not None else
                    'Start recorded; start time unavailable.')
-        summary += ' No end observed yet.'
-        if checked is not None:
-            summary += f' Motet last read its log at {_when(checked, now)}.'
-        if expired:
-            summary += ' The request is past the content retention window.'
-        elif row is None:
-            summary += ' The request record is unavailable.'
+        summary += ' No end observed.'
+        if _timestamp(now) and now - created > 900:
+            summary += ' If that turn has stopped, the owner can clear this request.'
     elif execution == 'submitted' and dates['accepted_at'] is not None:
         phase = 'accepted'
-        summary = f'Native acceptance observed at {_when(dates["accepted_at"], now)}. Start not observed.'
-    elif execution == 'submitted' and provider == 'claude':
+        summary = f'Accepted by the app at {_when(dates["accepted_at"], now)}. Start not observed.'
+    elif execution == 'submitted' and provider == 'claude' and (row is not None or dates['claim_issued_at'] is not None):
         keys = _binding_fields(agent, 'claim_issued', evidence)
-        _check_binding(keys, evidence, {key: row.get(key) for key in keys})
+        receipt = row if row is not None else evidence
+        _check_binding(keys, evidence, {key: receipt.get(key) for key in keys})
         phase = 'claim_issued'
         issued = dates['claim_issued_at']
-        summary = (f'Claude claim issued at {_when(issued, now)}.' if issued is not None else 'Claude claim issued.')
-        summary += ' Native submission unconfirmed.'
+        summary = (f'Handed to the Claude plugin at {_when(issued, now)}.' if issued is not None else
+                   'Handed to the Claude plugin.')
+        summary += ' Not confirmed as submitted.'
+    elif expired or row is None:
+        phase = 'unavailable'
+        summary = ('This request is older than 24 hours and its text is no longer kept. No end was verified.' if expired else
+                   "This request's record is unavailable. No end was verified.")
     elif execution == 'reserved' and launched is None:
-        phase, summary = 'waiting_dispatch', 'Waiting for dispatch.'
+        phase, summary = 'waiting_dispatch', 'Waiting to be sent.'
     else:
-        phase, summary = 'unavailable', 'Dispatch recorded. Native acceptance is unconfirmed.'
+        phase, summary = 'unavailable', 'Sent. Not confirmed as accepted by the app.'
     return {'version': _VERSION, 'provider': provider, 'phase': phase,
             **{key: _iso(value) for key, value in dates.items()}, 'summary': summary, 'held_reason': reason}
 
