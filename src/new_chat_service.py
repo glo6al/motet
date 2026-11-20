@@ -180,7 +180,7 @@ class NewChatService:
     def _journal_guard(self):
         if self._journal_unavailable:
             _error('saved_folders_unavailable',
-                   'Saved project folders are unavailable. Refresh saved folders to check.', 503)
+                   'Saved project folders are unavailable. Restart Motet before trying again.', 503)
 
     def _adapter(self, row):
         adapter = self.adapters.get(row['provider'])
@@ -253,7 +253,7 @@ class NewChatService:
                 folders, unreadable = self._read_registered_folders()
             except sqlite3.Error:
                 _error('saved_folders_unavailable',
-                       'Saved project folders are unavailable. Refresh saved folders to check.', 503)
+                       'Saved project folders are unavailable. Refresh the list to check.', 503)
             return {'schemaVersion': 1, 'savedFolders': [public_folder(folder) for folder in folders],
                     'complete': unreadable == 0, 'unreadableCount': unreadable}
 
@@ -278,12 +278,12 @@ class NewChatService:
                                'This saved project folder could not be verified. Nothing was removed.', 409)
                     if not hmac.compare_digest(folder.revision, data['revision']):
                         _error('saved_folder_changed',
-                               'This saved project folder changed. Refresh saved folders before removing it.', 409)
+                               'This saved project folder changed. Refresh the list before removing it.', 409)
                     deleted = self.db.execute("DELETE FROM registered_folders WHERE id=? AND typeof(id)='text' "
                                               "AND typeof(data)='text' AND CAST(data AS BLOB)=?", (ident, row[1]))
                     if deleted.rowcount != 1:
                         _error('saved_folder_changed',
-                               'This saved project folder changed. Refresh saved folders before removing it.', 409)
+                               'This saved project folder changed. Refresh the list before removing it.', 409)
             except sqlite3.Error:
                 # Older sqlite3 context managers can leave a failed COMMIT's
                 # delete pending. Finish recovery before another caller enters.
@@ -301,7 +301,9 @@ class NewChatService:
                     finally:
                         self.db = None
                 _error('saved_folders_unavailable',
-                       'Saved project folders are unavailable. Refresh saved folders to check.', 503)
+                       ('Saved project folders are unavailable. Restart Motet before trying again.'
+                        if self._journal_unavailable else
+                        'Saved project folders are unavailable. Refresh the list to check.'), 503)
         return {'schemaVersion': 1, 'removed': {'id': folder.id, 'revision': folder.revision}}
 
     def register_folder(self, data):
