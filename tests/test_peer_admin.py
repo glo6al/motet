@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -33,6 +34,11 @@ class AdminTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.tid, self.agent, self.cid = uid(), 'x:' + uid(), uid()
         self.created = 100.
+        clock_patch = patch.object(admin, 'time', wraps=time)
+        clock = clock_patch.start()
+        self.addCleanup(clock_patch.stop)
+        self.clock = clock.time
+        self.clock.return_value = self.created + 2
         self.row = dict(request_id=self.tid, agent=self.agent, created=self.created, launched=True,
                         state='unknown', origin='peer', runtime='codex', bridge_version=2,
                         reply='', candidate_reply='', final='', bound_turn='fictional-turn')
@@ -105,6 +111,137 @@ class AdminTests(unittest.TestCase):
             self.store.db.execute('UPDATE peer_execution SET execution=?,capture=?', (execution, capture)); self.store.db.commit()
             with self.subTest(execution=execution, capture=capture), self.assertRaises(peer_bridge.PeerError):
                 admin.retire(self.store, self.request())
+
+    def open_attempt(self, runtime, state, *, abort_without_turn=False, delete_transcript=False, **evidence):
+        tid, agent, cid = uid(), ('c:' if runtime == 'claude' else 'x:') + uid(), uid()
+        row = dict(self.row, request_id=tid, agent=agent, runtime=runtime, state=state)
+        row.pop('bound_turn')
+        if runtime == 'claude':
+            row.update(transport='claude_mod', target_project=self.tmp.name, mod_project=self.tmp.name,
+                       mod_enrollment=uid(), mod_attempt_id=uid(), mod_generation=uid())
+        row.update(evidence)
+        if abort_without_turn:
+            event = dict(type='event_msg', payload=dict(type='turn_aborted'))
+            self.assertIsNone(self.store._consume(row, event))
+            self.assertFalse(row.get('settled'))
+        if delete_transcript:
+            transcript = Path(self.tmp.name) / (tid + '.jsonl')
+            event = dict(type='event_msg', payload=dict(type='task_started', turn_id=row['bound_turn']))
+            transcript.write_text(json.dumps(event) + '\n')
+            st = transcript.stat()
+            row.update(path=str(transcript), device=st.st_dev, inode=st.st_ino, cursor=st.st_size)
+        self.store.db.execute('INSERT INTO shared_bridge_requests VALUES (?,?,?,?,?,?,?,?,?)',
+                              (cid, agent, '{}', 'a'*64, tid, uid(), self.created, 101., 'Fictional prompt'))
+        self.store._save(row)
+        if delete_transcript:
+            transcript.unlink()
+        return dict(transport_id=tid, agent=agent, confirm=admin.CONFIRM), row
+
+    def test_aged_unresolved_provider_attempts_can_be_retired_online(self):
+        scenarios = (
+            ('Codex start without end', 'codex', 'awaiting_reply', dict(bound_turn='fictional-turn')),
+            ('Codex transcript removed after start', 'codex', 'awaiting_reply',
+             dict(bound_turn='fictional-turn', delete_transcript=True)),
+            ('Codex accepted and never picked up', 'codex', 'queued', {}),
+            ('Codex abort without turn ID', 'codex', 'awaiting_reply',
+             dict(bound_turn='fictional-turn', abort_without_turn=True)),
+            ('Claude started with plugin polling', 'claude', 'awaiting_reply', dict(mod_turn='fictional-turn')),
+            ('Claude claimed with plugin polling', 'claude', 'queued', {}),
+        )
+        with patch.object(self.store, '_send', side_effect=AssertionError('native dispatch')), \
+                patch.object(self.store, '_poll', side_effect=AssertionError('native read')):
+            for name, runtime, state, evidence in scenarios:
+                for age in (20 * 60, 5 * 3600, 25 * 3600):
+                    for retained in (True, False):
+                        with self.subTest(scenario=name, age=age, retained=retained):
+                            request, _ = self.open_attempt(runtime, state, **evidence)
+                            tid, agent = request['transport_id'], request['agent']
+                            if not retained:
+                                self.store.db.execute('DELETE FROM requests WHERE id=?', (tid,))
+                                self.store.db.commit()
+                            self.clock.return_value = self.created + age
+                            before = self.store.db.total_changes
+                            view = admin.inspect(self.store, {'transport_id': tid})
+                            self.assertEqual(self.store.db.total_changes, before)
+                            self.assertEqual(view['execution'], 'running' if state == 'awaiting_reply' else 'submitted')
+                            self.assertEqual(view['retained_payload'], retained)
+                            self.assertTrue(view['eligible'])
+                            self.assertTrue(life.blockers(self.store.db, agent))
+                            receipt = admin.retire(self.store, request)
+                            self.assertEqual((receipt['status'], receipt['provider_outcome']), ('retired', 'unknown'))
+                            self.assertEqual(life.blockers(self.store.db, agent), [])
+                            remains = self.store.db.execute('SELECT data FROM requests WHERE id=?', (tid,)).fetchone()
+                            self.assertEqual(remains is not None, retained)
+                            if remains:
+                                final = json.loads(remains[0])
+                                self.assertEqual((final['state'], final['reply']), ('unknown', ''))
+                                self.assertFalse(final.get('settled'))
+
+    def test_active_retirement_checks_deadline_and_exact_identity(self):
+        request, row = self.open_attempt('codex', 'queued')
+        selection = {'transport_id': row['request_id']}
+        self.clock.return_value = self.created + peer_bridge.TTL - 0.001
+        self.assertFalse(admin.inspect(self.store, selection)['eligible'])
+        with self.assertRaises(peer_bridge.PeerError) as raised:
+            admin.retire(self.store, request)
+        self.assertEqual(raised.exception.status, 409)
+        self.clock.return_value = self.created + peer_bridge.TTL
+        self.assertTrue(admin.inspect(self.store, selection)['eligible'])
+        with self.assertRaises(peer_bridge.PeerError):
+            admin.retire(self.store, dict(request, agent='x:' + uid()))
+        # Retirement rechecks the server boundary rather than trusting inspection.
+        self.clock.return_value = self.created + peer_bridge.TTL - 0.001
+        with self.assertRaises(peer_bridge.PeerError):
+            admin.retire(self.store, request)
+        self.assertTrue(life.blockers(self.store.db, row['agent']))
+        self.clock.return_value = self.created + peer_bridge.TTL
+        self.assertEqual(admin.retire(self.store, request)['provider_outcome'], 'unknown')
+
+    def test_aged_attempt_excludes_new_completion_capture_and_protected_payload(self):
+        self.clock.return_value = self.created + 1200
+        for update in (dict(state='answered', reply='Fictional answer', settled=True),
+                       dict(settled=True), dict(execution_outcome='completed'),
+                       dict(state='quarantined'), dict(capture_disposition='captured'),
+                       dict(agent='x:' + uid()), dict(attachment_owner_version=None)):
+            with self.subTest(change=set(update)):
+                request, row = self.open_attempt('codex', 'awaiting_reply', bound_turn='fictional-turn')
+                selection = {'transport_id': row['request_id']}
+                self.assertTrue(admin.inspect(self.store, selection)['eligible'])
+                raw = json.dumps(dict(row, **update))
+                self.store.db.execute('UPDATE requests SET data=? WHERE id=?', (raw, row['request_id']))
+                self.store.db.commit()
+                before = self.store.db.total_changes
+                if 'agent' in update or 'attachment_owner_version' in update:
+                    with self.assertRaises(peer_bridge.PeerError):
+                        admin.inspect(self.store, selection)
+                else:
+                    self.assertFalse(admin.inspect(self.store, selection)['eligible'])
+                self.assertEqual(self.store.db.total_changes, before)
+                with self.assertRaises(peer_bridge.PeerError) as raised:
+                    admin.retire(self.store, request)
+                self.assertEqual(raised.exception.status, 409)
+                self.assertEqual(life.get(self.store.db, row['request_id'])['execution'], 'running')
+                self.assertEqual(self.store.db.execute('SELECT data FROM requests WHERE id=?',
+                                                       (row['request_id'],)).fetchone(), (raw,))
+
+    def test_completion_after_inspection_cannot_be_retired(self):
+        self.clock.return_value = self.created + 1200
+        request, row = self.open_attempt('codex', 'awaiting_reply', bound_turn='fictional-turn')
+        selection = {'transport_id': row['request_id']}
+        self.assertTrue(admin.inspect(self.store, selection)['eligible'])
+        self.store._save(dict(row, state='answered', settled=True, reply='Fictional answer'))
+        self.assertFalse(admin.inspect(self.store, selection)['eligible'])
+        with self.assertRaises(peer_bridge.PeerError) as raised:
+            admin.retire(self.store, request)
+        self.assertEqual(raised.exception.status, 409)
+        record = life.get(self.store.db, row['request_id'])
+        self.assertEqual((record['execution'], record['capture']), ('completed', 'captured'))
+        self.store.db.execute('DELETE FROM requests WHERE id=?', (row['request_id'],))
+        self.store.db.commit()
+        self.assertFalse(admin.inspect(self.store, selection)['eligible'])
+        with self.assertRaises(peer_bridge.PeerError):
+            admin.retire(self.store, request)
+        self.assertEqual(life.get(self.store.db, row['request_id']), record)
 
     def test_failure_rolls_back_retirement_and_reconciliation(self):
         before = self.store.db.execute('SELECT * FROM peer_execution').fetchall()

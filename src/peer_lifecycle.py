@@ -15,6 +15,7 @@ RETIRE_REASON = 'owner_requested_clear_unresolved_attempt'
 RETIRE_MESSAGE = ('This attempt was retired by the owner. Provider outcome remains unknown; '
                   'late replies are withheld. Nothing was cancelled or resent.')
 DROP_MESSAGE = 'The native input was dropped before it started. Nothing was resubmitted.'
+CODEX_RETENTION_HOLD = 'Content retention passed before an end was observed.'
 MAX_RESERVATIONS = 200000  # Both immutable ledgers are individually capped at 100000.
 MAX_EVENTS, EVENT_RETENTION = 2048, 86400
 
@@ -200,6 +201,8 @@ def reconcile(db, row, meta=None, *, missing_payload=False, write_payload=True):
         if old['execution'] == 'dropped' and old['capture'] != 'withheld':
             db.execute("UPDATE peer_execution SET capture='withheld' WHERE request_id=?", (tid,))
         return
+    if old and old['execution'] == 'uncertain' and old['evidence'].get('codex_retention_hold') == CODEX_RETENTION_HOLD:
+        return  # A detached tracker cannot revise a retention hold. The owner can still retire it.
     if write_payload and not missing_payload and not valid_payload(tid, row, meta):
         row = dict(request_id=tid, agent=target, state='unknown')
     if row.get('execution_outcome') == 'dropped' and old and (
@@ -364,13 +367,16 @@ def blockers(db, agent, *, excluding=None):
 
 
 def capacity_error(db, agent, now, ttl):
-    blocked = db.execute("SELECT request_id,execution,created FROM peer_execution WHERE agent=? AND execution NOT IN ('completed','dropped','retired') ORDER BY created LIMIT 1", (agent,)).fetchall()
+    # Dispatch deadlines are applied by the worker. Capacity comes only from
+    # durable reservations and their verified terminal states for this recipient.
+    # Only recent admissions consume the shared four-slot dispatch window.
+    blocked = db.execute("SELECT request_id,execution FROM peer_execution WHERE agent=? AND execution NOT IN ('completed','dropped','retired') ORDER BY created LIMIT 1", (agent,)).fetchone()
     if blocked:
-        tid, state, created = blocked[0]
-        if state == 'uncertain' or created <= now - ttl:
+        tid, state = blocked
+        if state == 'uncertain':
             return 'Earlier delivery requires recovery for this recipient (' + tid + '). The new request was not accepted; nothing was resent.'
         return 'This recipient has an active request (' + tid + '). The new request was not accepted.'
-    count = db.execute("SELECT COUNT(*) FROM peer_execution WHERE execution NOT IN ('completed','dropped','retired') AND created>?", (now - ttl,)).fetchone()[0]
+    count = db.execute("SELECT COUNT(*) FROM (SELECT 1 FROM peer_execution WHERE execution NOT IN ('completed','dropped','retired') AND created>? LIMIT 4)", (now - ttl,)).fetchone()[0]
     if count >= 4:
         return 'Four peer deliveries are active. The new request was not accepted.'
     return None

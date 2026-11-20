@@ -164,7 +164,9 @@ class ClaudeMod:
             if not row.get('launched') and now >= row['created'] + TTL:
                 row.update(state='failed', error='This message expired before a Claude mod claimed it. Nothing was submitted.')
                 self.put(row)
-            elif row.get('launched') and row['state'] in ('queued', 'awaiting_reply') and now >= row['created'] + TTL:
+            # This reply deadline applies to the owner Desk.
+            elif (row.get('origin') in (None, 'owner') and row.get('launched')
+                    and row['state'] in ('queued', 'awaiting_reply') and now >= row['created'] + TTL):
                 row.update(state='expired', error='No matching reply yet. Native input may still run; Motet will not resubmit.')
                 self.put(row)
 
