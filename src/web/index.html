@@ -5914,20 +5914,50 @@ function demo(){
   const now=()=>Date.now()/1000; let t=now()-900;
   KEY=''; APPROVE=false;      /* the two switches work on this page only: presence, decisions and notification permission are all guarded by DEMO */
   WATCH_RULES=['deploy','push','publish','delete','send','check','action','decide'].map(label=>({label,on:true,shipped:true})); paintWatch();   /* the Watch panel works here; nothing is written */
-  lock(false); connected=true; connectedAt=now()-30; HEALTH={at:now(),now:now(),scan:now(),ready:true,tails:6};
+  lock(false); connected=true; connectedAt=now()-30; HEALTH={at:now(),now:now(),scan:now(),ready:true,tails:21};
   setInterval(()=>{HEALTH.at=now(); HEALTH.now=now(); HEALTH.scan=now()},3000);
   const tag=document.createElement('span'); tag.id='demoTag'; tag.textContent='DEMO · synthetic agents · nothing here is real'; $('#brand').after(tag);
   const P={orchard:'/Users/demo/Projects/Orchard',lighthouse:'/Users/demo/Projects/Lighthouse',tidewater:'/Users/demo/Projects/Tidewater'};
   const ag=(id,o)=>handle(Object.assign({kind:'agent',agent:id,ts:t,started:o.started||t},o));
   const ev=(id,o)=>handle(Object.assign({agent:id,ts:t,seq:++DSEQ},o));
   /* the fleet */
+  ag('e:demo-dot',{name:'Codex cloud',runtime:'Codex cloud',cwd:P.orchard,observed:'the process list, sampled about once a second (a sample can take longer while a folder is being looked up): a shorter command can be missed; of more than four new commands at once the oldest four are examined and the rest the next sample, so a short-lived one among them can be missed; each command\'s folder from lsof; what a command changed is not recorded here'});
   ag('c:demo-ada',{name:'Ada',runtime:'Claude',cwd:P.orchard,model:'claude-opus-5-5',branch:'pricing-table',goal:'Add the seasonal pricing table to the catalogue and wire it to checkout.',ctx:61000,ctxref:140000});
   ag('x:demo-bram',{name:'Bram',runtime:'Codex',cwd:P.orchard,model:'gpt-6-astra',branch:'pricing-table',goal:"Review Ada's pricing change before it ships. Read-only.",ctx:88000,ctxmax:258000});
   ag('c:demo-cleo',{name:'Cleo',runtime:'Claude',cwd:P.lighthouse,model:'claude-sonnet-5-5',branch:'main',goal:'Find out why the nightly build fails on arm64 and fix it.',ctx:120000,ctxref:140000});
   ag('c:demo-dov',{name:'Dov',runtime:'Claude',cwd:P.lighthouse,parent:'c:demo-cleo',sub:true,task:'log search',goal:'Search the build logs for the first arm64 failure and report the line.',ctx:14000});
   ag('x:demo-esme',{name:'Esme',runtime:'Codex',cwd:P.tidewater,model:'gpt-6-astra',branch:'sessions-migration',goal:'Migrate the sessions table to the new schema without downtime.',ctx:150000,ctxmax:258000});
-  ag('e:demo-dot',{name:'Codex cloud',runtime:'Codex cloud',cwd:P.orchard,observed:'the process list, sampled about once a second (a sample can take longer while a folder is being looked up): a shorter command can be missed; of more than four new commands at once the oldest four are examined and the rest the next sample, so a short-lived one among them can be missed; each command\'s folder from lsof; what a command changed is not recorded here'});
   ag('c:demo-fen',{name:'Fen',runtime:'Claude',cwd:P.tidewater,model:'claude-opus-5-5',branch:'docs',goal:'Rewrite the onboarding guide for the new CLI.',ctx:42000,ctxref:140000});
+  /* Fictional supporting work. Arrival keeps the fullest families in the centre. */
+  const children=[
+    ["Gita", "ada", "cart totals", "Check seasonal cart totals against the shared line price.", "src/cart/lineTotal.ts", "Three cart sizes use the shared seasonal price.", "Comparing the empty-cart boundary next.", false],
+    ["Hale", "ada", "receipt labels", "Verify seasonal discounts appear once on each receipt.", "src/receipt/discount.ts", "The discount label appears once for each discounted line.", "Receipt labels match the cart lines.", true],
+    ["Ivo", "ada", "table columns", "Check that every season has a price-table column.", "src/pricing/table.ts", "All four season keys have matching table columns.", "Checking the narrow table headings next.", false],
+    ["Juna", "ada", "price boundaries", "Check zero and full-price seasonal boundaries.", "test/pricing-boundaries.test.ts", "Zero discount keeps the price; full discount returns zero.", "Both boundary cases agree with checkout.", true],
+    ["Kian", "ada", "cart regression", "Review the four-item rounding regression fixture.", "test/fixtures/four-item-cart.json", "The fixture expects four rounded lines and a total of $67.96.", "Checking the line-by-line assertions next.", false],
+    ["Leda", "ada", "rounding rule", "Compare the table and receipt rounding helpers.", "src/pricing/round.ts", "Both callers round each discounted line to two decimal places.", "No second rounding rule remains in these callers.", true],
+    ["Miro", "bram", "receipt review", "Review receipt totals without changing the implementation.", "src/receipt/total.ts", "The receipt adds the same rounded lines as the cart.", "Tracing the quantity multiplier next.", false],
+    ["Neri", "cleo", "feature audit", "Inspect the arm64 CRC feature guard.", "build/crc-flags.mk", "The hardware target needs the explicit +crc feature.", "Comparing the configure probe with this guard.", false],
+    ["Orin", "cleo", "portable fallback", "Check that the soft CRC source is included on arm64.", "src/crc/soft.c", "The portable implementation exports the expected CRC symbol.", "The soft-source entry is present in the build list.", true],
+    ["Pavo", "bram", "cart matrix", "Review discount combinations across the cart fixture matrix.", "test/fixtures/season-matrix.json", "Spring and autumn cases cover single and mixed quantities.", "Checking the remaining winter row next.", false],
+    ["Rhea", "bram", "price compatibility", "Check the public price response keeps its existing fields.", "src/api/price.ts", "The response still contains currency, amount and season.", "Existing clients can read the unchanged response shape.", true],
+    ["Suri", "bram", "catalogue schema", "Review the seasonal catalogue schema for duplicate keys.", "schema/catalogue.json", "Each seasonal key appears once and uses the money definition.", "The catalogue schema has no duplicate seasonal keys.", true],
+    ["Tavi", "esme", "rollback check", "Check the session migration rollback preserves old rows.", "migrations/session_rollback.sql", "The rollback restores the old columns before dropping the new index.", "Tracing the transaction boundary next.", false],
+    ["Uma", "esme", "migration example", "Verify the replica-only migration command in the runbook.", "docs/session-migration.md", "The example names the replica and includes the dry-run option.", "The runbook example does not target the primary database.", true],
+    ["Vero", "fen", "setup check", "Check the first-project CLI sequence in the onboarding guide.", "docs/first-project.md", "The example creates a project before running its first check.", "Comparing the configuration step with the CLI help.", false],
+  ];
+  const historyAt=t;
+  for(const [name,parent,task,goal,file,result,summary,ended] of children){
+    const id='c:demo-'+name.toLowerCase(),owner=parent==='cleo'?P.lighthouse:parent==='esme'||parent==='fen'?P.tidewater:P.orchard;
+    t=now()-75;
+    ag(id,{name,runtime:'Claude',model:'claude-sonnet-5-5',cwd:owner,parent:(parent==='bram'||parent==='esme'?'x:':'c:')+'demo-'+parent,sub:true,task,goal,ctx:17000});
+    ev(id,{kind:'user',text:goal});
+    ev(id,{kind:'read',id:'sample-'+name,path:owner+'/'+file}); t+=3;
+    ev(id,{kind:'result',id:'sample-'+name,text:result}); t+=2;
+    ev(id,{kind:'say',text:summary});
+    if(ended) ev(id,{kind:'turn_end'});
+  }
+  t=historyAt;
   /* history, so the desks have something to show */
   for(const [id,g] of [['c:demo-ada','Add the seasonal pricing table to the catalogue and wire it to checkout.'],['x:demo-bram',"Review Ada's pricing change before it ships. Read-only."],['c:demo-cleo','Find out why the nightly build fails on arm64 and fix it.'],['x:demo-esme','Migrate the sessions table to the new schema without downtime.'],['c:demo-fen','Rewrite the onboarding guide for the new CLI.']]){ev(id,{kind:'user',text:g}); t+=20}
   ev('e:demo-dot',{kind:'run',id:'g1',cmd:'ls -la',cwd:P.orchard,seen:true}); t+=1; ev('e:demo-dot',{kind:'result',id:'g1',text:'',unknown:true,seen:true}); t+=12;
@@ -5976,7 +6006,7 @@ function demo(){
     if(n%3===0){ev('c:demo-dov',{kind:'read',id:'d'+n,path:'/Users/demo/Projects/Lighthouse/build/'+logs[(n/3|0)%3]})} else if(n%3===1){ev('c:demo-dov',{kind:'result',id:'d'+(n-1),text:'… [arm64] ld: symbol not found: _crc32_hw'})}
     if(n%9===4){if(n===4) ev('c:demo-dov',{kind:'say',text:'First arm64 failure is in nightly-2026-10-03.log line 1142: ld: symbol not found: _crc32_hw. It appears after the crc32 fast path was enabled.'}); pulse('c:demo-dov','c:demo-cleo','reported back')}      /* said once; the hand-off pulse recurs */
   };
-  tick(); const idleDemoHealth=()=>{const at=now();handle({kind:'health',ready:true,err:'',failing:0,tails:6,now:at,scan:at,idle_ready:true,idle_through:DSEQ,idle_at:at})}; idleDemoHealth(); setInterval(()=>{tick();idleDemoHealth()},3500);
+  tick(); const idleDemoHealth=()=>{const at=now();handle({kind:'health',ready:true,err:'',failing:0,tails:21,now:at,scan:at,idle_ready:true,idle_through:DSEQ,idle_at:at})}; idleDemoHealth(); setInterval(()=>{tick();idleDemoHealth()},3500);
   const asked=location.search.match(/[?&]ask=(report|stuck|waiting|rule)\b/);      /* a staged question, for stills and recordings of the demo */
   if(asked) setTimeout(()=>{ofToggle(true); ofIn.value={report:'What did I miss?',stuck:'Is anything stuck?',waiting:'Who is waiting on me?',rule:'Draft a rule that flags the sessions migration as a deploy.'}[asked[1]]; ofSend().then(()=>{ofLog.scrollTop=0})},1500);      /* and show the answer from its top, for a still */
 }

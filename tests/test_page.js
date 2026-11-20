@@ -2959,7 +2959,7 @@ const memoryResumeLine=html.split('\n').find(l=>l.startsWith('function workspace
   for(const workspace of [false,true])for(const all of [0,1]){
     const nodes={},get=id=>nodes[id]||(nodes[id]={classList:{toggle(){}},hidden:false,title:''});const c={WORKSPACE:workspace,DEMO:true,connected:true,locked:false,lastSeq:-1,DSEQ:3,idleMinutes:0,idleFence:null,order:['a'],A:{},PINS:{},HEALTH:null,Date,now:()=>1000,all,WINDOW_S:1200,$:get,txt:(x,v)=>x.textContent=v,hid:(x,v)=>x.hidden=v,put:(x,v)=>x.innerHTML=v,dur:String,esc:String,idleFenceReset(){c.idleFence=null}};
     vm.runInNewContext(health+'\n'+handler+'\n'+demo+'\nidleDemoHealth();',c);c.now=1000;vm.runInNewContext(html.split('\n').find(l=>l.startsWith('function workspaceEmptyMarkup('))+'\n'+render,c);
-    assert.equal(c.HEALTH.ready,true);assert.equal(c.HEALTH.tails,6);assert.equal(get('#live').textContent,'demo');assert.ok(!String(get('#empty').innerHTML||'').includes('Reading session logs'));assert.equal(get('#empty').hidden,!!all);
+    assert.equal(c.HEALTH.ready,true);assert.equal(c.HEALTH.tails,21);assert.equal(get('#live').textContent,'demo');assert.ok(!String(get('#empty').innerHTML||'').includes('Reading session logs'));assert.equal(get('#empty').hidden,!!all);
   }
   console.log('ok F48/F49 healthy host-time fence and actual demo health/empty-state rendering');
 }
@@ -4166,3 +4166,48 @@ let quietProofDeadline;(async()=>{
  ]){assert(html.includes(from),'quiet causal target '+from);let failure=null;try{await check(code=>code.replace(from,to))}catch(e){failure=e}assert(failure,'quiet mutant survived '+from);if(check!==quietBootstrapChecks)assert.equal(failure.name,'AssertionError','quiet mutant must fail a semantic assertion: '+from)}
  for(const [from,to] of [['border:1px solid #c9c6be;border-radius:6px;padding:1px 8px;margin-left:8px;font:13px/normal system-ui;text-decoration:none','margin-left:6px;text-decoration:underline'],['width:7px;height:7px;border-radius:50%;background:#1c1b19','width:5px;height:5px;border-radius:50%;background:#66635d'],['box-shadow:none;margin:14px 0 6px','box-shadow:none'],['font:13px/18.85px system-ui','font:12.5px/1.4 system-ui'],['.workspace-relay-answer{border:0','.workspace-relay-answer{align-self:stretch;max-width:100%;border:0']]){assert(html.includes(from));assert.throws(()=>quietBoardStyleChecks(html.replace(from,to)),{name:'AssertionError'},'board style mutant')}assert(html.includes('const WORKSPACE_QUIET_RELAY_CACHE=false;'));clearTimeout(quietProofDeadline);console.log('ok quiet Workspace relay/control: exact paired identities, actual send/card/CU paint/grouping, unchanged model/cache/direct/Classic, scope-only unseen, bootstrap/auth/tickets and causal mutants');
 })().catch(error=>{clearTimeout(quietProofDeadline);console.error(error);process.exitCode=1});
+
+/* The complete fictional cast is executed, rather than counted in source text. */
+{
+  const assert=require('assert/strict'),start=html.indexOf('function demo(){'),end=html.indexOf('/* Workspace shell helpers:',start),demoSource=html.slice(start,end);
+  const expected=['Ada','Bram','Cleo','Dov','Esme','Codex cloud','Fen','Gita','Hale','Ivo','Juna','Kian','Leda','Miro','Neri','Orin','Pavo','Rhea','Suri','Tavi','Uma','Vero'];
+  function verify(source){
+    const events=[],intervals=[],forbidden=()=>{throw Error('demo attempted a live effect')},c={Date:class extends Date{static now(){return 1800000000000}},DSEQ:0,location:{search:'?demo'},document:{createElement:()=>({})},$:()=>({after(){}}),paintWatch(){},lock(){},handle:e=>events.push(e),setInterval:(f,ms)=>intervals.push({f,ms}),setTimeout:forbidden,fetch:forbidden,XMLHttpRequest:forbidden,WebSocket:forbidden,EventSource:forbidden,Notification:forbidden,navigator:new Proxy({},{get:forbidden})};
+    vm.runInNewContext(source+';demo();',c);
+    const agents=events.filter(e=>e.kind==='agent'),byId=new Map(agents.map(a=>[a.agent,a])),roots=agents.filter(a=>!a.parent),kids=agents.filter(a=>a.parent);
+    assert.equal(agents.length,22);assert.equal(byId.size,22);assert.equal(roots.length,6);assert.equal(kids.length,16);
+    assert.deepEqual(agents.map(a=>a.name).sort(),[...expected].sort());
+    assert.deepEqual([...byId.keys()].sort(),['c:demo-ada','x:demo-bram','c:demo-cleo','c:demo-dov','x:demo-esme','e:demo-dot','c:demo-fen',...expected.slice(7).map(name=>'c:demo-'+name.toLowerCase())].sort());
+    assert.equal(byId.get('c:demo-dov').parent,'c:demo-cleo');
+    assert.equal(new Set(kids.map(a=>a.task)).size,16);
+    for(const a of kids){assert.equal(a.sub,true);assert.ok(byId.has(a.parent));assert.equal(a.cwd,byId.get(a.parent).cwd);const seen=new Set([a.agent]);let p=a.parent;while(p){assert.ok(!seen.has(p),'no ancestry cycle');seen.add(p);p=byId.get(p).parent;}}
+    const counts=Object.fromEntries(roots.map(a=>[a.name,kids.filter(k=>k.parent===a.agent).length]));
+    assert.deepEqual(counts,{ 'Codex cloud':0,Ada:6,Bram:4,Cleo:3,Esme:2,Fen:1 });
+    assert.deepEqual(roots.filter(a=>a.cwd.endsWith('/Orchard')).map(a=>a.name),['Codex cloud','Ada','Bram']);
+    assert.equal(Math.ceil(counts.Ada/2),3,'existing pair layout reaches a third child row');
+    assert.deepEqual(Object.fromEntries(['Orchard','Lighthouse','Tidewater'].map(p=>[p,agents.filter(a=>a.cwd.endsWith('/'+p)).length])),{Orchard:13,Lighthouse:4,Tidewater:5});
+    const added=kids.filter(a=>a.name!=='Dov'),results=added.map(a=>events.find(e=>e.agent===a.agent&&e.kind==='result').text);
+    assert.equal(new Set(results).size,15);assert.equal(new Set(added.map(a=>a.goal)).size,15);
+    assert.equal(new Set(added.map(a=>a.started)).size,1,'new children share the same fictional start age');
+    for(const a of added)for(const e of events.filter(e=>e.agent===a.agent&&e.kind!=='agent'))assert.ok(e.ts>=a.started&&e.ts>=a.ts,a.name+' history follows its registration and start');
+    for(const a of added){const history=events.filter(e=>e.agent===a.agent&&e.kind!=='agent');for(const kind of ['user','read','result','say'])assert.ok(history.some(e=>e.kind===kind),a.name+' has '+kind);assert.ok(history.every(e=>!e.error));assert.ok(history.filter(e=>e.text).every(e=>!/^ok$|placeholder|lorem|…/i.test(e.text)));}
+    const ended=new Set(events.filter(e=>e.kind==='turn_end').map(e=>e.agent));
+    assert.deepEqual(agents.filter(a=>ended.has(a.agent)).map(a=>a.name).sort(),['Bram','Esme','Fen','Hale','Juna','Leda','Orin','Rhea','Suri','Uma']);
+    assert.equal(agents.length-ended.size,12);assert.equal(agents.filter(a=>a.observed).length,1);
+    assert.equal(c.HEALTH.tails,21);assert.equal(events.filter(e=>e.kind==='health').at(-1).tails,21);
+    assert.equal(events.filter(e=>e.error).length,1,'Cleo remains the sole recorded failure');
+    assert.deepEqual(events.filter(e=>e.kind==='perm').map(e=>e.agent),['c:demo-cleo']);
+    assert.equal(events.filter(e=>e.kind==='say'&&/\?/.test(e.text)).length,1,'Esme remains the sole possible decision request');
+    const A={};for(const a of agents)A[a.agent]={...a,id:a.agent,story:[],calls:{},perms:{},asks:{},turn:'in'};
+    for(const e of events){const a=A[e.agent];if(!a||e.kind==='agent')continue;if(e.kind==='result'){const it=a.story.find(x=>x.e?.id===e.id);if(it){it.e.err=e.error;it.e.unknown=e.unknown;}delete a.calls[e.id];}else if(e.kind==='say'){a.said={text:e.text,ts:e.ts};a.story.push({t:'say',...e});}else if(e.kind==='turn_end')a.turn='ended';else if(e.kind==='perm'){a.perms[e.pid]=e;a.story.push({t:'wait',text:'permission: '+e.text,...e});}else if(e.kind!=='user'){a.story.push({t:'did',e,ts:e.ts,seq:e.seq});if(e.id)a.calls[e.id]=e;}}
+    const answerSource=html.slice(html.indexOf('function ofDemoAnswer('),html.indexOf('\nfunction ofToggle(',html.indexOf('function ofDemoAnswer(')));
+    const answer=vm.runInNewContext(answerSource+';ofDemoAnswer',{A,order:agents.map(a=>a.agent),Date:c.Date,one:s=>String(s).replace(/\s+/g,' '),plain:String,did:e=>e.kind+' '+(e.path||''),clock:String,proj:id=>A[id].cwd.split('/').at(-1),projLabel:String,judgeLocal:()=>({command:''}),need:a=>Object.keys(a.perms).length?{sure:true,kind:'Approve',text:Object.values(a.perms)[0].text}:a.name==='Esme'?{sure:false,kind:'Decide',text:a.said.text}:null});
+    const report=answer('What did I miss?');for(const name of expected)assert.ok(report.text.includes('**'+name+'**'));assert.ok(report.cites.length<=12);
+    const stuck=answer('Is anything stuck?');assert.match(stuck.text,/One thing \*\*failed\*\*/);assert.match(stuck.text,/outcome|whether it finished/);assert.match(stuck.text,/waiting on your permission/);
+    const waiting=answer('Who is waiting on me?');assert.match(waiting.text,/\*\*Cleo\*\*/);assert.match(waiting.text,/\*\*Esme\*\* probably/);assert.equal((waiting.text.match(/- \[ \]/g)||[]).length,2);
+    const rule=answer('Draft a Watch rule');assert.equal(rule.actions[0].words,'alembic upgrade');assert.match(rule.text,/nothing is saved/);
+  }
+  verify(demoSource);
+  for(const [from,to] of [['tails:21','tails:22'],['"Gita", "ada"','"Gita", "missing"'],['"Vero", "fen"','"Gita", "fen"']]){assert.ok(demoSource.includes(from));let caught=false;try{verify(demoSource.replaceAll(from,to))}catch{caught=true}assert.ok(caught,'cast mutation detected: '+from);}
+  console.log('ok full fictional demo: 22 IDs, hierarchy, central families, distinct histories, states, health and four scripted answers; three causal mutations');
+}
