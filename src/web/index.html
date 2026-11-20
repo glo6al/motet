@@ -3086,13 +3086,13 @@ function permissionDispatch(a,p,allow){if(typeof workspaceManagedLegacyAllowed==
       if(DEMO){const now=()=>Date.now()/1000, H=o=>handle(Object.assign({agent:id,ts:now(),seq:++DSEQ},o)), after=(ms,f)=>setTimeout(()=>{f(); render()},ms);      /* numbered from the same counter as the demo's history, so the Officer's chips can cite these too */      /* nothing leaves the page: the request ends here and the fictional agent carries on for a while */
         note((allow?'Allowed':'Denied')+' from here'); render();
         after(600,()=>{H({kind:'perm_end',pid:p.pid,how:(allow?'allowed':'denied')+' from the stage'});
-          if(allow) H({kind:'run',id:'c9',cmd:'rm -rf build/ && make nightly ARCH=arm64 CRC=soft',why:'rebuild with the soft CRC path'});
-          else{H({kind:'say',text:'Understood, I will not clear the build directory. I will try an out-of-tree build in /tmp instead and report back.'}); H({kind:'turn_end'})}});
+          if(allow) H({kind:'run',id:'a-permission-check',cmd:'npm test -- pricing --updateSnapshot',why:'refresh the seasonal pricing snapshot'});
+          else{H({kind:'say',text:'Understood, I will leave the pricing snapshots unchanged and report the pending four-item regression check for review.'}); H({kind:'turn_end'})}});
         if(allow){
-          after(4000,()=>{H({kind:'result',id:'c9',text:'…\nlinking nightly (arm64, CRC=soft)\nok'}); H({kind:'say',text:'Linked. The nightly builds on arm64 with CRC=soft. Now making that the default for arm64 targets so the fast path is only used where the symbol exists.'})});
-          after(7000,()=>H({kind:'edit',id:'c10',path:'/Users/demo/Projects/Lighthouse/Makefile',before:'CRC ?= hw',after:'CRC ?= $(if $(filter arm64,$(ARCH)),auto,hw)'}));
-          after(9500,()=>{H({kind:'result',id:'c10',text:'ok'}); H({kind:'run',id:'c11',cmd:'make nightly ARCH=arm64',why:'confirm the default links'})});
-          after(13000,()=>{H({kind:'result',id:'c11',text:'linking nightly (arm64, CRC=auto)\nok'}); H({kind:'say',text:'Done. arm64 now defaults to CRC=auto and the nightly links cleanly; the diff is one line in the Makefile. Ready for a pull request when you are.'}); H({kind:'turn_end'})});
+          after(4000,()=>{H({kind:'result',id:'a-permission-check',text:'12 passing, 1 pending; seasonal pricing snapshot refreshed'}); H({kind:'say',text:'The pricing snapshot now records $67.96. I am enabling the pending four-item regression check before verifying the suite again.'})});
+          after(7000,()=>H({kind:'edit',id:'a-permission-enable',path:'/Users/demo/Projects/Orchard/test/pricing.test.ts',before:"it.skip('four discounted items', checkCart);",after:"it('four discounted items', checkCart);"}));
+          after(9500,()=>{H({kind:'result',id:'a-permission-enable',text:'Enabled the four-item regression check.'}); H({kind:'run',id:'a-permission-verify',cmd:'npm test -- pricing',why:'verify the enabled pricing regression'})});
+          after(13000,()=>{a.demoPricingVerified=true;H({kind:'result',id:'a-permission-verify',text:'13 passing, including the four-item regression check'}); H({kind:'say',text:'The pricing suite passes all 13 checks. Four discounted items total $67.96 in both views. The recorded pricing change is ready for review.'}); H({kind:'turn_end'})});
         }
         return}
       return post('/decide',{pid:p.pid,allow}).then(r=>{if(!r.ok){if(r.status===409||r.status===404)note(r.status===409?'Already answered in another window.':'This request has expired.');else{p.uncertain=true;note('Outcome unknown. Check the app before trying again.')}}}).catch(()=>{p.uncertain=true;note('Outcome unknown. Check the app before trying again.')});
@@ -5915,11 +5915,10 @@ function ofDemoAnswer(q,request){      /* the demo's Officer: four scripted answ
     if(today==='deploy') return {text:"Esme said her migration will run through `alembic upgrade head`. The stage already flags **alembic upgrade** as a deploy (that is your rule), so there is nothing to draft.",cites,actions};
     actions.push({do:'watch_draft',words:'alembic upgrade',label:'deploy'});
     return {text:`Esme said her migration will run through \`alembic upgrade head\`, which the stage would ${today?'flag as '+today:'not flag'} today.\n\nI drafted a rule to flag **alembic upgrade** as a deploy. It is in the Watch panel with a **Keep this rule** button; nothing is saved until you press it.`,cites,actions}}
-  if(/wait|need|ask|permission|\bme\b/.test(low)){needs.forEach(([a])=>cite(a,lastOf(a)));
+  if(/wait|need|ask|permission|\bme\b/.test(low)){needs.forEach(([a,N])=>cite(a,N.perm||lastOf(a)));
     return {text:`## Waiting on you\n${list}\n\nEveryone else is working or finished.`,cites,actions}}
   if(/stuck|slow|hang|fail|wrong/.test(low)){const cleo=who.find(a=>a.name==='Cleo'), dov=who.find(a=>a.name==='Dov'), dot=who.find(a=>a.runtime==='Codex cloud'); [cleo,dov,dot].forEach(a=>a&&cite(a,lastOf(a)));
-    const held=cleo&&Object.keys(cleo.perms||{}).length, st=cleo?cleo.story:[], endedAt=st.findLastIndex(x=>x.t==='wait'&&/^permission: /.test(x.text)), retryAt=st.findLastIndex(x=>x.t==='did'&&x.e.kind==='run'&&/CRC=soft/.test(x.e.cmd)), ended=st[endedAt], retry=st[retryAt];      /* whichever the record says last */
-    const cleoNow=held?'She is waiting on your permission to clear the build folder and retry with `CRC=soft`.':retryAt>endedAt?(cleo.calls&&cleo.calls[retry.e.id]?'You allowed the retry; `make nightly ARCH=arm64 CRC=soft` is running now.':retry.e.err?'You allowed the retry and it failed too.':'You allowed the retry; it ran, and the log records no error.'):ended?(/denied/.test(ended.text)?'You denied the clean rebuild; she said she would try an out-of-tree build instead.':'You allowed it; what came next is not recorded yet.'):'Her request ended; what came next is not recorded yet.';
+    const cleoNow='She is investigating the feature guard and configure probe. `CRC=soft` is a proposed fallback; no successful rebuild is recorded.';
     const dotRun=dot&&[...dot.story].reverse().find(x=>x.t==='did'&&x.e.kind==='run'), dotOpen=dotRun&&dot.calls&&dot.calls[dotRun.e.id];
     return {text:`Nothing is stuck. One thing **failed**:\n\n- **Cleo**'s \`make nightly ARCH=arm64\` ended with a linker error (\`_crc32_hw\` missing). ${cleoNow}\n\nTwo things are *long*, not stuck:\n\n1. **Dov** has been reading nightly logs for Cleo${dov?' ('+agoW(dov.story[0]?dov.story[0].ts:nowS).replace(' ago','')+' so far)':''}.\n2. **Codex cloud**'s \`${dotRun?one(dotRun.e.cmd).slice(0,40):'command'}\` ${dotOpen?'is still running, seen in the process list; whether it finished is not recorded here':'was seen in the process list; its outcome is not recorded here'}.`,cites,actions}}
   if(/miss|happen|since|report|away|summary|shift|what/.test(low)){const rows=who.map(a=>{const it=lastOf(a); cite(a,it); return `| **${a.name}** | ${projLabel(proj(a.id))||'—'} | ${words(a,it)} | ${it?agoW(it.ts):'—'} |`}).join('\n');
@@ -5939,20 +5938,51 @@ function demo(){
   const now=()=>Date.now()/1000; let t=now()-900;
   KEY=''; APPROVE=false;      /* the two switches work on this page only: presence, decisions and notification permission are all guarded by DEMO */
   WATCH_RULES=['deploy','push','publish','delete','send','check','action','decide'].map(label=>({label,on:true,shipped:true})); paintWatch();   /* the Watch panel works here; nothing is written */
-  lock(false); connected=true; connectedAt=now()-30; HEALTH={at:now(),now:now(),scan:now(),ready:true,tails:6};
+  lock(false); connected=true; connectedAt=now()-30; HEALTH={at:now(),now:now(),scan:now(),ready:true,tails:21};
   setInterval(()=>{HEALTH.at=now(); HEALTH.now=now(); HEALTH.scan=now()},3000);
   const tag=document.createElement('span'); tag.id='demoTag'; tag.textContent='DEMO · synthetic agents · nothing here is real'; $('#brand').after(tag);
   const P={orchard:'/Users/demo/Projects/Orchard',lighthouse:'/Users/demo/Projects/Lighthouse',tidewater:'/Users/demo/Projects/Tidewater'};
   const ag=(id,o)=>handle(Object.assign({kind:'agent',agent:id,ts:t,started:o.started||t},o));
   const ev=(id,o)=>handle(Object.assign({agent:id,ts:t,seq:++DSEQ},o));
   /* the fleet */
-  ag('c:demo-ada',{name:'Ada',runtime:'Claude',cwd:P.orchard,model:'claude-opus-5-5',branch:'pricing-table',goal:'Add the seasonal pricing table to the catalogue and wire it to checkout.',ctx:61000,ctxref:140000});
+  ag('e:demo-dot',{name:'Codex cloud',runtime:'Codex cloud',cwd:P.orchard,observed:'the process list, sampled about once a second (a sample can take longer while a folder is being looked up): a shorter command can be missed; of more than four new commands at once the oldest four are examined and the rest the next sample, so a short-lived one among them can be missed; each command\'s folder from lsof; what a command changed is not recorded here'});
   ag('x:demo-bram',{name:'Bram',runtime:'Codex',cwd:P.orchard,model:'gpt-6-astra',branch:'pricing-table',goal:"Review Ada's pricing change before it ships. Read-only.",ctx:88000,ctxmax:258000});
+  ag('c:demo-ada',{name:'Ada',runtime:'Claude',cwd:P.orchard,model:'claude-opus-5-5',branch:'pricing-table',goal:'Add the seasonal pricing table to the catalogue and wire it to checkout.',ctx:61000,ctxref:140000});
   ag('c:demo-cleo',{name:'Cleo',runtime:'Claude',cwd:P.lighthouse,model:'claude-sonnet-5-5',branch:'main',goal:'Find out why the nightly build fails on arm64 and fix it.',ctx:120000,ctxref:140000});
   ag('c:demo-dov',{name:'Dov',runtime:'Claude',cwd:P.lighthouse,parent:'c:demo-cleo',sub:true,task:'log search',goal:'Search the build logs for the first arm64 failure and report the line.',ctx:14000});
   ag('x:demo-esme',{name:'Esme',runtime:'Codex',cwd:P.tidewater,model:'gpt-6-astra',branch:'sessions-migration',goal:'Migrate the sessions table to the new schema without downtime.',ctx:150000,ctxmax:258000});
-  ag('e:demo-dot',{name:'Codex cloud',runtime:'Codex cloud',cwd:P.orchard,observed:'the process list, sampled about once a second (a sample can take longer while a folder is being looked up): a shorter command can be missed; of more than four new commands at once the oldest four are examined and the rest the next sample, so a short-lived one among them can be missed; each command\'s folder from lsof; what a command changed is not recorded here'});
   ag('c:demo-fen',{name:'Fen',runtime:'Claude',cwd:P.tidewater,model:'claude-opus-5-5',branch:'docs',goal:'Rewrite the onboarding guide for the new CLI.',ctx:42000,ctxref:140000});
+  /* Fictional supporting work. Arrival keeps the fullest families in the centre. */
+  const children=[
+    ["Gita", "ada", "cart totals", "Check seasonal cart totals against the shared line price.", "src/cart/lineTotal.ts", "Three cart sizes use the shared seasonal price.", "Comparing the empty-cart boundary next.", false],
+    ["Hale", "ada", "receipt labels", "Verify seasonal discounts appear once on each receipt.", "src/receipt/discount.ts", "The discount label appears once for each discounted line.", "Receipt labels match the cart lines.", true],
+    ["Ivo", "ada", "table columns", "Check that every season has a price-table column.", "src/pricing/table.ts", "All four season keys have matching table columns.", "Checking the narrow table headings next.", false],
+    ["Juna", "ada", "price boundaries", "Check zero and full-price seasonal boundaries.", "test/pricing-boundaries.test.ts", "Zero discount keeps the price; full discount returns zero.", "Both boundary cases agree with checkout.", true],
+    ["Kian", "ada", "cart regression", "Review the four-item rounding regression fixture.", "test/fixtures/four-item-cart.json", "The fixture expects four rounded lines and a total of $67.96.", "Checking the line-by-line assertions next.", false],
+    ["Leda", "ada", "rounding rule", "Compare the table and receipt rounding helpers.", "src/pricing/round.ts", "Both callers round each discounted line to two decimal places.", "No second rounding rule remains in these callers.", true],
+    ["Miro", "bram", "receipt review", "Review receipt totals without changing the implementation.", "src/receipt/total.ts", "The receipt adds the same rounded lines as the cart.", "Tracing the quantity multiplier next.", false],
+    ["Neri", "cleo", "feature audit", "Inspect the arm64 CRC feature guard.", "build/crc-flags.mk", "The hardware target needs the explicit +crc feature.", "Comparing the configure probe with this guard.", false],
+    ["Orin", "cleo", "portable fallback", "Check that the soft CRC source is included on arm64.", "src/crc/soft.c", "The portable implementation exports the expected CRC symbol.", "The soft-source entry is present in the build list.", true],
+    ["Pavo", "bram", "cart matrix", "Review discount combinations across the cart fixture matrix.", "test/fixtures/season-matrix.json", "Spring and autumn cases cover single and mixed quantities.", "Checking the remaining winter row next.", false],
+    ["Rhea", "bram", "price compatibility", "Check the public price response keeps its existing fields.", "src/api/price.ts", "The response still contains currency, amount and season.", "Existing clients can read the unchanged response shape.", true],
+    ["Suri", "bram", "catalogue schema", "Review the seasonal catalogue schema for duplicate keys.", "schema/catalogue.json", "Each seasonal key appears once and uses the money definition.", "The catalogue schema has no duplicate seasonal keys.", true],
+    ["Tavi", "esme", "rollback check", "Check the session migration rollback preserves old rows.", "migrations/session_rollback.sql", "The rollback restores the old columns before dropping the new index.", "Tracing the transaction boundary next.", false],
+    ["Uma", "esme", "migration example", "Verify the replica-only migration command in the runbook.", "docs/session-migration.md", "The example names the replica and includes the dry-run option.", "The runbook example does not target the primary database.", true],
+    ["Vero", "fen", "setup check", "Check the first-project CLI sequence in the onboarding guide.", "docs/first-project.md", "The example creates a project before running its first check.", "Comparing the configuration step with the CLI help.", false],
+  ];
+  const historyAt=t;
+  for(const [name,parent,task,goal,file,result,summary,ended] of children){
+    const id='c:demo-'+name.toLowerCase(),owner=parent==='cleo'?P.lighthouse:parent==='esme'||parent==='fen'?P.tidewater:P.orchard;
+    t=now()-780; // Routine history precedes the core shift facts in the bounded evidence window.
+    ag(id,{name,runtime:'Claude',model:'claude-sonnet-5-5',cwd:owner,parent:(parent==='bram'||parent==='esme'?'x:':'c:')+'demo-'+parent,sub:true,task,goal,ctx:17000});
+    ev(id,{kind:'user',text:goal});
+    ev(id,{kind:'read',id:'sample-'+name,path:owner+'/'+file}); t+=3;
+    if(name==='Leda'||name==='Miro') t=now()-75; // These findings follow Ada's recorded rounding fix.
+    ev(id,{kind:'result',id:'sample-'+name,text:result}); t+=2;
+    ev(id,{kind:'say',text:summary});
+    if(ended) ev(id,{kind:'turn_end'});
+  }
+  t=historyAt;
   /* history, so the desks have something to show */
   for(const [id,g] of [['c:demo-ada','Add the seasonal pricing table to the catalogue and wire it to checkout.'],['x:demo-bram',"Review Ada's pricing change before it ships. Read-only."],['c:demo-cleo','Find out why the nightly build fails on arm64 and fix it.'],['x:demo-esme','Migrate the sessions table to the new schema without downtime.'],['c:demo-fen','Rewrite the onboarding guide for the new CLI.']]){ev(id,{kind:'user',text:g}); t+=20}
   ev('e:demo-dot',{kind:'run',id:'g1',cmd:'ls -la',cwd:P.orchard,seen:true}); t+=1; ev('e:demo-dot',{kind:'result',id:'g1',text:'',unknown:true,seen:true}); t+=12;
@@ -5971,11 +6001,11 @@ function demo(){
   ev('c:demo-cleo',{kind:'say',text:'The nightly fails at link time on arm64: _crc32_hw is missing. I will have a sub-agent find the first run that failed while I check whether the crc32 fast path was switched on recently.'}); t+=3;
   ev('c:demo-cleo',{kind:'spawn',id:'c2',name:'log search'}); ev('c:demo-dov',{kind:'user',text:'Search the build logs for the first arm64 failure and report the line.'}); t+=3;
   ev('c:demo-dov',{kind:'read',id:'d1',path:'/Users/demo/Projects/Lighthouse/build/nightly-2026-10-05.log'}); t+=4; ev('c:demo-dov',{kind:'result',id:'d1',text:'…'}); t+=10;
-  ev('c:demo-cleo',{kind:'say',text:'The symbol comes from the crc32 fast path; building with CRC=soft should link. I need to clear the build directory first, which is why I am asking before I run it.'}); t+=2;
-  ev('c:demo-cleo',{kind:'perm',pid:'demo-c3',tool:'Bash',text:'rm -rf build/ && make nightly ARCH=arm64 CRC=soft'});      /* a held request: with the switch on, Allow and Deny are shown at the desk and answered on the page */
+  ev('c:demo-cleo',{kind:'say',text:'The symbol comes from the crc32 fast path. CRC=soft is a candidate fallback. I am comparing the feature guard with the configure probe before choosing a fix.'}); t+=2;
   ev('c:demo-ada',{kind:'edit',id:'a-seed',path:P.orchard+'/src/pricing/season.ts',before:'export function seasonalPrice(price, season) {\n  return price * (1 - season.discount);\n}',after:'export function seasonalPrice(price, season) {\n  return round(price * (1 - season.discount));\n}'}); t+=3; ev('c:demo-ada',{kind:'result',id:'a-seed',text:'Updated shared seasonal pricing function.'}); t+=2;
   ev('c:demo-ada',{kind:'run',id:'a0',cmd:'npm test -- pricing',why:'run the pricing tests'}); t+=12; ev('c:demo-ada',{kind:'result',id:'a0',text:'12 passing, 1 pending'}); t+=5;
   ev('c:demo-ada',{kind:'say',text:'## Fixing checkout rounding\n\nBram found a one-cent difference in the four-item cart. I moved rounding into the shared pricing function so the table and checkout use the same line price.\n\n```ts\nreturn round(price * (1 - season.discount));\n```\n\n**Validation:** 12 checks passing; the four-item regression check is next. Open **Work → Changes** to inspect the recorded edit.'}); t+=4;
+  ev('c:demo-ada',{kind:'perm',pid:'demo-a3',tool:'Bash',text:'npm test -- pricing --updateSnapshot'});      /* a held request: answers stay on this fictional page */
   // Keep the default demo evidence stable. The Steps preview adds a longer fictional run.
   if(/[?&]steps=preview(?:&|$)/.test(location.search)){
     ev('c:demo-ada',{kind:'web',id:'a-web',q:'rounding half-cent values'}); t+=1;
@@ -5991,17 +6021,20 @@ function demo(){
     ev('c:demo-ada',{kind:'run',id:'a-l3',cmd:'git diff --stat && git diff --check && git status --short --untracked-files=no -- src/pricing src/cart test'}); t+=1; ev('c:demo-ada',{kind:'result',id:'a-l3',text:' src/pricing/season.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)'}); t+=3;
   }
   /* and the present: Ada works on, Dov reads on, a hand-off goes back to Cleo now and then */
-  let n=0; const files=['src/pricing/table.ts','src/pricing/season.ts','src/checkout/total.ts','test/pricing.test.ts'], logs=['nightly-2026-10-05.log','nightly-2026-10-04.log','nightly-2026-10-03.log'];
+  let n=0, an=0; const files=['src/pricing/table.ts','src/pricing/season.ts','src/checkout/total.ts','test/pricing.test.ts'], logs=['nightly-2026-10-05.log','nightly-2026-10-04.log','nightly-2026-10-03.log'];
   const ADA=['The shared `season.ts` edit is recorded. Next I am checking the table and checkout callers.','The pending test was the four-item cart. Running the pricing suite again with the per-line rounding.','Thirteen passing. Next: wire the table into the checkout total so the cart uses the rounded line prices.','## Pricing checks pass\n\n**13 passing**, including the four-item regression check.\n\n- The table and checkout share per-line rounding.\n- Four discounted items total **$67.96** in both views.\n- I am checking the remaining callers before handing this back for review.'];
   const tick=()=>{t=now(); n++;
-    if(n%4===3&&(n/4|0)<ADA.length){ev('c:demo-ada',{kind:'say',text:ADA[n/4|0]})}      /* narration as it unfolds: a synthetic line every fourth tick, each once */
+    const verified=!!A['c:demo-ada']?.demoPricingVerified;
+    if(!Object.keys(A['c:demo-ada']?.perms||{}).length){an++;
+    if(an%4===3&&(an/4|0)<ADA.length){ev('c:demo-ada',{kind:'say',text:verified?ADA[an/4|0]:'The pricing suite records 12 passing and 1 pending. I am checking the existing table and checkout callers without updating the snapshots.'})}      /* progress follows the approved verification result */
+    if(an%2){ev('c:demo-ada',{kind:an%4===1?'edit':'run',id:'a'+an,path:'/Users/demo/Projects/Orchard/'+files[an%4],cmd:'npm test -- pricing',why:an%4===1?'':'run the pricing tests',before:'return price * (1 - season.discount);',after:'return round(price * (1 - season.discount));'})}
+    else{ev('c:demo-ada',{kind:'result',id:'a'+(an-1),text:an%4===2?'ok':verified?'13 passing':'12 passing, 1 pending'})}
+    }
     if(n===7){ev('c:demo-dov',{kind:'say',text:'The 04 run linked fine, so the break is between the 03 and 05 runs. Checking what changed in the crc32 build flags between them.'})}
-    if(n%2){ev('c:demo-ada',{kind:n%4===1?'edit':'run',id:'a'+n,path:'/Users/demo/Projects/Orchard/'+files[n%4],cmd:'npm test -- pricing',why:n%4===1?'':'run the pricing tests',before:'return price * (1 - season.discount);',after:'return round(price * (1 - season.discount));'})}
-    else{ev('c:demo-ada',{kind:'result',id:'a'+(n-1),text:n%4===2?'ok':'13 passing'})}
     if(n%3===0){ev('c:demo-dov',{kind:'read',id:'d'+n,path:'/Users/demo/Projects/Lighthouse/build/'+logs[(n/3|0)%3]})} else if(n%3===1){ev('c:demo-dov',{kind:'result',id:'d'+(n-1),text:'… [arm64] ld: symbol not found: _crc32_hw'})}
     if(n%9===4){if(n===4) ev('c:demo-dov',{kind:'say',text:'First arm64 failure is in nightly-2026-10-03.log line 1142: ld: symbol not found: _crc32_hw. It appears after the crc32 fast path was enabled.'}); pulse('c:demo-dov','c:demo-cleo','reported back')}      /* said once; the hand-off pulse recurs */
   };
-  tick(); const idleDemoHealth=()=>{const at=now();handle({kind:'health',ready:true,err:'',failing:0,tails:6,now:at,scan:at,idle_ready:true,idle_through:DSEQ,idle_at:at})}; idleDemoHealth(); setInterval(()=>{tick();idleDemoHealth()},3500);
+  tick(); const idleDemoHealth=()=>{const at=now();handle({kind:'health',ready:true,err:'',failing:0,tails:21,now:at,scan:at,idle_ready:true,idle_through:DSEQ,idle_at:at})}; idleDemoHealth(); setInterval(()=>{tick();idleDemoHealth()},3500);
   const asked=location.search.match(/[?&]ask=(report|stuck|waiting|rule)\b/);      /* a staged question, for stills and recordings of the demo */
   if(asked) setTimeout(()=>{ofToggle(true); ofIn.value={report:'What did I miss?',stuck:'Is anything stuck?',waiting:'Who is waiting on me?',rule:'Draft a rule that flags the sessions migration as a deploy.'}[asked[1]]; ofSend().then(()=>{ofLog.scrollTop=0})},1500);      /* and show the answer from its top, for a still */
 }

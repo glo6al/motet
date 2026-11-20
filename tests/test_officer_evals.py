@@ -72,10 +72,17 @@ class OfficerEvidenceEvals(unittest.TestCase):
     def test_real_demo_export_is_deterministic_and_has_no_scripted_answers(self):
         self.assertEqual(self.seed, demo_fixture())
         names = [row['name'] for row in self.seed['records'] if row['kind'] == 'agent']
-        self.assertEqual(names, ['Ada', 'Bram', 'Cleo', 'Dov', 'Esme', 'Codex cloud', 'Fen'])
-        self.assertEqual(len(self.seed['records']), 50)   # 49 on main, plus the demo's idle-time health record
+        self.assertEqual(names, ['Codex cloud', 'Bram', 'Ada', 'Cleo', 'Dov', 'Esme', 'Fen',
+                                 'Gita', 'Hale', 'Ivo', 'Juna', 'Kian', 'Leda', 'Miro',
+                                 'Neri', 'Orin', 'Pavo', 'Rhea', 'Suri', 'Tavi', 'Uma', 'Vero'])
+        self.assertEqual(len(self.seed['records']), 131)   # 22 agents, 108 sequenced events, one health record
         self.assertTrue(any(row.get('kind') == 'health' and row.get('idle_ready') is True for row in self.seed['records']))
-        self.assertEqual(max(row.get('seq', 0) for row in self.seed['records']), 42)
+        self.assertEqual(max(row.get('seq', 0) for row in self.seed['records']), 108)
+        edit = next(row for row in self.seed['records'] if row.get('id') == 'a-seed' and row['kind'] == 'edit')
+        for name in ('Leda', 'Miro'):
+            report = next(row for row in self.seed['records']
+                          if row.get('agent') == 'c:demo-' + name.lower() and row['kind'] == 'say')
+            self.assertGreaterEqual(report['ts'], edit['ts'], name + ' verifies the recorded fix afterward')
         self.assertFalse(any(row.get('kind') == 'officer_answer' for row in self.seed['records']))
 
     def test_live_runner_rejects_key_shaped_model_before_call_or_output(self):
@@ -114,13 +121,38 @@ class OfficerEvidenceEvals(unittest.TestCase):
         self.assertIn('only new ones', text)
         agents, _ = self.tool('list_agents')
         by_name = {a['name']: a for a in agents['agents']}
-        self.assertTrue(by_name['Cleo']['waiting_for_owner_permission'])
+        self.assertTrue(by_name['Ada']['waiting_for_owner_permission'])
+        self.assertFalse(by_name['Cleo']['waiting_for_owner_permission'])
         self.assertFalse(by_name['Esme']['waiting_for_owner_permission'])
         self.assertEqual(by_name['Dov']['parent']['how'], 'recorded')
         bram, _ = self.tool('agent_timeline', {'agent': 'Bram', 'limit': 40})
         self.assertTrue(any(s['what'] == 'its turn ended' for s in bram['steps']))
         self.assertTrue(any('read ' in s['what'] for s in bram['steps']))
         self.assertFalse(any('edited ' in s['what'] for s in bram['steps']))
+
+    def test_recent_child_routine_counterfactual_displaces_shift_evidence(self):
+        # Exercise the real latest-60 tool, retaining its limit and the pinned
+        # shift assertion above. Recent routine work really can crowd facts out.
+        before, _ = self.tool('events_since', {'minutes': 60, 'limit': 60})
+        self.assertIn('12 checks passing', json.dumps(before))
+        self.assertTrue(0 < len(before['steps']) <= 60)
+        self.assertIn('the latest 60 are here', before['note'])
+        fixture = copy.deepcopy(self.seed)
+        children = {row['agent'] for row in fixture['records']
+                    if row['kind'] == 'agent' and row.get('parent') and row['name'] != 'Dov'}
+        for row in fixture['records']:
+            if (row.get('agent') in children and row['kind'] != 'agent'
+                    and row['ts'] < self.seed['now'] - 75):
+                row['ts'] += 705   # Move only the routine history from 13 minutes ago to 75 seconds ago.
+        self.assertTrue(all(row.get('ts', 0) <= self.seed['now'] for row in fixture['records']))
+        for child in children:
+            times = [row['ts'] for row in fixture['records'] if row.get('agent') == child]
+            self.assertEqual(times, sorted(times))
+        self.load(fixture)
+        after, _ = self.tool('events_since', {'minutes': 60, 'limit': 60})
+        self.assertTrue(0 < len(after['steps']) <= 60)
+        self.assertIn('the latest 60 are here', after['note'])
+        self.assertNotIn('12 checks passing', json.dumps(after))
 
     def test_synthetic_silence_counterfactual_changes_evidence_not_into_idle(self):
         before, _ = self.tool('events_since', {'minutes': 30})
@@ -185,7 +217,7 @@ class OfficerEvidenceEvals(unittest.TestCase):
         self.assertTrue(draft['queued_for_screen'])
         self.assertIn('do not say it is done', draft['note'])
         self.assertEqual(actions, [{'do': 'draft', 'text': 'Fictional handover draft'}])
-        self.assertIsNone(server.PENDING['demo-c3']['allow'])
+        self.assertIsNone(server.PENDING['demo-a3']['allow'])
 
 
 if __name__ == '__main__':

@@ -3034,7 +3034,7 @@ const memoryResumeLine=html.split('\n').find(l=>l.startsWith('function workspace
   for(const workspace of [false,true])for(const all of [0,1]){
     const nodes={},get=id=>nodes[id]||(nodes[id]={classList:{toggle(){}},hidden:false,title:''});const c={WORKSPACE:workspace,DEMO:true,connected:true,locked:false,lastSeq:-1,DSEQ:3,idleMinutes:0,idleFence:null,order:['a'],A:{},PINS:{},HEALTH:null,Date,now:()=>1000,all,WINDOW_S:1200,$:get,txt:(x,v)=>x.textContent=v,hid:(x,v)=>x.hidden=v,put:(x,v)=>x.innerHTML=v,dur:String,esc:String,idleFenceReset(){c.idleFence=null}};
     vm.runInNewContext(health+'\n'+handler+'\n'+demo+'\nidleDemoHealth();',c);c.now=1000;vm.runInNewContext(html.split('\n').find(l=>l.startsWith('function workspaceEmptyMarkup('))+'\n'+render,c);
-    assert.equal(c.HEALTH.ready,true);assert.equal(c.HEALTH.tails,6);assert.equal(get('#live').textContent,'demo');assert.ok(!String(get('#empty').innerHTML||'').includes('Reading session logs'));assert.equal(get('#empty').hidden,!!all);
+    assert.equal(c.HEALTH.ready,true);assert.equal(c.HEALTH.tails,21);assert.equal(get('#live').textContent,'demo');assert.ok(!String(get('#empty').innerHTML||'').includes('Reading session logs'));assert.equal(get('#empty').hidden,!!all);
   }
   console.log('ok F48/F49 healthy host-time fence and actual demo health/empty-state rendering');
 }
@@ -4249,3 +4249,87 @@ let quietProofDeadline;(async()=>{
  ]){assert(html.includes(from),'quiet causal target '+from);let failure=null;try{await check(code=>code.replace(from,to))}catch(e){failure=e}assert(failure,'quiet mutant survived '+from);if(check!==quietBootstrapChecks)assert.equal(failure.name,'AssertionError','quiet mutant must fail a semantic assertion: '+from)}
  for(const [from,to] of [['border:1px solid #c9c6be;border-radius:6px;padding:1px 8px;margin-left:8px;font:13px/normal system-ui;text-decoration:none','margin-left:6px;text-decoration:underline'],['width:7px;height:7px;border-radius:50%;background:#1c1b19','width:5px;height:5px;border-radius:50%;background:#66635d'],['box-shadow:none;margin:14px 0 6px','box-shadow:none'],['font:13px/18.85px system-ui','font:12.5px/1.4 system-ui'],['.workspace-relay-answer{border:0','.workspace-relay-answer{align-self:stretch;max-width:100%;border:0']]){assert(html.includes(from));assert.throws(()=>quietBoardStyleChecks(html.replace(from,to)),{name:'AssertionError'},'board style mutant')}assert(html.includes('const WORKSPACE_QUIET_RELAY_CACHE=false;'));clearTimeout(quietProofDeadline);console.log('ok quiet Workspace relay/control: exact paired identities, actual send/card/CU paint/grouping, unchanged model/cache/direct/Classic, scope-only unseen, bootstrap/auth/tickets and causal mutants');
 })().catch(error=>{clearTimeout(quietProofDeadline);console.error(error);process.exitCode=1});
+
+/* The complete fictional cast is executed, rather than counted in source text. */
+{
+  const assert=require('assert/strict'),start=html.indexOf('function demo(){'),end=html.indexOf('/* Workspace shell helpers:',start),demoSource=html.slice(start,end);
+  const expected=['Ada','Bram','Cleo','Dov','Esme','Codex cloud','Fen','Gita','Hale','Ivo','Juna','Kian','Leda','Miro','Neri','Orin','Pavo','Rhea','Suri','Tavi','Uma','Vero'];
+  function verify(source,storyHtml=html){
+    const events=[],intervals=[],forbidden=()=>{throw Error('demo attempted a live effect')},c={Date:class extends Date{static now(){return 1800000000000}},DSEQ:0,location:{search:'?demo'},SNAMES:{},document:{createElement:()=>({})},$:()=>({after(){}}),paintWatch(){},lock(){},A:{},handle:e=>{events.push(e);if(e.kind==='agent')c.A[e.agent]={...e,perms:{}};else if(e.kind==='perm')c.A[e.agent].perms[e.pid]=e},setInterval:(f,ms)=>intervals.push({f,ms}),setTimeout:forbidden,fetch:forbidden,XMLHttpRequest:forbidden,WebSocket:forbidden,EventSource:forbidden,Notification:forbidden,navigator:new Proxy({},{get:forbidden})};
+    vm.runInNewContext(source+';demo();',c);
+    const agents=events.filter(e=>e.kind==='agent'),byId=new Map(agents.map(a=>[a.agent,a])),roots=agents.filter(a=>!a.parent),kids=agents.filter(a=>a.parent);
+    assert.equal(agents.length,22);assert.equal(byId.size,22);assert.equal(roots.length,6);assert.equal(kids.length,16);
+    assert.deepEqual(agents.map(a=>a.name).sort(),[...expected].sort());
+    assert.deepEqual([...byId.keys()].sort(),['c:demo-ada','x:demo-bram','c:demo-cleo','c:demo-dov','x:demo-esme','e:demo-dot','c:demo-fen',...expected.slice(7).map(name=>'c:demo-'+name.toLowerCase())].sort());
+    assert.equal(byId.get('c:demo-dov').parent,'c:demo-cleo');
+    assert.equal(new Set(kids.map(a=>a.task)).size,16);
+    for(const a of kids){assert.equal(a.sub,true);assert.ok(byId.has(a.parent));assert.equal(a.cwd,byId.get(a.parent).cwd);const seen=new Set([a.agent]);let p=a.parent;while(p){assert.ok(!seen.has(p),'no ancestry cycle');seen.add(p);p=byId.get(p).parent;}}
+    const counts=Object.fromEntries(roots.map(a=>[a.name,kids.filter(k=>k.parent===a.agent).length]));
+    assert.deepEqual(counts,{ 'Codex cloud':0,Ada:6,Bram:4,Cleo:3,Esme:2,Fen:1 });
+    assert.deepEqual(roots.filter(a=>a.cwd.endsWith('/Orchard')).map(a=>a.name),['Codex cloud','Bram','Ada']);
+    assert.equal(Math.ceil(counts.Ada/2),3,'existing pair layout reaches a third child row');
+    assert.deepEqual(Object.fromEntries(['Orchard','Lighthouse','Tidewater'].map(p=>[p,agents.filter(a=>a.cwd.endsWith('/'+p)).length])),{Orchard:13,Lighthouse:4,Tidewater:5});
+    const added=kids.filter(a=>a.name!=='Dov'),results=added.map(a=>events.find(e=>e.agent===a.agent&&e.kind==='result').text);
+    assert.equal(new Set(results).size,15);assert.equal(new Set(added.map(a=>a.goal)).size,15);
+    assert.equal(new Set(added.map(a=>a.started)).size,1,'new children share the same fictional start age');
+    for(const a of added)for(const e of events.filter(e=>e.agent===a.agent&&e.kind!=='agent'))assert.ok(e.ts>=a.started&&e.ts>=a.ts,a.name+' history follows its registration and start');
+    for(const a of added){const history=events.filter(e=>e.agent===a.agent&&e.kind!=='agent');for(const kind of ['user','read','result','say'])assert.ok(history.some(e=>e.kind===kind),a.name+' has '+kind);assert.ok(history.every(e=>!e.error));assert.ok(history.filter(e=>e.text).every(e=>!/^ok$|placeholder|lorem|…/i.test(e.text)));}
+    const ended=new Set(events.filter(e=>e.kind==='turn_end').map(e=>e.agent));
+    assert.deepEqual(agents.filter(a=>ended.has(a.agent)).map(a=>a.name).sort(),['Bram','Esme','Fen','Hale','Juna','Leda','Orin','Rhea','Suri','Uma']);
+    assert.equal(agents.length-ended.size,12);assert.equal(agents.filter(a=>a.observed).length,1);
+    assert.equal(c.SNAMES.Lighthouse,undefined);
+    assert.equal(c.HEALTH.tails,21);assert.equal(events.filter(e=>e.kind==='health').at(-1).tails,21);
+    assert.equal(events.filter(e=>e.error).length,1,'Cleo remains the sole recorded failure');
+    assert.deepEqual(events.filter(e=>e.kind==='perm').map(e=>e.agent),['c:demo-ada']);
+    assert.equal(events.filter(e=>e.kind==='say'&&/\?/.test(e.text)).length,1,'Esme remains the sole possible decision request');
+    const A={};for(const a of agents)A[a.agent]={...a,id:a.agent,story:[],calls:{},perms:{},asks:{},turn:'in'};
+    for(const e of events){const a=A[e.agent];if(!a||e.kind==='agent')continue;if(e.kind==='result'){const it=a.story.find(x=>x.e?.id===e.id);if(it){it.e.err=e.error;it.e.unknown=e.unknown;}delete a.calls[e.id];}else if(e.kind==='say'){a.said={text:e.text,ts:e.ts};a.story.push({t:'say',...e});}else if(e.kind==='turn_end')a.turn='ended';else if(e.kind==='perm'){a.perms[e.pid]=e;a.story.push({t:'wait',text:'permission: '+e.text,...e});}else if(e.kind!=='user'){a.story.push({t:'did',e,ts:e.ts,seq:e.seq});if(e.id)a.calls[e.id]=e;}}
+    const answerSource=storyHtml.slice(storyHtml.indexOf('function ofDemoAnswer('),storyHtml.indexOf('\nfunction ofToggle(',storyHtml.indexOf('function ofDemoAnswer(')));
+    const answer=vm.runInNewContext(answerSource+';ofDemoAnswer',{A,order:agents.map(a=>a.agent),Date:c.Date,one:s=>String(s).replace(/\s+/g,' '),plain:String,did:e=>e.kind+' '+(e.path||''),clock:String,proj:id=>A[id].cwd.split('/').at(-1),projLabel:String,judgeLocal:()=>({command:''}),need:a=>Object.keys(a.perms).length?{sure:true,kind:'Approve',text:Object.values(a.perms)[0].text,perm:Object.values(a.perms)[0]}:a.name==='Esme'?{sure:false,kind:'Decide',text:a.said.text}:null});
+    const report=answer('What did I miss?');for(const name of expected)assert.ok(report.text.includes('**'+name+'**'));assert.ok(report.cites.length<=12);
+    const stuck=answer('Is anything stuck?');assert.match(stuck.text,/One thing \*\*failed\*\*/);assert.match(stuck.text,/outcome|whether it finished/);assert.match(stuck.text,/proposed fallback/);assert.doesNotMatch(stuck.text,/waiting on your permission|Her request ended|You allowed the retry/);
+    // A later retained read must never replace the held request as its evidence.
+    A['c:demo-ada'].story.push({t:'did',e:{kind:'read',path:'src/pricing/table.ts'},seq:999999,ts:c.Date.now()/1000});
+    const waiting=answer('Who is waiting on me?');assert.match(waiting.text,/\*\*Ada\*\*/);assert.doesNotMatch(waiting.text,/\*\*Cleo\*\*/);assert.equal(waiting.cites.find(c=>c.aid==='c:demo-ada').n,events.find(e=>e.pid==='demo-a3').seq,'held permission evidence survives later Ada edits');assert.match(waiting.text,/\*\*Esme\*\* probably/);assert.equal((waiting.text.match(/- \[ \]/g)||[]).length,2);
+    const permission=events.find(e=>e.kind==='perm');assert.equal(permission.pid,'demo-a3');assert.equal(permission.text,'npm test -- pricing --updateSnapshot');
+    const dispatch=storyHtml.slice(storyHtml.indexOf('function permissionDispatch('),storyHtml.indexOf('/* end permission dispatch */'));
+    for(const allow of [false,true]){
+      const history=[],timers=[],p={...permission},a={id:permission.agent,perms:{[p.pid]:p}},ctx={DEMO:true,DSEQ:999,Date:c.Date,handle:e=>history.push(e),render(){},need:()=>({perm:p}),setTimeout:(f,ms)=>timers.push({f,ms}),post:forbidden};
+      vm.runInNewContext(dispatch+';permissionDispatch',ctx)(a,p,allow);
+      assert.deepEqual(timers.map(t=>t.ms),allow?[600,4000,7000,9500,13000]:[600]);
+      for(const timer of timers)timer.f();
+      assert.equal(history[0].kind,'perm_end');assert.equal(history[0].pid,'demo-a3');assert.equal(history[0].how,(allow?'allowed':'denied')+' from the stage');assert.ok(history.every(e=>e.agent==='c:demo-ada'));
+      assert.equal(history.at(-1).kind,'turn_end');assert.doesNotMatch(JSON.stringify(history),/Lighthouse|CRC=|make nightly|clear the build/);
+      if(allow){assert.deepEqual(history.filter(e=>e.kind==='run').map(e=>e.cmd),['npm test -- pricing --updateSnapshot','npm test -- pricing']);assert.equal(history.find(e=>e.kind==='edit').path,'/Users/demo/Projects/Orchard/test/pricing.test.ts');assert.ok(history.some(e=>e.kind==='result'&&/13 passing/.test(e.text)));}
+      else{assert.ok(!history.some(e=>['run','edit'].includes(e.kind)));assert.match(history.find(e=>e.kind==='say').text,/snapshots unchanged/);}
+    }
+    for(const decision of [null,false,true]){
+      const timeline=[],scheduled=[],loops=[],ctx={...c,A:{},DSEQ:0,DEMO:true,render(){},pulse(){},setInterval:(f,ms)=>loops.push({f,ms}),setTimeout:(f,ms)=>scheduled.push({f,ms}),post:forbidden};
+      ctx.handle=e=>{timeline.push(e);if(e.kind==='agent')ctx.A[e.agent]={...e,id:e.agent,perms:{}};else if(e.kind==='perm')ctx.A[e.agent].perms[e.pid]=e;else if(e.kind==='perm_end')delete ctx.A[e.agent].perms[e.pid];};
+      ctx.need=a=>({perm:Object.values(a.perms)[0]});
+      vm.runInNewContext(source+'\n'+dispatch+';demo();',ctx);
+      const tick=loops.find(x=>x.ms===3500).f,ada=ctx.A['c:demo-ada'],seedLength=timeline.length;
+      if(decision!==null)ctx.permissionDispatch(ada,ada.perms['demo-a3'],decision);
+      for(const ms of [600,3500,4000,7000,9500,10500,13000,14000,17500,21000,24500,28000]){
+        for(const task of scheduled.filter(x=>x.ms===ms))task.f();
+        if([3500,7000,10500,14000,17500,21000,24500,28000].includes(ms))tick();
+        const verified=decision===true&&ms>=13000;
+        assert.equal(!!ada.demoPricingVerified,verified,'verification flag follows the successful13s result');
+        const claims=timeline.filter(e=>e.agent==='c:demo-ada'&&e.text&&/13 passing|Thirteen passing|all 13|Pricing checks pass|snapshot.*(?:refreshed|now records)/i.test(e.text));
+        if(!verified&&!(decision===true&&ms>=4000))assert.equal(claims.length,0,'held/denied ticks cannot invent successful pricing or snapshots');
+        if(!verified)assert.ok(!timeline.some(e=>e.agent==='c:demo-ada'&&e.text&&/13 passing|Thirteen passing|all 13|Pricing checks pass/i.test(e.text)),'thirteen checks require approved verification');
+      }
+      const resumed=timeline.slice(seedLength).filter(e=>e.agent==='c:demo-ada');
+      assert.ok(timeline.slice(seedLength).some(e=>e.agent==='c:demo-dov'),'Dov continues independently');
+      if(decision===null)assert.equal(resumed.length,0,'held permission pauses all new Ada work and narration');
+      else{const ticks=resumed.filter(e=>/^a\d+$/.test(e.id||''));assert.equal(ticks[0].id,'a1','resume begins with a real action, not a phantom result');assert.equal(ticks[0].kind,'edit');for(const e of ticks.filter(e=>e.kind==='result'))assert.ok(ticks.some(x=>x.id===e.id&&['edit','run'].includes(x.kind)&&ticks.indexOf(x)<ticks.indexOf(e)),'resumed result has an earlier matching action');}
+      if(decision!==true)assert.ok(!timeline.some(e=>e.agent==='c:demo-ada'&&e.text&&/13 passing|Thirteen passing|all 13|snapshot.*(?:refreshed|now records)/i.test(e.text)));
+      else{const verifiedAt=timeline.findIndex(e=>e.id==='a-permission-verify'&&e.kind==='result');assert.ok(verifiedAt>=0);assert.ok(timeline.slice(verifiedAt).some(e=>e.agent==='c:demo-ada'&&e.text==='13 passing'));assert.ok(!timeline.slice(verifiedAt+1).some(e=>e.agent==='c:demo-ada'&&e.kind==='result'&&e.text==='12 passing, 1 pending'));}
+    }
+    const rule=answer('Draft a Watch rule');assert.equal(rule.actions[0].words,'alembic upgrade');assert.match(rule.text,/nothing is saved/);
+  }
+  verify(demoSource);
+  for(const [from,to] of [["if(!Object.keys(A['c:demo-ada']?.perms||{}).length){an++;",'if(true){an++;'],["const verified=!!A['c:demo-ada']?.demoPricingVerified;",'const verified=true;'],['tails:21','tails:22'],['"Gita", "ada"','"Gita", "missing"'],['"Vero", "fen"','"Gita", "fen"']]){assert.ok(demoSource.includes(from));let caught=false;try{verify(demoSource.replaceAll(from,to))}catch{caught=true}assert.ok(caught,'cast mutation detected: '+from);}
+  for(const [from,to] of [["a.demoPricingVerified=true;H({","H({"],['cite(a,N.perm||lastOf(a))','cite(a,lastOf(a))'],["cmd:'npm test -- pricing --updateSnapshot',why:","cmd:'make nightly ARCH=arm64',why:"]]){assert.ok(html.includes(from));let caught=false;try{verify(demoSource,html.replace(from,to))}catch{caught=true}assert.ok(caught,'permission story mutation detected: '+from);}
+  console.log('ok full fictional demo: 22 IDs, hierarchy, central families, distinct histories, states, health and four scripted answers; eight causal mutations');
+}

@@ -13,8 +13,13 @@ if (start < 0 || end <= start + 1 || !html.slice(start, end).endsWith('\n}')) th
 const now = 1794412800; // Fixed fictional observation clock; no machine/session data.
 const records = [];
 const context = {
-  Date: {now: () => now * 1000}, DSEQ: 0,
-  handle: event => records.push(event),
+  Date: {now: () => now * 1000}, DSEQ: 0, A: {},
+  handle: event => {
+    records.push(event);
+    if (event.kind === 'agent') context.A[event.agent] = {perms: {}};
+    else if (event.kind === 'perm') context.A[event.agent].perms[event.pid] = event;
+    else if (event.kind === 'perm_end') delete context.A[event.agent].perms[event.pid];
+  },
   paintWatch() {}, lock() {}, $: () => ({after() {}}),
   document: {createElement: () => ({})},
   setInterval() {},
