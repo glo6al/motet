@@ -68,7 +68,23 @@ export function surfaceRoster(value) {
   return [...new Set(value)];
 }
 
-export function publicStatus(state, owner) {
+function deferredReceiptStatus(state, now, conflicts) {
+  let count = 0, oldest = Infinity;
+  for (const request of Object.values(state.data?.requests || {})) {
+    if (!Array.isArray(request.events) || conflicts.includes(request.request_id)) continue;
+    for (const value of request.events) {
+      const deferral = state.transientReceiptRetries.get(value);
+      if (deferral?.first_deferred_at === undefined) continue;
+      count += 1;
+      if (Number.isFinite(deferral.first_deferred_at)) oldest = Math.min(oldest,deferral.first_deferred_at);
+    }
+  }
+  return {count,oldest_age_ms:Number.isFinite(now) && Number.isFinite(oldest) ? Math.max(0,now - oldest) : null,
+    // The pending receipts survive reloads. These observations belong to the loaded context.
+    scope:'current_loaded_receipt_context'};
+}
+
+export function publicStatus(state, owner, now) {
   const conflicts = state.data?.conflict_ids || [];
   const held = Object.values(state.data?.requests || {}).filter(request =>
     Object.values(request.rejections || {}).some(result => result.count >= MAX_RECEIPT_REJECTIONS));
@@ -78,6 +94,7 @@ export function publicStatus(state, owner) {
     startup_surface:surfaceRoster([state.startupSurface])?.[0] ?? null, timer_installed:!!state.timer,
     timer_ticks:Number.isSafeInteger(state.timerTicks) && state.timerTicks >= 0 ? state.timerTicks : 0,
     current_surfaces:surfaceRoster(state.currentSurfaces),
+    deferred_receipts:owner ? deferredReceiptStatus(state,now,conflicts) : null,
     receipt_recovery:owner && (conflicts.length || held.length) ? {
       conflict_count:conflicts.length, conflicts:conflicts.slice(0,32),
       held_count:held.length, held:held.slice(0,32).map(request=>request.request_id),
