@@ -6,6 +6,20 @@
 const fs = require('fs'), path = require('path'), vm = require('vm');
 // Normalize HTML input line endings before matching and executing script fragments.
 const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'web', 'index.html'), 'utf8').replace(/\r\n?/g, '\n');
+/* Stage Send owns its place even when the optional dictation stylesheet is absent. */
+{
+  const assert=require('assert/strict'),selector='html.workspace body:not(.stepped):not(.workspace-officer-desk) #officer[data-workspace-composer] #ofRow>#ofSend';
+  function stageSendOrder(source){
+    const block=source.split('/* Stage model choice belongs beside the microphone at every width. */')[1]?.split('/* End stage model choice placement. */')[0]||'';
+    const rules=[...block.matchAll(/([^{}]+)\{([^{}]*)\}/g)].filter(m=>m[1].trim()===selector);
+    assert.equal(rules.length,1,'the page must own one stage-only Send rule, independently of dictation');
+    assert.match(rules[0][2],/(?:^|;)\s*order\s*:\s*5\s*!important\s*(?:;|$)/,'Send follows the model (3) and optional microphone (4), including attachment overrides');
+  }
+  stageSendOrder(html);
+  const rule=selector+'{order:5!important}';assert(html.includes(rule));
+  for(const replacement of ['',selector+'{order:5}',selector+'{order:0!important}'])assert.throws(()=>stageSendOrder(html.replace(rule,replacement)),{name:'AssertionError'},'missing, weak or first-position Send rule must fail');
+  console.log('ok stage Send page-owned order: no dictation dependency; three causal regressions caught');
+}
 {
   const assert = require('assert/strict');
   const lines = html.split('\n');
