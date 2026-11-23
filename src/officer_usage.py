@@ -150,7 +150,7 @@ class UsageLedger:
         if directory != stat.S_ISDIR(info.st_mode) or (not directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1)):
             raise OSError('invalid usage storage')
         if os.name == 'nt':
-            from deck_log import _windows_security  # Security helper only; no archive is constructed.
+            from private_storage import windows_security as _windows_security
             _windows_security(path, directory)
         elif info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != (0o700 if directory else 0o600):
             raise OSError('nonprivate usage storage')
@@ -179,14 +179,14 @@ class UsageLedger:
             parent = os.path.dirname(parent)
         if not os.path.lexists(self.root):
             if os.name == 'nt':
-                from deck_log import _windows_security
+                from private_storage import windows_security as _windows_security
                 _windows_security(self.root, True, True)
             else:
                 os.mkdir(self.root, 0o700)
         self.root_identity = self._private(self.root, True)
         if not os.path.lexists(self.path):
             if os.name == 'nt':
-                from deck_log import _windows_security
+                from private_storage import windows_security as _windows_security
                 _windows_security(self.path, False, True)
             else:
                 fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
