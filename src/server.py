@@ -3542,20 +3542,17 @@ def officer_model_path():
 
 
 def officer_private_model_file(path, create=False):
-    """Selection shares the existing POSIX-only Motet key privacy boundary."""
-    import stat as st
-    if WIN:
-        raise OSError('Motet settings unavailable')
+    """Selection shares the Motet key's privacy boundary (private_storage): owner and mode on macOS and Linux, the
+    access list on Windows. A folder or file that is not private is refused, never repaired."""
     directory = os.path.dirname(path)
-    if create and not os.path.lexists(directory):
-        os.mkdir(directory, 0o700)
-    parent = os.lstat(directory)
-    if not st.S_ISDIR(parent.st_mode) or st.S_ISLNK(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
-        raise OSError('Motet settings unavailable')
-    if os.path.lexists(path):
-        current = os.lstat(path)
-        if not st.S_ISREG(current.st_mode) or current.st_uid != os.getuid() or current.st_mode & 0o077 or current.st_nlink != 1:
-            raise OSError('Motet settings unavailable')
+    try:
+        if create and not os.path.lexists(directory):
+            private_storage.make_private_folder(directory)
+        private_storage.check_private(directory, directory=True)
+        if os.path.lexists(path):
+            private_storage.check_private(path, single_link=True)
+    except OSError:
+        raise OSError('Motet settings unavailable') from None
 
 
 def load_officer_model():
@@ -3568,11 +3565,9 @@ def load_officer_model():
         return
     try:
         officer_private_model_file(path)
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd, info = private_storage.open_private_file(path, folder=True, single_link=True)
         try:
-            import stat as st
-            info = os.fstat(fd)
-            if not st.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 4096:
+            if info.st_size > 4096:
                 raise ValueError()
             value = json.loads(os.read(fd, 4097).decode('utf-8'))
         finally:
@@ -3686,14 +3681,12 @@ def officer_models_view(models=None, error=''):
 
 def save_officer_model(model):
     """Publish a private atomic selection file; no active state changes here."""
-    import tempfile
     temporary = None
     try:
         path = officer_model_path()
         officer_private_model_file(path, create=True)
-        fd, temporary = tempfile.mkstemp(prefix='.officer-model-', dir=os.path.dirname(path))
+        fd, temporary = private_storage.create_private_temp(os.path.dirname(path), '.officer-model-')
         try:
-            os.fchmod(fd, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as out:
                 json.dump({'schema_version': 2, 'model': model}, out)
                 out.flush()

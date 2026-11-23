@@ -14,6 +14,7 @@ import uuid
 from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import server
+import private_storage
 
 
 class OfficerModelTests(unittest.TestCase):
@@ -29,15 +30,10 @@ class OfficerModelTests(unittest.TestCase):
         server.OFFICER_CATALOG = {'key': '', 'at': 0, 'models': []}
         self.calls = []
         self.srv = None
-        # Windows has no Officer key-file support; portable protocol tests use
-        # synthetic in-memory persistence and make no Windows privacy claim.
-        self.memory_save = patch.object(server, 'save_officer_model') if os.name == 'nt' else None
-        if self.memory_save: self.memory_save.start()
 
     def tearDown(self):
         if self.srv:
             self.srv.shutdown(); self.thread.join(2); self.srv.server_close()
-        if self.memory_save: self.memory_save.stop()
         for key, value in self.saved.items(): setattr(server, key, value)
         self.tmp.cleanup()
 
@@ -118,14 +114,24 @@ class OfficerModelTests(unittest.TestCase):
         self.cache([self.item('claude-fixture-b', 'Fixture B', None)])
         self.assertNotIn('output_config', server.officer_request_options(server.officer_model_snapshot()))
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX Officer persistence boundary')
+    def write_private(self, path, data):
+        """A settings file private from the start on every system (0600, or a protected access list)."""
+        if os.path.lexists(path):
+            os.unlink(path)
+        descriptor = private_storage.create_private_file(path)
+        os.write(descriptor, data)
+        os.close(descriptor)
+
     def test_persistence_restart_missing_model_and_failed_write_no_change(self):
         self.cache()
         status, result = server.select_officer_model('claude-fixture-b')
         self.assertEqual(status, 200)
         self.assertEqual(result['selected_model'], 'claude-fixture-b')
         path = server.officer_model_path()
-        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        private_storage.check_private(os.path.dirname(path), directory=True)
+        private_storage.check_private(path, single_link=True)
+        if os.name != 'nt':
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         server.OFFICER_MODEL = 'claude-fixture-a'
         server.load_officer_model()
         self.assertEqual(server.OFFICER_MODEL, 'claude-fixture-b')
@@ -146,7 +152,7 @@ class OfficerModelTests(unittest.TestCase):
             self.assertEqual(json.load(saved)['model'], 'claude-fixture-b')
         self.assertEqual(server.select_officer_model('claude-fixture-a')[0], 200)
 
-    @unittest.skipIf(os.name == 'nt', 'Officer settings are intentionally unavailable on Windows')
+    @unittest.skipIf(os.name == 'nt', 'POSIX symbolic links and modes; Windows cases follow')
     def test_unsafe_persistence_refuses_symlink_mode_and_invalid_content(self):
         self.cache()
         os.mkdir(os.path.join(self.home, '.live-room'), 0o700)
@@ -168,23 +174,56 @@ class OfficerModelTests(unittest.TestCase):
         os.chmod(path, 0o644)
         self.assertEqual(server.select_officer_model('claude-fixture-b')[0], 503)
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX Officer persistence boundary')
     def test_loader_rejects_key_shaped_or_exact_private_key_model_ids(self):
         models = self.cache()
-        os.mkdir(os.path.join(self.home, '.live-room'), 0o700)
+        private_storage.make_private_folder(os.path.join(self.home, '.live-room'))
         path = server.officer_model_path()
+        self.write_private(path, json.dumps({'schema_version': 2, 'model': 'claude-fixture-b'}).encode())
+        server.load_officer_model()
+        self.assertEqual((server.OFFICER_MODEL, server.OFFICER_MODEL_ERROR), ('claude-fixture-b', ''), 'the private fixture itself loads')
+        server.OFFICER_MODEL = 'claude-fixture-a'
         shaped = 'sk' + '-ant-' + 'x' * 32
         for value in (shaped, server.OFFICER_KEY):
             with self.subTest(value_kind='shaped' if value == shaped else 'exact'):
-                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                os.write(descriptor, json.dumps({'model': value}).encode())
-                os.close(descriptor)
+                self.write_private(path, json.dumps({'model': value}).encode())
                 server.load_officer_model()
                 view = server.officer_models_view(models)
                 self.assertTrue(server.OFFICER_MODEL_ERROR)
                 self.assertEqual(view['selected_model'], 'claude-fixture-a')
                 self.assertNotIn(value, json.dumps(view))
                 with self.assertRaises(ValueError): server.officer_model_snapshot()
+
+    @unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists and junctions')
+    def test_windows_unsafe_persistence_refuses_open_list_inherited_file_and_junction(self):
+        import subprocess
+        self.cache()
+        folder = os.path.join(self.home, '.live-room')
+        private_storage.make_private_folder(folder)
+        path = server.officer_model_path()
+        self.assertEqual(server.select_officer_model('claude-fixture-b')[0], 200)
+        subprocess.run(['icacls', path, '/grant', '*S-1-1-0:(R)'], check=True, capture_output=True, timeout=30)
+        server.load_officer_model()
+        self.assertTrue(server.OFFICER_MODEL_ERROR, 'a settings file Everyone can read is refused')
+        self.assertEqual(server.select_officer_model('claude-fixture-a')[0], 503)
+        with open(path) as saved:
+            self.assertEqual(json.load(saved)['model'], 'claude-fixture-b', 'nothing was changed or repaired')
+        os.unlink(path)
+        with open(path, 'w') as out:
+            out.write(json.dumps({'schema_version': 2, 'model': 'claude-fixture-a'}))   # follows the folder's list
+        server.load_officer_model()
+        self.assertTrue(server.OFFICER_MODEL_ERROR, 'an inherited settings file is refused')
+        os.unlink(path)
+        self.write_private(path, json.dumps({'schema_version': 2, 'model': 'claude-fixture-a'}).encode())
+        server.load_officer_model()
+        self.assertEqual((server.OFFICER_MODEL, server.OFFICER_MODEL_ERROR), ('claude-fixture-a', ''))
+        moved = os.path.join(self.home, 'real-state')
+        os.rename(folder, moved)
+        subprocess.run(['cmd', '/c', 'mklink', '/J', folder, moved], check=True, capture_output=True, timeout=30)
+        server.load_officer_model()
+        self.assertTrue(server.OFFICER_MODEL_ERROR, 'a junction in place of the folder is refused')
+        self.assertEqual(server.select_officer_model('claude-fixture-b')[0], 503)
+        with open(os.path.join(moved, 'officer-model.json')) as saved:
+            self.assertEqual(json.load(saved)['model'], 'claude-fixture-a')
 
     def test_authenticated_http_contract_invalid_posts_and_unavailable_fetch(self):
         self.start_http()
