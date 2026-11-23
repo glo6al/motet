@@ -33,6 +33,8 @@ Trust boundary
 Run:  python3 src/server.py      (Windows: py src/server.py) then open http://127.0.0.1:8793/ and press Unlock
 Env:  PORT (8793), WINDOW_MIN (20: how recently a session must have been active to appear)
 """
+import ntpath
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -46,7 +48,7 @@ if __name__ == '__main__' and sys.argv[1:] == ['--version']:
     print('Motet ' + version[1])
     raise SystemExit(0)
 
-import glob, gzip, hashlib, hmac, http.client, json, math, mimetypes, os, secrets, select, socket, sqlite3, ssl, subprocess, threading, time, urllib.parse
+import glob, gzip, hashlib, hmac, http.client, json, math, mimetypes, os, secrets, select, shutil, socket, sqlite3, ssl, subprocess, threading, time, urllib.parse
 import uuid
 from socketserver import TCPServer
 from contextlib import nullcontext
@@ -120,7 +122,12 @@ def launch(target):
     if WIN:
         os.startfile(target)
     else:
-        subprocess.Popen(['/usr/bin/open', target])
+        opener = '/usr/bin/open'
+        if sys.platform.startswith('linux'):
+            opener = shutil.which('xdg-open')
+            if not opener:
+                raise FileNotFoundError('xdg-open')        # an OSError, as callers already expect when nothing can open it
+        subprocess.Popen([opener, target])
 
 BOOT = '%x' % int(time.time() * 1000)
 PKEY = secrets.token_urlsafe(16)          # previews only; changes every run
@@ -1380,9 +1387,26 @@ def match_launch(aid=None):
 BACKFILLED = set()            # agents whose "first message" was recovered from further back, so its time is not a start time
 EXEC_KIDS = {}               # script-launched runs still without a parent: agent -> None
 WORKED = {}                  # folder -> [(agent, first seen there, last seen there), …]: where agents have been reading, writing, running
-PATH_RX = re.compile(r"(?<![\w:])[A-Za-z]:[/\\]Users[/\\][^/\\\n\"'`]+(?:[/\\][^/\\\n\"'`<>|;*$]+){2,8}" if WIN else     # folder names may contain spaces
-                     r"/Users/[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}")         # a computer's logs hold its own kind of path
-CD_RX = re.compile(r'cd\s+(["\']?)((?:[A-Za-z]:)?[/\\]Users[/\\][^"\']+)\1\s*$' if WIN else r'cd\s+(["\']?)(/Users/[^"\']+)\1\s*$')
+
+
+def home_patterns(home=None, win=None):
+    """(PATH_RX, CD_RX) for the folder that holds home folders: /Users on a Mac, /home on Linux, C:\\Users (or wherever a
+    profile lives) on Windows. A root-level or missing home falls back to /Users or Users."""
+    win = WIN if win is None else win
+    mod = ntpath if win else posixpath
+    parent = mod.dirname(mod.normpath(HOME if home is None else home))
+    if win:
+        parts = [x for x in re.split(r'[/\\]', parent.split(':', 1)[-1]) if x] or ['Users']
+        top = r'[/\\]' + r'[/\\]'.join(re.escape(x) for x in parts) + r'[/\\]'
+        return (re.compile(r"(?<![\w:])[A-Za-z]:" + top + r"[^/\\\n\"'`]+(?:[/\\][^/\\\n\"'`<>|;*$]+){2,8}"),     # folder names may contain spaces
+                re.compile(r'cd\s+(["\']?)((?:[A-Za-z]:)?' + top + r'[^"\']+)\1\s*$'))
+    parts = [x for x in parent.split('/') if x] or ['Users']
+    top = '/' + '/'.join(re.escape(x) for x in parts) + '/'
+    return (re.compile(top + r"[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}"),         # a computer's logs hold its own kind of path
+            re.compile(r'cd\s+(["\']?)(' + top + r'[^"\']+)\1\s*$'))
+
+
+PATH_RX, CD_RX = home_patterns()
 
 
 def folder_keys(path):

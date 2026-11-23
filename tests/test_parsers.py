@@ -1588,10 +1588,47 @@ def test_idle_tail_catchup():
         server.MAX_POLL = saved
 
 
+def test_home_paths_and_launch():
+    from unittest.mock import patch
+    mac_path, mac_cd = server.home_patterns('/Users/me', win=False)
+    check('a Mac path is matched under /Users', mac_path.findall('see /Users/me/a/b/c.py') == ['/Users/me/a/b/c.py'])
+    check('a Mac cd is matched under /Users', bool(mac_cd.match('cd /Users/me/a')))
+    check('a Mac home does not match /home', not mac_path.findall('see /home/me/a/b/c.py') and not mac_cd.match('cd /home/me/a'))
+    path, cd = server.home_patterns('/home/me', win=False)
+    check('a Linux path is matched under /home', path.findall('see /home/me/proj/src/c.py') == ['/home/me/proj/src/c.py'])
+    check('a Linux cd is matched under /home', cd.match('cd "/home/me/my proj"').group(2) == '/home/me/my proj')
+    check('a Linux home does not match /Users', not path.findall('see /Users/me/a/b/c.py'))
+    check('a root-level home falls back to /Users', server.home_patterns('/root', win=False)[0].pattern == mac_path.pattern)
+    wpath, wcd = server.home_patterns('C:\\Users\\me', win=True)
+    check('a Windows path matches with either slash', wpath.findall('x c:/Users/me/a/b/c.py') == ['c:/Users/me/a/b/c.py']
+          and wpath.findall(r'x C:\Users\me\a\b\c.py') == [r'C:\Users\me\a\b\c.py'])
+    check('a Windows cd matches with or without a drive', bool(wcd.match('cd C:/Users/me/a')) and bool(wcd.match('cd /Users/me/a')))
+    opath, _ = server.home_patterns('D:\\Profiles\\me', win=True)
+    check('a Windows profile outside C:\\Users is matched', opath.findall(r'x D:\Profiles\me\a\b\c.py') == [r'D:\Profiles\me\a\b\c.py'])
+
+    with patch.object(server, 'WIN', False), patch.object(server.sys, 'platform', 'darwin'), \
+            patch.object(server.subprocess, 'Popen') as popen:
+        server.launch('/tmp/a.html')
+        check('macOS still opens with /usr/bin/open', popen.call_args[0][0] == ['/usr/bin/open', '/tmp/a.html'])
+    with patch.object(server, 'WIN', False), patch.object(server.sys, 'platform', 'linux'), \
+            patch.object(server.shutil, 'which', return_value='/usr/bin/xdg-open'), patch.object(server.subprocess, 'Popen') as popen:
+        server.launch('/tmp/a.html')
+        check('Linux opens with xdg-open', popen.call_args[0][0] == ['/usr/bin/xdg-open', '/tmp/a.html'])
+    with patch.object(server, 'WIN', False), patch.object(server.sys, 'platform', 'linux'), \
+            patch.object(server.shutil, 'which', return_value=None), patch.object(server.subprocess, 'Popen') as popen:
+        try:
+            server.launch('/tmp/a.html')
+            failed = False
+        except OSError:
+            failed = True
+        check('Linux without xdg-open fails as an OSError and starts nothing', failed and not popen.called)
+
+
 if __name__ == '__main__':
     test_idle_stream_fence()
     test_idle_tail_catchup()
     test_import_is_quiet()
+    test_home_paths_and_launch()
     test_release_version()
     test_static_brand_assets()
     test_pair_keeps_only_supported_view_flags()

@@ -1,6 +1,6 @@
 # Installing and trying Motet on Windows
 
-Motet shows your coding agents (Claude Code, Codex, Cursor) on a browser stage with one monitor per agent, updated as they work. This guide takes you from a Windows PC with nothing installed to that stage. It also lists what we would like you to check, because **nobody has run it on a real Windows desktop yet**. So far the tests have passed on Windows in automated CI, but only in CI. Your report is the first real one.
+Motet shows your coding agents (Claude Code, Codex, Cursor) on a browser stage with one monitor per agent, updated as they work. This guide takes you from a Windows PC with nothing installed to that stage. It also lists what we would like you to check, because it has so far been run on **one real Windows 11 PC** ([report #4](https://github.com/glo6al/motet/issues/4)), plus automated tests in CI. More reports are still welcome, especially from other setups. The goal is for Windows to match the Mac. Windows comes first, then Linux.
 
 Allow about fifteen minutes. You need no administrator rights unless your installer asks for them, and you install nothing besides Python and Git.
 
@@ -206,6 +206,20 @@ dir "$env:USERPROFILE\.cursor\projects"
 ---
 
 ## What does not work on Windows yet
+
+Motet **watches** on Windows: the live stage, risk flags, previews (page only, Python 3.12 or later) and Unlock all work. Everything that **acts** is switched off for now. The goal is parity with the Mac, and these are still to come:
+
+- **Motet's own answers and model settings.** Not available on Windows yet.
+- **Messaging between agents, and the bridge.**
+- **New chat.**
+- **Files and attachments.**
+- **Dictation.** The whole feature is off on Windows, not only the speech engine.
+- **App icons** for the agents.
+- **Codex cloud agents** on the stage, which are found through the process list.
+- **Open in Antigravity.**
+- **iTerm2 terminal tabs.** iTerm2 is Mac only.
+
+Details on the rest:
 
 - **Answering permission prompts from the stage (Allow / Deny), and the hooks behind it.** The hooks are shell scripts, and how Claude Code runs hook commands on Windows has not been checked. `py scripts\install_hooks.py` says so and changes nothing. Motet still watches, and Claude asks in its own app as usual.
 - **Rendered previews show the page alone.** The styles, scripts and images it links to from files beside it are not served on Windows yet (inline ones still apply), so a previewed page can look unstyled; previews need Python 3.12 or later. A page reached through a link or junction, with more than one name (such as files pnpm hard-links into `node_modules`), or in `AppData` is refused. OneDrive-synced, network and ReFS/Dev Drive folders have not been tried: they may be refused by those checks, or may work. Please tell us which happen to you.
