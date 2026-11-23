@@ -59,6 +59,7 @@ from officer_capabilities import (ANSWER_CHARS, ANSWER_SCHEMA, EVIDENCE_SYSTEM, 
                                   live_view as officer_live_projection, sign_receipt, verify_receipt, authenticate_receipt, receipt_refs, record_fingerprint)
 from officer_evidence import EvidenceService
 from anthropic_reporting import report as anthropic_report
+import private_storage
 from officer_request import BudgetPolicy, RequestBudget, BudgetExceeded, AssertionRegistry
 import antigravity
 import antigravity_open
@@ -2897,8 +2898,8 @@ class CloudExec:
 # your screen, and are all reversible from the screen; those tools cannot reach an agent.
 # Log text is untrusted input to the model: the prompt tells it to act only when you asked, but a prompt is guidance,
 # not a wall, so a poisoned transcript could make it propose one of those screen actions, and the page says what it
-# did. The feature is off, with the reason shown in the drawer, unless the key file passes every check. Not offered
-# on Windows yet: the key file's permissions cannot be checked there the same way.
+# did. The feature is off, with the reason shown in the drawer, unless the key file passes every check. On Windows the
+# key file's access list stands in for its owner and mode (see private_storage).
 OFFICER_MODEL = AUTOMATIC
 OFFICER_MODEL_ERROR = ''
 OFFICER_CATALOG = {'key': '', 'at': 0, 'models': []}
@@ -2996,42 +2997,58 @@ def secret_scanner():
         return None
 
 
+OFFICER_KEY_FILE = '%USERPROFILE%\\.live-room\\anthropic-key' if WIN else '~/.live-room/anthropic-key'
+OFFICER_KEY_PRIVATE = ('in Command Prompt run: icacls "%s" /inheritance:r /grant:r "%%USERNAME%%:F"' % OFFICER_KEY_FILE
+                       if WIN else 'chmod 600')
+OFFICER_FOLDER_PRIVATE = 'icacls "%USERPROFILE%\\.live-room" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"'
+
+
+def officer_key_refusal(problem):
+    """Plain words for a refused key file (private_storage reasons); never a path from the system or its error text."""
+    reason, folder = problem.reason, problem.subject == 'folder'
+    if folder:
+        return {'missing': 'no key file at ' + OFFICER_KEY_FILE,
+                'link': 'the folder holding the key file is a link or junction, not a plain folder',
+                'not_regular': 'the folder holding the key file is not a plain folder',
+                'owner': 'the folder holding the key file is not owned by you',
+                'access': 'other accounts can open the folder holding the key file; make it yours alone (in Command Prompt run: %s)' % OFFICER_FOLDER_PRIVATE,
+                }.get(reason, 'the folder holding the key file could not be checked')
+    return {'missing': 'no key file at ' + OFFICER_KEY_FILE,
+            'link': 'the key file is a link, not a plain file',
+            'not_regular': 'the key file is not a plain file',
+            'owner': 'the key file is not owned by you',
+            'access': ('the key file is not yours alone; make it private (%s)' if WIN else
+                       'the key file can be read by others; make it yours alone (%s)') % OFFICER_KEY_PRIVATE,
+            'changed': 'the key file changed while it was being opened; start Motet again',
+            'unavailable': 'the key file\'s access list could not be checked',
+            }.get(reason, 'the key file could not be opened')
+
+
 def load_officer_key(path=None, root=None):
     """Read the Anthropic key from ~/.live-room/anthropic-key, or leave Motet off with a plain reason. The file
     is opened without following links, and the file that was opened (not one looked at earlier) must be a regular
-    file owned by you that nobody else can read; then no key-shaped string may sit anywhere in the project tree,
-    tracked or not, and every file there must have been readable. The key is kept in this process and printed
-    nowhere; a reason never contains one either."""
+    file owned by you that nobody else can read: on macOS and Linux by its owner and mode; on Windows by its access
+    list (only you and SYSTEM, nothing inherited), with no link, junction or other reparse point at the file and
+    its folder held private and in place while it is opened (private_storage). Then no key-shaped string may sit
+    anywhere in the project tree, tracked or not, and every file there must have been readable. The key is kept in
+    this process and printed nowhere; a reason never contains one either."""
     global OFFICER_KEY, OFFICER_WHY
-    import errno
-    import stat as _st
     OFFICER_KEY = ''
-    if WIN:
-        OFFICER_WHY = 'not offered on Windows yet (the key file\'s owner and permissions are not checked there)'
-        return
     p = path or os.path.join(HOME, '.live-room', 'anthropic-key')
     try:
-        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))     # a pipe at that path cannot hang the start
-    except OSError as e:
-        OFFICER_WHY = ('no key file at ~/.live-room/anthropic-key' if e.errno == errno.ENOENT else
-                       'the key file is a link, not a plain file' if e.errno in (errno.ELOOP, errno.EMLINK) else 'the key file could not be opened')
+        # POSIX keeps its file-only check: load_key() has already forced ~/.live-room private and yours there.
+        fd, _ = private_storage.open_private_file(p, folder=WIN)
+    except private_storage.PrivateStorageError as problem:
+        OFFICER_WHY = officer_key_refusal(problem)
+        return
+    except OSError:
+        OFFICER_WHY = 'the key file could not be opened'
         return
     try:
-        st = os.fstat(fd)
-        if not _st.S_ISREG(st.st_mode):
-            OFFICER_WHY = 'the key file is not a plain file'
-            return
-        if st.st_uid != os.getuid():
-            OFFICER_WHY = 'the key file is not owned by you'
-            return
-        if st.st_mode & 0o077:
-            OFFICER_WHY = 'the key file can be read by others; make it yours alone (chmod 600)'
-            return
-        try:
-            k = os.read(fd, 400).decode('ascii', 'ignore').strip()
-        except OSError:
-            OFFICER_WHY = 'the key file could not be read'
-            return
+        k = os.read(fd, 400).decode('ascii', 'ignore').strip()
+    except OSError:
+        OFFICER_WHY = 'the key file could not be read'
+        return
     finally:
         os.close(fd)
     if not KEY_SHAPE.fullmatch(k.encode()):

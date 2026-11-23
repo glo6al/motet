@@ -890,8 +890,37 @@ def test_officer():
     try:
         import check_secrets
         if server.WIN:
+            import subprocess, private_storage
+            # A private folder owned by you explicitly: an elevated runner's default owner can be Administrators.
+            folder = os.path.join(d.name, 'state'); private_storage.make_private_folder(folder)
+            key = os.path.join(folder, 'anthropic-key')
             server.load_officer_key(path=key, root=root)
-            check('on Windows the Officer is off and says why', server.OFFICER_KEY == '' and 'Windows' in server.OFFICER_WHY)
+            check('Windows: no key file: the Officer is off and says so', server.OFFICER_KEY == '' and 'no key file' in server.OFFICER_WHY)
+            with open(key, 'w') as f:
+                f.write(fake + '\n')                        # an ordinary file follows its folder's access list
+            server.load_officer_key(path=key, root=root)
+            check('Windows: a key file that is not protected on its own is refused, with the fix', server.OFFICER_KEY == ''
+                  and (('not yours alone' in server.OFFICER_WHY and 'icacls' in server.OFFICER_WHY)
+                       or 'not owned by you' in server.OFFICER_WHY))     # an elevated runner may own new files as Administrators
+            os.remove(key)
+            fd = private_storage.create_private_file(key); os.write(fd, (fake + '\n').encode()); os.close(fd)
+            server.load_officer_key(path=key, root=root)
+            check('Windows: a private key file switches the Officer on', server.OFFICER_KEY == fake and server.OFFICER_WHY == '')
+            subprocess.run(['icacls', key, '/grant', '*S-1-1-0:(R)'], check=True, capture_output=True, timeout=30)
+            server.load_officer_key(path=key, root=root)
+            check('Windows: a key file Everyone can read is refused', server.OFFICER_KEY == '' and 'not yours alone' in server.OFFICER_WHY)
+            subprocess.run(['icacls', key, '/remove:g', '*S-1-1-0'], check=True, capture_output=True, timeout=30)
+            server.load_officer_key(path=key, root=root)
+            check('Windows: and accepted again once private', server.OFFICER_KEY == fake)
+            link = os.path.join(d.name, 'junction')
+            subprocess.run(['cmd', '/c', 'mklink', '/J', link, folder], check=True, capture_output=True, timeout=30)
+            server.load_officer_key(path=os.path.join(link, 'anthropic-key'), root=root)
+            check('Windows: a junction in place of the key folder is refused', server.OFFICER_KEY == '' and 'link or junction' in server.OFFICER_WHY)
+            with open(os.path.join(root, 'notes.txt'), 'w') as f:
+                f.write('token ' + fake)
+            server.load_officer_key(path=key, root=root)
+            check('Windows: a key-shaped string in the project tree switches the Officer off', server.OFFICER_KEY == '' and 'project tree' in server.OFFICER_WHY and 'notes.txt' in server.OFFICER_WHY)
+            os.remove(os.path.join(root, 'notes.txt'))
         else:
             server.load_officer_key(path=os.path.join(d.name, 'missing'), root=root)
             check('no key file: the Officer is off and says so', server.OFFICER_KEY == '' and 'no key file' in server.OFFICER_WHY)
