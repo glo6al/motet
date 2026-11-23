@@ -15,11 +15,11 @@
     },
     {
       "label": "delete",
-      "pattern": "^(?:sudo\\s+)?rm\\s+(?:-\\w+\\s+)*-\\w*[rR]\\w*\\s|^(?:sudo\\s+)?rm\\s+(?:-\\w+\\s+)*--recursive|^git\\s+(?:-\\S+\\s+\\S+\\s+)*(reset\\s+--hard|clean\\s+-\\w*f)"
+      "pattern": "^(?:sudo\\s+)?rm\\s+(?:-\\w+\\s+)*-\\w*[rR]\\w*\\s|^(?:sudo\\s+)?rm\\s+(?:-\\w+\\s+)*--recursive|^git\\s+(?:-\\S+\\s+\\S+\\s+)*(reset\\s+--hard|clean\\s+-\\w*f)|(?i:^(?:remove-item|ri|rm|rmdir|rd|del|erase)\\b[^\\n]*\\s-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?\\b)|(?i:^(?:rd|rmdir|del|erase)\\b[^\\n]*\\s/s\\b)|(?i:^(?:format-volume|clear-disk|remove-partition)\\b)"
     },
     {
       "label": "send",
-      "pattern": "^(sendmail|mailx|mail\\s+-s)\\b"
+      "pattern": "^(sendmail|mailx|mail\\s+-s)\\b|(?i:^send-mailmessage\\b)"
     }
   ],
   "toolRisk": "send|publish|deploy|delete|trash|share|merge|post_|create_scheduled|RemoteTrigger",

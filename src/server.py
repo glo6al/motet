@@ -1093,6 +1093,9 @@ apply_watch(False)
 
 PREFIX = re.compile(r'^\s*(?:(?:sudo|env|time|nohup|command|exec)\s+|\w+=\S*\s+)*')
 SHELL_C = re.compile(r'^(?:ba|z|da)?sh\s+(?:-\w+\s+)*-\w*c\s+(["\'])(.*)\1\s*$', re.S)
+# Windows shells: `cmd /c ...` and `powershell -Command ...` (pwsh too, with or without .exe, any case). Other switches
+# may come first, and a switch may take one value (-ExecutionPolicy Bypass). The command text is group 1, quoted or not.
+WIN_C = re.compile(r'^(?:cmd(?:\.exe)?\s+(?:/\w+\s+)*/[ck]|(?:powershell|pwsh)(?:\.exe)?\s+(?:-(?!c\b|command\b)\w+(?:\s+(?!-)[^\s"\']+)?\s+)*-(?:c|command))\s+(.*)$', re.S | re.I)
 
 
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1(.*?)\n\2\b", re.S)
@@ -1175,8 +1178,14 @@ def segments(cmd, depth=0, mark=False, body=False):
         if not seg:
             continue
         m = SHELL_C.match(seg)
+        w = None if m else WIN_C.match(seg)
         if m and depth < 3:
             res += segments(m.group(2), depth + 1, mark)
+        elif w and depth < 3:
+            inner = w.group(1).strip()
+            if len(inner) > 1 and inner[0] == inner[-1] and inner[0] in '"\'':
+                inner = inner[1:-1]
+            res += segments(inner, depth + 1, mark)
         else:
             res.append(seg)
     if depth < 3:
@@ -2104,8 +2113,12 @@ def load_titles():
 
 
 def desktop_files():
-    base = os.environ.get('APPDATA', '') + '/Claude' if WIN else HOME + '/Library/Application Support/Claude'     # Windows: unverified
-    return glob.glob(base + '/claude-code-sessions/*/*/local_*.json')
+    if not WIN:
+        return glob.glob(HOME + '/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json')
+    # Windows: on one install (Windows 11, Nov 2026) the records were under %LOCALAPPDATA%\Claude-Data\<profile>\ and
+    # %APPDATA%\Claude was empty. Both are searched. Only the folder layout was checked there, not the files' contents.
+    bases = [os.environ.get('APPDATA', '') + '/Claude'] + glob.glob(os.environ.get('LOCALAPPDATA', '') + '/Claude-Data/*')
+    return [f for b in bases for f in glob.glob(b + '/claude-code-sessions/*/*/local_*.json')]
 
 
 def desktop_scan():

@@ -202,6 +202,17 @@ def test_shell():
     check('sh -c is followed', server.risk('sh -c "git push origin main"') == 'push')
     check('delete', server.risk('rm -rf /tmp/x') == 'delete')
     check('deploy', server.risk('npx vercel deploy --prod') == 'deploy')
+    for cmd in ('Remove-Item -Recurse -Force .\\build', 'remove-item build -r', 'ri build -Recurse', 'rm build -Recurse',
+                'rd /s /q build', 'rmdir /S build', 'del /s /q *.log', 'erase /s x', 'Format-Volume -DriveLetter D',
+                'cmd /c "rd /s /q build"', 'cmd.exe /C rd /s /q build', 'powershell -Command "Remove-Item x -Recurse"',
+                'powershell.exe -NoProfile -ExecutionPolicy Bypass -c "Remove-Item x -Recurse"', 'pwsh -c ri x -r'):
+        check('windows delete: ' + cmd, server.risk(cmd) == 'delete')
+    check('windows send', server.risk('Send-MailMessage -To a@example.com -Subject hi') == 'send')
+    check('cmd /c is followed', server.risk('cmd /c "git push origin main"') == 'push')
+    check('powershell -Command is followed', server.risk('powershell -Command "git push origin main"') == 'push')
+    for cmd in ('Remove-Item notes.txt', 'del notes.txt', 'rd emptydir', 'Get-ChildItem -Recurse',
+                'echo Remove-Item x -Recurse', 'cmd /c dir', 'powershell -Command "Get-Process"', 'rm -f notes.txt'):
+        check('not a delete: ' + cmd, server.risk(cmd) == '')
     check('npm test is a check', server.is_check('npm test'))
     check('git push is not a check', not server.is_check('git push origin main'))
     calls = server.launch_calls('claude -p "build the pricing table for the catalogue"')

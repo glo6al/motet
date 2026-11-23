@@ -209,7 +209,7 @@ dir "$env:USERPROFILE\.cursor\projects"
 
 - **Answering permission prompts from the stage (Allow / Deny), and the hooks behind it.** The hooks are shell scripts, and how Claude Code runs hook commands on Windows has not been checked. `py scripts\install_hooks.py` says so and changes nothing. Motet still watches, and Claude asks in its own app as usual.
 - **Rendered previews show the page alone.** The styles, scripts and images it links to from files beside it are not served on Windows yet (inline ones still apply), so a previewed page can look unstyled; previews need Python 3.12 or later. A page reached through a link or junction, with more than one name (such as files pnpm hard-links into `node_modules`), or in `AppData` is refused. OneDrive-synced, network and ReFS/Dev Drive folders have not been tried: they may be refused by those checks, or may work. Please tell us which happen to you.
-- **Desktop app details** (session titles, permission mode, when you last looked at a session) come from the Claude desktop app's own records. We assumed they are in `%APPDATA%\Claude`, but have not checked.
+- **Desktop app details** (session titles, permission mode, when you last looked at a session) come from the Claude desktop app's own records. On one Windows 11 PC they were under `%LOCALAPPDATA%\Claude-Data\<profile>\claude-code-sessions`, and `%APPDATA%\Claude` was empty, so Motet looks in both. Only the folder layout was checked there, not that the records read correctly.
 
 ---
 
@@ -249,6 +249,7 @@ Please tell us what happened, even if it was "everything worked". [Open an issue
 - [ ] Is there a Claude desktop app sessions folder? Paste the output of:
   ```powershell
   dir "$env:APPDATA\Claude" ; dir "$env:APPDATA\Claude\claude-code-sessions" -ErrorAction SilentlyContinue
+  dir "$env:LOCALAPPDATA\Claude-Data\*\claude-code-sessions" -ErrorAction SilentlyContinue
   ```
 - [ ] Did a page an agent wrote show as a rendered preview at its desk? Which folder was it in (local disk, OneDrive, network, Dev Drive)?
 - [ ] After **Ctrl+C**, could you start the server again straight away, or did it say the port was busy, and for how long?
