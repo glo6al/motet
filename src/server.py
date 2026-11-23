@@ -1391,17 +1391,19 @@ WORKED = {}                  # folder -> [(agent, first seen there, last seen th
 
 def home_patterns(home=None, win=None):
     """(PATH_RX, CD_RX) for the folder that holds home folders: /Users on a Mac, /home on Linux, C:\\Users (or wherever a
-    profile lives) on Windows. A root-level or missing home falls back to /Users or Users."""
+    profile lives) on Windows. Users is always matched too, so a home elsewhere (a test's temp folder, CI's home folder) keeps today's matching."""
     win = WIN if win is None else win
     mod = ntpath if win else posixpath
     parent = mod.dirname(mod.normpath(HOME if home is None else home))
     if win:
-        parts = [x for x in re.split(r'[/\\]', parent.split(':', 1)[-1]) if x] or ['Users']
-        top = r'[/\\]' + r'[/\\]'.join(re.escape(x) for x in parts) + r'[/\\]'
+        parts = [x for x in re.split(r'[/\\]', parent.split(':', 1)[-1]) if x]
+        names = r'[/\\]'.join(re.escape(x) for x in parts)
+        top = r'[/\\]' + ('Users' if parts in ([], ['Users']) else '(?:Users|' + names + ')') + r'[/\\]'
         return (re.compile(r"(?<![\w:])[A-Za-z]:" + top + r"[^/\\\n\"'`]+(?:[/\\][^/\\\n\"'`<>|;*$]+){2,8}"),     # folder names may contain spaces
                 re.compile(r'cd\s+(["\']?)((?:[A-Za-z]:)?' + top + r'[^"\']+)\1\s*$'))
-    parts = [x for x in parent.split('/') if x] or ['Users']
-    top = '/' + '/'.join(re.escape(x) for x in parts) + '/'
+    parts = [x for x in parent.split('/') if x]
+    names = '/'.join(re.escape(x) for x in parts)
+    top = '/' + ('Users' if parts in ([], ['Users']) else '(?:Users|' + names + ')') + '/'
     return (re.compile(top + r"[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}"),         # a computer's logs hold its own kind of path
             re.compile(r'cd\s+(["\']?)(' + top + r'[^"\']+)\1\s*$'))
 

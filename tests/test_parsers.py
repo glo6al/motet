@@ -1597,8 +1597,11 @@ def test_home_paths_and_launch():
     path, cd = server.home_patterns('/home/me', win=False)
     check('a Linux path is matched under /home', path.findall('see /home/me/proj/src/c.py') == ['/home/me/proj/src/c.py'])
     check('a Linux cd is matched under /home', cd.match('cd "/home/me/my proj"').group(2) == '/home/me/my proj')
-    check('a Linux home does not match /Users', not path.findall('see /Users/me/a/b/c.py'))
-    check('a root-level home falls back to /Users', server.home_patterns('/root', win=False)[0].pattern == mac_path.pattern)
+    check('a Linux home still matches /Users too', path.findall('see /Users/me/a/b/c.py') == ['/Users/me/a/b/c.py'])
+    runner, runner_cd = server.home_patterns('/home/me', win=False)
+    check('a CI home matches both /Users and /home', runner.findall('a /Users/me/a/b/c') == ['/Users/me/a/b/c'] and runner.findall('a /home/me/a/b/c') == ['/home/me/a/b/c']
+          and bool(runner_cd.match('cd /Users/me/a')) and bool(runner_cd.match('cd /home/me/a')))
+    check('a root-level home keeps the plain /Users pattern', server.home_patterns('/root', win=False)[0].pattern == mac_path.pattern)
     wpath, wcd = server.home_patterns('C:\\Users\\me', win=True)
     check('a Windows path matches with either slash', wpath.findall('x c:/Users/me/a/b/c.py') == ['c:/Users/me/a/b/c.py']
           and wpath.findall(r'x C:\Users\me\a\b\c.py') == [r'C:\Users\me\a\b\c.py'])
