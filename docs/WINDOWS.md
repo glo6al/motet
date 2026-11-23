@@ -249,6 +249,20 @@ Details on the rest:
 
 ---
 
+## Help us finish Windows support
+
+Some Windows features depend on facts only a real Windows PC can tell us (which apps are installed, how they name their pipes and links, and so on). If you have a Windows 11 PC, a one-minute check helps a lot:
+
+```powershell
+py scripts\windows_probe.py
+```
+
+Read the output, then paste it into a new [issue](https://github.com/glo6al/motet/issues/new) titled `Windows: probe output`.
+
+**What it does:** it prints a short report: your Windows and Python versions; whether the Codex, Claude, Cursor and Antigravity apps and command-line tools are installed (and their versions); which `.codex` folders exist; the names of related named pipes; which `claude://`, `codex://`, `cursor://` and `antigravity://` links have a handler; whether Git Bash and Windows Terminal are there; and which of those programs are running.
+
+**What it does not do:** it changes nothing, writes no files, makes no network connection, opens no app window and sends no message. It only reads the registry, folder listings, and `--version` or `--help` output from command-line tools. It never prints file contents (it only checks whether `%USERPROFILE%\.claude\settings.json` has hooks, and prints just the hook event names). Your profile path, user name, computer name, e-mail addresses and anything that looks like a key are replaced before printing, but **please read the output before you post it** and remove anything you would rather not share.
+
 ## Your feedback
 
 Please tell us what happened, even if it was "everything worked". [Open an issue](https://github.com/glo6al/motet/issues/new) titled `Windows: …`.
