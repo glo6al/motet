@@ -129,6 +129,8 @@ def _win_api():
     kernel.GetFileInformationByHandle.restype = w.BOOL
     kernel.GetFileType.argtypes = [w.HANDLE]
     kernel.GetFileType.restype = w.DWORD
+    kernel.SetFileInformationByHandle.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
+    kernel.SetFileInformationByHandle.restype = w.BOOL
     _API = (adv, kernel, w, SA, FILEINFO)
     return _API
 
@@ -261,6 +263,8 @@ def windows_handle_security(handle, directory=False):
 
 # Win32 constants for handle-based opens.
 _GENERIC_READ, _GENERIC_WRITE, _READ_CONTROL, _FILE_READ_ATTRIBUTES = 0x80000000, 0x40000000, 0x20000, 0x80
+_DELETE = 0x10000
+_FILE_DISPOSITION_INFO = 4     # FILE_INFO_BY_HANDLE_CLASS FileDispositionInfo
 _SHARE_READ, _SHARE_WRITE, _SHARE_DELETE = 1, 2, 4
 _CREATE_NEW, _OPEN_EXISTING, _OPEN_ALWAYS = 1, 3, 4
 _BACKUP_SEMANTICS, _OPEN_REPARSE_POINT, _ATTRIBUTE_NORMAL = 0x02000000, 0x00200000, 0x80
@@ -304,6 +308,16 @@ def _win_check_handle(handle, directory, subject, single_link=False):
     except PrivateStorageError as e:
         raise PrivateStorageError(str(e), e.reason, subject) from None
     return info
+
+
+def _win_discard(handle):
+    """Delete the file this handle has open (it must hold DELETE access), then close it. The deletion is by
+    handle, so it can only remove the file that was created, whatever its name points to by then."""
+    try:
+        flag = ctypes.c_ubyte(1)                  # FILE_DISPOSITION_INFO.DeleteFile = TRUE
+        _win_api()[1].SetFileInformationByHandle(handle, _FILE_DISPOSITION_INFO, ctypes.byref(flag), ctypes.sizeof(flag))
+    finally:
+        _win_close(handle)
 
 
 def _win_fd(handle, flags=0):
@@ -449,17 +463,33 @@ def create_private_file(path):
             os.fchmod(fd, 0o600)       # a umask can only remove bits; this puts the owner's back
             posix_verdict(os.fstat(fd), False, True)
         except BaseException:
-            os.close(fd)
+            _posix_discard(fd, path)
             raise
         return fd
     with _CurrentUser() as user, _PrivateAttributes(user) as sa:
-        handle = _win_open(path, _GENERIC_READ | _GENERIC_WRITE, 0, _CREATE_NEW, _ATTRIBUTE_NORMAL, sa)
+        # DELETE access lets a failed check remove the new file through this same handle.
+        handle = _win_open(path, _GENERIC_READ | _GENERIC_WRITE | _DELETE, 0, _CREATE_NEW, _ATTRIBUTE_NORMAL, sa)
     try:
         _win_check_handle(handle, False, 'file', True)
+        import msvcrt
+        return msvcrt.open_osfhandle(handle, 0)
     except BaseException:
-        _win_close(handle)
+        _win_discard(handle)
         raise
-    return _win_fd(handle)
+
+
+def _posix_discard(fd, path):
+    """Close a file just created at ``path`` and remove that name, but only while it still names this file."""
+    try:
+        mine = os.fstat(fd)
+    except OSError:
+        mine = None
+    os.close(fd)
+    try:
+        if mine is not None and os.path.samestat(os.lstat(path), mine):
+            os.unlink(path)
+    except OSError:
+        pass
 
 
 def create_private_temp(directory, prefix):
@@ -485,6 +515,7 @@ def create_private_temp(directory, prefix):
 
 # ---------------------------------------------------------------------------
 # (d) A non-blocking exclusive lock on a private lock file.
+# Not called yet: these are for the coming messaging and bridge migration off fcntl.flock.
 
 def open_lock_file(path):
     """Open or create a private lock file (never through a link) and return its descriptor."""

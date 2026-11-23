@@ -228,7 +228,71 @@ class Posix(unittest.TestCase):
             ps.make_private_folder(self.folder)
 
 
+class CreationCleanup(unittest.TestCase):
+    """A new file whose post-create check fails is removed, not left behind."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = os.path.join(os.path.realpath(self.tmp.name), 'state')
+        ps.make_private_folder(self.folder)
+        self.path = os.path.join(self.folder, 'secret')
+        self.check = '_win_check_handle' if os.name == 'nt' else 'posix_verdict'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_refused_new_file_is_removed(self):
+        refused = ps.PrivateStorageError('refused', 'access')
+        with patch.object(ps, self.check, side_effect=refused):
+            reason(self, lambda: ps.create_private_file(self.path), 'access')
+        self.assertFalse(os.path.lexists(self.path))
+        if os.name == 'nt':
+            with patch.object(ps, self.check, side_effect=refused):
+                reason(self, lambda: ps.create_private_temp(self.folder, '.fixture-'), 'access')
+        else:
+            with patch.object(ps.os, 'fchmod', side_effect=PermissionError('refused')):
+                with self.assertRaises(PermissionError):
+                    ps.create_private_temp(self.folder, '.fixture-')
+        self.assertEqual(os.listdir(self.folder), [])
+        os.close(ps.create_private_file(self.path))       # the name is free again
+        ps.check_private(self.path, single_link=True)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX removes by name; Windows removes through the handle')
+    def test_a_name_replaced_before_the_cleanup_is_left_alone(self):
+        def replace_then_refuse(*args, **kwargs):
+            os.rename(self.path, self.path + '.created')
+            with open(self.path, 'w') as out:
+                out.write('someone else')
+            raise ps.PrivateStorageError('refused', 'access')
+        with patch.object(ps, 'posix_verdict', side_effect=replace_then_refuse):
+            reason(self, lambda: ps.create_private_file(self.path), 'access')
+        with open(self.path) as kept:
+            self.assertEqual(kept.read(), 'someone else')
+
+    def test_windows_cleanup_deletes_through_the_created_handle(self):
+        calls = []
+        class Nothing:
+            def __init__(self, *a): pass
+            def __enter__(self): return None
+            def __exit__(self, *exc): return False
+        def fake_open(path, access, share, disposition, flags, sa=None):
+            calls.append(('open', access, share, disposition))
+            return 7
+        with patch.object(ps, 'WIN', True), patch.object(ps, '_CurrentUser', Nothing), patch.object(ps, '_PrivateAttributes', Nothing), \
+                patch.object(ps, '_win_open', fake_open), patch.object(ps, '_win_close', lambda h: calls.append(('close', h))), \
+                patch.object(ps, '_win_check_handle', side_effect=ps.PrivateStorageError('refused', 'owner')), \
+                patch.object(ps, '_win_discard', lambda h: calls.append(('discard', h))):
+            reason(self, lambda: ps.create_private_file(self.path), 'owner')
+        (_, access, share, disposition), last = calls[0], calls[-1]
+        self.assertTrue(access & ps._DELETE, 'the handle can delete its own file')
+        self.assertEqual((share, disposition), (0, ps._CREATE_NEW))
+        self.assertEqual(last, ('discard', 7))
+        self.assertNotIn(('close', 7), calls, 'closed only by the discard')
+
+
 class Lock(unittest.TestCase):
+    """open_lock_file, try_lock and unlock have no callers yet; this keeps them working until messaging uses them."""
+
     def test_exclusive_non_blocking_lock(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = os.path.join(os.path.realpath(tmp), 'state')
