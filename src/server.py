@@ -33,6 +33,8 @@ Trust boundary
 Run:  python3 src/server.py      (Windows: py src/server.py) then open http://127.0.0.1:8793/ and press Unlock
 Env:  PORT (8793), WINDOW_MIN (20: how recently a session must have been active to appear)
 """
+import ntpath
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -46,7 +48,7 @@ if __name__ == '__main__' and sys.argv[1:] == ['--version']:
     print('Motet ' + version[1])
     raise SystemExit(0)
 
-import glob, gzip, hashlib, hmac, http.client, json, math, mimetypes, os, secrets, select, socket, sqlite3, ssl, subprocess, threading, time, urllib.parse
+import glob, gzip, hashlib, hmac, http.client, json, math, mimetypes, os, secrets, select, shutil, socket, sqlite3, ssl, subprocess, threading, time, urllib.parse
 import uuid
 from socketserver import TCPServer
 from contextlib import nullcontext
@@ -59,6 +61,7 @@ from officer_capabilities import (ANSWER_CHARS, ANSWER_SCHEMA, EVIDENCE_SYSTEM, 
                                   live_view as officer_live_projection, sign_receipt, verify_receipt, authenticate_receipt, receipt_refs, record_fingerprint)
 from officer_evidence import EvidenceService
 from anthropic_reporting import report as anthropic_report
+import private_storage
 from officer_request import BudgetPolicy, RequestBudget, BudgetExceeded, AssertionRegistry
 import antigravity
 import antigravity_open
@@ -120,7 +123,12 @@ def launch(target):
     if WIN:
         os.startfile(target)
     else:
-        subprocess.Popen(['/usr/bin/open', target])
+        opener = '/usr/bin/open'
+        if sys.platform.startswith('linux'):
+            opener = shutil.which('xdg-open')
+            if not opener:
+                raise FileNotFoundError('xdg-open')        # an OSError, as callers already expect when nothing can open it
+        subprocess.Popen([opener, target])
 
 BOOT = '%x' % int(time.time() * 1000)
 PKEY = secrets.token_urlsafe(16)          # previews only; changes every run
@@ -1380,9 +1388,29 @@ def match_launch(aid=None):
 BACKFILLED = set()            # agents whose "first message" was recovered from further back, so its time is not a start time
 EXEC_KIDS = {}               # script-launched runs still without a parent: agent -> None
 WORKED = {}                  # folder -> [(agent, first seen there, last seen there), …]: where agents have been reading, writing, running
-PATH_RX = re.compile(r"(?<![\w:])[A-Za-z]:[/\\]Users[/\\][^/\\\n\"'`]+(?:[/\\][^/\\\n\"'`<>|;*$]+){2,8}" if WIN else     # folder names may contain spaces
-                     r"/Users/[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}")         # a computer's logs hold its own kind of path
-CD_RX = re.compile(r'cd\s+(["\']?)((?:[A-Za-z]:)?[/\\]Users[/\\][^"\']+)\1\s*$' if WIN else r'cd\s+(["\']?)(/Users/[^"\']+)\1\s*$')
+
+
+def home_patterns(home=None, win=None):
+    """(PATH_RX, CD_RX) for the folder that holds home folders: /Users on a Mac, /home on Linux, C:\\Users (or wherever a
+    profile lives) on Windows. Users is always matched too, so a home elsewhere (a test's temp folder, CI's home folder) keeps today's matching.
+    On macOS and Linux /home is added only when the home is directly in /home: a home such as /var/root or a service account's
+    /var/lib/x does not make /var a folder of homes. The /home form also refuses a match right after a letter or digit, so the
+    path part of a web link (a host name followed by /home/...) is not taken for a folder; the /Users form is left exactly as it always was."""
+    win = WIN if win is None else win
+    mod = ntpath if win else posixpath
+    parent = mod.dirname(mod.normpath(HOME if home is None else home))
+    if win:
+        parts = [x for x in re.split(r'[/\\]', parent.split(':', 1)[-1]) if x]
+        names = r'[/\\]'.join(re.escape(x) for x in parts)
+        top = r'[/\\]' + ('Users' if parts in ([], ['Users']) else '(?:Users|' + names + ')') + r'[/\\]'
+        return (re.compile(r"(?<![\w:])[A-Za-z]:" + top + r"[^/\\\n\"'`]+(?:[/\\][^/\\\n\"'`<>|;*$]+){2,8}"),     # folder names may contain spaces
+                re.compile(r'cd\s+(["\']?)((?:[A-Za-z]:)?' + top + r'[^"\']+)\1\s*$'))
+    top, guard = ('/(?:Users|home)/', r'(?<!\w)') if parent == '/home' else ('/Users/', '')
+    return (re.compile(guard + top + r"[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}"),         # a computer's logs hold its own kind of path
+            re.compile(r'cd\s+(["\']?)(' + top + r'[^"\']+)\1\s*$'))
+
+
+PATH_RX, CD_RX = home_patterns()
 
 
 def folder_keys(path):
@@ -2897,8 +2925,8 @@ class CloudExec:
 # your screen, and are all reversible from the screen; those tools cannot reach an agent.
 # Log text is untrusted input to the model: the prompt tells it to act only when you asked, but a prompt is guidance,
 # not a wall, so a poisoned transcript could make it propose one of those screen actions, and the page says what it
-# did. The feature is off, with the reason shown in the drawer, unless the key file passes every check. Not offered
-# on Windows yet: the key file's permissions cannot be checked there the same way.
+# did. The feature is off, with the reason shown in the drawer, unless the key file passes every check. On Windows the
+# key file's access list stands in for its owner and mode (see private_storage).
 OFFICER_MODEL = AUTOMATIC
 OFFICER_MODEL_ERROR = ''
 OFFICER_CATALOG = {'key': '', 'at': 0, 'models': []}
@@ -2996,42 +3024,63 @@ def secret_scanner():
         return None
 
 
+OFFICER_KEY_FILE = '%USERPROFILE%\\.live-room\\anthropic-key' if WIN else '~/.live-room/anthropic-key'
+OFFICER_FOLDER = '%USERPROFILE%\\.live-room'
+OFFICER_ACCOUNT = '%USERDOMAIN%\\%USERNAME%'      # the domain too: a bare name can pick a same-named local account
+OFFICER_KEY_PRIVATE = ('in Command Prompt run: icacls "%s" /inheritance:r /grant:r "%s:F"' % (OFFICER_KEY_FILE, OFFICER_ACCOUNT)
+                       if WIN else 'chmod 600')
+OFFICER_KEY_OWNER = 'in Command Prompt run: icacls "%s" /setowner "%s", then make it private' % (OFFICER_KEY_FILE, OFFICER_ACCOUNT)
+OFFICER_FOLDER_PRIVATE = 'in Command Prompt run: icacls "%s" /inheritance:r /grant:r "%s:(OI)(CI)F"' % (OFFICER_FOLDER, OFFICER_ACCOUNT)
+OFFICER_FOLDER_OWNER = 'in Command Prompt run: icacls "%s" /setowner "%s"' % (OFFICER_FOLDER, OFFICER_ACCOUNT)
+
+
+def officer_key_refusal(problem):
+    """Plain words for a refused key file (private_storage reasons); never a path from the system or its error text.
+    On Windows each permission refusal names the icacls command that fixes it; Motet never runs it itself."""
+    reason, folder = problem.reason, problem.subject == 'folder'
+    if folder:      # the folder is checked on Windows only (POSIX's is forced private by load_key)
+        return {'missing': 'no key file at ' + OFFICER_KEY_FILE,
+                'link': 'the folder holding the key file is a link or junction, not a plain folder',
+                'not_regular': 'the folder holding the key file is not a plain folder',
+                'owner': 'the folder holding the key file is not owned by you' + ('; make it yours (%s)' % OFFICER_FOLDER_OWNER if WIN else ''),
+                'access': 'other accounts can open the folder holding the key file; make it yours alone (%s)' % (OFFICER_FOLDER_PRIVATE if WIN else 'chmod 700'),
+                }.get(reason, 'the folder holding the key file could not be checked')
+    return {'missing': 'no key file at ' + OFFICER_KEY_FILE,
+            'link': 'the key file is a link, not a plain file',
+            'not_regular': 'the key file is not a plain file',
+            'owner': 'the key file is not owned by you' + ('; make it yours (%s)' % OFFICER_KEY_OWNER if WIN else ''),
+            'access': ('the key file is not yours alone; make it private (%s)' if WIN else
+                       'the key file can be read by others; make it yours alone (%s)') % OFFICER_KEY_PRIVATE,
+            'changed': 'the key file changed while it was being opened; start Motet again',
+            'unavailable': 'the key file\'s access list could not be checked',
+            }.get(reason, 'the key file could not be opened')
+
+
 def load_officer_key(path=None, root=None):
     """Read the Anthropic key from ~/.live-room/anthropic-key, or leave Motet off with a plain reason. The file
     is opened without following links, and the file that was opened (not one looked at earlier) must be a regular
-    file owned by you that nobody else can read; then no key-shaped string may sit anywhere in the project tree,
-    tracked or not, and every file there must have been readable. The key is kept in this process and printed
-    nowhere; a reason never contains one either."""
+    file owned by you that nobody else can read: on macOS and Linux by its owner and mode; on Windows by its access
+    list (only you and SYSTEM, nothing inherited), with no link, junction or other reparse point at the file and
+    its folder held private and in place while it is opened (private_storage). Then no key-shaped string may sit
+    anywhere in the project tree, tracked or not, and every file there must have been readable. The key is kept in
+    this process and printed nowhere; a reason never contains one either."""
     global OFFICER_KEY, OFFICER_WHY
-    import errno
-    import stat as _st
     OFFICER_KEY = ''
-    if WIN:
-        OFFICER_WHY = 'not offered on Windows yet (the key file\'s owner and permissions are not checked there)'
-        return
     p = path or os.path.join(HOME, '.live-room', 'anthropic-key')
     try:
-        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))     # a pipe at that path cannot hang the start
-    except OSError as e:
-        OFFICER_WHY = ('no key file at ~/.live-room/anthropic-key' if e.errno == errno.ENOENT else
-                       'the key file is a link, not a plain file' if e.errno in (errno.ELOOP, errno.EMLINK) else 'the key file could not be opened')
+        # POSIX keeps its file-only check: load_key() has already forced ~/.live-room private and yours there.
+        fd, _ = private_storage.open_private_file(p, folder=WIN)
+    except private_storage.PrivateStorageError as problem:
+        OFFICER_WHY = officer_key_refusal(problem)
+        return
+    except OSError:
+        OFFICER_WHY = 'the key file could not be opened'
         return
     try:
-        st = os.fstat(fd)
-        if not _st.S_ISREG(st.st_mode):
-            OFFICER_WHY = 'the key file is not a plain file'
-            return
-        if st.st_uid != os.getuid():
-            OFFICER_WHY = 'the key file is not owned by you'
-            return
-        if st.st_mode & 0o077:
-            OFFICER_WHY = 'the key file can be read by others; make it yours alone (chmod 600)'
-            return
-        try:
-            k = os.read(fd, 400).decode('ascii', 'ignore').strip()
-        except OSError:
-            OFFICER_WHY = 'the key file could not be read'
-            return
+        k = os.read(fd, 400).decode('ascii', 'ignore').strip()
+    except OSError:
+        OFFICER_WHY = 'the key file could not be read'
+        return
     finally:
         os.close(fd)
     if not KEY_SHAPE.fullmatch(k.encode()):
@@ -3525,20 +3574,17 @@ def officer_model_path():
 
 
 def officer_private_model_file(path, create=False):
-    """Selection shares the existing POSIX-only Motet key privacy boundary."""
-    import stat as st
-    if WIN:
-        raise OSError('Motet settings unavailable')
+    """Selection shares the Motet key's privacy boundary (private_storage): owner and mode on macOS and Linux, the
+    access list on Windows. A folder or file that is not private is refused, never repaired."""
     directory = os.path.dirname(path)
-    if create and not os.path.lexists(directory):
-        os.mkdir(directory, 0o700)
-    parent = os.lstat(directory)
-    if not st.S_ISDIR(parent.st_mode) or st.S_ISLNK(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
-        raise OSError('Motet settings unavailable')
-    if os.path.lexists(path):
-        current = os.lstat(path)
-        if not st.S_ISREG(current.st_mode) or current.st_uid != os.getuid() or current.st_mode & 0o077 or current.st_nlink != 1:
-            raise OSError('Motet settings unavailable')
+    try:
+        if create and not os.path.lexists(directory):
+            private_storage.make_private_folder(directory)
+        private_storage.check_private(directory, directory=True)
+        if os.path.lexists(path):
+            private_storage.check_private(path, single_link=True)
+    except OSError:
+        raise OSError('Motet settings unavailable') from None
 
 
 def load_officer_model():
@@ -3551,11 +3597,9 @@ def load_officer_model():
         return
     try:
         officer_private_model_file(path)
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd, info = private_storage.open_private_file(path, folder=True, single_link=True)
         try:
-            import stat as st
-            info = os.fstat(fd)
-            if not st.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 4096:
+            if info.st_size > 4096:
                 raise ValueError()
             value = json.loads(os.read(fd, 4097).decode('utf-8'))
         finally:
@@ -3669,14 +3713,12 @@ def officer_models_view(models=None, error=''):
 
 def save_officer_model(model):
     """Publish a private atomic selection file; no active state changes here."""
-    import tempfile
     temporary = None
     try:
         path = officer_model_path()
         officer_private_model_file(path, create=True)
-        fd, temporary = tempfile.mkstemp(prefix='.officer-model-', dir=os.path.dirname(path))
+        fd, temporary = private_storage.create_private_temp(os.path.dirname(path), '.officer-model-')
         try:
-            os.fchmod(fd, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as out:
                 json.dump({'schema_version': 2, 'model': model}, out)
                 out.flush()

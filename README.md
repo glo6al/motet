@@ -80,7 +80,7 @@ Motet does not ask for your logins to those apps. The one separate cost is Motet
 
 ## Take the podium
 
-Two minutes, nothing to install. You need a Mac with Git and Python 3.9 or later.
+Two minutes, nothing to install. You need Git and Python 3.9 or later, on a Mac or a Windows PC. On Windows use `py` in place of `python3`; [docs/WINDOWS.md](docs/WINDOWS.md) has the steps.
 
 ```bash
 git clone https://github.com/glo6al/motet.git && cd motet
@@ -133,7 +133,7 @@ A chat has to qualify before Motet will send to it. When something isn't availab
 - **Motet thinks with one provider.** Its own answers run on Anthropic's models only.
 - **Cursor and Antigravity are watch-only.** Motet can see them but cannot message them.
 - **No live browser.** You see the pages an agent opened, not the page as it is right now.
-- **Mac only,** and only coding sessions on this computer. Web chats are not brought in.
+- **Mac and Windows, and only coding sessions on this computer.** On Windows, Motet watches and answers, but messaging between agents, Allow and Deny, New chat, files and dictation are still to come. Web chats are not brought in.
 
 **Designed, not built yet**
 
@@ -148,7 +148,7 @@ A chat has to qualify before Motet will send to it. When something isn't availab
 - **New chat everywhere.** Claude Code and more apps, with files in the first instruction.
 - **More players.** Messaging for Cursor and Antigravity where a supported route exists.
 - **Older history.** Bring in sessions from before Motet was running. Today its optional memory covers only what it recorded while it ran.
-- **Windows and Linux.**
+- **Everything on Windows, then Linux.**
 
 A roadmap is a direction, not a promise or a date. The full version, with what has been proven and what is only an idea, is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -199,7 +199,7 @@ The detail lives in guides, one subject each.
 
 ## Status
 
-Early, and in daily use by its author. It runs on macOS. On Windows only the automated tests have run; [docs/WINDOWS.md](docs/WINDOWS.md) explains how to try it and what to report. The earlier interface is still available at `?ui=classic`.
+Early, and in daily use by its author. It runs on macOS. On Windows it has been run on one real PC, where watching works; its answers are checked so far only by the automated tests, and it does not act on your agents yet; [docs/WINDOWS.md](docs/WINDOWS.md) explains how to try it and what to report. The earlier interface is still available at `?ui=classic`.
 
 Current version is [v0.1.0](CHANGELOG.md).
 

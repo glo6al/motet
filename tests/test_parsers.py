@@ -873,6 +873,33 @@ time.sleep(60)
                 proc.wait(timeout=3)
 
 
+def test_key_refusal_texts():
+    """Each Windows permission refusal names its icacls fix with the domain-qualified account, and the Windows
+    troubleshooting table quotes the same words and commands. POSIX wording stays as it was."""
+    import re
+    from pathlib import Path
+    import private_storage
+    root = Path(__file__).resolve().parents[1]
+    source = (root / 'src' / 'server.py').read_text(encoding='utf-8')
+    texts = source[source.index('OFFICER_KEY_FILE = '):source.index('def load_officer_key(')]
+    windows_doc = (root / 'docs' / 'WINDOWS.md').read_text(encoding='utf-8')
+    motet_doc = (root / 'docs' / 'MOTET.md').read_text(encoding='utf-8')
+    for win in (True, False):
+        names = {'WIN': win}
+        exec(texts, names)
+        refusal = lambda subject, reason: names['officer_key_refusal'](private_storage.PrivateStorageError('x', reason, subject))
+        if not win:
+            check('POSIX key refusals keep their words', refusal('file', 'owner') == 'the key file is not owned by you'
+                  and refusal('file', 'access') == 'the key file can be read by others; make it yours alone (chmod 600)')
+            continue
+        for subject, reason in (('file', 'access'), ('file', 'owner'), ('folder', 'owner'), ('folder', 'access')):
+            text = refusal(subject, reason)
+            command = re.search(r'icacls "[^"]+"(?: /[\w:]+)+ "[^"]+"', text).group(0)
+            check('Windows %s %s refusal gives a domain-qualified icacls fix that the docs repeat' % (subject, reason),
+                  '"%USERDOMAIN%\\%USERNAME%' in command and '"Motet is off: ' + text.split(';')[0] + '"' in windows_doc
+                  and command in motet_doc and (command in windows_doc or (subject, reason) == ('file', 'access')))
+
+
 def test_officer():
     """Motet: the key file policy (owner-only, a plain file opened without following links, no key
     anywhere in the project, every file there readable), the scanner's fail-closed rules, the read-only tools over
@@ -890,8 +917,37 @@ def test_officer():
     try:
         import check_secrets
         if server.WIN:
+            import subprocess, private_storage
+            # A private folder owned by you explicitly: an elevated runner's default owner can be Administrators.
+            folder = os.path.join(d.name, 'state'); private_storage.make_private_folder(folder)
+            key = os.path.join(folder, 'anthropic-key')
             server.load_officer_key(path=key, root=root)
-            check('on Windows the Officer is off and says why', server.OFFICER_KEY == '' and 'Windows' in server.OFFICER_WHY)
+            check('Windows: no key file: the Officer is off and says so', server.OFFICER_KEY == '' and 'no key file' in server.OFFICER_WHY)
+            with open(key, 'w') as f:
+                f.write(fake + '\n')                        # an ordinary file follows its folder's access list
+            server.load_officer_key(path=key, root=root)
+            check('Windows: a key file that is not protected on its own is refused, with the fix', server.OFFICER_KEY == ''
+                  and (('not yours alone' in server.OFFICER_WHY and 'icacls' in server.OFFICER_WHY)
+                       or 'not owned by you' in server.OFFICER_WHY))     # an elevated runner may own new files as Administrators
+            os.remove(key)
+            fd = private_storage.create_private_file(key); os.write(fd, (fake + '\n').encode()); os.close(fd)
+            server.load_officer_key(path=key, root=root)
+            check('Windows: a private key file switches the Officer on', server.OFFICER_KEY == fake and server.OFFICER_WHY == '')
+            subprocess.run(['icacls', key, '/grant', '*S-1-1-0:(R)'], check=True, capture_output=True, timeout=30)
+            server.load_officer_key(path=key, root=root)
+            check('Windows: a key file Everyone can read is refused', server.OFFICER_KEY == '' and 'not yours alone' in server.OFFICER_WHY)
+            subprocess.run(['icacls', key, '/remove:g', '*S-1-1-0'], check=True, capture_output=True, timeout=30)
+            server.load_officer_key(path=key, root=root)
+            check('Windows: and accepted again once private', server.OFFICER_KEY == fake)
+            link = os.path.join(d.name, 'junction')
+            subprocess.run(['cmd', '/c', 'mklink', '/J', link, folder], check=True, capture_output=True, timeout=30)
+            server.load_officer_key(path=os.path.join(link, 'anthropic-key'), root=root)
+            check('Windows: a junction in place of the key folder is refused', server.OFFICER_KEY == '' and 'link or junction' in server.OFFICER_WHY)
+            with open(os.path.join(root, 'notes.txt'), 'w') as f:
+                f.write('token ' + fake)
+            server.load_officer_key(path=key, root=root)
+            check('Windows: a key-shaped string in the project tree switches the Officer off', server.OFFICER_KEY == '' and 'project tree' in server.OFFICER_WHY and 'notes.txt' in server.OFFICER_WHY)
+            os.remove(os.path.join(root, 'notes.txt'))
         else:
             server.load_officer_key(path=os.path.join(d.name, 'missing'), root=root)
             check('no key file: the Officer is off and says so', server.OFFICER_KEY == '' and 'no key file' in server.OFFICER_WHY)
@@ -1588,10 +1644,59 @@ def test_idle_tail_catchup():
         server.MAX_POLL = saved
 
 
+def test_home_paths_and_launch():
+    from unittest.mock import patch
+    mac_path, mac_cd = server.home_patterns('/Users/me', win=False)
+    check('a Mac path is matched under /Users', mac_path.findall('see /Users/me/a/b/c.py') == ['/Users/me/a/b/c.py'])
+    check('a Mac cd is matched under /Users', bool(mac_cd.match('cd /Users/me/a')))
+    check('a Mac home does not match /home', not mac_path.findall('see /home/me/a/b/c.py') and not mac_cd.match('cd /home/me/a'))
+    path, cd = server.home_patterns('/home/me', win=False)
+    check('a Linux path is matched under /home', path.findall('see /home/me/proj/src/c.py') == ['/home/me/proj/src/c.py'])
+    check('a Linux cd is matched under /home', cd.match('cd "/home/me/my proj"').group(2) == '/home/me/my proj')
+    check('a Linux home still matches /Users too', path.findall('see /Users/me/a/b/c.py') == ['/Users/me/a/b/c.py'])
+    runner, runner_cd = server.home_patterns('/home/me', win=False)
+    check('a CI home matches both /Users and /home', runner.findall('a /Users/me/a/b/c') == ['/Users/me/a/b/c'] and runner.findall('a /home/me/a/b/c') == ['/home/me/a/b/c']
+          and bool(runner_cd.match('cd /Users/me/a')) and bool(runner_cd.match('cd /home/me/a')))
+    check('a root-level home keeps the plain /Users pattern', server.home_patterns('/root', win=False)[0].pattern == mac_path.pattern)
+    old_path, old_cd = r"/Users/[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}", r'cd\s+(["\']?)(/Users/[^"\']+)\1\s*$'
+    check('a Mac home keeps the original /Users patterns byte for byte', mac_path.pattern == old_path and mac_cd.pattern == old_cd)
+    for odd in ('/var/root', '/var/lib/fictional-service', '/srv/homes/me', '/Users'):
+        odd_path, odd_cd = server.home_patterns(odd, win=False)
+        check('a home outside /home (%s) adds no other folder of homes' % odd, (odd_path.pattern, odd_cd.pattern) == (old_path, old_cd)
+              and not odd_path.findall('see /var/lib/x/a/b/c') and not odd_path.findall('see /home/me/a/b/c'))
+    check('a Linux path inside a link is not a folder', path.findall('see https://example.test/home/me/a/b/c and https://example.test/Users/me/a/b/c') == []
+          and path.findall('open file:///home/me/a/b/c.py') == ['/home/me/a/b/c.py'] and path.findall('see file:/Users/me/a/b/c.py') == ['/Users/me/a/b/c.py'])
+    check('a Mac pattern is unchanged inside a link, as before', mac_path.findall('see https://example.test/Users/me/a/b/c') == ['/Users/me/a/b/c'])
+    wpath, wcd = server.home_patterns('C:\\Users\\me', win=True)
+    check('a Windows path matches with either slash', wpath.findall('x c:/Users/me/a/b/c.py') == ['c:/Users/me/a/b/c.py']
+          and wpath.findall(r'x C:\Users\me\a\b\c.py') == [r'C:\Users\me\a\b\c.py'])
+    check('a Windows cd matches with or without a drive', bool(wcd.match('cd C:/Users/me/a')) and bool(wcd.match('cd /Users/me/a')))
+    opath, _ = server.home_patterns('D:\\Profiles\\me', win=True)
+    check('a Windows profile outside C:\\Users is matched', opath.findall(r'x D:\Profiles\me\a\b\c.py') == [r'D:\Profiles\me\a\b\c.py'])
+
+    with patch.object(server, 'WIN', False), patch.object(server.sys, 'platform', 'darwin'), \
+            patch.object(server.subprocess, 'Popen') as popen:
+        server.launch('/tmp/a.html')
+        check('macOS still opens with /usr/bin/open', popen.call_args[0][0] == ['/usr/bin/open', '/tmp/a.html'])
+    with patch.object(server, 'WIN', False), patch.object(server.sys, 'platform', 'linux'), \
+            patch.object(server.shutil, 'which', return_value='/usr/bin/xdg-open'), patch.object(server.subprocess, 'Popen') as popen:
+        server.launch('/tmp/a.html')
+        check('Linux opens with xdg-open', popen.call_args[0][0] == ['/usr/bin/xdg-open', '/tmp/a.html'])
+    with patch.object(server, 'WIN', False), patch.object(server.sys, 'platform', 'linux'), \
+            patch.object(server.shutil, 'which', return_value=None), patch.object(server.subprocess, 'Popen') as popen:
+        try:
+            server.launch('/tmp/a.html')
+            failed = False
+        except OSError:
+            failed = True
+        check('Linux without xdg-open fails as an OSError and starts nothing', failed and not popen.called)
+
+
 if __name__ == '__main__':
     test_idle_stream_fence()
     test_idle_tail_catchup()
     test_import_is_quiet()
+    test_home_paths_and_launch()
     test_release_version()
     test_static_brand_assets()
     test_pair_keeps_only_supported_view_flags()
@@ -1606,5 +1711,6 @@ if __name__ == '__main__':
     test_platform()
     test_cloud_exec()
     test_active_log()
+    test_key_refusal_texts()
     test_officer()
     print('all ok')

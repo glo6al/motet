@@ -36,8 +36,38 @@ def _now():
     return dt.datetime.now(UTC)
 
 
+def _admin_key(raw):
+    if len(raw) > 512:
+        raise ReportError('credential_unavailable')
+    key = raw.decode('ascii').strip()
+    if not re.fullmatch(r'sk-ant-admin[0-9A-Za-z_-]{8,450}', key):
+        raise ReportError('credential_unavailable')
+    return key
+
+
+def _load_key_windows():
+    """The same fixed file on Windows, through the shared private-storage layer: the folder and file private to
+    this user by access list, no reparse point at either, the folder held in place while the file is opened, one
+    name only, and the opened handle identical to the file looked at."""
+    import private_storage
+    fd = None
+    try:
+        path = str(Path.home() / '.live-room' / 'anthropic-admin-key')
+        fd, info = private_storage.open_private_file(path, folder=True, single_link=True)
+        if not 1 <= info.st_size <= 512:
+            raise ReportError('credential_unavailable')
+        return _admin_key(os.read(fd, 513))
+    except (OSError, UnicodeError, ValueError):
+        raise ReportError('credential_unavailable') from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def _load_key():
     """Open the fixed private credential once; never include filesystem diagnostics."""
+    if os.name == 'nt':
+        return _load_key_windows()
     fd = parent_fd = None
     try:
         if os.name != 'posix' or not hasattr(os, 'O_NOFOLLOW'):
@@ -55,13 +85,7 @@ def _load_key():
                 not stat.S_ISREG(after.st_mode) or after.st_uid != os.getuid() or
                 after.st_nlink != 1 or after.st_mode & 0o177 or not 1 <= after.st_size <= 512):
             raise ReportError('credential_unavailable')
-        raw = os.read(fd, 513)
-        if len(raw) > 512:
-            raise ReportError('credential_unavailable')
-        key = raw.decode('ascii').strip()
-        if not re.fullmatch(r'sk-ant-admin[0-9A-Za-z_-]{8,450}', key):
-            raise ReportError('credential_unavailable')
-        return key
+        return _admin_key(os.read(fd, 513))
     except (OSError, UnicodeError, ValueError):
         raise ReportError('credential_unavailable') from None
     finally:

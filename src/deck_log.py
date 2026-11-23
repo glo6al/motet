@@ -5,7 +5,6 @@ cannot identify every secret in arbitrary prose. Source logs and OS backups are
 outside this archive's deletion boundary.
 """
 import collections
-import ctypes
 import hashlib
 import hmac
 import json
@@ -18,6 +17,8 @@ import stat
 import threading
 import time
 from officer_history import OfficerHistoryMixin
+# The Windows access-list check lives in the shared private-storage layer; this name is kept for callers and tests.
+from private_storage import windows_security as _windows_security
 
 DEFAULTS = dict(enabled=False, paused=False, retention_days=30,
                 excluded_chats=[], excluded_projects=[])
@@ -85,99 +86,6 @@ def _relative(value):
     if value.startswith(('/', '~')) or ':' in value or any(x in ('', '.', '..') for x in value.split('/')) or any(ord(c) < 32 for c in value):
         return ''
     return value
-
-
-def _windows_security(path, directory=False, create=False):
-    """Protected current-user/SYSTEM DACL, checked with actual Win32 APIs."""
-    from ctypes import wintypes as w
-    adv = ctypes.WinDLL('advapi32', use_last_error=True)
-    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-    adv.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE)]
-    adv.GetTokenInformation.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD, ctypes.POINTER(w.DWORD)]
-    adv.ConvertSidToStringSidW.argtypes = [w.LPVOID, ctypes.POINTER(w.LPWSTR)]
-    adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [w.LPCWSTR, w.DWORD, ctypes.POINTER(w.LPVOID), ctypes.POINTER(w.DWORD)]
-    adv.GetNamedSecurityInfoW.argtypes = [w.LPWSTR, ctypes.c_int, w.DWORD, ctypes.POINTER(w.LPVOID), ctypes.POINTER(w.LPVOID), ctypes.POINTER(w.LPVOID), ctypes.POINTER(w.LPVOID), ctypes.POINTER(w.LPVOID)]
-    adv.GetSecurityDescriptorControl.argtypes = [w.LPVOID, ctypes.POINTER(w.WORD), ctypes.POINTER(w.DWORD)]
-    adv.GetAclInformation.argtypes = [w.LPVOID, w.LPVOID, w.DWORD, ctypes.c_int]
-    adv.GetAce.argtypes = [w.LPVOID, w.DWORD, ctypes.POINTER(w.LPVOID)]
-    adv.EqualSid.argtypes = [w.LPVOID, w.LPVOID]
-    kernel.CloseHandle.argtypes = [w.HANDLE]
-    kernel.CloseHandle.restype = w.BOOL
-    kernel.GetCurrentProcess.restype = w.HANDLE
-    kernel.LocalFree.argtypes = [w.LPVOID]
-    token, needed, sid_text = w.HANDLE(), w.DWORD(), w.LPWSTR()
-    if not adv.OpenProcessToken(kernel.GetCurrentProcess(), 8, ctypes.byref(token)):
-        raise OSError('private storage unavailable')
-    try:
-        adv.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
-        buf = ctypes.create_string_buffer(needed.value)
-        if not adv.GetTokenInformation(token, 1, buf, needed, ctypes.byref(needed)):
-            raise OSError('private storage unavailable')
-        user_sid = ctypes.cast(buf, ctypes.POINTER(w.LPVOID))[0]
-        if not adv.ConvertSidToStringSidW(user_sid, ctypes.byref(sid_text)):
-            raise OSError('private storage unavailable')
-        try:
-            sddl = 'O:%sD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;%s)' % (sid_text.value, sid_text.value)
-        finally:
-            kernel.LocalFree(sid_text)
-        if create:
-            descriptor = w.LPVOID()
-            if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
-                raise OSError('private storage unavailable')
-            class SA(ctypes.Structure):
-                _fields_ = [('size', w.DWORD), ('descriptor', w.LPVOID), ('inherit', w.BOOL)]
-            sa = SA(ctypes.sizeof(SA), descriptor, False)
-            try:
-                if directory:
-                    kernel.CreateDirectoryW.argtypes = [w.LPCWSTR, ctypes.POINTER(SA)]
-                    if not kernel.CreateDirectoryW(path, ctypes.byref(sa)):
-                        raise OSError('private storage unavailable')
-                else:
-                    kernel.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.POINTER(SA), w.DWORD, w.DWORD, w.HANDLE]
-                    kernel.CreateFileW.restype = w.HANDLE
-                    handle = kernel.CreateFileW(path, 0xC0000000, 0, ctypes.byref(sa), 1, 0x80, None)
-                    if handle == w.HANDLE(-1).value:
-                        raise OSError('private storage unavailable')
-                    kernel.CloseHandle(handle)
-            finally:
-                kernel.LocalFree(descriptor)
-        owner, dacl, sd = w.LPVOID(), w.LPVOID(), w.LPVOID()
-        if adv.GetNamedSecurityInfoW(path, 1, 5, ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(sd)):
-            raise OSError('private storage unavailable')
-        try:
-            control, revision = w.WORD(), w.DWORD()
-            if not adv.EqualSid(owner, user_sid):
-                raise OSError('nonprivate storage owner')
-            if not dacl or not adv.GetSecurityDescriptorControl(sd, ctypes.byref(control), ctypes.byref(revision)) or (not directory and not control.value & 0x1000):
-                raise OSError('private storage unavailable')
-            class ACLINFO(ctypes.Structure):
-                _fields_ = [('count', w.DWORD), ('used', w.DWORD), ('free', w.DWORD)]
-            info = ACLINFO()
-            if not adv.GetAclInformation(dacl, ctypes.byref(info), ctypes.sizeof(info), 2):
-                raise OSError('private storage unavailable')
-            for i in range(info.count):
-                ace = w.LPVOID()
-                if not adv.GetAce(dacl, i, ctypes.byref(ace)):
-                    raise OSError('private storage unavailable')
-                data = ctypes.string_at(ace, 8)
-                if data[0] != 0:  # only plain access-allowed ACEs
-                    raise OSError('private storage unavailable')
-                ace_sid = w.LPVOID(ace.value + 8)
-                value = w.LPWSTR()
-                if not adv.ConvertSidToStringSidW(ace_sid, ctypes.byref(value)):
-                    raise OSError('private storage unavailable')
-                try:
-                    # Python's private mkdir DACL uses OWNER RIGHTS (S-1-3-4).
-                    # It names this user because the owner was checked above.
-                    allowed = ('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4') if directory else ('S-1-5-18',)
-                    if not adv.EqualSid(ace_sid, user_sid) and value.value not in allowed:
-                        raise OSError('private storage unavailable')
-                finally:
-                    kernel.LocalFree(value)
-        finally:
-            kernel.LocalFree(sd)
-    finally:
-        kernel.CloseHandle(token)
 
 
 class DeckLog(OfficerHistoryMixin):

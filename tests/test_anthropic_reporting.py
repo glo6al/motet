@@ -340,12 +340,81 @@ class Credentials(unittest.TestCase):
 
 
 class CredentialPlatform(unittest.TestCase):
-    def test_non_posix_loader_fails_closed_without_opening_a_file(self):
-        with patch.object(ar.os, 'name', 'nt'), patch.object(ar.os, 'open') as opening:
+    def test_unknown_platform_loader_fails_closed_without_opening_a_file(self):
+        with patch.object(ar.os, 'name', 'java'), patch.object(ar.os, 'open') as opening:
             with self.assertRaises(ar.ReportError) as raised:
                 ar._load_key()
             self.assertEqual(raised.exception.reason, 'credential_unavailable')
             opening.assert_not_called()
+
+    def test_windows_loader_uses_the_shared_private_storage_layer(self):
+        import private_storage
+        refused = private_storage.PrivateStorageError('refused', 'access')
+        home = Path('fictional-home')       # made before os.name changes which path class Path builds
+        with patch.object(ar.Path, 'home', return_value=home), patch.object(ar.os, 'name', 'nt'), \
+                patch.object(private_storage, 'open_private_file', side_effect=refused) as opening:
+            with self.assertRaises(ar.ReportError) as raised:
+                ar._load_key()
+        self.assertEqual(raised.exception.reason, 'credential_unavailable')
+        self.assertEqual(opening.call_args.kwargs, {'folder': True, 'single_link': True})
+        self.assertEqual(Path(opening.call_args.args[0]), home / '.live-room' / 'anthropic-admin-key')
+
+
+@unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists and junctions')
+class WindowsCredentials(unittest.TestCase):
+    def setUp(self):
+        import private_storage
+        self.ps = private_storage
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.parent = self.home / '.live-room'
+        private_storage.make_private_folder(str(self.parent))     # owned by you explicitly, private from the start
+        self.keyfile = self.parent / 'anthropic-admin-key'
+        self.write(KEY.encode() + b'\n')
+        self.home_patch = patch.object(ar.Path, 'home', return_value=self.home)
+        self.home_patch.start()
+
+    def tearDown(self):
+        self.home_patch.stop()
+        self.tmp.cleanup()
+
+    def write(self, raw):
+        if self.keyfile.exists():
+            self.keyfile.unlink()
+        fd = self.ps.create_private_file(str(self.keyfile))
+        os.write(fd, raw)
+        os.close(fd)
+
+    def refused(self):
+        with self.assertRaises(ar.ReportError) as raised:
+            ar._load_key()
+        self.assertEqual(raised.exception.reason, 'credential_unavailable')
+
+    def test_private_file_loads_and_unsafe_ones_are_refused(self):
+        import subprocess
+        self.assertEqual(ar._load_key(), KEY)
+        self.write(KEY.encode() + b'new')
+        self.assertEqual(ar._load_key(), KEY + 'new')
+        subprocess.run(['icacls', str(self.keyfile), '/grant', '*S-1-1-0:(R)'], check=True, capture_output=True, timeout=30)
+        self.refused()
+        self.write(KEY.encode())
+        os.link(str(self.keyfile), str(self.parent / 'other'))
+        self.refused()
+        (self.parent / 'other').unlink()
+        for raw in (b'x' * 513, b'\xff', b'header\r\ninjection', b''):
+            self.write(raw)
+            self.refused()
+        self.write(KEY.encode())
+        self.keyfile.unlink()
+        self.keyfile.write_text(KEY)       # an ordinary file follows its folder's access list
+        self.refused()
+
+    def test_junction_in_place_of_the_folder_is_refused(self):
+        import subprocess
+        moved = self.home / 'real-state'
+        os.rename(str(self.parent), str(moved))
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(self.parent), str(moved)], check=True, capture_output=True, timeout=30)
+        self.refused()
 
 
 class Transport(unittest.TestCase):
