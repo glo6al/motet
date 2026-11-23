@@ -377,9 +377,9 @@ class Windows(unittest.TestCase):
         reason(self, lambda: ps.open_private_file(plain), 'access' if owned else 'owner')
         reason(self, lambda: windows_handle_check(plain), 'access' if owned else 'owner')
         if not owned:
-            subprocess.run('icacls "%s" /setowner "%%USERNAME%%"' % plain, shell=True, check=True, capture_output=True, timeout=30)
+            subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % plain, shell=True, check=True, capture_output=True, timeout=30)
             reason(self, lambda: ps.open_private_file(plain), 'access')
-        subprocess.run('icacls "%s" /inheritance:r /grant:r "%%USERNAME%%:F"' % plain, shell=True, check=True, capture_output=True, timeout=30)
+        subprocess.run('icacls "%s" /inheritance:r /grant:r "%%USERDOMAIN%%\\%%USERNAME%%:F"' % plain, shell=True, check=True, capture_output=True, timeout=30)
         fd, _ = ps.open_private_file(plain, folder=True)
         os.close(fd)
 

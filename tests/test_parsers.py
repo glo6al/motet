@@ -873,6 +873,33 @@ time.sleep(60)
                 proc.wait(timeout=3)
 
 
+def test_key_refusal_texts():
+    """Each Windows permission refusal names its icacls fix with the domain-qualified account, and the Windows
+    troubleshooting table quotes the same words and commands. POSIX wording stays as it was."""
+    import re
+    from pathlib import Path
+    import private_storage
+    root = Path(__file__).resolve().parents[1]
+    source = (root / 'src' / 'server.py').read_text(encoding='utf-8')
+    texts = source[source.index('OFFICER_KEY_FILE = '):source.index('def load_officer_key(')]
+    windows_doc = (root / 'docs' / 'WINDOWS.md').read_text(encoding='utf-8')
+    motet_doc = (root / 'docs' / 'MOTET.md').read_text(encoding='utf-8')
+    for win in (True, False):
+        names = {'WIN': win}
+        exec(texts, names)
+        refusal = lambda subject, reason: names['officer_key_refusal'](private_storage.PrivateStorageError('x', reason, subject))
+        if not win:
+            check('POSIX key refusals keep their words', refusal('file', 'owner') == 'the key file is not owned by you'
+                  and refusal('file', 'access') == 'the key file can be read by others; make it yours alone (chmod 600)')
+            continue
+        for subject, reason in (('file', 'access'), ('file', 'owner'), ('folder', 'owner'), ('folder', 'access')):
+            text = refusal(subject, reason)
+            command = re.search(r'icacls "[^"]+"(?: /[\w:]+)+ "[^"]+"', text).group(0)
+            check('Windows %s %s refusal gives a domain-qualified icacls fix that the docs repeat' % (subject, reason),
+                  '"%USERDOMAIN%\\%USERNAME%' in command and '"Motet is off: ' + text.split(';')[0] + '"' in windows_doc
+                  and command in motet_doc and (command in windows_doc or (subject, reason) == ('file', 'access')))
+
+
 def test_officer():
     """Motet: the key file policy (owner-only, a plain file opened without following links, no key
     anywhere in the project, every file there readable), the scanner's fail-closed rules, the read-only tools over
@@ -1675,5 +1702,6 @@ if __name__ == '__main__':
     test_platform()
     test_cloud_exec()
     test_active_log()
+    test_key_refusal_texts()
     test_officer()
     print('all ok')

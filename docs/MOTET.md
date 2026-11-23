@@ -60,10 +60,16 @@ Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.live-room\anthropic-ke
 Then make the file yours alone in Command Prompt:
 
 ```
-icacls "%USERPROFILE%\.live-room\anthropic-key" /inheritance:r /grant:r "%USERNAME%:F"
+icacls "%USERPROFILE%\.live-room\anthropic-key" /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:F"
 ```
 
-Use `anthropic-admin-key` in place of `anthropic-key` for the admin key. If Motet says the file is not owned by you (a file made from an administrator window can belong to the Administrators group), first run `icacls "%USERPROFILE%\.live-room\anthropic-key" /setowner "%USERNAME%"`. Motet creates its saved model choice, `officer-model.json`, private on its own.
+Use `anthropic-admin-key` in place of `anthropic-key` for the admin key. The account is written as `%USERDOMAIN%\%USERNAME%` because a bare name can pick a different, same-named account on a work PC. Motet creates its saved model choice, `officer-model.json`, private on its own.
+
+If Motet says something is not owned by you, it was probably made from an administrator window, which can give it to the Administrators group. Each message names its fix; run it in Command Prompt, then restart the server:
+
+- The key file is not owned by you: `icacls "%USERPROFILE%\.live-room\anthropic-key" /setowner "%USERDOMAIN%\%USERNAME%"`, then the command above.
+- The folder holding the key file is not owned by you (for example, the server was first started from an administrator window): `icacls "%USERPROFILE%\.live-room" /setowner "%USERDOMAIN%\%USERNAME%"`. The same fix applies if the Motet model choice cannot be saved.
+- Other accounts can open the folder holding the key file: `icacls "%USERPROFILE%\.live-room" /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:(OI)(CI)F"`.
 
 ## Motet memory
 

@@ -3024,25 +3024,30 @@ def secret_scanner():
 
 
 OFFICER_KEY_FILE = '%USERPROFILE%\\.live-room\\anthropic-key' if WIN else '~/.live-room/anthropic-key'
-OFFICER_KEY_PRIVATE = ('in Command Prompt run: icacls "%s" /inheritance:r /grant:r "%%USERNAME%%:F"' % OFFICER_KEY_FILE
+OFFICER_FOLDER = '%USERPROFILE%\\.live-room'
+OFFICER_ACCOUNT = '%USERDOMAIN%\\%USERNAME%'      # the domain too: a bare name can pick a same-named local account
+OFFICER_KEY_PRIVATE = ('in Command Prompt run: icacls "%s" /inheritance:r /grant:r "%s:F"' % (OFFICER_KEY_FILE, OFFICER_ACCOUNT)
                        if WIN else 'chmod 600')
-OFFICER_FOLDER_PRIVATE = 'icacls "%USERPROFILE%\\.live-room" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"'
+OFFICER_KEY_OWNER = 'in Command Prompt run: icacls "%s" /setowner "%s", then make it private' % (OFFICER_KEY_FILE, OFFICER_ACCOUNT)
+OFFICER_FOLDER_PRIVATE = 'in Command Prompt run: icacls "%s" /inheritance:r /grant:r "%s:(OI)(CI)F"' % (OFFICER_FOLDER, OFFICER_ACCOUNT)
+OFFICER_FOLDER_OWNER = 'in Command Prompt run: icacls "%s" /setowner "%s"' % (OFFICER_FOLDER, OFFICER_ACCOUNT)
 
 
 def officer_key_refusal(problem):
-    """Plain words for a refused key file (private_storage reasons); never a path from the system or its error text."""
+    """Plain words for a refused key file (private_storage reasons); never a path from the system or its error text.
+    On Windows each permission refusal names the icacls command that fixes it; Motet never runs it itself."""
     reason, folder = problem.reason, problem.subject == 'folder'
-    if folder:
+    if folder:      # the folder is checked on Windows only (POSIX's is forced private by load_key)
         return {'missing': 'no key file at ' + OFFICER_KEY_FILE,
                 'link': 'the folder holding the key file is a link or junction, not a plain folder',
                 'not_regular': 'the folder holding the key file is not a plain folder',
-                'owner': 'the folder holding the key file is not owned by you',
-                'access': 'other accounts can open the folder holding the key file; make it yours alone (in Command Prompt run: %s)' % OFFICER_FOLDER_PRIVATE,
+                'owner': 'the folder holding the key file is not owned by you' + ('; make it yours (%s)' % OFFICER_FOLDER_OWNER if WIN else ''),
+                'access': 'other accounts can open the folder holding the key file; make it yours alone (%s)' % (OFFICER_FOLDER_PRIVATE if WIN else 'chmod 700'),
                 }.get(reason, 'the folder holding the key file could not be checked')
     return {'missing': 'no key file at ' + OFFICER_KEY_FILE,
             'link': 'the key file is a link, not a plain file',
             'not_regular': 'the key file is not a plain file',
-            'owner': 'the key file is not owned by you',
+            'owner': 'the key file is not owned by you' + ('; make it yours (%s)' % OFFICER_KEY_OWNER if WIN else ''),
             'access': ('the key file is not yours alone; make it private (%s)' if WIN else
                        'the key file can be read by others; make it yours alone (%s)') % OFFICER_KEY_PRIVATE,
             'changed': 'the key file changed while it was being opened; start Motet again',

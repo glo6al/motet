@@ -239,8 +239,10 @@ Details on the rest:
 | Unlock opens an editor | See step 5: set your browser as the default for `.html`. |
 | A preview says not found, or a page looks unstyled | See "What does not work on Windows yet": the page alone is served, without the files beside it, and only from Python 3.12. Tell us which folder kind it was in. |
 | Odd characters in the terminal view | Use Windows Terminal. |
-| "Motet is off" and the key file is not yours alone | Run the `icacls … /inheritance:r /grant:r` command in [Keys and settings on Windows](MOTET.md#keys-and-settings-on-windows), then restart the server. |
-| "Motet is off" and the key file is not owned by you | Run `icacls "%USERPROFILE%\.live-room\anthropic-key" /setowner "%USERNAME%"`, then the command above. |
+| "Motet is off: the key file is not yours alone" | Run the `icacls … /inheritance:r /grant:r` command in [Keys and settings on Windows](MOTET.md#keys-and-settings-on-windows), then restart the server. |
+| "Motet is off: the key file is not owned by you" | In Command Prompt run `icacls "%USERPROFILE%\.live-room\anthropic-key" /setowner "%USERDOMAIN%\%USERNAME%"`, then the command above, then restart the server. |
+| "Motet is off: the folder holding the key file is not owned by you", or the Motet model choice cannot be saved | The server was probably first started from an administrator window. In Command Prompt run `icacls "%USERPROFILE%\.live-room" /setowner "%USERDOMAIN%\%USERNAME%"`, then restart the server. |
+| "Motet is off: other accounts can open the folder holding the key file" | In Command Prompt run `icacls "%USERPROFILE%\.live-room" /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:(OI)(CI)F"`, then restart the server. |
 | `~/.live-room is a link` | `%USERPROFILE%\.live-room` is a link or junction. Remove it; the server creates a fresh one. |
 
 **To stop the server**, press **Ctrl+C** in its window (or close the window). **To remove Motet completely**, delete the project folder and `%USERPROFILE%\.live-room`. It changes nothing else on your PC.
