@@ -2,7 +2,7 @@
 
 The helper is a separate, optional component. Motet runs as usual without it.
 The page adds a microphone beside Send. The helper and its server proxy are
-separately enabled; normal typing works without either one. Page checks use generated audio plus an earlier real-microphone proof; the native engine has been verified only on Apple Silicon macOS.
+separately enabled; normal typing works without either one. Page checks use generated audio plus an earlier real-microphone proof; the native engine has been verified only on Apple Silicon macOS. The whole feature is off on Windows, not only the engine: the helper and its proxy refuse to start there.
 
 Recognition uses Moonshine Small Streaming English on this computer, without an
 account or inference service. The helper accepts audio supplied by an authorized
