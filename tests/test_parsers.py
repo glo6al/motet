@@ -1658,6 +1658,15 @@ def test_home_paths_and_launch():
     check('a CI home matches both /Users and /home', runner.findall('a /Users/me/a/b/c') == ['/Users/me/a/b/c'] and runner.findall('a /home/me/a/b/c') == ['/home/me/a/b/c']
           and bool(runner_cd.match('cd /Users/me/a')) and bool(runner_cd.match('cd /home/me/a')))
     check('a root-level home keeps the plain /Users pattern', server.home_patterns('/root', win=False)[0].pattern == mac_path.pattern)
+    old_path, old_cd = r"/Users/[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}", r'cd\s+(["\']?)(/Users/[^"\']+)\1\s*$'
+    check('a Mac home keeps the original /Users patterns byte for byte', mac_path.pattern == old_path and mac_cd.pattern == old_cd)
+    for odd in ('/var/root', '/var/lib/fictional-service', '/srv/homes/me', '/Users'):
+        odd_path, odd_cd = server.home_patterns(odd, win=False)
+        check('a home outside /home (%s) adds no other folder of homes' % odd, (odd_path.pattern, odd_cd.pattern) == (old_path, old_cd)
+              and not odd_path.findall('see /var/lib/x/a/b/c') and not odd_path.findall('see /home/me/a/b/c'))
+    check('a Linux path inside a link is not a folder', path.findall('see https://example.test/home/me/a/b/c and https://example.test/Users/me/a/b/c') == []
+          and path.findall('open file:///home/me/a/b/c.py') == ['/home/me/a/b/c.py'] and path.findall('see file:/Users/me/a/b/c.py') == ['/Users/me/a/b/c.py'])
+    check('a Mac pattern is unchanged inside a link, as before', mac_path.findall('see https://example.test/Users/me/a/b/c') == ['/Users/me/a/b/c'])
     wpath, wcd = server.home_patterns('C:\\Users\\me', win=True)
     check('a Windows path matches with either slash', wpath.findall('x c:/Users/me/a/b/c.py') == ['c:/Users/me/a/b/c.py']
           and wpath.findall(r'x C:\Users\me\a\b\c.py') == [r'C:\Users\me\a\b\c.py'])

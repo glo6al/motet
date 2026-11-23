@@ -1392,7 +1392,10 @@ WORKED = {}                  # folder -> [(agent, first seen there, last seen th
 
 def home_patterns(home=None, win=None):
     """(PATH_RX, CD_RX) for the folder that holds home folders: /Users on a Mac, /home on Linux, C:\\Users (or wherever a
-    profile lives) on Windows. Users is always matched too, so a home elsewhere (a test's temp folder, CI's home folder) keeps today's matching."""
+    profile lives) on Windows. Users is always matched too, so a home elsewhere (a test's temp folder, CI's home folder) keeps today's matching.
+    On macOS and Linux /home is added only when the home is directly in /home: a home such as /var/root or a service account's
+    /var/lib/x does not make /var a folder of homes. The /home form also refuses a match right after a letter or digit, so the
+    path part of a web link (a host name followed by /home/...) is not taken for a folder; the /Users form is left exactly as it always was."""
     win = WIN if win is None else win
     mod = ntpath if win else posixpath
     parent = mod.dirname(mod.normpath(HOME if home is None else home))
@@ -1402,10 +1405,8 @@ def home_patterns(home=None, win=None):
         top = r'[/\\]' + ('Users' if parts in ([], ['Users']) else '(?:Users|' + names + ')') + r'[/\\]'
         return (re.compile(r"(?<![\w:])[A-Za-z]:" + top + r"[^/\\\n\"'`]+(?:[/\\][^/\\\n\"'`<>|;*$]+){2,8}"),     # folder names may contain spaces
                 re.compile(r'cd\s+(["\']?)((?:[A-Za-z]:)?' + top + r'[^"\']+)\1\s*$'))
-    parts = [x for x in parent.split('/') if x]
-    names = '/'.join(re.escape(x) for x in parts)
-    top = '/' + ('Users' if parts in ([], ['Users']) else '(?:Users|' + names + ')') + '/'
-    return (re.compile(top + r"[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}"),         # a computer's logs hold its own kind of path
+    top, guard = ('/(?:Users|home)/', r'(?<!\w)') if parent == '/home' else ('/Users/', '')
+    return (re.compile(guard + top + r"[^/\n\"'`]+(?:/[^/\n\"'`<>|;*$]+){2,8}"),         # a computer's logs hold its own kind of path
             re.compile(r'cd\s+(["\']?)(' + top + r'[^"\']+)\1\s*$'))
 
 
