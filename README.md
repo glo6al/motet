@@ -199,7 +199,7 @@ The detail lives in guides, one subject each.
 
 ## Status
 
-Early, and in daily use by its author. It runs on macOS. On Windows it has been run on one real PC; it watches and answers there, but does not act on your agents yet; [docs/WINDOWS.md](docs/WINDOWS.md) explains how to try it and what to report. The earlier interface is still available at `?ui=classic`.
+Early, and in daily use by its author. It runs on macOS. On Windows it has been run on one real PC, where watching works; its answers are checked so far only by the automated tests, and it does not act on your agents yet; [docs/WINDOWS.md](docs/WINDOWS.md) explains how to try it and what to report. The earlier interface is still available at `?ui=classic`.
 
 Current version is [v0.1.0](CHANGELOG.md).
 
