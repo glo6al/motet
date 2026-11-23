@@ -133,7 +133,7 @@ A chat has to qualify before Motet will send to it. When something isn't availab
 - **Motet thinks with one provider.** Its own answers run on Anthropic's models only.
 - **Cursor and Antigravity are watch-only.** Motet can see them but cannot message them.
 - **No live browser.** You see the pages an agent opened, not the page as it is right now.
-- **Mac and Windows, and only coding sessions on this computer.** On Windows, Motet watches but does not act yet: its own answers, messaging between agents, Allow and Deny, New chat, files and dictation are still to come. Web chats are not brought in.
+- **Mac and Windows, and only coding sessions on this computer.** On Windows, Motet watches and answers, but messaging between agents, Allow and Deny, New chat, files and dictation are still to come. Web chats are not brought in.
 
 **Designed, not built yet**
 
@@ -199,7 +199,7 @@ The detail lives in guides, one subject each.
 
 ## Status
 
-Early, and in daily use by its author. It runs on macOS. On Windows it has been run on one real PC and watches but does not act yet; [docs/WINDOWS.md](docs/WINDOWS.md) explains how to try it and what to report. The earlier interface is still available at `?ui=classic`.
+Early, and in daily use by its author. It runs on macOS. On Windows it has been run on one real PC; it watches and answers there, but does not act on your agents yet; [docs/WINDOWS.md](docs/WINDOWS.md) explains how to try it and what to report. The earlier interface is still available at `?ui=classic`.
 
 Current version is [v0.1.0](CHANGELOG.md).
 

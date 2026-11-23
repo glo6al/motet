@@ -50,7 +50,14 @@ Only validated numerical aggregates, dates, fixed qualifications and optional pu
 
 Motet's answers, its model menu and the Anthropic-reported usage report work on Windows too. Windows has no owner-only file modes, so Motet reads each key file's access list instead: the file must be owned by you, give access only to you (and the system account), and not take its permissions from its folder. The `.live-room` folder must be owned by you and not open to other accounts. A link, junction or other reparse point in place of the file or the folder is refused. Motet never changes the permissions of a file you made: it stays off and says why.
 
-Save the key as plain text, for example with `Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.live-room\anthropic-key" "<your key>"` in PowerShell (Windows PowerShell's `>` writes UTF-16, which Motet does not read as a key). Then make the file yours alone in Command Prompt:
+Save the key as plain text. In PowerShell, run these two lines and paste the key when asked, so it is not kept in PowerShell's command history (Windows PowerShell's `>` writes UTF-16, which Motet does not read as a key):
+
+```powershell
+$k = Read-Host "Paste your Anthropic API key"
+Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.live-room\anthropic-key" $k
+```
+
+Then make the file yours alone in Command Prompt:
 
 ```
 icacls "%USERPROFILE%\.live-room\anthropic-key" /inheritance:r /grant:r "%USERNAME%:F"

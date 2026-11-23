@@ -160,6 +160,8 @@ py src\server.py
 
 These last only for that PowerShell window.
 
+**To ask Motet questions**, save your Anthropic API key in `%USERPROFILE%\.live-room\anthropic-key` and make that file yours alone, as [Keys and settings on Windows](MOTET.md#keys-and-settings-on-windows) shows: two PowerShell lines that ask for the key, then one `icacls` command. Restart the server afterwards. Motet never loosens or repairs the file's permissions itself; if they are wrong it stays off and says why.
+
 To give a project folder a friendlier name on the stage, create `%USERPROFILE%\.live-room\projects.json` containing, for example:
 
 ```json
@@ -207,9 +209,8 @@ dir "$env:USERPROFILE\.cursor\projects"
 
 ## What does not work on Windows yet
 
-Motet **watches** on Windows: the live stage, risk flags, previews (page only, Python 3.12 or later) and Unlock all work. Everything that **acts** is switched off for now. The goal is parity with the Mac, and these are still to come:
+Motet **watches** on Windows: the live stage, risk flags, previews (page only, Python 3.12 or later) and Unlock all work. **Motet's own answers** and its model menu work too, once the key file is private (step 6); so far only the automated tests have checked them on Windows. Everything that **acts** on your agents is switched off for now. The goal is parity with the Mac, and these are still to come:
 
-- **Motet's own answers and model settings.** Not available on Windows yet.
 - **Messaging between agents, and the bridge.**
 - **New chat.**
 - **Files and attachments.**
@@ -238,6 +239,8 @@ Details on the rest:
 | Unlock opens an editor | See step 5: set your browser as the default for `.html`. |
 | A preview says not found, or a page looks unstyled | See "What does not work on Windows yet": the page alone is served, without the files beside it, and only from Python 3.12. Tell us which folder kind it was in. |
 | Odd characters in the terminal view | Use Windows Terminal. |
+| "Motet is off" and the key file is not yours alone | Run the `icacls … /inheritance:r /grant:r` command in [Keys and settings on Windows](MOTET.md#keys-and-settings-on-windows), then restart the server. |
+| "Motet is off" and the key file is not owned by you | Run `icacls "%USERPROFILE%\.live-room\anthropic-key" /setowner "%USERNAME%"`, then the command above. |
 | `~/.live-room is a link` | `%USERPROFILE%\.live-room` is a link or junction. Remove it; the server creates a fresh one. |
 
 **To stop the server**, press **Ctrl+C** in its window (or close the window). **To remove Motet completely**, delete the project folder and `%USERPROFILE%\.live-room`. It changes nothing else on your PC.
