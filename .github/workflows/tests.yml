@@ -106,6 +106,8 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_history.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_private_storage.py
+        if: ${{ !cancelled() }}
       - run: python tests/test_deck_log.py
         if: ${{ !cancelled() }}
       - run: python tests/test_deck_log_integration.py
