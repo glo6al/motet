@@ -38,13 +38,25 @@ Token counts come from API responses. Dollar amounts are **estimates**, using da
 
 ## Anthropic-reported usage and cost
 
-Optionally connect an Anthropic Console Admin API key to ask Motet about actual organization usage and costs. Save the key separately in `~/.live-room/anthropic-admin-key`, in the private state directory, as an owner-only regular file (`chmod 600` on macOS/Linux). Keep the normal model key in `~/.live-room/anthropic-key`. Admin keys have broad provider permissions; Motet uses this credential only for fixed, read-only reporting requests. Never put either key in the repository or a conversation. [Anthropic's Admin key setup](https://platform.claude.com/docs/en/manage-claude/admin-api-keys) explains creation and expiration.
+Optionally connect an Anthropic Console Admin API key to ask Motet about actual organization usage and costs. Save the key separately in `~/.live-room/anthropic-admin-key`, in the private state directory, as an owner-only regular file (`chmod 600` on macOS/Linux; on Windows see [Keys and settings on Windows](#keys-and-settings-on-windows)). Keep the normal model key in `~/.live-room/anthropic-key`. Admin keys have broad provider permissions; Motet uses this credential only for fixed, read-only reporting requests. Never put either key in the repository or a conversation. [Anthropic's Admin key setup](https://platform.claude.com/docs/en/manage-claude/admin-api-keys) explains creation and expiration.
 
 Ask naturally: **“What is my actual Anthropic token usage and cost this month, broken down by model?”** Other examples are **“Show yesterday's reported usage”** and **“Compare reported token use and cost for the last seven days.”** Calendar ranges cover at most 31 days; requested local dates and the actual UTC-hour reporting bounds are returned separately. This connection follows Motet's existing platform restrictions.
 
 These reports cover the Anthropic organization accessible to that key, including usage outside Motet. They are separate from the estimates for Motet’s own model calls and cannot identify a particular Motet agent's costs. Reported cost is in USD after discounts and before credits; it is not an invoice, prepaid balance, subscription allowance or remaining spending budget. Motet does not read or change spending limits through this connection. [Anthropic's reporting documentation](https://platform.claude.com/docs/en/manage-claude/usage-cost-analytics-api) describes coverage: data can lag by up to 24 hours and is subject to later reconciliation. Motet receives each report's refresh time; missing or incomplete results remain unknown rather than zero.
 
 Only validated numerical aggregates, dates, fixed qualifications and optional public model labels reach Motet. The admin key, raw provider bodies, account identities, actor names, workspace and API-key identifiers, pagination tokens and provider error text are excluded. Reporting creates no raw-report database, cache or background polling, and grants no new peer messaging or account-management capability. Existing Motet conversation history can retain the aggregate answers under its normal retention rules. Removing the optional credential stops subsequent reporting requests without affecting the model key.
+
+## Keys and settings on Windows
+
+Motet's answers, its model menu and the Anthropic-reported usage report work on Windows too. Windows has no owner-only file modes, so Motet reads each key file's access list instead: the file must be owned by you, give access only to you (and the system account), and not take its permissions from its folder. The `.live-room` folder must be owned by you and not open to other accounts. A link, junction or other reparse point in place of the file or the folder is refused. Motet never changes the permissions of a file you made: it stays off and says why.
+
+Save the key as plain text, for example with `Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.live-room\anthropic-key" "<your key>"` in PowerShell (Windows PowerShell's `>` writes UTF-16, which Motet does not read as a key). Then make the file yours alone in Command Prompt:
+
+```
+icacls "%USERPROFILE%\.live-room\anthropic-key" /inheritance:r /grant:r "%USERNAME%:F"
+```
+
+Use `anthropic-admin-key` in place of `anthropic-key` for the admin key. If Motet says the file is not owned by you (a file made from an administrator window can belong to the Administrators group), first run `icacls "%USERPROFILE%\.live-room\anthropic-key" /setowner "%USERNAME%"`. Motet creates its saved model choice, `officer-model.json`, private on its own.
 
 ## Motet memory
 
@@ -60,7 +72,7 @@ The underlying local archive is called the Deck Log. Same-named chats remain dis
 
 The separate SQLite database is `~/.live-room/deck-log.sqlite3`, outside the repository. Its directory and files must pass private ownership/permission checks on Unix or protected access-control checks on Windows; unsafe storage leaves recording unavailable. Other programs running as the same operating-system user remain inside this privacy boundary. Recording is bounded by a 64 MiB SQLite page limit, 50,000 events, and a bounded queue; reaching a limit or encountering a write failure stops or drops capture with an explicit coverage warning. Journal files can temporarily require additional disk space. Text search uses SQLite FTS5 when available, with a disclosed bounded plain-search fallback.
 
-Expiry and deletion remove matching archive records and search data; daily digests are derived from the remaining records. Minimal hashed deletion markers remain to prevent replay from restoring erased entries. Deleting or expiring any Deck Log source conservatively removes all durable Motet history prose, including unrelated earlier answers. It does not delete original provider logs, copies already open in a browser, provider-side records, or operating-system backups. The archive has its own storage and does not erase messaging delivery/recovery records. Windows archive tests are separate from the existing restriction that Motet requests are unavailable on Windows.
+Expiry and deletion remove matching archive records and search data; daily digests are derived from the remaining records. Minimal hashed deletion markers remain to prevent replay from restoring erased entries. Deleting or expiring any Deck Log source conservatively removes all durable Motet history prose, including unrelated earlier answers. It does not delete original provider logs, copies already open in a browser, provider-side records, or operating-system backups. The archive has its own storage and does not erase messaging delivery/recovery records.
 
 ### Rolling back the Memory archive
 
