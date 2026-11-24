@@ -323,7 +323,8 @@ def test_terminal_text():
 
 def test_platform():
     """Runs on every system (CI: Ubuntu, macOS, Windows): the key, previews with a link in the way or in place of the
-    granted folder, what Windows grants (pages only, and only from Python 3.12), and the port held exclusively."""
+    granted folder (on Windows a junction, walked by handle), nothing granted on Windows before Python 3.12, and the
+    port held exclusively. Fixtures are written in binary, so Windows adds no CR."""
     import socket
     saved = (server.HOME, server.PRIVATE_ROOTS, dict(server.ALLOWED_FILES), dict(server.ALLOWED_DIRS), list(server.LOG), server.BASE)
     tmp = tempfile.TemporaryDirectory()
@@ -351,7 +352,7 @@ def test_platform():
         server.H.preview(f, path)
         return f.got
 
-    previews, folders = server.WIN_IDS, not server.WIN          # Windows: pages only, and only with whole file ids
+    previews = server.WIN_IDS                    # Windows: only with whole file ids (Python 3.12 or later)
     server.HOME = home
     server.PRIVATE_ROOTS = tuple(os.path.join(home, p) + os.sep for p in ('.live-room', 'AppData'))
     try:
@@ -362,8 +363,8 @@ def test_platform():
         proj = os.path.join(home, 'work', 'site')
         os.makedirs(os.path.join(proj, 'css'))
         page = os.path.join(proj, 'index.html')
-        with open(page, 'w', encoding='utf-8') as f:
-            f.write('<link rel="stylesheet" href="css/a.css">ü')
+        with open(page, 'wb') as f:
+            f.write('<link rel="stylesheet" href="css/a.css">ü'.encode('utf-8'))
         asset = os.path.join(proj, 'css', 'a.css')
         with open(asset, 'wb') as f:
             f.write(b'body{}\r\n\x1a after a Ctrl-Z')
@@ -371,20 +372,17 @@ def test_platform():
         other = os.path.join(home, 'other')
         os.makedirs(other)
         for d in (private, other):
-            with open(os.path.join(d, 'x.css'), 'w', encoding='utf-8') as f:
-                f.write('secret')
+            with open(os.path.join(d, 'x.css'), 'wb') as f:
+                f.write(b'secret')
         server.ALLOWED_FILES.clear(); server.ALLOWED_DIRS.clear()
         server.allow_preview('c:00000000', False, 0, 'id1', page)
         if not previews:
             check('nothing granted on Windows before Python 3.12', not server.ALLOWED_FILES and not server.ALLOWED_DIRS and get(page)[0] == 404)
         else:
             check('page granted', page in server.ALLOWED_FILES)
-            check('folder granted' if folders else 'no folder granted on Windows', (proj in server.ALLOWED_DIRS) == folders)
+            check('folder granted', proj in server.ALLOWED_DIRS)
             check('page served', get(page)[0] == 200)
-            if folders:
-                check('asset served byte for byte', get(asset) == (200, b'body{}\r\n\x1a after a Ctrl-Z'))
-            else:
-                check('asset beside the page refused on Windows', get(asset)[0] == 404)
+            check('asset served byte for byte', get(asset) == (200, b'body{}\r\n\x1a after a Ctrl-Z'))
             check('outside the grant refused', get(os.path.join(private, 'x.css'))[0] == 404)
             twin = os.path.join(proj, 'css', 'twin.css')
             os.link(os.path.join(private, 'key'), twin)
@@ -395,8 +393,8 @@ def test_platform():
             check('a hard-linked page is not granted', kpage not in server.ALLOWED_FILES and get(kpage)[0] == 404)
             if server.WIN:
                 check('a device name is refused', get(os.path.join(proj, 'css', 'CON.css'))[0] == 404)
-                with open(page + ':s.html', 'w', encoding='utf-8') as f:     # an alternate data stream of the page
-                    f.write('<p>stream')
+                with open(page + ':s.html', 'wb') as f:     # an alternate data stream of the page
+                    f.write(b'<p>stream')
                 server.allow_preview('c:00000000', False, 0, 'id3', page + ':s.html')
                 check('an alternate data stream is not granted', page + ':s.html' not in server.ALLOWED_FILES and get(page + ':s.html')[0] == 404)
             for name, target in (('in', private), ('out', other)):
@@ -412,10 +410,10 @@ def test_platform():
             check('a page behind a link in place of its folder: refused on Windows, the same file on macOS', get(page)[0] == (404 if server.WIN else 200))
             unlink_all()
             os.rename(proj + '-aside', proj)
-            check('the page back in place is served again', get(page)[0] == 200 and (get(asset)[0] == 200) == folders)
+            check('the page back in place is served again', get(page)[0] == 200 and get(asset)[0] == 200)
             # a page granted, then swapped for another file under the same name: not the same file, not served
-            with open(page + '.new', 'w', encoding='utf-8') as f:
-                f.write('<p>other')
+            with open(page + '.new', 'wb') as f:
+                f.write(b'<p>other')
             os.replace(page + '.new', page)
             check('a page swapped under its name is refused', get(page)[0] == 404)
     finally:

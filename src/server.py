@@ -1528,6 +1528,10 @@ PRIVATE_ROOTS = tuple(os.path.join(HOME, p) + os.sep for p in ('.live-room', '.s
 
 
 def dir_ids(paths):
+    """The identities (file id, volume) of these folders, following links, as os.stat reports them. On Windows each
+    folder's identity as read from a held handle (``held_id``, after resolving the path once) is added as well, so a
+    folder is recognised whichever way Python read it: the preview walk compares identities read from its own
+    handles with these, and a folder that could only be told apart by one reading is counted under both."""
     out = set()
     for p in paths:
         try:
@@ -1535,22 +1539,19 @@ def dir_ids(paths):
             out.add((st.st_ino, st.st_dev))
         except OSError:
             pass
+        if WIN:
+            try:
+                with private_storage.open_folder(os.path.realpath(p)) as folder:
+                    out.add(held_id(folder))
+            except OSError:
+                pass
     return out
 
 
-def no_reparse(start, path, lstat=os.lstat):
-    """Windows only: is neither `start` nor any name from it down to `path` a link or junction? lstat does not
-    follow the name it is given, so a link to a network share is noticed before anything would wait on the share.
-    Each name is its own snapshot: a folder swapped after its check is not seen here, and a later lstat resolves
-    through whatever is then above it (see preview, which rests on the file id check after the open, not on this)."""
-    import stat as _st
-    walk = start
-    for name in [None] + [x for x in path[len(start):].split(os.sep) if x]:
-        if name is not None:
-            walk = os.path.join(walk, name)
-        if lstat(walk).st_file_attributes & _st.FILE_ATTRIBUTE_REPARSE_POINT:
-            return False
-    return True
+def held_id(folder):
+    """The identity (file id, volume) of a folder held by the no-link walk, read through its own handle."""
+    st = folder.stat()
+    return (st.st_ino, st.st_dev)
 
 
 def above(path):
@@ -1571,13 +1572,15 @@ def in_private(real):
 def allow_preview(aid, old, ts, cid, path):
     """Let the page render an HTML file an agent wrote. The path must be a real, regular .html file reached without
     any symlink, outside private configuration folders. Its identity is recorded, so a file swapped in later under
-    the same name is not served. On macOS the folder it sits in is granted for its styles, scripts and images, unless
-    that folder is your home folder or above it; private folders below a granted folder are never served (see
-    preview). On Windows no folder is granted (see preview), and nothing is granted before Python 3.12, which can
-    report full-width Windows file ids (the version is checked, not whether the filesystem supplied one): the "same
-    file id" check rests on them (an id a filesystem may reuse after the file is deleted, so a file deleted and
-    replaced is not always told apart; an open handle per grant would be the cure, and is not kept).
-    A Windows path with a second colon names an alternate data stream and is refused."""
+    the same name is not served. The folder it sits in is granted for its styles, scripts and images, unless that
+    folder is your home folder or above it; private folders below a granted folder are never served (see preview).
+    The folder is recorded by identity: on macOS and Linux as os.stat reports it, on Windows as read from the folder's
+    own handle after the no-link walk has opened it (the same reading the preview walk compares it with later). On
+    Windows nothing is granted before Python 3.12, which can report full-width Windows file ids (the version is
+    checked, not whether the filesystem supplied one): the "same file id" checks rest on them (an id a filesystem may
+    reuse after the file is deleted, so a file deleted and replaced is not always told apart; an open handle per grant
+    would be the cure, and is not kept). A Windows path with a second colon names an alternate data stream and is
+    refused."""
     if not WIN_IDS or (WIN and ':' in path[2:]):
         return
     try:
@@ -1594,13 +1597,16 @@ def allow_preview(aid, old, ts, cid, path):
     while len(ALLOWED_FILES) > 400:
         ALLOWED_FILES.pop(next(iter(ALLOWED_FILES)))
     try:
-        if WIN:
-            raise OSError('no folder grants on Windows (see preview)')
-        ds = os.stat(os.path.dirname(real))
-        if (ds.st_ino, ds.st_dev) in dir_ids(above(HOME)) or under(HOME + os.sep, [os.path.dirname(real).rstrip(os.sep) + os.sep]):
+        if WIN:                                       # read through the walk's own handle, as preview will read it
+            with private_storage.open_folder(os.path.dirname(real)) as folder:
+                ident = held_id(folder)
+        else:
+            ds = os.stat(os.path.dirname(real))
+            ident = (ds.st_ino, ds.st_dev)
+        if ident in dir_ids(above(HOME)) or under(HOME + os.sep, [os.path.dirname(real).rstrip(os.sep) + os.sep]):
             raise OSError('too broad')                # a page saved straight into the home folder brings no folder with it
         ALLOWED_DIRS.pop(os.path.dirname(real), None)
-        ALLOWED_DIRS[os.path.dirname(real)] = (ds.st_ino, ds.st_dev)     # styles, scripts and images beside it; never other pages
+        ALLOWED_DIRS[os.path.dirname(real)] = ident   # styles, scripts and images beside it; never other pages
         while len(ALLOWED_DIRS) > 100:
             ALLOWED_DIRS.pop(next(iter(ALLOWED_DIRS)))
     except OSError:
@@ -4923,6 +4929,34 @@ def app_icon(name, home=None):
         return None
 
 
+def preview_asset_windows(want):
+    """Windows: a descriptor for a style, script, image or font inside a granted folder, or -1. The same rules as
+    the macOS walk in preview, on held handles: the granted folder is opened with no link or junction from the
+    drive root down and held without delete sharing, so it cannot be renamed or replaced while it is used; its
+    identity must be the one granted and not a private folder's; then each next name is opened relative to the
+    folder handle above it (a link, junction or other reparse point there is refused, never followed), and each
+    folder walked through is compared by identity with the private ones. Which folder is which is decided by
+    those identities, not by spelling, so a differently cased name cannot reach a private folder."""
+    import contextlib
+    root = next((d for d in list(ALLOWED_DIRS) if want.startswith(d + os.sep)), None)
+    if not root or not want.lower().endswith(ASSET_EXT) or in_private(want):
+        return -1
+    parts = [x for x in want[len(root) + 1:].split(os.sep) if x]
+    if any(x in ('.', '..') for x in parts) or not parts:
+        return -1
+    private = dir_ids(PRIVATE_ROOTS)
+    with contextlib.ExitStack() as held:          # closes the deepest folder first, as the walk requires
+        cur = held.enter_context(private_storage.open_folder(root))
+        ident = held_id(cur)
+        if ident != ALLOWED_DIRS[root] or ident in private:
+            return -1
+        for name in parts[:-1]:
+            cur = held.enter_context(cur.folder(name))
+            if held_id(cur) in private:
+                return -1
+        return cur.open(parts[-1], single_link=True)
+
+
 # Fixed, because on Windows mimetypes reads the registry, where .js is sometimes text/plain (and nosniff then blocks it).
 PREVIEW_TYPES = {'.html': 'text/html', '.htm': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript',
                  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.svg': 'image/svg+xml',
@@ -5210,10 +5244,11 @@ class H(BaseHTTPRequestHandler):
         else must be a style, script, image or font inside a granted folder, and is opened by walking down from that
         folder one name at a time with symlinks refused at every step, so what is served is always inside the grant.
         Nothing in or under a private folder is served that way, whatever folder was granted: the granted folder and
-        every folder walked through is compared, by identity, with the private ones. On Windows only granted pages
-        and images are served, each walked by name from its drive root first (a snapshot: nothing on the way may be
-        a link or junction) and then required to be, by file id, the very file that was granted; its folder is not
-        granted there (see the branch below)."""
+        every folder walked through is compared, by identity, with the private ones. On Windows the walk is the shared
+        held-handle one (private_storage): the granted folder is opened from its drive root with no link or junction
+        anywhere on the way and held, each next name is opened relative to the folder handle above it, and every
+        identity is read from those handles. A granted page or image is opened the same way there, then required to
+        be, by file id, the very file that was granted."""
         import stat as _st
         want = os.path.normpath(want)
         flags = os.O_RDONLY | BINARY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
@@ -5221,19 +5256,20 @@ class H(BaseHTTPRequestHandler):
         try:
             granted = ALLOWED_FILES.get(want)
             if granted:
-                if WIN:                     # no link or junction from the drive root down, name by name; C:file is refused
-                    drive, rest = os.path.splitdrive(want)
-                    if not drive or not rest.startswith(os.sep) or not no_reparse(drive + os.sep, want):
+                if WIN:     # held from the drive root down, no link or junction anywhere; C:file and streams are refused
+                    if not os.path.isabs(want):     # C:file names a folder by the drive's current one
                         return self.send(404, b'not found')
-                fd = os.open(want, flags)
+                    fd = private_storage.open_no_links(want, single_link=True)
+                else:
+                    fd = os.open(want, flags)
                 st = os.fstat(fd)
                 if (st.st_ino, st.st_dev) != granted:
                     return self.send(404, b'not found')
             elif WIN:
-                # No folder is granted on Windows (allow_preview), so nothing but a granted page or image is served
-                # there: Python's os API cannot open a folder and walk down from it on Windows, and a walk by name
-                # cannot be made atomic. A walk pinned through Windows directory handles is on the roadmap.
-                return self.send(404, b'not found')
+                fd = preview_asset_windows(want)
+                if fd < 0:
+                    return self.send(404, b'not found')
+                st = os.fstat(fd)
             else:
                 root = next((d for d in list(ALLOWED_DIRS) if want.startswith(d + os.sep)), None)
                 if not root or not want.lower().endswith(ASSET_EXT) or in_private(want):
