@@ -14,11 +14,14 @@ from attachments_files import identity, private
 from attachments_types import OPAQUE, fail
 import officer_documents as documents
 
-EVIDENCE_ID = 'haiku-pdf-png-2026-11-15'
-VALID_FROM = 1794700800  # 2026-11-15T00:00:00Z
-VALID_UNTIL = 1795305600  # 2026-11-22T00:00:00Z, exclusive
+# Renewed 2026-11-24 after the sources below were checked again that day: prices, tiers, routing, context window and
+# PDF limit are unchanged, so only the evidence date and its window move. The 2026-11-15 qualification ended at
+# 2026-11-22T00:00:00Z.
+EVIDENCE_ID = 'haiku-pdf-png-2026-11-24'
+VALID_FROM = 1795478400  # 2026-11-24T00:00:00Z
+VALID_UNTIL = 1798070400  # 2026-12-24T00:00:00Z, exclusive
 PROFILE_REVISION = 'haiku-direct-pdf-png-2026-11'
-PRICING_REVISION = 'haiku-tiered-2026-11-15'
+PRICING_REVISION = 'haiku-tiered-2026-11-24'
 BILLING_REVISION = 'minimal-standard-default-global-or-us-v1'
 MAX_INPUT = 1_000_000
 LOW_THRESHOLD = 100_000
@@ -30,6 +33,16 @@ SOURCES = ('https://platform.claude.com/docs/en/build-with-claude/context-window
 # Integer nanodollars per token, ordered input/output/cache read/5m/1h.
 HIGH = (500, 2500, 50, 625, 1000)
 LOW = (100, 500, 10, 125, 200)
+# Earlier qualifications whose stored budget carries forward into this one: a closed list of exact ids, never a
+# pattern. Each entry records every term that build priced with. It is honoured only while those terms equal today's,
+# so a later price change ends the carry-forward instead of re-pricing an old budget. Carrying forward never touches
+# the stored budget: its scope, limit and every recorded charge stay as they are (see officer_document_ledger).
+PREDECESSORS = (
+    dict(evidence_id='haiku-pdf-png-2026-11-15', pricing_revision='haiku-tiered-2026-11-15',
+         profile_revision='haiku-direct-pdf-png-2026-11', billing_revision='minimal-standard-default-global-or-us-v1',
+         high=(500, 2500, 50, 625, 1000), low=(100, 500, 10, 125, 200), low_threshold=100_000,
+         max_input=1_000_000, per_call_usd='1.11'),
+)
 
 
 def unavailable():
@@ -43,8 +56,12 @@ def current(clock=time.time):
 
 
 def input_profile():
-    proof = documents.StrictBudgetEvidence('strict_usd', PRICING_REVISION, BILLING_REVISION,
-        PER_CALL_USD, 'documented-context-maximum', EVIDENCE_ID, MAX_INPUT, '0'*64)
+    return _profile_for(EVIDENCE_ID, PRICING_REVISION)
+
+
+def _profile_for(evidence_id, pricing_revision):
+    proof = documents.StrictBudgetEvidence('strict_usd', pricing_revision, BILLING_REVISION,
+        PER_CALL_USD, 'documented-context-maximum', evidence_id, MAX_INPUT, '0'*64)
     profile = documents.OfficerInputProfile('officer-direct-pdf-png', 'v1', PROFILE_REVISION,
         documents.MODEL, 'minimal-direct-v1', ('application/pdf', 'image/png'), proof)
     return replace(profile, strict_budget_evidence=replace(proof, profile_binding=documents.profile_binding(profile)))
@@ -194,9 +211,27 @@ def _load_windows(parent, clock):
 
 
 def document_pricing():
+    return _pricing_for(EVIDENCE_ID, PRICING_REVISION)
+
+
+def _pricing_for(evidence_id, pricing_revision):
     from officer_document_ledger import DocumentPricing
-    return DocumentPricing(PRICING_REVISION, BILLING_REVISION, 'default_global_or_us',
-                           *HIGH, qualification_id=EVIDENCE_ID)
+    return DocumentPricing(pricing_revision, BILLING_REVISION, 'default_global_or_us',
+                           *HIGH, qualification_id=evidence_id)
+
+
+def predecessor_terms():
+    """The exact (profile, pricing) each listed predecessor registered its budget with, for the predecessors whose
+    recorded terms equal today's. Only the evidence id and pricing revision differ from this qualification's."""
+    today = dict(profile_revision=PROFILE_REVISION, billing_revision=BILLING_REVISION, high=HIGH, low=LOW,
+                 low_threshold=LOW_THRESHOLD, max_input=MAX_INPUT, per_call_usd=PER_CALL_USD)
+    terms = []
+    for entry in PREDECESSORS:
+        rest = {k: v for k, v in entry.items() if k not in ('evidence_id', 'pricing_revision')}
+        if rest == today and EVIDENCE_ID != entry['evidence_id'] and PRICING_REVISION != entry['pricing_revision']:
+            terms.append((_profile_for(entry['evidence_id'], entry['pricing_revision']),
+                          _pricing_for(entry['evidence_id'], entry['pricing_revision'])))
+    return tuple(terms)
 
 
 def validate_pricing(profile, pricing):

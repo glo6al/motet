@@ -14,14 +14,14 @@ This example gives file questions a one-time **USD 6.00 total** allowance. Choos
 ```json
 {
   "version": 1,
-  "evidenceId": "haiku-pdf-png-2026-11-15",
+  "evidenceId": "haiku-pdf-png-2026-11-24",
   "scopeId": "officer-files",
   "scopeRevision": "v1",
   "usdLimit": "6.00"
 }
 ```
 
-Each attempted file question reserves up to **USD 1.11** against the local allowance. The reservation is a budget check, not an invoice. It does not reset automatically. An unknown outcome may hold its reservation. This release accepts the example policy from **2026-11-15 at 00:00 UTC** until **2026-11-22 at 00:00 UTC**, exclusive. Once that qualification expires, installing the example again will not restore file questions. Update to a Motet build with a current qualification and use its policy instructions.
+Each attempted file question reserves up to **USD 1.11** against the local allowance. The reservation is a budget check, not an invoice. It does not reset automatically. An unknown outcome may hold its reservation. This release accepts the example policy from **2026-11-24 at 00:00 UTC** until **2026-12-24 at 00:00 UTC**, exclusive. Once that qualification expires, installing the example again will not restore file questions. Update to a Motet build with a current qualification and use its policy instructions. A policy written for an earlier qualification (an older `evidenceId`) is refused: replace it with the example above. A budget you already set up under the earlier dates (2026-11-15 to 2026-11-22) carries forward. When the new policy has the same `scopeId`, `scopeRevision` and `usdLimit`, Motet keeps using that budget. What it already spent and any amount still held both count, and nothing is reset. Motet keeps one budget per file-reading setup, so a different `scopeId`, `scopeRevision` or `usdLimit` is refused rather than starting a fresh one. If that happens, file questions stay off in that `.live-room`, but you can still list and remove its kept files under **Files**.
 
 ## On Windows
 
@@ -30,7 +30,7 @@ File reading on Windows is new: automated tests on Windows cover it, but nobody 
 Save the key first, as [Keys and settings on Windows](MOTET.md#keys-and-settings-on-windows) shows. Then write the policy as plain UTF-8 text in PowerShell (Windows PowerShell's `>` writes UTF-16, which Motet does not read), with your own limit in place of `6.00`:
 
 ```powershell
-Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.live-room\officer-document-policy.json" '{"version":1,"evidenceId":"haiku-pdf-png-2026-11-15","scopeId":"officer-files","scopeRevision":"v1","usdLimit":"6.00"}'
+Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.live-room\officer-document-policy.json" '{"version":1,"evidenceId":"haiku-pdf-png-2026-11-24","scopeId":"officer-files","scopeRevision":"v1","usdLimit":"6.00"}'
 ```
 
 Then make the file yours alone. Run this, and the `/setowner` command below if you need it, in a normal Command Prompt, not one opened with "Run as administrator": files made from an administrator window usually belong to the Administrators group rather than to you, and if the window was opened with another administrator's sign-in, `%USERNAME%` names that account instead of yours.

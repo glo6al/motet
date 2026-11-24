@@ -1,6 +1,7 @@
 """Dated immutable qualification, exact tier/default billing; no network."""
 from dataclasses import replace
 from decimal import localcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import officer_documents as documents
 from attachments_types import AttachmentError
 import test_attachments_officer_storage as fixtures
 from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
+from test_officer_documents import response, wire
 
 
 def usage(n=100,geo='global',**kw):
@@ -36,6 +38,26 @@ class PolicyTests(unittest.TestCase):
         for change in ({'input_rate':1},{'qualification_id':'invented'},{'inference_geo':'global'}):
             with self.subTest(change=change),self.assertRaises(AttachmentError):
                 p.validate_pricing(profile,replace(p.document_pricing(),**change))
+
+    def test_renewed_window_and_evidence(self):
+        """The 2026-11-24 renewal: a new month-long window, a new evidence id, the same prices. The old window is not
+        accepted, nor is the end of the new one, nor a policy or registered budget from the old qualification."""
+        import datetime
+        def epoch(day): return int(datetime.datetime(*day, tzinfo=datetime.timezone.utc).timestamp())
+        self.assertEqual((p.VALID_FROM, p.VALID_UNTIL), (epoch((2026, 11, 24)), epoch((2026, 12, 24))))
+        self.assertEqual((p.EVIDENCE_ID, p.PRICING_REVISION), ('haiku-pdf-png-2026-11-24', 'haiku-tiered-2026-11-24'))
+        self.assertEqual((p.HIGH, p.LOW, p.LOW_THRESHOLD, p.MAX_INPUT, p.PER_CALL_USD),
+                         ((500, 2500, 50, 625, 1000), (100, 500, 10, 125, 200), 100_000, 1_000_000, '1.11'))
+        old_from, old_until = epoch((2026, 11, 15)), epoch((2026, 11, 22))
+        for stamp in (old_from, old_until - 1, old_until, p.VALID_UNTIL, p.VALID_UNTIL + 1):
+            with self.subTest(stamp=stamp), self.assertRaises(AttachmentError):
+                p.current(lambda: stamp)
+        p.current(lambda: p.VALID_FROM)
+        p.current(lambda: p.VALID_UNTIL - 1)
+        with self.assertRaises(AttachmentError):
+            p.HostAllowance('haiku-pdf-png-2026-11-15', 'fictional-scope', 'v1', '2.22').validate(lambda: p.VALID_FROM + 1)
+        self.assertEqual(p.HostAllowance(p.EVIDENCE_ID, 'fictional-scope', 'v1', '2.22').validate(lambda: p.VALID_FROM + 1).usd_limit,
+                         '2.22')
 
     def test_half_open_validity_no_clock_reset_or_extension(self):
         for stamp in (p.VALID_FROM,p.VALID_UNTIL-0.001):p.current(lambda:stamp)
@@ -290,6 +312,131 @@ class QualifiedLedgerTests(unittest.TestCase):
         self.profile=p.input_profile();self.price=p.document_pricing()
         self.scope=ledger.DocumentBudgetScope('fictional-qualified','v1','2.22')
     def tearDown(self):self.f.tearDown()
+    OLD = dict(EVIDENCE_ID='haiku-pdf-png-2026-11-15', VALID_FROM=1794700800, VALID_UNTIL=1795305600,
+               PRICING_REVISION='haiku-tiered-2026-11-15')
+
+    def register_old(self, scope=None, **old):
+        """Register a budget as the 2026-11-15 build did: its constants, its window, its clock."""
+        with mock.patch.multiple(p, **dict(self.OLD, **old)):
+            self.store.clock = lambda: p.VALID_FROM + 1
+            self.l.register_scope(scope or self.scope, p.input_profile(), p.document_pricing())
+        self.store.clock = lambda: p.VALID_FROM + 1
+
+    def stored(self):
+        return [tuple(row) for row in self.store.db.execute('SELECT * FROM officer_document_scopes')]
+
+    def answer(self, request, profile):
+        """Claim, consume and settle one fictional question; the fixture response uses 100 input, 80 output tokens."""
+        state, permit, prepared = self.l.claim(self.f.selection, request['id'])
+        self.assertTrue(self.l.consume(permit, self.f.selection, request['id'], prepared.body_digest, state['profileDigest']))
+        raw = wire(response('Fictional answer.', citations=False))
+        candidate = documents.validate_response(profile, prepared, raw)
+        facts = ledger.ResultFacts(request['id'], state['claimNonce'], prepared.body_digest, state['profileDigest'],
+                                   'accepted', hashlib.sha256(raw).hexdigest(), candidate.message_id, documents.MODEL,
+                                   p.BILLING_REVISION, candidate.usage_facts)
+        return self.l.record_result(self.f.selection, facts)
+
+    def test_a_budget_from_the_earlier_qualification_carries_forward_with_its_charges(self):
+        """(a) The 2026-11-15 budget keeps working under the renewal: the same row, its settled charge and its held
+        reservation still count, and new questions draw on the same remaining amount."""
+        scope = ledger.DocumentBudgetScope('fictional-qualified', 'v1', '3.33')
+        d = self.f.draft(); self.f.upload(d); self.f.admit(d)
+        with mock.patch.multiple(p, **self.OLD):
+            self.store.clock = lambda: p.VALID_FROM + 1
+            old_profile = p.input_profile()
+            self.l.register_scope(scope, old_profile, p.document_pricing())
+            first = self.l.prepare(self.f.selection, old_profile, scope.id, self.f.key(), 'Read the fictional file.')
+            spent = self.answer(first, old_profile)
+            held = self.l.prepare(self.f.selection, old_profile, scope.id, self.f.key(), 'Read it again.')
+            self.l.claim(self.f.selection, held['id'])     # left unsettled: its full reservation stays charged
+        self.store.clock = lambda: p.VALID_FROM + 1
+        self.assertEqual((spent['chargedUnits'], spent['settled']), (100 * 100 + 80 * 500, True))
+        before = self.stored()
+        self.l.register_scope(scope, self.profile, self.price)       # the renewed build starting: carried forward
+        self.assertEqual(self.stored(), before, 'carrying forward writes nothing')
+        self.assertEqual(self.l.status(self.f.selection, first['id'])['chargedUnits'], spent['chargedUnits'])
+        self.assertEqual(self.l.status(self.f.selection, held['id'])['chargedUnits'], 1_110_000_000)
+        # 3.33 - 0.00005 spent - 1.11 held leaves room for exactly one more 1.11 reservation.
+        new = self.l.prepare(self.f.selection, self.profile, scope.id, self.f.key(), 'A renewed question.')
+        self.assertEqual(self.l.claim(self.f.selection, new['id'])[0]['chargedUnits'], 1_110_000_000)
+        extra = self.l.prepare(self.f.selection, self.profile, scope.id, self.f.key(), 'One question too many.')
+        with self.assertRaises(AttachmentError) as raised:
+            self.l.claim(self.f.selection, extra['id'])
+        self.assertEqual(raised.exception.code, 'document_budget_exhausted')
+        # The old held question settles at today's prices, which equal the ones it was reserved under.
+        view = self.l.status(self.f.selection, held['id'])
+        facts = ledger.ResultFacts(held['id'], view['claimNonce'], view['bodyDigest'], view['profileDigest'],
+                                   'accepted', 'a' * 64, 'msg_fictional_held', documents.MODEL, p.BILLING_REVISION, usage(100))
+        settled = self.l.record_result(self.f.selection, facts)
+        self.assertEqual((settled['settled'], settled['chargedUnits']), (True, p.usage_units(usage(100))))
+        config, halted = self.l._scope(scope.id)
+        self.assertEqual((config['limit'], halted), (3_330_000_000, False))
+        self.assertEqual(self.l.claim(self.f.selection, extra['id'])[0]['state'], 'claimed')
+
+    def test_a_carried_budget_with_another_scope_or_limit_is_still_refused(self):
+        """(b) Only the same budget carries forward: another scope id (rotation), revision or limit is refused."""
+        self.register_old()
+        for scope in (ledger.DocumentBudgetScope('fictional-renewed', 'v1', '2.22'),
+                      ledger.DocumentBudgetScope(self.scope.id, 'v1', '4.44'),
+                      ledger.DocumentBudgetScope(self.scope.id, 'v2', '2.22')):
+            with self.subTest(scope=scope), self.assertRaises(AttachmentError) as raised:
+                self.l.register_scope(scope, self.profile, self.price)
+            self.assertEqual(raised.exception.code, 'document_budget_conflict')
+        self.assertEqual(len(self.stored()), 1)
+
+    def refused_after(self, **old):
+        """(c) Only an exact listed predecessor whose terms equal today's carries forward: this one is refused."""
+        self.register_old(**old)
+        with self.assertRaises(AttachmentError) as raised:
+            self.l.register_scope(self.scope, self.profile, self.price)
+        self.assertEqual(raised.exception.code, 'document_budget_conflict')
+        d = self.f.draft(); self.f.upload(d); self.f.admit(d)
+        with self.assertRaises(AttachmentError) as raised:
+            self.l.prepare(self.f.selection, self.profile, self.scope.id, self.f.key(), 'Refused.')
+        self.assertEqual(raised.exception.code, 'document_budget_conflict')
+
+    def test_an_unlisted_earlier_qualification_is_still_refused(self):
+        self.refused_after(EVIDENCE_ID='haiku-pdf-png-2026-11-08', PRICING_REVISION='haiku-tiered-2026-11-08')
+
+    def test_a_listed_evidence_id_with_another_pricing_revision_is_still_refused(self):
+        self.refused_after(PRICING_REVISION='haiku-tiered-2026-11-08')
+
+    def test_a_listed_qualification_registered_at_other_prices_is_still_refused(self):
+        self.refused_after(HIGH=(500, 2500, 50, 625, 999))
+
+    def test_a_listed_predecessor_whose_terms_differ_from_today_drops_out(self):
+        self.assertEqual([pricing.qualification_id for _, pricing in p.predecessor_terms()], ['haiku-pdf-png-2026-11-15'])
+        for change in (dict(LOW=(100, 500, 10, 125, 199)), dict(LOW_THRESHOLD=200_000), dict(HIGH=(500, 2500, 50, 625, 999)),
+                       dict(PER_CALL_USD='1.12'), dict(MAX_INPUT=900_000), dict(EVIDENCE_ID='haiku-pdf-png-2026-11-15')):
+            with self.subTest(change=change), mock.patch.multiple(p, **change):
+                self.assertEqual(p.predecessor_terms(), ())
+
+    def test_carrying_forward_again_after_a_restart_is_idempotent(self):
+        """(d) Each start of the renewed build registers again; every time the same stored row carries forward."""
+        self.register_old()
+        before = self.stored()
+        for _ in range(3):
+            self.l = ledger.OfficerDocumentLedger(self.store)
+            self.l.register_scope(self.scope, self.profile, self.price)
+            self.assertEqual(self.stored(), before)
+
+    def test_requests_keep_the_qualification_they_were_prepared_under(self):
+        """(e) The ledger shows no budget history of its own (no view lists budgets); the trail is each request's
+        immutable record, which names the qualification it was prepared under, old or renewed."""
+        d = self.f.draft(); self.f.upload(d); self.f.admit(d)
+        with mock.patch.multiple(p, **self.OLD):
+            self.store.clock = lambda: p.VALID_FROM + 1
+            self.l.register_scope(self.scope, p.input_profile(), p.document_pricing())
+            old = self.l.prepare(self.f.selection, p.input_profile(), self.scope.id, self.f.key(), 'Before.')
+        self.store.clock = lambda: p.VALID_FROM + 1
+        self.l.register_scope(self.scope, self.profile, self.price)
+        new = self.l.prepare(self.f.selection, self.profile, self.scope.id, self.f.key(), 'After.')
+        evidence = {row['id']: json.loads(row['record'])['profile']['strict_budget_evidence']['token_bound_revision']
+                    for row in self.store.db.execute('SELECT id,record FROM officer_document_requests')}
+        self.assertEqual(evidence, {old['id']: 'haiku-pdf-png-2026-11-15', new['id']: p.EVIDENCE_ID})
+        config, _ = self.l._scope(self.scope.id)
+        self.assertEqual(config['pricing']['qualification_id'], 'haiku-pdf-png-2026-11-15')   # the stored budget is unchanged
+
     def test_closed_registration_and_full_both_geo_reservation(self):
         self.l.register_scope(self.scope,self.profile,self.price)
         config,_=self.l._scope(self.scope.id)

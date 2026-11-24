@@ -244,8 +244,11 @@ class OfficerDocumentLedger:
         with self.store._gate(), self.store._transaction():
             prior = self.store.db.execute('SELECT * FROM officer_document_scopes WHERE id=?',(scope.id,)).fetchone()
             if prior:
-                if prior['configuration'] != canonical(configuration): reject('document_budget_conflict')
-                return
+                if prior['configuration'] == canonical(configuration): return
+                # The same budget, registered under an exact listed predecessor qualification with identical terms,
+                # carries forward as it is: nothing is written, so its limit and every recorded charge stand.
+                if qualified and self._carries(self._scope(scope.id)[0], json.loads(canonical(configuration))): return
+                reject('document_budget_conflict')
             # One immutable global scope per registered profile; no rotation to escape debt.
             for existing in self.store.db.execute('SELECT configuration FROM officer_document_scopes'):
                 if json.loads(existing[0])['profile']['profile_id'] == profile.profile_id:
@@ -254,6 +257,32 @@ class OfficerDocumentLedger:
                 reject('document_budget_capacity')
             self.store.db.execute('INSERT INTO officer_document_scopes VALUES(?,?,?)',
                                  (scope.id,canonical(configuration),pack({'v':1,'halted':False},RECEIPT_BYTES)))
+
+    @staticmethod
+    def _carried(config):
+        """Today's qualified profile and pricing records, when this stored budget was registered under an exact listed
+        predecessor qualification whose terms equal today's; otherwise None.
+
+        The stored configuration is immutable (a trigger refuses any update), so a budget is never rebound or
+        re-registered. A carried budget keeps its own row: the same scope, limit and ceiling, and every request
+        charged to it, prepared under either qualification, still counts against that one limit. Only the
+        evidence id and pricing revision may differ; any other difference refuses the budget as before."""
+        if config['pricing'].get('qualification_id') is None:
+            return None
+        from officer_document_policy import predecessor_terms, input_profile, document_pricing
+        for profile, pricing in predecessor_terms():
+            if (config['profile'] == json.loads(canonical(asdict(profile)))
+                    and config['pricing'] == json.loads(canonical(asdict(pricing)))
+                    and config['ceiling'] == money(profile.strict_budget_evidence.usd_ceiling)):
+                return json.loads(canonical(asdict(input_profile()))), json.loads(canonical(asdict(document_pricing())))
+        return None
+
+    def _carries(self, stored, configuration):
+        """Whether registering ``configuration`` names exactly the ``stored`` budget, carried forward."""
+        carried = self._carried(stored)
+        return (carried is not None and carried == (configuration['profile'], configuration['pricing'])
+                and (stored['scope'], stored['limit'], stored['ceiling'])
+                == (configuration['scope'], configuration['limit'], configuration['ceiling']))
 
     def _scope(self, scope_id, profile=None, *, authority=False):
         row = self.store.db.execute('SELECT * FROM officer_document_scopes WHERE id=?',(scope_id,)).fetchone()
@@ -264,8 +293,10 @@ class OfficerDocumentLedger:
                 or config['scope']['id'] != scope_id or not integer(config['limit'],1,MAX_MONEY)
                 or not integer(config['ceiling'],1,config['limit'])):
             reject('document_record_invalid')
-        if profile is not None and config['profile'] != json.loads(canonical(asdict(profile))):
-            reject('document_budget_conflict')
+        if profile is not None:
+            wanted = json.loads(canonical(asdict(profile)))
+            if config['profile'] != wanted and (self._carried(config) or (None,))[0] != wanted:
+                reject('document_budget_conflict')
         if authority and config['pricing'].get('qualification_id') is not None:
             from officer_document_policy import current
             current(self.store.clock)
@@ -714,8 +745,10 @@ class OfficerDocumentLedger:
         p = config['pricing'];proof = config['profile']['strict_budget_evidence']
         if p.get('qualification_id') is not None:
             from officer_document_policy import usage_units, validate_pricing
+            # A carried budget prices with today's terms, which equal the ones it was registered with.
+            profile, p = self._carried(config) or (config['profile'], p)
             pricing = DocumentPricing(**p)
-            validate_pricing(self._profile_from(config), pricing)
+            validate_pricing(self._profile_from(dict(profile=profile)), pricing)
             cost = usage_units(usage)
             if not integer(cost,0,config['ceiling']): reject('document_usage_unverified')
             return cost
