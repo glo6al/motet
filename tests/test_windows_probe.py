@@ -13,12 +13,10 @@ spec = importlib.util.spec_from_file_location('windows_probe', SCRIPT)
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
 
-UP = 'C:\\' + 'Users' + '\\'      # built in pieces: the privacy check dislikes literal example account paths
-
 CTX = {
-    'profile': UP + r'demo',
-    'localappdata': UP + r'demo\AppData\Local',
-    'appdata': UP + r'demo\AppData\Roaming',
+    'profile': r'C:\Users\demo',
+    'localappdata': r'C:\Users\demo\AppData\Local',
+    'appdata': r'C:\Users\demo\AppData\Roaming',
     'user': 'demo',
     'pc': 'DEMO-PC',
 }
@@ -26,11 +24,11 @@ CTX = {
 
 class RedactionTests(unittest.TestCase):
     def test_profile_and_app_data_paths(self):
-        r = probe.redact(UP + r'demo\.codex\sessions', CTX)
+        r = probe.redact(r'C:\Users\demo\.codex\sessions', CTX)
         self.assertEqual(r, r'%USERPROFILE%\.codex\sessions')
         r = probe.redact(r'c:\users\DEMO\appdata\local\Programs\Codex\codex.exe', CTX)
         self.assertEqual(r, r'%LOCALAPPDATA%\Programs\Codex\codex.exe')
-        self.assertEqual(probe.redact(UP + r'demo\AppData\Roaming\Claude', CTX), r'%APPDATA%\Claude')
+        self.assertEqual(probe.redact(r'C:\Users\demo\AppData\Roaming\Claude', CTX), r'%APPDATA%\Claude')
 
     def test_forward_slashes_and_doubled_backslashes(self):
         self.assertEqual(probe.redact('C:/Users/demo/.claude', CTX), '%USERPROFILE%/.claude')
@@ -43,8 +41,8 @@ class RedactionTests(unittest.TestCase):
         self.assertIn('<pc>', r)
 
     def test_short_user_name_does_not_mangle_words(self):
-        ctx = dict(CTX, user='me', profile=UP + r'me', localappdata='', appdata='')
-        r = probe.redact('mesh pipe me-1 and %s' % UP + r'me\x', ctx)
+        ctx = dict(CTX, user='me', profile=r'C:\Users\me', localappdata='', appdata='')
+        r = probe.redact('mesh pipe me-1 and %s' % r'C:\Users\me\x', ctx)
         self.assertIn('mesh', r)
         self.assertEqual(r, 'mesh pipe <user>-1 and %USERPROFILE%\\x')
 
@@ -79,31 +77,31 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn('hooks key', src)
 
     def test_short_names_of_a_long_user_name(self):
-        ctx = dict(CTX, user='John Smith', profile=UP + r'John Smith', localappdata='', appdata='')
-        for text in (UP + r'JOHNSM~1\x', UP + r'johnsm~2', 'JohnSm~12'):
+        ctx = dict(CTX, user='John Smith', profile=r'D:\Profiles\John Smith', localappdata='', appdata='')
+        for text in (r'D:\Profiles\JOHNSM~1\x', r'D:\Profiles\johnsm~2', 'JohnSm~12'):
             r = probe.redact(text, ctx)
             self.assertNotIn('~', r, text)
-        self.assertEqual(probe.redact(UP + r'John Smith\.codex', ctx), r'%USERPROFILE%\.codex')
+        self.assertEqual(probe.redact(r'D:\Profiles\John Smith\.codex', ctx), r'%USERPROFILE%\.codex')
 
     def test_one_letter_user_name(self):
-        ctx = dict(CTX, user='a', profile=UP + r'a', localappdata='', appdata='', pc='PC1')
-        self.assertEqual(probe.redact(UP + r'a\x', ctx), r'%USERPROFILE%\x')
+        ctx = dict(CTX, user='a', profile=r'D:\Profiles\a', localappdata='', appdata='', pc='PC1')
+        self.assertEqual(probe.redact(r'D:\Profiles\a\x', ctx), r'%USERPROFILE%\x')
         self.assertEqual(probe.redact('codex-a-1', ctx), 'codex-<user>-1')
         self.assertEqual(probe.redact('found a pipe', ctx), 'found a pipe')
 
     def test_common_word_user_names_keep_placeholders_and_words(self):
         for name in ('User', 'code', 'admin'):
-            ctx = dict(CTX, user=name, profile='C:\\Users\\' + name, localappdata='', appdata='', pc='PC1')
-            r = probe.redact('C:\\Users\\%s\\.codex %%USERPROFILE%%\\x codex' % name, ctx)
+            ctx = dict(CTX, user=name, profile='D:\\Profiles\\' + name, localappdata='', appdata='', pc='PC1')
+            r = probe.redact('D:\\Profiles\\%s\\.codex %%USERPROFILE%%\\x codex' % name, ctx)
             self.assertEqual(r, '%USERPROFILE%\\.codex %USERPROFILE%\\x codex', name)
             self.assertEqual(probe.redact('\\\\.\\pipe\\%s\\x' % name, ctx), '\\\\.\\pipe\\<user>\\x')
             self.assertIn('%LOCALAPPDATA%', probe.redact(
-                'C:\\Users\\%s\\AppData\\Local\\x' % name,
-                dict(ctx, localappdata='C:\\Users\\%s\\AppData\\Local' % name)))
+                'D:\\Profiles\\%s\\AppData\\Local\\x' % name,
+                dict(ctx, localappdata='D:\\Profiles\\%s\\AppData\\Local' % name)))
 
     def test_placeholders_are_not_rewritten_by_later_steps(self):
         ctx = dict(CTX, user='USERPROFILE', pc='LOCALAPPDATA')
-        r = probe.redact(UP + r'demo\x and %LOCALAPPDATA%', ctx)
+        r = probe.redact(r'C:\Users\demo\x and %LOCALAPPDATA%', ctx)
         self.assertIn('%USERPROFILE%\\x', r)
 
 
@@ -139,7 +137,7 @@ class ToolTests(unittest.TestCase):
 
 class PathTests(unittest.TestCase):
     def test_app_aliases_and_shims_are_not_run(self):
-        self.assertIn('not run', probe.not_run_reason(UP + r'x\AppData\Local\Microsoft\WindowsApps\codex.exe'))
+        self.assertIn('not run', probe.not_run_reason(r'C:\Users\demo\AppData\Local\Microsoft\WindowsApps\codex.exe'))
         self.assertIn('not run', probe.not_run_reason(r'C:\npm\codex.cmd'))
         self.assertEqual(probe.not_run_reason(r'C:\Tools\codex.exe'), '')
 
