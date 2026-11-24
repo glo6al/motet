@@ -12,6 +12,13 @@ import watch_reply_hook as hook
 
 MARK = 'watch-peer-reply-hook-v1'
 LIMIT = 1024 * 1024
+NONE_ON_WINDOWS = 'No reply hooks to remove: automatic reply notices were never available on Windows.'
+
+
+def hook_folders_available():
+    """Removal opens each folder by handle, refusing links on the way (dir_fd); Windows has no such walk yet. Reply
+    notices were retired before they could be installed there, so a Windows profile has none to remove."""
+    return os.name == 'posix'
 
 
 def parent(path, create=False):
@@ -133,7 +140,15 @@ def main():
     args=parser.parse_args()
     if not args.remove or args.setup or args.credential_file:
         raise ValueError('Automatic reply notices have been removed; use --remove, optionally with --revoke.')
-    hook.require(os.name=='posix' and (args.remove or args.accept_native_parent_return))
+    if not hook_folders_available():
+        # Nothing was ever installed here. Revocation touches only Motet's database, under Motet's own lifetime lock.
+        if args.revoke:
+            sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
+            import peer_reply_delivery
+            peer_reply_delivery.revoke_offline(str(Path.home()/'.live-room'))
+        print(NONE_ON_WINDOWS+(' Saved reply-notice access was turned off.' if args.revoke else ''))
+        return
+    hook.require(args.remove or args.accept_native_parent_return)
     home=Path.home();state=home/'.live-room';store=state/'reply-hook';private_directory(state);private_directory(store)
     providers=['codex','claude'] if args.provider=='both' else [args.provider]
     paths={'codex':home/'.codex/hooks.json','claude':home/'.claude/settings.json'}

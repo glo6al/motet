@@ -56,15 +56,17 @@ class EnvelopeEncodingTests(unittest.TestCase):
 
 
 class PlatformTests(unittest.TestCase):
-    def test_unsupported_platform_refuses_before_state_access(self):
-        with patch.object(recovery.os, 'name', 'nt'), \
+    def test_system_without_the_folder_walk_refuses_before_state_access(self):
+        with patch.object(recovery.claude_channel, 'folder_walk_available', return_value=False), \
                 patch.object(recovery, 'private_directory', side_effect=AssertionError('State accessed')), \
                 patch.object(recovery.sqlite3, 'connect', side_effect=AssertionError('Database opened')):
             for apply in (False, True):
-                with self.subTest(apply=apply), self.assertRaisesRegex(recovery.RecoveryError, 'requires POSIX file locking'):
+                with self.subTest(apply=apply), self.assertRaises(recovery.RecoveryError) as raised:
                     recovery.recover('fictional-state', selected=[ident()], apply=apply)
+                self.assertEqual(str(raised.exception), recovery.UNAVAILABLE)
+                self.assertIn('not available on Windows yet', str(raised.exception))
 
-    def test_missing_fcntl_allows_import_but_refuses_recovery(self):
+    def test_imports_without_fcntl_and_refuses_with_its_reason_on_windows(self):
         original_import = builtins.__import__
         def without_fcntl(name, *args, **kwargs):
             if name == 'fcntl':
@@ -74,13 +76,19 @@ class PlatformTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         with patch.object(builtins, '__import__', side_effect=without_fcntl):
             spec.loader.exec_module(module)
-        self.assertIsNone(module.fcntl)
-        with patch.object(module, 'private_directory', side_effect=AssertionError('State accessed')):
-            with self.assertRaisesRegex(module.RecoveryError, 'requires POSIX file locking'):
+        self.assertFalse(hasattr(module, 'fcntl'))
+        with patch.object(module.claude_channel, 'folder_walk_available', return_value=False), \
+                patch.object(module, 'private_directory', side_effect=AssertionError('State accessed')):
+            with self.assertRaisesRegex(module.RecoveryError, '^Offline bridge recovery is not available on Windows yet'):
                 module.recover('fictional-state')
 
+    @unittest.skipUnless(os.name == 'nt', 'real Windows')
+    def test_windows_refuses_cleanly(self):
+        with self.assertRaisesRegex(recovery.RecoveryError, '^Offline bridge recovery is not available on Windows yet'):
+            recovery.recover(tempfile.gettempdir(), selected=[ident()], apply=True)
 
-@unittest.skipUnless(os.name == 'posix' and recovery.fcntl is not None, 'Recovery requires POSIX file locking')
+
+@unittest.skipUnless(recovery.claude_channel.folder_walk_available(), 'Recovery reads proof files by handle-based folder walk, which Windows lacks')
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -283,9 +291,17 @@ class RecoveryTests(unittest.TestCase):
 
     def test_active_writer_and_missing_lock_refuse_apply(self):
         row=self.ledger()
+        import fcntl
         with self.lock_path.open('rb') as lock:
-            recovery.fcntl.flock(lock.fileno(),recovery.fcntl.LOCK_EX|recovery.fcntl.LOCK_NB)
+            fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
             with self.assertRaisesRegex(recovery.RecoveryError,'writer is active'):self.run_recovery(row,apply=True)
+        # The lock exactly as Motet's messaging store takes it for its lifetime.
+        held=recovery.private_storage.open_lock_file(str(self.lock_path))
+        try:
+            self.assertTrue(recovery.private_storage.try_lock(held))
+            with self.assertRaisesRegex(recovery.RecoveryError,'writer is active'):self.run_recovery(row,apply=True)
+        finally:
+            recovery.private_storage.close_lock(held)
         self.lock_path.unlink()
         with self.assertRaises(recovery.RecoveryError):self.run_recovery(row,apply=True)
         self.assertFalse(self.lock_path.exists())

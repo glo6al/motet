@@ -4,10 +4,6 @@ Explicit owner retirement is separate from proof-based execution completion.
 No native dispatch, reply reconstruction, cancellation, or receipt fabrication.
 Sources are reread; reports from earlier investigations are never accepted as proof.
 """
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 import hashlib
 import hmac
 import json
@@ -19,15 +15,20 @@ import stat
 from datetime import datetime
 from urllib.parse import quote
 
+import claude_channel
 import claude_mod
 import codex_transcript
 import peer_bridge
 import peer_lifecycle
+import private_storage
 
 MAX_LINE = 32 * 1024 * 1024
 MAX_SOURCE = 4 * 1024 * 1024 * 1024
 MAX_STORE = 16 * 1024 * 1024
 MAX_SELECTED = 100
+UNAVAILABLE = ('Offline bridge recovery is not available on Windows yet: it reads its proof files by opening their '
+               'folders one by one and refusing links on the way, which Motet cannot do on Windows yet. The bridge '
+               'cannot send messages on Windows, so there is nothing here for it to recover.')
 HEX = re.compile(r'[0-9a-f]{64}')
 
 
@@ -638,8 +639,8 @@ def settle(db, ledger, evidence):
 
 
 def recover(state_dir, selected=None, *, retire_selected=None, apply=False, codex_sessions=None, claude_projects=None, claude_store=None):
-    if os.name != 'posix' or fcntl is None:
-        fail('Offline bridge recovery requires POSIX file locking and is unsupported on this platform.')
+    if not claude_channel.folder_walk_available():
+        fail(UNAVAILABLE)
     if apply and not selected and not retire_selected:
         fail('Apply requires an explicit client-ID allowlist.')
     combined = (selected or []) + (retire_selected or [])
@@ -654,9 +655,12 @@ def recover(state_dir, selected=None, *, retire_selected=None, apply=False, code
         if apply:
             lock_path = os.path.join(state_dir, 'officer-messages.lock')
             lock, _ = sources.open(state_dir, lock_path, private=True, limit=4096)
+            # Motet's own lifetime lock, taken as Motet takes it (private_storage.try_lock is flock on POSIX).
             try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = private_storage.try_lock(lock.fileno())
             except OSError:
+                held = False
+            if not held:
                 fail('The bridge writer is active; stop it before applying recovery.')
         dbpath = os.path.join(state_dir, 'officer-messages.sqlite3')
         _, dbstat = sources.open(state_dir, dbpath, private=True)

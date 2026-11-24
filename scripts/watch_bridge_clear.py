@@ -14,6 +14,14 @@ import uuid
 
 MAX_RESPONSE = 16384
 CONFIRM = 'retire_unknown_without_resend'
+# Kept in step with peer_bridge.BRIDGE_UNAVAILABLE; this script reads nothing from src.
+UNAVAILABLE = ('Bridge holds cannot be inspected or cleared on Windows. The agent-to-agent bridge is not available on '
+               'Windows yet, so no chat can be on hold through it here. Nothing was changed.')
+
+
+def bridge_available():
+    """The bridge runs only where chats can be found by handle-based folder walk: macOS and Linux for now."""
+    return os.name == 'posix'
 
 
 def canonical_id(value):
@@ -123,6 +131,10 @@ def main(argv=None):
         parser.error('Use the exact native recipient identifier.')
     if args.apply and not args.expected_agent:
         parser.error('--apply requires --expected-agent from inspection.')
+    if not bridge_available():
+        # Refused before the owner key is read or anything is sent: nothing can be on hold without the bridge.
+        print(UNAVAILABLE, file=sys.stderr)
+        return 1
     try:
         key = read_owner_key(args.state_dir)
         data = {selector: identifier}

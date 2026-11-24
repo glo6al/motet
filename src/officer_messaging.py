@@ -164,24 +164,13 @@ def check_database_companions(path):
     inherited access list. Refuse a journal (or a stray -wal/-shm) that is a link, junction, not a plain file or a
     file with a second name, so SQLite never writes through one to somewhere outside the private folder. A plain leftover journal is kept: SQLite needs it to
     roll back an interrupted write."""
-    for suffix in ('-journal', '-wal', '-shm'):
-        try:
-            info = os.lstat(path + suffix)
-        except FileNotFoundError:
-            continue
-        if (stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & private_storage.REPARSE_POINT
-                or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
-            raise OSError(DATABASE_REFUSED)
+    if not private_storage.sqlite_companions_plain(path):
+        raise OSError(DATABASE_REFUSED)
 
 
 def close_owner_lock(fd):
     """Release the lifetime lock and close it. Windows may hold a lock for a while after its file closes."""
-    if private_storage.WIN:
-        try:
-            private_storage.unlock(fd)
-        except OSError:
-            pass   # not held: closing is all that is left
-    os.close(fd)
+    private_storage.close_lock(fd)
 
 
 class MessagingStore:

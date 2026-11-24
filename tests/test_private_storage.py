@@ -388,6 +388,40 @@ class Lock(unittest.TestCase):
                     ps.open_lock_file(link)
 
 
+    def test_close_lock_releases_a_held_lock_and_closes_an_unheld_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(os.path.realpath(tmp), 'state')
+            ps.make_private_folder(folder)
+            path = os.path.join(folder, 'fixture.lock')
+            first, second = ps.open_lock_file(path), ps.open_lock_file(path)
+            self.assertTrue(ps.try_lock(first))
+            self.assertFalse(ps.try_lock(second))
+            ps.close_lock(second)                     # never held: simply closed
+            ps.close_lock(first)
+            third = ps.open_lock_file(path)
+            try:
+                self.assertTrue(ps.try_lock(third))
+            finally:
+                ps.close_lock(third)
+            with self.assertRaises(OSError):
+                os.fstat(first)
+
+
+class SqliteCompanions(unittest.TestCase):
+    def test_plain_journal_passes_and_a_second_name_or_folder_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = os.path.join(os.path.realpath(tmp), 'fixture.sqlite3')
+            self.assertTrue(ps.sqlite_companions_plain(database))
+            with open(database + '-journal', 'wb') as out:
+                out.write(b'fixture')
+            self.assertTrue(ps.sqlite_companions_plain(database))
+            os.link(database + '-journal', database + '-second')
+            self.assertFalse(ps.sqlite_companions_plain(database))
+            os.unlink(database + '-second')
+            os.mkdir(database + '-shm')
+            self.assertFalse(ps.sqlite_companions_plain(database))
+
+
 def icacls(*args):
     subprocess.run(['icacls'] + list(args), check=True, capture_output=True, timeout=30)
 
