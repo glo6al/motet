@@ -4899,13 +4899,55 @@ APP_ICON_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
 
 def app_icon(name, home=None):
     """Return (bytes, content type) for one owner icon, or None. Nothing from a request becomes a path: the name must
-    be one of APP_ICON_NAMES. The folders above the state folder (your home) are resolved once, as they always were
-    (``private_storage.anchored``); from there the shared no-link walk opens ``.live-room``, then ``app-icons`` inside
-    the folder it holds, then the icon inside that, refusing a link or junction at each of the three, on macOS, Linux
-    and Windows alike. The state folder is not required to be private here: an icon is not a secret, it is served only
-    to the owner's key under a draw-only policy, and the key's own checks (load_key, Motet's storage) guard the folder."""
+    be one of APP_ICON_NAMES. On macOS and Linux the state folder is opened by its path with the last name not
+    followed, so the folders above it need only search permission (a 0711 /home works), then app-icons and the icon
+    are opened inside it by descriptor with links refused. On Windows the folders above the state folder (your home)
+    are resolved once (``private_storage.anchored``), and from there the shared no-link walk opens ``.live-room``,
+    then ``app-icons``, then the icon, refusing a link or junction at each. The state folder is not required to be
+    private here: an icon is not a secret, it is served only to the owner's key under a draw-only policy, and the
+    key's own checks (load_key, Motet's storage) guard the folder."""
     if name not in APP_ICON_NAMES:
         return None
+    if WIN:
+        return _app_icon_windows(name, home)
+    import stat as _st
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    folder = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | nofollow
+    cur = fd = -1
+    try:
+        cur = os.open(os.path.join(home or HOME, '.live-room'), folder)
+        nxt = os.open('app-icons', folder, dir_fd=cur)
+        os.close(cur)
+        cur = nxt
+        for ext, ctype in (('.svg', 'image/svg+xml'), ('.png', 'image/png')):
+            try:
+                fd = os.open(name + ext, os.O_RDONLY | nofollow | getattr(os, 'O_NONBLOCK', 0), dir_fd=cur)
+            except FileNotFoundError:
+                continue
+            st = os.fstat(fd)
+            if not _st.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                return None
+            return _app_icon_body(fd, st, ctype)
+        return None
+    except OSError:
+        return None
+    finally:
+        for f in (fd, cur):
+            if f >= 0:
+                os.close(f)
+
+
+def _app_icon_body(fd, st, ctype):
+    """The size cap, a whole read and the PNG signature, the same on every system."""
+    if not 0 < st.st_size <= APP_ICON_MAX:
+        return None
+    body = os.read(fd, APP_ICON_MAX + 1)
+    if len(body) != st.st_size or ctype == 'image/png' and not body.startswith(b'\x89PNG\r\n\x1a\n'):
+        return None
+    return body, ctype
+
+
+def _app_icon_windows(name, home):
     try:
         with private_storage.open_folder(private_storage.anchored(os.path.join(home or HOME, '.live-room'))) as state, \
                 state.folder('app-icons') as icons:
@@ -4915,15 +4957,9 @@ def app_icon(name, home=None):
                 except FileNotFoundError:
                     continue
                 try:
-                    st = os.fstat(fd)
-                    if not 0 < st.st_size <= APP_ICON_MAX:
-                        return None
-                    body = os.read(fd, APP_ICON_MAX + 1)
+                    return _app_icon_body(fd, os.fstat(fd), ctype)
                 finally:
                     os.close(fd)
-                if len(body) != st.st_size or ctype == 'image/png' and not body.startswith(b'\x89PNG\r\n\x1a\n'):
-                    return None
-                return body, ctype
         return None
     except OSError:
         return None

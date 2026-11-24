@@ -119,6 +119,7 @@ class AppIconFolder(unittest.TestCase):
         self.link_folder(self.home, self.home.parent / (self.home.name + '-via-link'))
         self.assertEqual(server.app_icon('claude', home=str(self.links[-1])), (SVG, 'image/svg+xml'))
 
+    @unittest.skipUnless(server.WIN, 'Windows opens icons through the shared walk; macOS and Linux keep the path open')
     def test_icons_are_opened_through_the_shared_walk(self):
         (self.icons / 'claude.svg').write_bytes(SVG)
         calls = []
@@ -130,6 +131,34 @@ class AppIconFolder(unittest.TestCase):
         with unittest.mock.patch.object(server.private_storage, 'open_folder', recorded):
             self.assertEqual(self.get('claude'), (SVG, 'image/svg+xml'))
         self.assertEqual(calls, [os.path.join(os.path.realpath(str(self.home)), '.live-room')])
+
+    @unittest.skipIf(server.WIN, 'POSIX permission bits')
+    def test_a_search_only_folder_above_home_is_enough(self):
+        """As before the walk: a folder above home that others may only pass through (/home at 0711 on Linux)."""
+        if os.geteuid() == 0:
+            self.skipTest('root reads any folder, so a search-only folder proves nothing')
+        outer = self.home / 'outer'
+        home = outer / 'person'
+        icons = home / '.live-room' / 'app-icons'
+        icons.mkdir(parents=True)
+        (icons / 'claude.svg').write_bytes(SVG)
+        outer.chmod(0o111)
+        try:
+            with self.assertRaises(PermissionError):
+                os.listdir(outer)              # the premise: nothing here may read the folder
+            self.assertEqual(server.app_icon('claude', home=str(home)), (SVG, 'image/svg+xml'))
+            with unittest.mock.patch.object(server, 'HOME', str(home)):
+                self.assertEqual(server.app_icon('claude'), (SVG, 'image/svg+xml'))
+        finally:
+            outer.chmod(0o755)
+
+    def test_posix_keeps_its_own_opens(self):
+        """macOS and Linux do not go through the shared walk for icons (it needs read access on every folder)."""
+        if server.WIN:
+            self.skipTest('Windows uses the walk')
+        (self.icons / 'claude.svg').write_bytes(SVG)
+        with unittest.mock.patch.object(server.private_storage, 'open_folder', side_effect=AssertionError('walk used')):
+            self.assertEqual(self.get('claude'), (SVG, 'image/svg+xml'))
 
 
 @unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS or Linux')
