@@ -975,6 +975,29 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
             finally:
                 attachments.close()
 
+    @unittest.skipIf(os.name == 'nt', 'Attachments need the handle-based folder walk, which Windows lacks')
+    def test_failed_attachment_binding_leaves_no_closure_over_the_closed_store(self):
+        import attachments_native_composition
+        os.mkdir(os.path.join(self.home, '.live-room'), 0o700)
+        with patch.object(server, 'KEY', 'fictional-owner-key-for-attachments'):
+            attachments = server.start_attachments()
+        self.assertIsNotNone(attachments)
+        seen = []
+        def fail_after_setup(*args, **kwargs):
+            seen.append(attachments._native_legacy_managed_storage)
+            raise OSError('fictional binding failure')
+        try:
+            with patch.object(server, 'ATTACHMENTS', attachments), \
+                    patch.object(attachments_native_composition, 'bind_owner_runtime', side_effect=fail_after_setup):
+                self.assertEqual(server.start_messaging(), (None, server.MESSAGING_STORAGE_WHY))
+            self.assertIsNotNone(seen[0], 'binding had installed the closure before it failed')
+            self.assertIsNone(attachments._native_legacy_managed_storage)
+            with self.assertRaises(Exception) as refused:              # the ordinary refusal, not a closed database
+                attachments.native_selection('fictional-destination')
+            self.assertEqual(getattr(refused.exception, 'code', None), 'attachments_disabled')
+        finally:
+            attachments.close()
+
     def test_retained_attachment_state_without_a_folder_walk_is_refused_with_its_own_reason(self):
         import claude_channel
         import private_storage
@@ -987,8 +1010,12 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
         self.assertEqual(reason, 'Agent messaging cannot start here: its state folder holds attachment or '
                                  'managed-chat records that this system cannot check safely yet.')
         self.assertFalse(os.path.lexists(os.path.join(state, 'officer-messages.sqlite3')), 'the database was not opened')
-        again, _ = server.start_messaging()        # the refusal released the lifetime lock
-        self.assertIsNone(again)
+        lock = private_storage.open_lock_file(os.path.join(state, 'officer-messages.lock'))
+        try:
+            self.assertTrue(private_storage.try_lock(lock), 'the refusal released the lifetime lock')
+            private_storage.unlock(lock)
+        finally:
+            os.close(lock)
 
     @unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists')
     def test_windows_key_folder_is_created_private_and_messaging_accepts_it(self):

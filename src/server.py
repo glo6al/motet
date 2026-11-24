@@ -343,8 +343,9 @@ def load_key():
                 raise
     else:
         os.makedirs(d, mode=0o700, exist_ok=True)
-    # Windows has no owner ids or modes here, and nothing is checked: the folder is as private as the user profile's
-    # default permissions make it. Links are refused on both.
+    # Here only a link (or, on Windows, a junction) is refused on both systems; POSIX also requires the folder to be
+    # ours. On Windows a folder made above starts with a private access list; one made earlier keeps the profile's
+    # permissions. Motet's answers and agent messaging check the folder's owner and access list themselves.
     if os.path.islink(d) or (WIN and os.lstat(d).st_file_attributes & _st.FILE_ATTRIBUTE_REPARSE_POINT) \
             or (not WIN and os.stat(d).st_uid != os.getuid()):
         raise SystemExit('~/.live-room is a link' if WIN else '~/.live-room is not a private directory owned by you; refusing to start')
@@ -6387,6 +6388,9 @@ def start_messaging():
         return store, None
     except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, ImportError, NotImplementedError) as error:
         if store is not None:
+            if getattr(ATTACHMENTS, '_native_legacy_managed_storage', None) is not None:
+                # Binding may have left a check that reads this store's database; it is about to close.
+                ATTACHMENTS._native_legacy_managed_storage = None
             try:
                 store.close()    # releases the database and the lifetime lock, and stops attachment runtimes
             except Exception:
