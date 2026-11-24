@@ -42,6 +42,12 @@ import test_attachments_officer_storage
 import test_attachments_preview_lifetime
 import test_attachments_requests
 import test_attachments_store_boundary
+import test_officer_document_intents
+import test_officer_document_ledger
+import test_officer_document_live_fixture
+import test_officer_document_policy
+import test_officer_document_projection
+import test_officer_document_replay
 
 # Store suites whose every test runs again with the store on its Windows branch, except these. The simulation's
 # switches between Windows and POSIX are process-wide, so a test with two threads would see the other's switch; those
@@ -63,12 +69,22 @@ NOT_SIMULATED = {
     'test_close_fences_new_reads_and_removals_before_descriptor_teardown': 'watches POSIX descriptor teardown',
     'test_unlinked_remove_descriptor_close_failure_stays_charged': (
         "POSIX's removal owns its descriptor; on Windows the walk deletes through its own handle"),
+    # Motet's own file reading (step 6c.3). Its provider transport, coordinator and page routes call the provider on
+    # worker threads, so those suites run for real on Windows CI only; these run here as well.
+    'test_concurrent_claim_and_consume_have_single_winner': 'two threads',
+    'test_concurrent_claims_cannot_cross_shared_remaining_budget': 'two threads',
+    'test_concurrent_consumes_have_exactly_one_winner': 'two threads',
+    'test_view_is_one_locked_snapshot_before_concurrent_consume': 'two threads',
+    'test_actual_worker_process_exit_recovers_retained_without_dispatch': 'a child process, not simulated',
+    'test_preview_publication_holds_store_gate_against_revocation': 'two threads',
 }
 
 SUITES = (foundation.StoreTests, test_attachments_store_boundary, test_attachments_catalogue,
           test_attachments_conversations, test_attachments_deletion_slots, test_attachments_officer_storage,
           test_attachments_preview_lifetime, test_attachments_http, test_attachments_integration,
-          test_attachments_requests)
+          test_attachments_requests, test_officer_document_policy, test_officer_document_ledger,
+          test_officer_document_intents, test_officer_document_projection, test_officer_document_replay,
+          test_officer_document_live_fixture)
 
 
 def _simulated(base):
@@ -95,7 +111,8 @@ def _cases(suite):
     if isinstance(suite, type):
         return [suite]
     return [value for value in vars(suite).values() if isinstance(value, type) and issubclass(value, unittest.TestCase)
-            and value.__module__ == suite.__name__ and any(n.startswith('test') for n in dir(value))]
+            and value.__module__ == suite.__name__ and any(n.startswith('test') for n in dir(value))
+            and not value.__name__.startswith(('SimulatedWindows', 'Windows'))]      # already Windows-specific
 
 
 for _suite in SUITES:

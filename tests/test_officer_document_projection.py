@@ -12,9 +12,10 @@ from officer_document_projection import OfficerDocumentProjection
 from officer_document_intents import OfficerIntents
 import test_officer_document_intents as fixtures
 from test_officer_document_ledger import PNG
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 
-@unittest.skipUnless(os.name=='posix','Private files require POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class ProjectionTests(unittest.TestCase):
     def setUp(self):
         self.t=fixtures.IntentTests();self.t.setUp()

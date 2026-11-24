@@ -7,9 +7,12 @@ const {webcrypto,createHash} = require('node:crypto');
 const path = require('node:path');
 const {createOfficerDocumentsClient} = require('../src/web/officer-documents-client.js');
 const {createOfficerDocumentPending} = require('../src/web/officer-document-pending.js');
+const {PYTHON,stopFixture,WINDOWS} = require('./officer_document_fixture_process.js');
 const key = 'fictional-officer-browser-fixture-key';
-const child = spawn('python3', [path.join(__dirname, 'officer_document_live_fixture.py')],
-  {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:['ignore','pipe','pipe']});
+// On Windows the fixture is stopped through its standard input (see officer_document_fixture_process.js).
+const fixtureArgs = extra => [path.join(__dirname, 'officer_document_live_fixture.py'), ...extra, ...(WINDOWS ? ['--stop-on-stdin'] : [])];
+const fixtureOptions = {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:[WINDOWS?'pipe':'ignore','pipe','pipe']};
+const child = spawn(PYTHON, fixtureArgs([]), fixtureOptions);
 let logs = '', errors = '', secondary = null;
 child.stderr.on('data', b => { errors = (errors + b).slice(-10000); });
 const ready = new Promise((resolve,reject) => {
@@ -251,8 +254,7 @@ const ready = new Promise((resolve,reject) => {
     const gone=s.answers.find(a=>a.id===last.id);assert.equal(gone.state,'source_unavailable');assert.equal(gone.answeredAt,last.answeredAt);assert.equal(gone.priorAnswerWindow,null);assert.equal(s.usableFileCount,1);
     const windowMeta=await metadata();assert.equal(windowMeta.fakeProviderCalls,13);assert.equal(windowMeta.outboundBlocked,0);assert.equal(windowMeta.ordinaryAskBlocked,0);
 
-    secondary=spawn('python3',[path.join(__dirname,'officer_document_live_fixture.py'),'--reading-off'],
-      {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:['ignore','pipe','pipe']});
+    secondary=spawn(PYTHON,fixtureArgs(['--reading-off']),fixtureOptions);
     let secondaryLog='',secondaryErrors='';secondary.stderr.on('data',b=>secondaryErrors=(secondaryErrors+b).slice(-10000));
     const coldOrigin=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Management-only fixture startup timed out')),10000);secondary.stdout.on('data',b=>{secondaryLog+=b;const match=secondaryLog.match(/http:\/\/127\.0\.0\.1:\d+\//);if(match){clearTimeout(timer);resolve(match[0].slice(0,-1));}});secondary.once('exit',code=>{clearTimeout(timer);reject(Error('Management-only fixture exited '+code+' '+secondaryErrors));});});
     const managementRequests=[];
@@ -270,8 +272,8 @@ const ready = new Promise((resolve,reject) => {
     console.log('Motet document client: actual HTTP reading/Auto/history, recent-answer window, deletion withdrawal/reopen and reading-off cleanup/reload passed. 13 fictional calls, 0 external calls.');
   } finally {
     client?.dispose();
-    if(secondary){secondary.kill('SIGINT');await new Promise(resolve=>secondary.exitCode!==null?resolve():secondary.once('exit',resolve));}
-    child.kill('SIGINT');
+    if(secondary){stopFixture(secondary);await new Promise(resolve=>secondary.exitCode!==null?resolve():secondary.once('exit',resolve));}
+    stopFixture(child);
     await new Promise(resolve=>child.exitCode!==null?resolve():child.once('exit',resolve));
   }
 })().catch(e=>{console.error(e);if(errors)console.error(errors);process.exitCode=1;});

@@ -97,6 +97,9 @@ def main():
     parser.add_argument('--management-fault', choices=('none', 'unreadable-once'), default='none')
     parser.add_argument('--upload-fault', choices=('none', 'interrupted-once'), default='none')
     parser.add_argument('--trace-startup', action='store_true', help='Print a traceback if startup takes five seconds')
+    parser.add_argument('--stop-on-stdin', action='store_true',
+                        help='Also stop, as Ctrl-C does, when standard input reads "stop" or closes (Windows has no '
+                             'Ctrl-C for a child process)')
     args = parser.parse_args()
     if args.seed_count != 1 and not (args.seed_file or args.reading_off):
         parser.error('--seed-count requires --seed-file or --reading-off')
@@ -393,7 +396,14 @@ def main():
         stack.enter_context(patch.object(transport, '_tls_context',
                                        lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)))
         root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='watch-offline-browser-'))).resolve()
-        os.chmod(root, 0o700)
+        if os.name == 'nt':
+            # A private folder owned by this user: an elevated runner's new folders belong to Administrators, which
+            # the store refuses. It is removed with the temporary folder around it.
+            import private_storage
+            root = root / 'state'
+            private_storage.make_private_folder(str(root))
+        else:
+            os.chmod(root, 0o700)
         clock = AdvancingClock(policy.VALID_FROM + 60)
         store = AttachmentStore(str(root), enabled=True, owner_epoch=hashlib.sha256(KEY.encode()).hexdigest(),
                                 clock=clock)
@@ -531,6 +541,15 @@ def main():
         print('Fictional owner key: ' + KEY + '\nStop with Ctrl-C; temporary state is removed.', flush=True)
         if args.browser_fault != 'none':
             print('EXTRA TEST INSTRUMENTATION: ' + args.browser_fault, flush=True)
+        if args.stop_on_stdin:
+            import _thread
+
+            def stop_on_stdin():
+                for line in sys.stdin:
+                    if line.strip() == 'stop':
+                        break
+                _thread.interrupt_main()          # the same KeyboardInterrupt as Ctrl-C, in the serving thread
+            threading.Thread(target=stop_on_stdin, name='fixture-stdin-stop', daemon=True).start()
         try:
             httpd.serve_forever(poll_interval=0.2)
         except KeyboardInterrupt:

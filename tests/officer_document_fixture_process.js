@@ -39,9 +39,15 @@ function waitForOwnerReady(child,args,{now=ownerNow,started=now(),readStderr=()=
   });
 }
 
-async function ownerFixture(run,args=[],{model='claude-haiku-5-5',spawnChild=spawn,now=ownerNow,setTimer=setTimeout,clearTimer=clearTimeout,cleanupMs=5000,killWaitMs=1000}={}) {
-  const variant=['--model',model,'--trace-startup',...args],started=now();let child;
-  try{child=spawnChild('python3',[path.join(__dirname,'officer_document_live_fixture.py'),...variant],{env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:['ignore','pipe','pipe']});}
+// Windows has no Ctrl-C for a child: Node's SIGINT there kills it outright, so the fixture is asked to stop through
+// its standard input instead and still removes its temporary state. Elsewhere it gets SIGINT, as before.
+const WINDOWS=process.platform==='win32';
+const PYTHON=WINDOWS?'python':'python3';
+const stopFixture=WINDOWS?child=>{child.stdin.end('stop\n');}:child=>child.kill('SIGINT');
+
+async function ownerFixture(run,args=[],{model='claude-haiku-5-5',spawnChild=spawn,now=ownerNow,setTimer=setTimeout,clearTimer=clearTimeout,cleanupMs=5000,killWaitMs=1000,stop=stopFixture,stdinStop=WINDOWS}={}) {
+  const variant=['--model',model,'--trace-startup',...args,...(stdinStop?['--stop-on-stdin']:[])],started=now();let child;
+  try{child=spawnChild(PYTHON,[path.join(__dirname,'officer_document_live_fixture.py'),...variant],{env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:[stdinStop?'pipe':'ignore','pipe','pipe']});}
   catch(error){throw ownerFixtureError(`startup spawn failed (${error.message})`,variant,started,now,()=>'');}
   let stderr='',primaryFailed=false,childClosed=false;const readStderr=()=>stderr;
   const appendStderr=bytes=>{stderr=(stderr+bytes).slice(-OWNER_STDERR_LIMIT);};child.stderr.on('data',appendStderr);
@@ -52,7 +58,7 @@ async function ownerFixture(run,args=[],{model='claude-haiku-5-5',spawnChild=spa
   catch(error){primaryFailed=true;throw error;}
   finally{try{
     let signalError;
-    if(!childClosed&&child.pid&&child.exitCode===null&&child.signalCode===null)try{child.kill('SIGINT')}catch(error){signalError=error;}
+    if(!childClosed&&child.pid&&child.exitCode===null&&child.signalCode===null)try{stop(child)}catch(error){signalError=error;}
     if(!await within(cleanupMs)){if(child.pid)try{child.kill('SIGKILL')}catch(error){signalError=error;}const reaped=await within(killWaitMs);throw ownerFixtureError(`cleanup timed out (SIGKILL close observed=${reaped}${signalError?', signal error='+signalError.message:''})`,variant,started,now,readStderr);}
     if(signalError)throw ownerFixtureError('cleanup signal failed ('+signalError.message+')',variant,started,now,readStderr);
   }catch(error){if(!primaryFailed)throw error;}
@@ -111,11 +117,13 @@ async function ownerStartupChecks({causals=true}={}) {
   const safe=ownerFixtureError('startup timed out',args,0,()=>10,()=>privateTail).message;
   assert(!safe.includes(path.resolve(__dirname,'..'))&&!safe.includes(require('node:os').homedir()),'known private prefixes are redacted');
   function lifecycle(mode){const child=new EventEmitter();child.stdout=new EventEmitter();child.stderr=new EventEmitter();child.pid=42;child.exitCode=null;child.signalCode=null;const signals=[];let reaped=false,observed=false;child.kill=signal=>{signals.push(signal);if(mode==='kill-error'&&signal==='SIGINT')throw Error('fictional cleanup signal error');if(mode==='forced'&&signal==='SIGINT')return true;queueMicrotask(()=>{reaped=true;observed=child.listenerCount('close')>0;child.emit('close',0,signal)});return true;};queueMicrotask(()=>child.stdout.emit('data','OFFLINE fixture URL: http://127.0.0.1:42017/#fictional\n'));return {child,signals,reaped:()=>reaped,observed:()=>observed};}
-  const success=lifecycle('success');assert.equal(await ownerFixture(async()=>17,[],{spawnChild:()=>success.child}),17);assert(success.reaped(),'callback success waits for close');assert.equal(success.child.stderr.listenerCount('data'),0);assert.equal(success.child.listenerCount('close'),0);
-  const failure=lifecycle('kill-error'),primary=Error('fictional callback failure');await assert.rejects(()=>ownerFixture(async()=>{throw primary},[],{spawnChild:()=>failure.child,cleanupMs:0}),error=>error===primary,'cleanup cannot replace callback failure');assert(failure.observed(),'signal failure still waits for observed close');assert.deepEqual(failure.signals,['SIGINT','SIGKILL'],'failed first signal still reaches owned fallback');
-  const forced=lifecycle('forced');await assert.rejects(()=>ownerFixture(async()=>{},[],{spawnChild:()=>forced.child,cleanupMs:0}),/cleanup timed out \(SIGKILL close observed=true\)/);assert.deepEqual(forced.signals,['SIGINT','SIGKILL']);assert(forced.reaped(),'SIGKILL is followed by observed close');
+  // The cleanup order under test is the signal one on every system (the fakes take signals, not standard input).
+  const signalled={stop:child=>child.kill('SIGINT'),stdinStop:false};
+  const success=lifecycle('success');assert.equal(await ownerFixture(async()=>17,[],{...signalled,spawnChild:()=>success.child}),17);assert(success.reaped(),'callback success waits for close');assert.equal(success.child.stderr.listenerCount('data'),0);assert.equal(success.child.listenerCount('close'),0);
+  const failure=lifecycle('kill-error'),primary=Error('fictional callback failure');await assert.rejects(()=>ownerFixture(async()=>{throw primary},[],{...signalled,spawnChild:()=>failure.child,cleanupMs:0}),error=>error===primary,'cleanup cannot replace callback failure');assert(failure.observed(),'signal failure still waits for observed close');assert.deepEqual(failure.signals,['SIGINT','SIGKILL'],'failed first signal still reaches owned fallback');
+  const forced=lifecycle('forced');await assert.rejects(()=>ownerFixture(async()=>{},[],{...signalled,spawnChild:()=>forced.child,cleanupMs:0}),/cleanup timed out \(SIGKILL close observed=true\)/);assert.deepEqual(forced.signals,['SIGINT','SIGKILL']);assert(forced.reaped(),'SIGKILL is followed by observed close');
   if(causals){const Module=require('node:module'),source=require('node:fs').readFileSync(__filename,'utf8');for(const [before,after]of [["scrub(readStderr().slice(-OWNER_STDERR_LIMIT)).slice(-OWNER_STDERR_LIMIT)","''"],["child.on('close',onClose)","child.on('exit',onClose)"],["clearTimer(timer);","void timer;"]]){assert(source.includes(before));const mutant=new Module(__filename,module);mutant.filename=__filename;mutant.paths=module.paths;mutant._compile(source.replace(before,after),__filename);await assert.rejects(()=>mutant.exports.ownerStartupChecks({causals:false}),{name:'AssertionError'},'startup diagnostic causal guard');}}
   console.log('ok fixture startup diagnostics and listener cleanup');
 }
 
-module.exports={ownerFixture,waitForOwnerReady,ownerStartupChecks};
+module.exports={ownerFixture,waitForOwnerReady,ownerStartupChecks,PYTHON,stopFixture,WINDOWS};

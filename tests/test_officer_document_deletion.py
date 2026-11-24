@@ -26,7 +26,7 @@ from test_attachments_foundation import EPOCH
 from test_attachments_foundation import fence, metadata
 import test_officer_document_ledger as ledger_fixtures
 import test_officer_document_intents as intent_fixtures
-from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, private_folder
 
 
 @unittest.skipUnless(STORE, STORE_WHY)        # on Windows too: the cleanup worker runs there
@@ -381,7 +381,7 @@ class DeletionTests(unittest.TestCase):
         self.assertEqual(call('POST', '/deletions/' + p['id'] + '/confirm', {'fingerprint': p['fingerprint']}, cap + [('Idempotency-Key', self.f.key())])[0], 200)
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private files require POSIX.')  # borrows the ledger's storage setUp
+@unittest.skipUnless(STORE, STORE_WHY)  # borrows the ledger's storage setUp
 class AnswerDeletionTests(unittest.TestCase):
     def setUp(self): self.f = ledger_fixtures.ExecutionTests(); self.f.setUp(); self.l = OfficerDeletion(self.f.store)
     def tearDown(self): self.f.tearDown()
@@ -442,7 +442,7 @@ class AnswerDeletionTests(unittest.TestCase):
         self.assertEqual(store.db.execute('PRAGMA max_page_count').fetchone()[0], maximum)
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private files require POSIX.')  # borrows the intents' storage setUp
+@unittest.skipUnless(STORE, STORE_WHY)  # borrows the intents' storage setUp
 class PendingEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.f = intent_fixtures.IntentTests(); self.f.setUp()
@@ -512,13 +512,13 @@ class StartupDeletionTests(unittest.TestCase):
                  mock.patch('officer_document_deletion.DeletionWorker', side_effect=AssertionError('cleanup constructed')):
                 self.assertIsNone(server.start_attachments())
 
-    @unittest.skipUnless(os.name == 'posix', 'Private files require POSIX.')
+    @unittest.skipUnless(STORE, STORE_WHY)
     def test_policy_fallback_and_missing_credential_keep_exact_management_available(self):
         import server
         import officer_document_policy as policy
         for mode in ('reading_off', 'missing_allowance', 'expired_allowance', 'missing_credential'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
-                home = Path(os.path.realpath(temporary)); state = home / '.live-room'; state.mkdir(mode=0o700)
+                home = Path(os.path.realpath(temporary)); state = private_folder(home / '.live-room')
                 seed = AttachmentStore(state, enabled=True, owner_epoch=EPOCH)
                 cid = seed.create_conversation('room', 'fictional-seed-conversation')['id']
                 binding = dict(kind='officer', id='officer', scopeId='room', conversationId=cid,

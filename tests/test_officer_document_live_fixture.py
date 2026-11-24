@@ -11,6 +11,7 @@ import select
 import signal
 import socket
 import subprocess
+import threading
 import sys
 import time
 import unittest
@@ -20,11 +21,12 @@ import urllib.parse
 from unittest import mock
 
 import officer_document_live_fixture as fixture
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 KEY = 'fictional-officer-browser-fixture-key'
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class FixtureProcess(unittest.TestCase):
     expected_fake_calls = 0
     expected_ordinary_blocks = 0
@@ -34,13 +36,24 @@ class FixtureProcess(unittest.TestCase):
 
     def start(self, outcome='normal', *, arguments=None):
         flags = ['--reading-off', '--deletion-outcome', outcome] if arguments is None else arguments
+        # Windows has no Ctrl-C for a child process and cannot select on a pipe: there the fixture is stopped
+        # through its standard input, and its first line is read on a helper thread.
+        windows = os.name == 'nt'
         self.child = subprocess.Popen([sys.executable, str(Path(__file__).with_name('officer_document_live_fixture.py')),
-            '--trace-startup', *flags], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            '--trace-startup', *flags, *(['--stop-on-stdin'] if windows else [])],
+            stdin=subprocess.PIPE if windows else subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True)
         self.stopped = False
         self.addCleanup(self.stop)
-        ready, _, _ = select.select([self.child.stdout], [], [], 15)
-        line = self.child.stdout.readline() if ready else ''
+        if windows:
+            first = []
+            reader = threading.Thread(target=lambda: first.append(self.child.stdout.readline()), daemon=True)
+            reader.start()
+            reader.join(15)
+            line = first[0] if first else ''
+        else:
+            ready, _, _ = select.select([self.child.stdout], [], [], 15)
+            line = self.child.stdout.readline() if ready else ''
         match = re.search(r'http://127\.0\.0\.1:\d+', line)
         if match is None:
             self.stopped = True
@@ -67,10 +80,12 @@ class FixtureProcess(unittest.TestCase):
         if self.stopped:
             return
         self.stopped = True
-        if self.child.poll() is None:
+        windows = os.name == 'nt'
+        if self.child.poll() is None and not windows:
             self.child.send_signal(signal.SIGINT)
         try:
-            out, err = self.child.communicate(timeout=10)
+            # Windows: "stop" on standard input, which communicate writes and then closes.
+            out, err = self.child.communicate(input='stop\n' if windows else None, timeout=10)
         except subprocess.TimeoutExpired:
             self.child.kill()
             out, err = self.child.communicate(timeout=5)

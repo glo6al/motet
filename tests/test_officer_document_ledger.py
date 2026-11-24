@@ -23,6 +23,7 @@ from attachments_types import AttachmentError, canonical
 import test_attachments_officer_storage as storage_fixtures
 PDF, PNG = storage_fixtures.PDF, storage_fixtures.PNG
 from test_officer_documents import profile, response, wire
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 
 class MoneyTests(unittest.TestCase):
@@ -59,7 +60,7 @@ class MoneyTests(unittest.TestCase):
             self.rejects(value)
 
 
-@unittest.skipUnless(os.name=='posix','Private attachment storage requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class ExecutionTests(unittest.TestCase):
     def setUp(self):
         self.f = storage_fixtures.DirectStoreTests(); self.f.setUp()
@@ -400,6 +401,7 @@ class ExecutionTests(unittest.TestCase):
         self.error('source_changed',lambda:self.l.consume(permit,self.selection,r['id'],prepared.body_digest,state['profileDigest']))
         self.assertEqual(self.receipt(r)['state'],'claimed')
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)       # replaces the object by path and sets its POSIX mode
     def test_actual_inode_replacement_before_answer_refuses(self):
         r=self.prepare();candidate,_=self.accept(r)
         path=self.store.files.root/'objects'/self.sources[0];raw=path.read_bytes();path.unlink();path.write_bytes(raw);path.chmod(0o600)

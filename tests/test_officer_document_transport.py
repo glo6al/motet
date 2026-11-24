@@ -23,6 +23,7 @@ import officer_document_ledger as ledger_module
 from attachments_types import AttachmentError
 import test_officer_document_ledger as execution_fixtures
 from test_officer_documents import response, wire
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 KEY = 'fictional-host-key'
 REAL_TLS_CONTEXT = transport._tls_context
@@ -108,7 +109,7 @@ class LatentThread:
     def finish_late(self): self.target()
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private source lifetime requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class TransportTests(unittest.TestCase):
     def setUp(self):
         self.f = execution_fixtures.ExecutionTests()
@@ -612,6 +613,7 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(run.returncode,0,run.stderr.decode())
                 self.assertEqual(run.stdout,b'')
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)       # reads object identities through POSIX's objects descriptor
     def test_fifty_existing_sources_pin_atomically_without_resource_lock_expansion(self):
         ids=tuple(f'{100000+i:032x}' for i in range(50))
         for source_id in ids:
@@ -683,7 +685,7 @@ def uncertain_close_child(mode):
     os._exit(0)
 
 
-@unittest.skipUnless(os.name=='posix','Private source lifetime requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class QualifiedTransportTests(unittest.TestCase):
     def setUp(self):
         import test_officer_document_policy as policy_fixtures

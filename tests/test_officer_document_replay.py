@@ -14,10 +14,11 @@ import officer_document_ledger as ledger
 from attachments_store import AttachmentStore
 from attachments_types import AttachmentError
 import test_officer_document_ledger as execution
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 PDF,PNG=execution.PDF,execution.PNG
 
 
-@unittest.skipUnless(os.name=='posix','Private storage requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class GovernedReplayTests(unittest.TestCase):
     for name in ('setUp','tearDown','selection','error','add','prepare','claim','accept','complete','reopen','receipt'):
         locals()[name]=getattr(execution.ExecutionTests,name)
