@@ -521,8 +521,11 @@ def open_private_rw(path, create=False):
 
     With ``create`` a missing file is made private from the start (mode 0600, or a protected this-user/SYSTEM
     access list); an existing file is only checked, never repaired. Either way the opened file must be a private
-    regular file with one name. A failed open itself raises the system's own OSError, unchanged. On Windows the
-    handle does not share delete, so while it is open nobody can rename or replace the file behind it."""
+    regular file with one name, or PrivateStorageError is raised. On POSIX a failed open raises the system's own
+    OSError unchanged (ELOOP for a link, ENOENT for a missing file without ``create``). On Windows the open does
+    not follow a reparse point, so a link or junction is opened itself and refused as 'link'; a failed open raises
+    OSError('private storage open failed') carrying ``winerror``. The Windows handle does not share delete, so while
+    it is open nobody can rename or replace the file behind it."""
     if not WIN:
         flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0) | (os.O_CREAT if create else 0)
         fd = os.open(path, flags, 0o600)
