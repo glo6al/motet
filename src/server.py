@@ -1104,6 +1104,15 @@ SHELL_C = re.compile(r'^(?:ba|z|da)?sh\s+(?:-\w+\s+)*-\w*c\s+(["\'])(.*)\1\s*$',
 # Windows shells: `cmd /c ...` and `powershell -Command ...` (pwsh too, with or without .exe, any case). Other switches
 # may come first, and a switch may take one value (-ExecutionPolicy Bypass). The command text is group 1, quoted or not.
 WIN_C = re.compile(r'^(?:cmd(?:\.exe)?\s+(?:/\w+\s+)*/[ck]|(?:powershell|pwsh)(?:\.exe)?\s+(?:-(?!c\b|command\b)\w+(?:\s+(?!-)[^\s"\']+)?\s+)*-(?:c|command))\s+(.*)$', re.S | re.I)
+# Windows PowerShell treats the first word that is not a switch as the start of -Command (`powershell Remove-Item x`).
+# pwsh does not (it runs a file), and -File / -EncodedCommand are not command text. Only switches known to take a value
+# consume the next word, so `-NoProfile Remove-Item` is not read as a switch with a value.
+PS_VALUE = r'(?:executionpolicy|ep|ex|windowstyle|w|outputformat|of|o|inputformat|if|i|version|v|psconsolefile|configurationname)'
+PS_BARE = re.compile(r'^powershell(?:\.exe)?\s+(?:-' + PS_VALUE + r'\s+[^\s"\']+\s+|-(?!' + PS_VALUE +
+                     r'\b|c\b|command\b|f\b|file\b|e\b|ec\b|encodedcommand\b)\w+\s+)*(?!-)(\S.*)$', re.S | re.I)
+# A PowerShell script block or bash group around a command: `& { Remove-Item x -Recurse }`, `{ rm -rf x; }`.
+BLOCK_OPEN = re.compile(r'^(?:[&.]\s*)?\{\s*')
+BLOCK_CLOSE = re.compile(r'\s*\}$')
 
 
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1(.*?)\n\2\b", re.S)
@@ -1135,12 +1144,13 @@ def sub_end(cmd, j):
     return n + 1
 
 
-def segments(cmd, depth=0, mark=False, body=False):
+def segments(cmd, depth=0, mark=False, body=False, piped=None):
     """The commands a shell line would run, as far as a small parser can tell: split on ; | & and newlines outside
     quotes; heredoc bodies and # comments removed; sudo/env wrappers stripped; `sh -c "..."`, $(...) and backtick
     substitutions followed, including those in a heredoc whose tag is unquoted (the shell runs them). Text that is
     only an argument (to echo, python -c, a commit message) is not a command.
-    This is lexical: it says what a line asks for, not that it ran. With mark, a substitution leaves $() behind."""
+    This is lexical: it says what a line asks for, not that it ran. With mark, a substitution leaves $() behind.
+    With piped (a list), each command that reads from a single | is also added to it."""
     bodies = []
 
     def heredoc(m):
@@ -1151,6 +1161,7 @@ def segments(cmd, depth=0, mark=False, body=False):
     if not body:
         cmd = HEREDOC.sub(heredoc, cmd)
     out, cur, q, esc, subs, i, n = [], '', '"' if body else '', False, [], 0, len(cmd)
+    fed = []                                        # fed[k]: segment k+1 reads from a single |
     while i < n:
         ch = cmd[i]
         if esc:
@@ -1176,31 +1187,34 @@ def segments(cmd, depth=0, mark=False, body=False):
             continue
         elif ch in ';|&\n':
             out.append(cur); cur = ''
+            fed.append(ch == '|' and cmd[i - 1:i] != '|' and cmd[i + 1:i + 2] not in ('|', '&'))
         else:
             cur += ch
         i += 1
     out.append(cur)
     res = []
-    for seg in ([] if body else out):               # a heredoc body is text; only what it substitutes is run
-        seg = PREFIX.sub('', seg).strip()
+    for k, seg in enumerate([] if body else out):   # a heredoc body is text; only what it substitutes is run
+        seg = BLOCK_CLOSE.sub('', BLOCK_OPEN.sub('', PREFIX.sub('', seg).strip()))
         if not seg:
             continue
         m = SHELL_C.match(seg)
-        w = None if m else WIN_C.match(seg)
+        w = None if m else (WIN_C.match(seg) or PS_BARE.match(seg))
         if m and depth < 3:
-            res += segments(m.group(2), depth + 1, mark)
+            res += segments(m.group(2), depth + 1, mark, piped=piped)
         elif w and depth < 3:
             inner = w.group(1).strip()
             if len(inner) > 1 and inner[0] == inner[-1] and inner[0] in '"\'':
                 inner = inner[1:-1]
-            res += segments(inner, depth + 1, mark)
+            res += segments(inner, depth + 1, mark, piped=piped)
         else:
             res.append(seg)
+            if piped is not None and k and fed[k - 1]:
+                piped.append(seg)
     if depth < 3:
         for inner in subs:
-            res += segments(inner, depth + 1)
+            res += segments(inner, depth + 1, piped=piped)
         for inner in bodies:
-            res += segments(inner, depth + 1, body=True)
+            res += segments(inner, depth + 1, body=True, piped=piped)
     return res
 
 
@@ -1218,11 +1232,18 @@ def sql_text(seg):
     return ' '.join(re.sub(r"'(?:[^']|'')*'", "''", w) for w in words)
 
 
+# PowerShell's Remove-Item (and its aliases) deletes every item piped into it: `Get-ChildItem *.log | Remove-Item`.
+PIPED_DELETE = re.compile(r'^(?:remove-item|ri|rm|rmdir|rd|del|erase)\b', re.I)
+
+
 def risk(cmd):
     """A label when a command LOOKS outward-facing or destructive. Pattern match on the parsed commands."""
-    for seg in segments(cmd):
+    piped = []
+    for seg in segments(cmd, piped=piped):
         if re.match(r'(echo|printf)\b', seg):
             continue
+        if seg in piped and PIPED_DELETE.match(seg):
+            return 'delete'
         for label, rx in RISKS:
             if rx.search(seg):
                 return label
