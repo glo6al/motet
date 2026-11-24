@@ -3,6 +3,7 @@
 
 Run: python tests/test_private_storage.py
 """
+import ctypes
 import os
 import subprocess
 import sys
@@ -545,6 +546,43 @@ class PosixWalk(unittest.TestCase):
         reason(self, top.names, 'changed', 'folder')
 
 
+def full_dir_record(name, last=False, pad=0):
+    """One FILE_FULL_DIR_INFO record, 8-byte aligned, as GetFileInformationByHandleEx writes it."""
+    import struct
+    raw = name.encode('utf-16-le')
+    size = 68 + len(raw)
+    size += -size % 8 + pad
+    head = struct.pack('<II6qIII', 0 if last else size, 7, 1, 2, 3, 4, 100, 104, 0x20, len(raw), 0)
+    record = head + raw
+    return record + b'\0' * (size - len(record))
+
+
+class WindowsRecordParsing(unittest.TestCase):
+    """Pure parts of the Windows walk that run on every system: directory records and NtCreateFile's structures."""
+
+    def test_full_dir_info_records(self):
+        raw = b''.join([full_dir_record('.'), full_dir_record('..'), full_dir_record('chat.jsonl', pad=8),
+                        full_dir_record('Café 😀.jsonl', last=True)]) + b'\xff' * 40   # unused buffer after the last
+        self.assertEqual(ps._full_dir_names(raw), ['chat.jsonl', 'Café 😀.jsonl'])
+        self.assertEqual(ps._full_dir_names(full_dir_record('only', last=True)), ['only'])
+
+    def test_records_running_past_the_buffer_are_refused(self):
+        record = full_dir_record('chat.jsonl', last=True)
+        for broken in (record[:60], record[:70], full_dir_record('chat.jsonl')):   # cut short, or a next that is not there
+            with self.subTest(size=len(broken)), self.assertRaises(ps.PrivateStorageError):
+                ps._full_dir_names(broken)
+
+    @unittest.skipUnless(ctypes.sizeof(ctypes.c_void_p) == 8, 'NtCreateFile layouts checked for 64-bit Windows')
+    def test_nt_structures_match_64_bit_windows(self):
+        UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK = ps._nt_structures()
+        self.assertEqual((ctypes.sizeof(UNICODE_STRING), UNICODE_STRING.Buffer.offset), (16, 8))
+        self.assertEqual(ctypes.sizeof(OBJECT_ATTRIBUTES), 48)
+        self.assertEqual([getattr(OBJECT_ATTRIBUTES, f).offset for f in
+                          ('Length', 'RootDirectory', 'ObjectName', 'Attributes', 'SecurityDescriptor', 'SecurityQualityOfService')],
+                         [0, 8, 16, 24, 32, 40])
+        self.assertEqual(ctypes.sizeof(IO_STATUS_BLOCK), 16)
+
+
 class SimulatedWindowsWalk(unittest.TestCase):
     """The Windows walk's decisions with the Win32 and NT calls replaced by a model of a drive; runs on every system.
 
@@ -780,12 +818,23 @@ class SimulatedWindowsWalk(unittest.TestCase):
         self.assert_nothing_open()
 
     def test_held_folders_list_through_the_handle_and_open_children_through_the_hold(self):
+        claude_node = self.folder_nodes()[3]
+        claude_node['children']['con.corp'] = self.node('file')
         with ps.open_folder('C:\\Users\\example') as home:
-            with home.folder('.claude') as claude:
-                self.assertEqual(claude.names(), ['chat.jsonl'])
+            reason(self, home.names, 'unavailable', 'folder')          # not opened for listing
+            with home.folder('.claude', listing=True) as claude:
+                self.assertEqual(claude.names(), ['chat.jsonl', 'con.corp'])
                 claude.open('chat.jsonl', single_link=True)
                 self.assertEqual(len(self.log[-1][3]), 4, 'root, Users, example and .claude held')
-            for name in ('..', 'a\\b', 'chat.jsonl:secret', 'trailing.', 'trailing ', 'CON', 'nul.txt', 'COM1.jsonl', 'conout$'):
+                claude.open('con.corp')                                # device-like names are ordinary names here
+                with self.assertRaises(FileNotFoundError):
+                    claude.open('NUL')                                 # looked up as a name, never a device
+            accesses = {entry[0]: entry[1] for entry in self.log}
+            self.assertEqual(accesses['.claude'], ps._LIST_ACCESS, 'only the listed folder asks to list')
+            for name in ('C:\\', 'Users', 'example'):
+                self.assertEqual(accesses[name], ps._HOLD_ACCESS)
+                self.assertFalse(accesses[name] & ps._FILE_LIST_DIRECTORY)
+            for name in ('..', 'a\\b', 'chat.jsonl:secret', 'trailing.', 'trailing '):
                 with self.subTest(name=name):
                     reason(self, lambda: home.open(name), 'unavailable')
         reason(self, lambda: claude.open('chat.jsonl'), 'changed', 'folder')   # its parent's hold is gone
@@ -794,7 +843,7 @@ class SimulatedWindowsWalk(unittest.TestCase):
     def test_paths_outside_plain_drive_paths_are_refused_before_any_open(self):
         for path in ('\\\\server\\share\\chat.jsonl', '\\\\?\\C:\\Users\\example\\chat.jsonl', '\\\\.\\C:\\chat.jsonl',
                      '//server/share/chat.jsonl', 'C:\\Users\\example\\chat.jsonl:stream',
-                     'C:\\Users\\example.\\chat.jsonl', '1:\\chat.jsonl', 'C:\\Users\\AUX\\chat.jsonl'):
+                     'C:\\Users\\example.\\chat.jsonl', '1:\\chat.jsonl'):
             with self.subTest(path=path):
                 with self.assertRaises(ps.PrivateStorageError) as raised:
                     ps.open_folder(path)
@@ -964,9 +1013,10 @@ class WindowsWalk(unittest.TestCase):
             self.assertTrue(os.path.samestat(os.fstat(fd), os.stat(self.middle)))
         finally:
             os.close(fd)
-        with ps.open_folder(self.top) as top, top.folder('middle') as middle:
+        with ps.open_folder(self.top) as top, top.folder('middle', listing=True) as middle:
             self.assertEqual(middle.names(), ['notes.jsonl'])
             self.assertEqual(self.read(middle.open('notes.jsonl')), b'fixture\n')
+            self.assertTrue(os.path.samestat(middle.stat(), os.stat(self.middle)))
 
     def test_a_junction_in_any_folder_position_is_refused(self):
         for link, target, path in ((os.path.join(self.base, 'top-junction'), self.top,
@@ -1019,11 +1069,12 @@ class WindowsWalk(unittest.TestCase):
         finally:
             subprocess.run(['subst', drive, '/d'], capture_output=True, timeout=30)
 
-    def test_reserved_device_names_are_refused(self):
-        with ps.open_folder(self.middle) as middle:
+    def test_device_names_below_the_root_are_only_names(self):
+        with ps.open_folder(self.middle, listing=True) as middle:
+            self.assertEqual(middle.names(), ['notes.jsonl'])
             for name in ('NUL', 'con.txt', 'COM1.jsonl'):
-                with self.subTest(name=name):
-                    reason(self, lambda: middle.open(name), 'unavailable')
+                with self.subTest(name=name), self.assertRaises(FileNotFoundError):
+                    middle.open(name)          # Win32 would open a device for some of these; a relative open does not
 
     def test_second_name_and_privacy(self):
         os.link(self.file, os.path.join(self.middle, 'second-name'))
