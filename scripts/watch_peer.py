@@ -17,9 +17,12 @@ import peer_bridge as p
 import claude_channel
 import private_storage
 
-# Commands that set up or use bridge messaging. Where the bridge cannot find chats (Windows for now) they refuse
-# with one reason; status and revoke still read and turn off saved access.
+# Commands that set up or use bridge messaging. Where the bridge cannot find chats (a system without the no-link
+# folder walk) they refuse with one reason; status and revoke still read and turn off saved access.
 NEEDS_BRIDGE = ('init', 'rotate', 'config', 'enroll', 'policy')
+# The Antigravity plugin and its pull inbox check their files with POSIX owner and mode bits only.
+ANTIGRAVITY_UNAVAILABLE = ('The Antigravity plugin and inbox need macOS or Linux. On Windows, connect Codex or '
+                           'Claude Code to the bridge with --client codex or --client claude instead.')
 
 
 class BridgeUnavailable(ValueError):
@@ -179,13 +182,16 @@ def read_credential(path, *, exact_mode=False):
     return data
 
 
-def config(path, node=None):
+def config(path, node=None, python=None):
     read_credential(path)
     node = node or shutil.which('node')
     if not node:
         raise ValueError('Node.js is required.')
-    return {'mcpServers': {'watch-peer': {'command': os.path.abspath(node),
-            'args': [str(ROOT / 'integrations/claude/peer.mjs'), '--credential', os.path.abspath(path)]}}}
+    args = [str(ROOT / 'integrations/claude/peer.mjs'), '--credential', os.path.abspath(path)]
+    if private_storage.WIN:
+        # Node cannot read a Windows access list: the adapter asks this Python to check and read the credential.
+        args += ['--python', os.path.abspath(python or sys.executable)]
+    return {'mcpServers': {'watch-peer': {'command': os.path.abspath(node), 'args': args}}}
 
 
 class AntigravityPathError(ValueError):
@@ -327,6 +333,8 @@ def main(argv=None):
     if args.command in NEEDS_BRIDGE and not p.bridge_available():
         raise BridgeUnavailable(p.BRIDGE_UNAVAILABLE)
     if args.command == 'config':
+        if args.client == 'antigravity' and private_storage.WIN:
+            raise BridgeUnavailable(ANTIGRAVITY_UNAVAILABLE)
         if args.inbox_credential and args.client != 'antigravity':
             raise ValueError('Inbox receiving is configured only for the Antigravity plugin.')
         if args.client == 'antigravity':

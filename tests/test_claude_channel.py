@@ -19,25 +19,43 @@ import server
 from legacy_claude_fixture import seed_legacy_claude
 
 
-class ChannelWithoutFolderWalk(unittest.TestCase):
-    """Windows has no handle-based folder walk yet: channel discovery is off with a plain reason, never a crash."""
+class ChannelOffOnWindows(unittest.TestCase):
+    """The old channel's files are written by Node, which cannot make a file private on Windows: discovery is off
+    there with a plain reason, never a crash, and never by loosening the access-list rule."""
 
-    def test_discovery_is_off_with_a_reason_and_configured_is_false(self):
+    def check_off(self):
         with tempfile.TemporaryDirectory() as temp:
             root = os.path.join(temp, 'claude-channels')
             os.mkdir(root)
             os.mkdir(os.path.join(root, str(uuid.uuid4())))
-            with patch.object(channel, 'folder_walk_available', return_value=False):
-                with self.assertRaises(channel.ChannelError) as refused:
-                    channel.discover(root, str(uuid.uuid4()))
-                self.assertEqual(str(refused.exception), channel.FOLDER_WALK_UNAVAILABLE)
-                self.assertFalse(channel.any_configured(root))
+            with self.assertRaises(channel.ChannelError) as refused:
+                channel.discover(root, str(uuid.uuid4()))
+            self.assertEqual(str(refused.exception), channel.CHANNEL_UNAVAILABLE)
+            self.assertFalse(channel.any_configured(root))
+        self.assertIn('need macOS or Linux', channel.CHANNEL_UNAVAILABLE)
+        self.assertIn('Motet plugin', channel.CHANNEL_UNAVAILABLE)
 
-    def test_this_system_reports_the_walk_truthfully(self):
-        self.assertEqual(channel.folder_walk_available(), os.name == 'posix')
+    @unittest.skipIf(os.name == 'nt', 'real Windows is checked below')
+    def test_simulated_windows(self):
+        from windows_simulation import simulated_windows
+        with simulated_windows():
+            self.assertFalse(channel.channel_available())
+            self.check_off()
+
+    def test_a_system_without_the_folder_walk(self):
+        with patch.object(channel.private_storage, 'folder_walk_available', return_value=False):
+            self.assertFalse(channel.channel_available())
+            self.check_off()
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows')
+    def test_windows(self):
+        self.check_off()
+
+    def test_this_system_reports_the_channel_truthfully(self):
+        self.assertEqual(channel.channel_available(), os.name == 'posix')
 
 
-@unittest.skipIf(os.name == 'nt', 'Channel discovery walks folders by handle (dir_fd), which Windows lacks')
+@unittest.skipIf(os.name == 'nt', 'The old Claude channel runs on macOS and Linux only')
 class ClaudeChannelTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

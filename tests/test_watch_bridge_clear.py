@@ -39,7 +39,8 @@ class WindowsRefusalTests(unittest.TestCase):
         with patch.object(cli, 'bridge_available', return_value=False):
             self.run_refused(['--port', '1', '--request-id', PUBLIC])
             self.run_refused(['--port', '1', '--transport-id', TID, '--expected-agent', AGENT, '--apply'])
-        self.assertIn('not available on Windows yet', cli.UNAVAILABLE)
+        self.assertIn('on Windows yet', cli.UNAVAILABLE)
+        self.assertIn('Chats on hold', cli.UNAVAILABLE)
         self.assertNotIn('Traceback', cli.UNAVAILABLE)
 
     @unittest.skipUnless(os.name == 'nt', 'real Windows')

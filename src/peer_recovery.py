@@ -15,7 +15,6 @@ import stat
 from datetime import datetime
 from urllib.parse import quote
 
-import claude_channel
 import claude_mod
 import codex_transcript
 import peer_bridge
@@ -26,9 +25,9 @@ MAX_LINE = 32 * 1024 * 1024
 MAX_SOURCE = 4 * 1024 * 1024 * 1024
 MAX_STORE = 16 * 1024 * 1024
 MAX_SELECTED = 100
-UNAVAILABLE = ('Offline bridge recovery is not available on Windows yet: it reads its proof files by opening their '
-               'folders one by one and refusing links on the way, which Motet cannot do on Windows yet. The bridge '
-               'cannot send messages on Windows, so there is nothing here for it to recover.')
+UNAVAILABLE = ('Offline bridge recovery is not available on Windows yet: it checks its proof files with Mac and Linux '
+               'owner and permission rules, which Windows does not have. Nothing was changed. To free a chat on hold, '
+               'use Settings, Connections, Chats on hold in Motet.')
 HEX = re.compile(r'[0-9a-f]{64}')
 
 
@@ -638,8 +637,13 @@ def settle(db, ledger, evidence):
     return 'recovered'
 
 
+def recovery_available():
+    """Proof files are opened by the no-link walk and then checked by POSIX owner and mode: macOS and Linux only."""
+    return not private_storage.WIN and private_storage.folder_walk_available()
+
+
 def recover(state_dir, selected=None, *, retire_selected=None, apply=False, codex_sessions=None, claude_projects=None, claude_store=None):
-    if not claude_channel.folder_walk_available():
+    if not recovery_available():
         fail(UNAVAILABLE)
     if apply and not selected and not retire_selected:
         fail('Apply requires an explicit client-ID allowlist.')

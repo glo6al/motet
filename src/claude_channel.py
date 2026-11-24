@@ -9,12 +9,19 @@ import stat
 import threading
 import uuid
 
+import private_storage
+
 PEER_IDENTITY_REASON = 'Claude peer receiving is unavailable: native conversation identity can change while its channel remains connected.'
 START_HINT = ('Start a new owner-connected Claude session with python3 scripts/watch_claude.py; already-open sessions cannot attach. '
               'After /clear, /resume or a fork, owner messages go to the conversation currently open in that process; close and relaunch to restore targeting.')
 MAX_RESPONSE = 100000
-FOLDER_WALK_UNAVAILABLE = ('Claude channel sessions started with scripts/watch_claude.py need macOS or Linux for now. '
-                           'On this system, message Claude chats through the Motet plugin instead.')
+# The old Claude channel (scripts/watch_claude.py and integrations/claude/channel.mjs) stays on macOS and Linux. Its
+# discovery file is written by Node, which cannot give a Windows file a private access list (only this user and
+# SYSTEM, nothing inherited), so Motet's own rule would refuse it; and the channel checks its folders with owner
+# and mode bits, which Windows does not have. Motet does not loosen the rule to read it.
+CHANNEL_UNAVAILABLE = ('Claude channel sessions started with scripts/watch_claude.py need macOS or Linux. On Windows '
+                       'the channel\'s files are written by Node, which cannot make a file private to you there, so '
+                       'Motet would not trust them. On this system, message Claude chats through the Motet plugin instead.')
 
 
 class ChannelError(Exception):
@@ -28,10 +35,9 @@ def is_uuid(value):
         return False
 
 
-def folder_walk_available():
-    """Channel discovery opens every folder by handle, refusing links on the way (``dir_fd``); Windows has no such walk yet."""
-    return (os.name == 'posix' and hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW')
-            and os.open in os.supports_dir_fd)
+def channel_available():
+    """The channel's discovery is read only where its files can be private by owner and mode: macOS and Linux."""
+    return not private_storage.WIN and private_storage.folder_walk_available()
 
 
 def _private(st, directory=False):
@@ -40,34 +46,18 @@ def _private(st, directory=False):
         raise ChannelError('Claude channel discovery must be private and owned by you. ' + START_HINT)
 
 
-def _directory(path):
-    """Walk directories by fd, rejecting links in every component."""
-    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for part in os.path.abspath(path).split(os.sep):
-            if not part:
-                continue
-            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = nxt
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
 def discover(root, session_id):
     if not is_uuid(session_id):
         raise ChannelError('Invalid Claude session identifier.')
-    if not folder_walk_available():
-        raise ChannelError(FOLDER_WALK_UNAVAILABLE)
-    root_fd = session_fd = fd = None
+    if not channel_available():
+        raise ChannelError(CHANNEL_UNAVAILABLE)
+    folder = session = fd = None
     try:
-        root_fd = _directory(root)
-        _private(os.fstat(root_fd), True)
-        session_fd = os.open(session_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
-        _private(os.fstat(session_fd), True)
-        fd = os.open('connection.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=session_fd)
+        folder = private_storage.open_folder(root)
+        _private(folder.stat(), True)
+        session = folder.folder(session_id)
+        _private(session.stat(), True)
+        fd = session.open('connection.json')
         _private(os.fstat(fd))
         raw = os.read(fd, 8193)
         if len(raw) > 8192:
@@ -86,9 +76,11 @@ def discover(root, session_id):
     except (OSError, ValueError, TypeError):
         raise ChannelError('No readable private Claude channel is connected. ' + START_HINT) from None
     finally:
-        for opened in (fd, session_fd, root_fd):
-            if opened is not None:
-                os.close(opened)
+        if fd is not None:
+            os.close(fd)
+        for held in (session, folder):
+            if held is not None:
+                held.close()
 
 
 def identity(descriptor):
@@ -105,7 +97,7 @@ def pinned(root, expected):
 
 
 def any_configured(root):
-    if not folder_walk_available():
+    if not channel_available():
         return False
     try:
         # Capability reporting only; sends always revalidate their exact descriptor.

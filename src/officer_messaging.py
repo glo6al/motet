@@ -126,6 +126,12 @@ def public(row):
     return result
 
 
+def posix_records_checkable():
+    """Attachment and managed-chat records, and Codex reply tracking, are checked with the POSIX folder walk, owner
+    and mode bits (and fcntl): macOS and Linux only."""
+    return not private_storage.WIN and private_storage.folder_walk_available()
+
+
 def private_state_folder(state_dir):
     """Make the messaging state folder if it is missing, then refuse it unless it is private to this user.
 
@@ -284,9 +290,10 @@ class MessagingStore:
                       root / 'managed-claude' / 'registry.sqlite3')
         if not any(present(path) for path in candidates):
             return None
-        if not claude_channel.folder_walk_available():
-            # The fence opens these records by handle-based folder walk (and fcntl), which Windows lacks. They can
-            # only have come from a Mac or Linux copy of this folder; refuse rather than open the database unfenced.
+        if not posix_records_checkable():
+            # The fence opens these records by the POSIX folder walk and fcntl, so it runs on macOS and Linux only.
+            # Elsewhere they can only have come from a Mac or Linux copy of this folder; refuse rather than open the
+            # database unfenced.
             raise MessagingStorageUnavailable(RETAINED_STATE_UNAVAILABLE)
         from attachments_native_namespace import NativeNamespaceFence
         fence = NativeNamespaceFence(state_dir)
@@ -1709,9 +1716,10 @@ class MessagingStore:
         for row in rows:
             if row.get('transport') == claude_mod.TRANSPORT:
                 continue  # HTTP claims/events exclusively own these rows; no stale tick writeback.
-            if row.get('runtime') == 'codex' and not claude_channel.folder_walk_available():
-                # Windows: a Codex row can only have come from a copy of a Mac's folder. Sending and reply
-                # tracking read its transcript by a folder walk Windows lacks; leave the row exactly as it is.
+            if row.get('runtime') == 'codex' and not posix_records_checkable():
+                # Windows: a Codex row can only have come from a copy of a Mac's folder, since sending to Codex needs
+                # the Mac app. Its sending and reply tracking check transcripts with POSIX owner and mode rules;
+                # leave the row exactly as it is.
                 continue
             if self.stop.is_set():
                 break

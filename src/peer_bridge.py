@@ -32,11 +32,11 @@ MAX_TOMBSTONES = 100000
 MAX_CHALLENGE_ENTRIES = 4096
 PEER_WARNING = 'This session may have received peer input before answering.'
 HEX = re.compile(r'[0-9a-f]{64}\Z')
-# One reason, shown wherever the bridge refuses on a system without the handle-based folder walk (Windows for now).
-BRIDGE_UNAVAILABLE = ('The agent-to-agent bridge is not available on Windows yet. It finds chats by opening their '
-                      'folders one by one and refusing links on the way, which Motet cannot do on Windows yet, so '
-                      'agents cannot list or message each other through Motet here. Your own messages to Claude chats '
-                      'on the stage still work.')
+# One reason, shown wherever the bridge refuses on a system that cannot open folders by handle without following
+# links (macOS, Linux and Windows all can; this is for anything else, or a Windows whose system calls do not load).
+BRIDGE_UNAVAILABLE = ('The agent-to-agent bridge is not available on this system. It finds chats by opening their '
+                      'folders one by one and refusing links on the way, which Motet cannot do here, so agents cannot '
+                      'list or message each other through Motet. Your own messages to Claude chats on the stage still work.')
 # Windows refusals from private_storage, in fixed words (the POSIX checks keep their own, older words).
 STATE_FOLDER_REFUSED = 'Motet bridge storage must be a private folder owned by you.'
 STATE_FILE_REFUSED = 'Motet bridge storage must be a private file owned by you.'
@@ -108,7 +108,7 @@ def transaction(db, lock=None):
 
 def bridge_available():
     """False where chats cannot be found for the bridge: the chat directory needs the handle-based folder walk."""
-    return claude_channel.folder_walk_available()
+    return private_storage.folder_walk_available()
 
 
 def _make_private_folders(path):
@@ -139,7 +139,7 @@ def private_directory(path, create=False):
         return path
     if create:
         os.makedirs(path, mode=0o700, exist_ok=True)
-    fd = claude_channel._directory(path)
+    fd = private_storage.open_no_links(path, directory=True)
     try:
         claude_channel._private(os.fstat(fd), True)
     finally:

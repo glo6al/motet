@@ -5898,10 +5898,9 @@ def shared_directory_snapshot(store):
 
 def configure_shared_directory(store, home):
     import chat_directory
-    import claude_channel
     import claude_mod
-    if not claude_channel.folder_walk_available():
-        # The shared chat directory reads transcripts by handle-based folder walk, which Windows lacks for now.
+    if not private_storage.folder_walk_available():
+        # The shared chat directory reads transcripts through the no-link folder walk (macOS, Linux and Windows).
         # Without it the bridge has no directory; owner messaging to Claude chats on the stage is unaffected.
         return
     def factory(policy):

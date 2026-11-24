@@ -3,8 +3,9 @@ import json
 import os
 import re
 import sqlite3
-import stat
 from urllib.parse import quote
+
+import private_storage
 
 MAX_HEADER = 1_000_000
 MAX_ENTRIES = 20000
@@ -50,26 +51,23 @@ def pure_text(content, role):
 
 def open_regular(root, path):
     """Validate every component and keep the descriptor used to read evidence."""
-    if not (hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW') and os.open in os.supports_dir_fd):
+    if not private_storage.folder_walk_available():
         raise Unavailable('Codex transcripts are read by a handle-based folder walk, which this system lacks.')
     root, path = os.path.abspath(root), os.path.abspath(path)
     if os.path.commonpath((root, path)) != root:
         raise Unavailable('Codex transcript is outside its configured root.')
-    parent = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        parts = path.split(os.path.sep)
-        for part in parts[1:-1]:
-            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-            os.close(parent)
-            parent = nxt
-        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        fd = private_storage.open_no_links(path, single_link=True)
+    except private_storage.PrivateStorageError as error:
+        if error.reason in ('not_regular', 'links'):
+            raise Unavailable('Codex transcript is not a plain regular file.') from None
+        raise
+    try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            os.close(fd)
-            raise Unavailable('Codex transcript is not a plain regular file.')
-        return os.fdopen(fd, 'rb'), st
-    finally:
-        os.close(parent)
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, 'rb'), st
 
 
 def header(source, ident, project=None):

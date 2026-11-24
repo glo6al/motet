@@ -56,8 +56,13 @@ class EnvelopeEncodingTests(unittest.TestCase):
 
 
 class PlatformTests(unittest.TestCase):
-    def test_system_without_the_folder_walk_refuses_before_state_access(self):
-        with patch.object(recovery.claude_channel, 'folder_walk_available', return_value=False), \
+    def test_this_system_reports_recovery_truthfully(self):
+        self.assertEqual(recovery.recovery_available(), os.name == 'posix')
+        with patch.object(recovery.private_storage, 'folder_walk_available', return_value=False):
+            self.assertFalse(recovery.recovery_available())
+
+    def test_system_without_recovery_refuses_before_state_access(self):
+        with patch.object(recovery, 'recovery_available', return_value=False), \
                 patch.object(recovery, 'private_directory', side_effect=AssertionError('State accessed')), \
                 patch.object(recovery.sqlite3, 'connect', side_effect=AssertionError('Database opened')):
             for apply in (False, True):
@@ -65,6 +70,7 @@ class PlatformTests(unittest.TestCase):
                     recovery.recover('fictional-state', selected=[ident()], apply=apply)
                 self.assertEqual(str(raised.exception), recovery.UNAVAILABLE)
                 self.assertIn('not available on Windows yet', str(raised.exception))
+                self.assertIn('Chats on hold', str(raised.exception))
 
     def test_imports_without_fcntl_and_refuses_with_its_reason_on_windows(self):
         original_import = builtins.__import__
@@ -77,7 +83,7 @@ class PlatformTests(unittest.TestCase):
         with patch.object(builtins, '__import__', side_effect=without_fcntl):
             spec.loader.exec_module(module)
         self.assertFalse(hasattr(module, 'fcntl'))
-        with patch.object(module.claude_channel, 'folder_walk_available', return_value=False), \
+        with patch.object(module, 'recovery_available', return_value=False), \
                 patch.object(module, 'private_directory', side_effect=AssertionError('State accessed')):
             with self.assertRaisesRegex(module.RecoveryError, '^Offline bridge recovery is not available on Windows yet'):
                 module.recover('fictional-state')
@@ -88,7 +94,7 @@ class PlatformTests(unittest.TestCase):
             recovery.recover(tempfile.gettempdir(), selected=[ident()], apply=True)
 
 
-@unittest.skipUnless(recovery.claude_channel.folder_walk_available(), 'Recovery reads proof files by handle-based folder walk, which Windows lacks')
+@unittest.skipUnless(recovery.recovery_available(), 'Recovery checks proof files with POSIX owner and mode rules: macOS and Linux only')
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

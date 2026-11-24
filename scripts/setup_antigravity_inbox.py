@@ -10,6 +10,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import claude_channel
+import private_storage
 import peer_inbox
 from install_antigravity_bridge import InstallError, SUPPORTED, rename_exclusive
 
@@ -41,7 +42,7 @@ def setup(action, state_dir):
     import fcntl
 
     try:
-        directory = claude_channel._directory(state_dir)
+        directory = private_storage.open_no_links(state_dir, directory=True)
     except FileNotFoundError:
         if action == 'status':
             return {'state': 'not_configured'}

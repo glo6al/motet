@@ -82,7 +82,8 @@ def main(argv=None):
     if args.peer is not None:
         raise ValueError('--peer is no longer supported. Configure the shared Motet MCP separately; this launcher only creates the inbound channel for a new session.')
     if os.name != 'posix':
-        # Private channel folders are checked by owner and mode bits, and discovery walks folders by handle.
+        # Private channel folders are checked by owner and mode bits, and channel.mjs (Node) writes files that
+        # cannot be made private on Windows; see claude_channel.CHANNEL_UNAVAILABLE.
         raise ValueError('This Motet Claude launcher needs macOS or Linux. On Windows, use the Motet plugin in Claude instead.')
     if not sys.stdin.isatty():
         raise ValueError('Run this launcher in an interactive terminal; Claude requires channel development consent.')

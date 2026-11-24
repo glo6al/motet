@@ -541,7 +541,8 @@ class SetupTests(unittest.TestCase):
 
 
 class PlatformTests(unittest.TestCase):
-    def test_non_posix_inbox_is_disabled_without_io_and_native_list_refuses_with_the_bridge_reason(self):
+    def test_non_posix_inbox_is_disabled_without_io_and_native_list_still_reaches_the_directory(self):
+        """The Antigravity inbox stays macOS and Linux only; on Windows the native bridge works without it."""
         with closing(sqlite3.connect(':memory:')) as db, db:
             bridge.shared_schema(db)
             credential = bridge.issue_service_credential(db)
@@ -549,21 +550,21 @@ class PlatformTests(unittest.TestCase):
             directory = Mock()
             native = {'agents': [], 'next_cursor': None}
             directory.list_agents.return_value = native
-            with patch.object(inbox.os, 'name', 'nt'), patch.object(inbox.claude_channel, '_directory',
-                    side_effect=AttributeError('POSIX directory flags unavailable')) as open_dir:
+            with patch.object(inbox.os, 'name', 'nt'), patch.object(inbox.private_storage, 'open_no_links',
+                    side_effect=AssertionError('inbox folder opened')) as open_dir, \
+                    patch.object(bridge.private_storage, 'folder_walk_available', return_value=True):
                 shared = bridge.SharedBridge(store, directory)
                 self.assertIsNone(shared.inbox.config)
                 with self.assertRaisesRegex(OSError, 'requires a POSIX system'):
                     inbox.read_config_file('/example/state/antigravity-inbox.json')
-                # Without the folder walk no chat can be found, so the bridge refuses before consulting a directory.
+                self.assertIs(shared.rpc(credential['credential_id'], {'method': 'list_agents', 'params': {}}), native)
+                open_dir.assert_not_called()
+            directory.list_agents.assert_called_once_with()
+            # Where the folder walk is missing, the bridge refuses before consulting a directory.
+            with patch.object(bridge.private_storage, 'folder_walk_available', return_value=False):
                 with self.assertRaises(bridge.PeerError) as refused:
                     shared.rpc(credential['credential_id'], {'method': 'list_agents', 'params': {}})
-                self.assertEqual(str(refused.exception), bridge.BRIDGE_UNAVAILABLE)
-                directory.list_agents.assert_not_called()
-                open_dir.assert_not_called()
-            # Where the folder walk exists, the same call reaches the directory.
-            with patch.object(bridge.claude_channel, 'folder_walk_available', return_value=True):
-                self.assertIs(shared.rpc(credential['credential_id'], {'method': 'list_agents', 'params': {}}), native)
+            self.assertEqual(str(refused.exception), bridge.BRIDGE_UNAVAILABLE)
             directory.list_agents.assert_called_once_with()
 
 

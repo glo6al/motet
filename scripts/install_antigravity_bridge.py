@@ -12,7 +12,7 @@ import stat
 import sys
 import uuid
 
-from watch_peer import ROOT, AntigravityPathError, antigravity_config, claude_channel
+from watch_peer import ROOT, AntigravityPathError, antigravity_config, claude_channel, private_storage
 
 
 if os.name == 'posix':
@@ -55,7 +55,7 @@ def open_directory(stack, parent, name, private=False, *, path=None):
 def plugin_parent(home, install=False, remove=False):
     with ExitStack() as stack:
         try:
-            fd = claude_channel._directory(home)
+            fd = private_storage.open_no_links(home, directory=True)
         except OSError:
             raise InstallError(f'Cannot open Antigravity home directory {home}.') from None
         stack.callback(os.close, fd)

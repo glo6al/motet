@@ -11,11 +11,11 @@ import json
 import math
 import os
 import re
-import stat
 import threading
 import time
 import uuid
 import codex_transcript
+import private_storage
 
 MAX_LINE = 262144
 _SKIP_STRING = re.compile(rb'["\\\n]')
@@ -59,24 +59,25 @@ def _hash(value):
 
 
 def _open(root, path):
-    """Open a regular file beneath a canonical root without following links."""
+    """Open a regular file with one name beneath a canonical root without following a link anywhere in its path."""
     if os.path.commonpath((root, path)) != root or os.path.abspath(path) != path:
         raise OSError('Nonlocal metadata path')
-    fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY)
+    fd = private_storage.open_no_links(path, single_link=True)
     try:
-        parts = os.path.abspath(path).split(os.sep)
-        for part in parts[1:-1]:
-            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = nxt
-        result = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-        st = os.fstat(result)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            os.close(result)
-            raise OSError('Not a plain metadata file')
-        return result, st
-    finally:
+        return fd, os.fstat(fd)
+    except BaseException:
         os.close(fd)
+        raise
+
+
+def _link(item):
+    """A listed entry that is a link, junction or other reparse point. Listing only proposes names: each file is
+    still opened through the no-link walk, so this skips them early rather than relying on it for safety."""
+    if item.is_symlink():
+        return True
+    # Windows reads the attributes with the listing itself (no extra call); a junction is not a symlink there.
+    return private_storage.WIN and bool(getattr(item.stat(follow_symlinks=False), 'st_file_attributes', 0)
+                                        & private_storage.REPARSE_POINT)
 
 
 class _MetadataRecord:
@@ -293,7 +294,7 @@ class ChatDirectory:
                     with os.scandir(folder) as items:
                         for item in items:
                             candidate = None
-                            if not item.is_symlink() and not item.name.startswith('.'):
+                            if not item.name.startswith('.') and not _link(item):
                                 if item.is_dir(follow_symlinks=False):
                                     if item.name not in ('subagents', 'archived_sessions', 'archived', 'exec', 'review') and depth < (3 if provider == 'codex' else 1):
                                         stack.append((item.path, depth + 1))
