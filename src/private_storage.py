@@ -23,8 +23,8 @@ followed anywhere in it (``open_folder``, ``open_no_links``): by ``dir_fd`` on P
 and on Windows by opening each name relative to the folder handle above it
 (``NtCreateFile``), holding those folders without delete sharing.
 
-Section (h) changes a held folder: create, open-or-create, make a folder, remove, stat a name and flush, each by the
-held folder (``dir_fd`` on POSIX, relative ``NtCreateFile`` and the opened handle on Windows), never by path. It
+Section (h) changes a held folder: create, open-or-create, open to append, make a folder, remove, stat a name and
+flush, each by the held folder (``dir_fd`` on POSIX, relative ``NtCreateFile`` and the opened handle on Windows), never by path. It
 also holds the descriptor checks ``read_only`` and ``unwritable`` (nobody but the owner can change it).
 """
 from contextlib import contextmanager
@@ -99,7 +99,12 @@ def acl_write_verdict(owner_sid, owner_is_user, has_dacl, aces, system_owned=Fal
     change right may name only the owner's side (this user unless ``system_owned``, and OWNER RIGHTS), SYSTEM,
     Administrators or TrustedInstaller. Deny entries only take rights away, and inherit-only entries do not apply to
     the object itself, so both are passed over; any other entry type is refused. A missing list grants everyone
-    everything and is refused."""
+    everything and is refused.
+
+    Like the POSIX rule, this refuses more than it may seem to: a folder made directly under a drive root (C:\\src,
+    say) usually inherits "Authenticated Users: Modify" from the root, so every signed-in user can change it, and it
+    is refused, as a POSIX folder with ``mode & 0o022`` would be. Folders under the user's profile inherit only the
+    user, SYSTEM and Administrators, and pass."""
     if system_owned:
         if owner_sid not in _SYSTEM_WRITERS:
             raise PrivateStorageError('storage owner is not the system', 'owner')
@@ -364,15 +369,16 @@ _FILE_LIST_DIRECTORY, _FILE_TRAVERSE, _SYNCHRONIZE = 0x1, 0x20, 0x100000
 # folder; holds last only as long as one open (or one held folder object), so this blocks them only briefly.
 _HOLD_ACCESS = _READ_CONTROL | _FILE_READ_ATTRIBUTES | _FILE_TRAVERSE
 _LIST_ACCESS = _HOLD_ACCESS | _FILE_LIST_DIRECTORY
-# A folder that will be changed is held "writable": it also asks to add files and subfolders and to delete children
-# (FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD). A relative create may not need them on the parent handle,
-# but asking makes the hold match what is done through it, and FILE_ADD_FILE (write data, for a folder) is the access
-# FlushFileBuffers needs to flush the folder.
-_FILE_ADD_FILE, _FILE_ADD_SUBDIRECTORY, _FILE_DELETE_CHILD = 0x2, 0x4, 0x40
-_WRITE_HOLD = _FILE_ADD_FILE | _FILE_ADD_SUBDIRECTORY | _FILE_DELETE_CHILD
+# A folder that will be changed is held "writable", which also asks for FILE_ADD_FILE: the write-class right
+# FlushFileBuffers needs on the handle to flush the folder. Nothing else is asked for. A relative create is checked
+# against the folder's access list (not the rights of the handle it is made through), and a removal against DELETE on
+# the file itself; FILE_DELETE_CHILD in particular would refuse a user who has Modify but not Full Control.
+_FILE_ADD_FILE = 0x2
+_WRITE_HOLD = _FILE_ADD_FILE
 _FILE_DISPOSITION_INFO = 4     # FILE_INFO_BY_HANDLE_CLASS FileDispositionInfo
-_FILE_DISPOSITION_INFO_EX = 21  # FileDispositionInfoEx: FILE_DISPOSITION_FLAG_DELETE | _POSIX_SEMANTICS below
-_DISPOSITION_DELETE, _DISPOSITION_POSIX_SEMANTICS = 0x1, 0x2
+_FILE_DISPOSITION_INFO_EX = 21  # FileDispositionInfoEx, with the FILE_DISPOSITION_FLAG_* values below
+_DISPOSITION_DELETE, _DISPOSITION_POSIX_SEMANTICS, _DISPOSITION_IGNORE_READONLY = 0x1, 0x2, 0x10
+_READONLY = 0x1                # FILE_ATTRIBUTE_READONLY
 _SHARE_READ, _SHARE_WRITE, _SHARE_DELETE = 1, 2, 4
 _CREATE_NEW, _OPEN_EXISTING, _OPEN_ALWAYS = 1, 3, 4
 _BACKUP_SEMANTICS, _OPEN_REPARSE_POINT, _ATTRIBUTE_NORMAL = 0x02000000, 0x00200000, 0x80
@@ -437,12 +443,19 @@ def _win_set_delete(handle):
     """Mark what this handle has open for deletion (the handle needs DELETE access). Returns 'posix' when the name went
     at once (FileDispositionInfoEx with POSIX semantics: Windows 10 1709 and later, on NTFS), or 'legacy' when the name
     stays, refusing new opens, until the last handle on it closes (FileDispositionInfo, the fallback where the newer
-    call is not supported). Raises PrivateStorageError('open') if neither is accepted."""
+    call is not supported). Raises PrivateStorageError('open') if none is accepted.
+
+    The newer call is tried first with FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE (Windows 10 1809 and later), so
+    a file someone marked read-only is still deleted, then without it. The older call cannot delete a read-only file:
+    it fails, and the caller decides (``NoLinkFolder.remove`` then leaves the file and reports 'changed')."""
     kernel = _win_api()[1]
     if _POSIX_DELETE:
-        flags = ctypes.c_uint32(_DISPOSITION_DELETE | _DISPOSITION_POSIX_SEMANTICS)
-        if kernel.SetFileInformationByHandle(handle, _FILE_DISPOSITION_INFO_EX, ctypes.byref(flags), ctypes.sizeof(flags)):
-            return 'posix'
+        for value in (_DISPOSITION_DELETE | _DISPOSITION_POSIX_SEMANTICS | _DISPOSITION_IGNORE_READONLY,
+                      _DISPOSITION_DELETE | _DISPOSITION_POSIX_SEMANTICS):
+            flags = ctypes.c_uint32(value)
+            if kernel.SetFileInformationByHandle(handle, _FILE_DISPOSITION_INFO_EX, ctypes.byref(flags),
+                                                 ctypes.sizeof(flags)):
+                return 'posix'
     flag = ctypes.c_ubyte(1)                      # FILE_DISPOSITION_INFO.DeleteFile = TRUE
     if kernel.SetFileInformationByHandle(handle, _FILE_DISPOSITION_INFO, ctypes.byref(flag), ctypes.sizeof(flag)):
         return 'legacy'
@@ -861,11 +874,13 @@ def _missing(subject):
     return error
 
 
-def _win_child(parent, name, access, share, directory, disposition=_NT_FILE_OPEN, options=0, descriptor=None):
+def _win_child(parent, name, access, share, directory, disposition=_NT_FILE_OPEN, options=0, descriptor=None,
+               information=None):
     """Open ``name`` (one component) inside the folder ``parent`` is a handle to, never following a reparse point
     there. ``directory`` True asks for a folder, False for anything but a folder, None for either. ``disposition``
     is NtCreateFile's (open, create, open-or-create); ``options`` adds create options; ``descriptor`` is the security
-    descriptor a new file or folder gets (ignored when the name exists). Raises OSError carrying ``ntstatus``."""
+    descriptor a new file or folder gets (ignored when the name exists). A list given as ``information`` receives
+    what the open did (``_FILE_OPENED`` or ``_FILE_CREATED``). Raises OSError carrying ``ntstatus``."""
     adv, kernel, w, SA, FILEINFO, nt = _win_api()
     UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK = nt.structures
     raw = name.encode('utf-16-le')
@@ -884,7 +899,12 @@ def _win_child(parent, name, access, share, directory, disposition=_NT_FILE_OPEN
         error = OSError('private storage open failed')
         error.ntstatus = status
         raise error
+    if information is not None:
+        information.append(status_block.Information)
     return handle.value
+
+
+_FILE_OPENED, _FILE_CREATED = 1, 2     # IO_STATUS_BLOCK.Information after NtCreateFile
 
 
 def _win_root_verified(handle, root):
@@ -1010,7 +1030,7 @@ class NoLinkFolder:
     folder from ``folder()`` relies on its parent's hold, so it refuses to work once its parent is closed.
 
     A folder opened with ``writable=True`` can also be changed through (section h): ``create``, ``open_or_create``,
-    ``mkdir``, ``remove`` and ``sync``. ``child_stat`` reads a name without following it."""
+    ``open_append``, ``mkdir``, ``remove`` and ``sync``. ``child_stat`` reads a name without following it."""
 
     def __init__(self, path, windows, fd=None, handles=None, parent=None, listing=True, writable=False):
         self.path, self._windows, self._fd, self._handles, self._parent = path, windows, fd, handles or [], parent
@@ -1094,7 +1114,9 @@ class NoLinkFolder:
                             writable=writable)
 
     # (h) Changing a held folder. Each call names one child of this folder and acts through the held folder, never by
-    # path. POSIX uses the same flags, modes and checks as the ``dir_fd`` calls the attachment code makes today.
+    # path. On POSIX each opens with the same flags as the ``dir_fd`` call the attachment code makes today and refuses
+    # at least what that code refuses; where a method does more (a mode set regardless of umask, a refused new file
+    # removed again, an open that cannot hang), its docstring says so.
 
     def _changeable(self, name, subject='file'):
         """A held, writable folder and a plain child name, or a refusal before anything is opened."""
@@ -1109,8 +1131,9 @@ class NoLinkFolder:
         and writing; the caller closes it. The name must not exist (a link there counts as existing): an existing
         name raises FileExistsError. A new file whose check fails is removed again before the refusal is raised.
 
-        POSIX: ``os.open(name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600, dir_fd=)``, then the
-        private rule on ``fstat`` (one name). Windows: a relative ``NtCreateFile`` that only creates, with a protected
+        POSIX: ``os.open(name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600, dir_fd=)``, then
+        ``fchmod(0o600)`` as ``create_private_file`` does (so the mode does not depend on the umask) and the private
+        rule on ``fstat`` (one name). Windows: a relative ``NtCreateFile`` that only creates, with a protected
         this-user/SYSTEM access list, never following a reparse point. The handle can delete its own file (used only
         to remove a refused one) and does not share delete, so nobody can rename or remove the file while it is open."""
         self._changeable(name)
@@ -1118,6 +1141,7 @@ class NoLinkFolder:
             return _win_create(self._handles[-1], name)
         fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _CLOEXEC, 0o600, dir_fd=self._fd)
         try:
+            os.fchmod(fd, 0o600)
             posix_verdict(os.fstat(fd), False, True)
         except BaseException:
             _posix_discard_at(fd, name, self._fd)
@@ -1132,7 +1156,10 @@ class NoLinkFolder:
         POSIX: ``os.open(name, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600, dir_fd=)`` (a link raises the system's
         own OSError, ELOOP), then the private rule on ``fstat``. Windows: a relative open-or-create with the private
         access list for a new file; a reparse point at the name is opened itself and refused as 'link'. The handle
-        shares reading and writing but not delete, like ``open_private_rw``."""
+        shares reading and writing but not delete, like ``open_private_rw``, and has no DELETE access (which would
+        refuse every later open that does not share delete, such as SQLite's). So a new file that is refused is
+        removed by name after its handle closes, only while the name still has that file's ID. A name whose removal
+        is pending, still open elsewhere, cannot be made again until it is gone, and is refused as 'changed'."""
         self._changeable(name)
         if self._windows:
             return _win_open_or_create(self._handles[-1], name)
@@ -1143,6 +1170,46 @@ class NoLinkFolder:
             os.close(fd)
             raise
         return fd
+
+    def open_append(self, name, create=True):
+        """Open the existing regular file ``name`` here to read it and append to it, or with ``create`` make it if it is
+        missing, and return ``(fd, created)``; the caller closes ``fd``. The file need not be private (Git's
+        ``.git/info/exclude``, for one), but nobody but its owner may change it: it must be a regular file with one
+        name that passes ``unwritable`` (owned by this user, and on POSIX ``mode & 0o022 == 0``). A link is refused.
+
+        POSIX, as the exclusion code opens it today: ``os.open(name, O_RDWR | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
+        dir_fd=)``; if that name is missing, ``O_RDWR | O_APPEND | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600``
+        (so a name that appears meanwhile raises FileExistsError; a folder raises the system's own
+        IsADirectoryError). Then the type, one name, owner and mode on ``fstat``. Windows: a relative open with read and append-only data access (writes go to the end whatever the
+        offset), sharing read, write and delete as other programs such as Git expect, never following a reparse
+        point; a missing name is created with the private access list. Then the type, one name and
+        ``acl_write_verdict`` on the handle. On both, a refused file this call created is removed again."""
+        self._changeable(name)
+        if self._windows:
+            return _win_open_append(self._handles[-1], name, create)
+        created = False
+        try:
+            fd = os.open(name, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | _CLOEXEC, dir_fd=self._fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            fd = os.open(name, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _CLOEXEC, 0o600,
+                         dir_fd=self._fd)
+            created = True
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise _refuse('not_regular')
+            if info.st_nlink != 1:
+                raise _refuse('links')
+            _posix_unwritable(info, False, 'file')
+        except BaseException:
+            if created:
+                _posix_discard_at(fd, name, self._fd)
+            else:
+                os.close(fd)
+            raise
+        return fd, created
 
     def mkdir(self, name):
         """Make the new folder ``name`` here, private from the start; an existing name raises FileExistsError. Open it
@@ -1165,17 +1232,20 @@ class NoLinkFolder:
 
         - 'removed': it was removed;
         - 'absent': there is no such name (on Windows also once an earlier, pending removal has finished);
-        - 'changed': a link, something other than a regular file, or a file ``expect`` did not recognise; nothing
-          was removed;
+        - 'changed': a link, something other than a regular file (a folder, pipe, socket or device), or a file
+          ``expect`` did not recognise; nothing was removed. On Windows also a file marked read-only where only the
+          older deletion is available, which cannot delete it;
         - 'busy' (Windows only): another program has the file open without sharing delete, or a removal is waiting
           for other programs to close it, so the name is still there; try again later.
 
-        POSIX: open with ``O_NOFOLLOW`` by ``dir_fd``, ask ``expect``, check the name still names that same file
-        (``stat`` with ``follow_symlinks=False``), then ``os.unlink(name, dir_fd=)``. Windows: open the name with DELETE
-        access, sharing only reading (so no writer meanwhile), ask ``expect``, then delete through that same handle, so
-        only the file that was checked can be removed. The name goes at once where Windows supports POSIX deletion;
-        where it falls back, the name stays until the last handle on it closes, and the result is 'busy' until then.
-        Call ``sync()`` afterwards to make the removal durable."""
+        POSIX: open with ``O_NOFOLLOW | O_NONBLOCK`` by ``dir_fd`` (a pipe cannot hang it), ask ``expect``, check the
+        name still names that same file (``stat`` with ``follow_symlinks=False``), then ``os.unlink(name, dir_fd=)``.
+        POSIX checks and then unlinks by name, so a swap by the same user between those two steps is not caught;
+        Windows has no such gap. Windows: open the name with DELETE access, sharing only reading (so no writer
+        meanwhile), give ``expect`` a read-only duplicate, then delete through the handle that was checked, so only
+        that file can be removed. The name goes at once where Windows supports POSIX deletion; where it falls back,
+        the name stays until the last handle on it closes, and the result is 'busy' until then. Call ``sync()``
+        afterwards to make the removal durable."""
         self._changeable(name)
         if self._windows:
             return _win_remove(self._handles[-1], name, expect)
@@ -1184,7 +1254,7 @@ class NoLinkFolder:
         except FileNotFoundError:
             return 'absent'
         except OSError as e:
-            if e.errno in (errno.ELOOP, errno.EMLINK):   # a link at the name (EMLINK: FreeBSD's O_NOFOLLOW)
+            if e.errno in _NOT_A_FILE_OPEN:              # a link, socket or device at the name
                 return 'changed'
             raise
         try:
@@ -1205,7 +1275,10 @@ class NoLinkFolder:
         """The stat result of the name ``name`` here, not following it (a link is reported as itself). A missing name
         raises FileNotFoundError. POSIX: ``os.stat(name, dir_fd=, follow_symlinks=False)``. Windows: the name is
         opened relative to the held folder with attribute access only, never following a reparse point, and read
-        with ``fstat``; a name whose removal is pending counts as missing."""
+        with ``fstat``; a name whose removal is pending counts as missing. Windows' ``fstat`` gives a reparse point
+        the type of what it stands for (a file symbolic link reads as a file, a junction as a folder), so any reparse
+        point is reported here as a link (``S_IFLNK``), as ``lstat`` reports a POSIX link; ``st_file_attributes``
+        still carries the reparse flag."""
         self._held()
         if not _plain_name(name, self._windows):
             raise _refuse('unavailable')
@@ -1220,7 +1293,8 @@ class NoLinkFolder:
                 raise _missing('file') from None
             raise _refuse('open') from None
         try:
-            return _win_fstat(handle)
+            info = _win_fstat(handle)
+            return _as_link(info) if _win_facts(handle)[0] & REPARSE_POINT else info
         finally:
             _win_close(handle)
 
@@ -1239,11 +1313,16 @@ class NoLinkFolder:
         return self.path + name if self.path.endswith('\\') else self.path + '\\' + name
 
 
-def _win_duplicate(handle):
-    """A second handle on the same folder or file, for a descriptor that closes on its own."""
+def _win_duplicate(handle, access=None):
+    """A second handle on the same folder or file, for a descriptor that closes on its own: with the same access, or
+    with ``access`` (which must be part of what the handle already has)."""
     kernel, w = _win_api()[1:3]
     process, copy = kernel.GetCurrentProcess(), w.HANDLE()
-    if not kernel.DuplicateHandle(process, handle, process, ctypes.byref(copy), 0, False, 2):   # DUPLICATE_SAME_ACCESS
+    if access is None:
+        done = kernel.DuplicateHandle(process, handle, process, ctypes.byref(copy), 0, False, 2)   # DUPLICATE_SAME_ACCESS
+    else:
+        done = kernel.DuplicateHandle(process, handle, process, ctypes.byref(copy), access, False, 0)
+    if not done:
         raise _unavailable('folder')
     return copy.value
 
@@ -1369,8 +1448,8 @@ def open_no_links(path, directory=False, single_link=False, private=False):
 
 
 # ---------------------------------------------------------------------------
-# (h) Changing a held folder (``NoLinkFolder.create``, ``open_or_create``, ``mkdir``, ``remove``, ``child_stat``,
-# ``sync``), and two checks on an open descriptor (``read_only``, ``unwritable``).
+# (h) Changing a held folder (``NoLinkFolder.create``, ``open_or_create``, ``open_append``, ``mkdir``, ``remove``,
+# ``child_stat``, ``sync``), and two checks on an open descriptor (``read_only``, ``unwritable``).
 #
 # On Windows every change is one relative ``NtCreateFile`` under the held folder handle, with
 # ``FILE_OPEN_REPARSE_POINT``, so no name is looked up by path and no reparse point is followed. New files and folders
@@ -1378,8 +1457,9 @@ def open_no_links(path, directory=False, single_link=False, private=False):
 # refused new one is deleted through that handle. A removal opens the file with DELETE access, lets the caller check
 # it on that handle, then deletes through the same handle (FileDispositionInfoEx with POSIX semantics, or the older
 # FileDispositionInfo where that is not supported), so only the file that was checked can go. Changes go through a
-# hold opened with ``writable=True``, which on Windows also asks for FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY and
-# FILE_DELETE_CHILD on that one folder.
+# hold opened with ``writable=True``, which on Windows also asks for FILE_ADD_FILE on that one folder (the right
+# FlushFileBuffers needs). ``open_append`` is for a file that is not private but that nobody else may change, such
+# as Git's exclude file: it opens for appending and applies ``unwritable`` instead of the private rule.
 
 def _posix_discard_at(fd, name, dir_fd):
     """Close a file just created as ``name`` in ``dir_fd`` and remove that name, but only while it names this file."""
@@ -1429,14 +1509,99 @@ def _win_create(parent, name):
 
 
 def _win_open_or_create(parent, name):
+    outcome = []
     with _private_descriptor() as descriptor:
         try:
             handle = _win_child(parent, name, _GENERIC_READ | _GENERIC_WRITE, _SHARE_READ | _SHARE_WRITE, False,
-                                _NT_FILE_OPEN_IF, descriptor=descriptor)
+                                _NT_FILE_OPEN_IF, descriptor=descriptor, information=outcome)
         except OSError as e:
-            raise _refuse('not_regular' if getattr(e, 'ntstatus', 0) in _NT_WRONG_TYPE else 'open') from None
-    _win_checked(handle, False, 'file', single_link=True, private=True)
+            status = getattr(e, 'ntstatus', 0)
+            if status == _NT_DELETE_PENDING:
+                raise _refuse('changed') from None       # being removed, still open elsewhere: not made again yet
+            raise _refuse('not_regular' if status in _NT_WRONG_TYPE else 'open') from None
+
+    def check(opened):
+        _win_kind(_win_facts(opened), False, 'file', True)
+        _win_private(opened, False, 'file')
+    _win_check_or_undo(parent, name, handle, outcome == [_FILE_CREATED], check)
     return _win_fd(handle, getattr(os, 'O_BINARY', 0))
+
+
+_FILE_READ_DATA, _FILE_APPEND_DATA = 0x1, 0x4
+_FILE_GENERIC_READ = 0x120089      # READ_CONTROL, read data, attributes and extended attributes, SYNCHRONIZE
+_APPEND_ACCESS = _FILE_READ_DATA | _FILE_APPEND_DATA | _FILE_READ_ATTRIBUTES | _READ_CONTROL
+
+
+def _win_open_append(parent, name, create):
+    share, created = _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE, False
+    try:
+        handle = _win_child(parent, name, _APPEND_ACCESS, share, False)
+    except OSError as e:
+        status = getattr(e, 'ntstatus', 0)
+        if status in _NT_NOT_FOUND and create:
+            with _private_descriptor() as descriptor:
+                try:
+                    handle = _win_child(parent, name, _APPEND_ACCESS, share, False, _NT_FILE_CREATE, descriptor=descriptor)
+                except OSError as again:
+                    raise _created_error(again, 'file') from None
+            created = True
+        elif status in _NT_NOT_FOUND or status == _NT_DELETE_PENDING:
+            if create:                                   # still open elsewhere after its removal: not made again yet
+                raise _created_error(e, 'file') from None
+            raise _missing('file') from None
+        else:
+            raise _refuse('not_regular' if status in _NT_WRONG_TYPE else 'open') from None
+
+    def check(opened):
+        _win_kind(_win_facts(opened), False, 'file', True)
+        try:
+            windows_handle_unwritable(opened)
+        except PrivateStorageError as e:
+            raise PrivateStorageError(str(e), e.reason, 'file') from None
+    _win_check_or_undo(parent, name, handle, created, check)
+    return _win_fd(handle, os.O_APPEND | getattr(os, 'O_BINARY', 0)), created
+
+
+def _win_file_id(handle):
+    """The volume and file index of what ``handle`` has open: which file it is, whatever its name."""
+    kernel, w, SA, FILEINFO = _win_api()[1:5]
+    info = FILEINFO()
+    if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+        raise _unavailable()
+    return info.volume, info.index_high, info.index_low
+
+
+def _win_check_or_undo(parent, name, handle, created, check):
+    """Run ``check(handle)``. On a refusal close the handle and, if this call created the file, remove it again by
+    name, but only while the name still has that file's ID (the handle has no DELETE access to do it itself)."""
+    try:
+        check(handle)
+    except BaseException:
+        file_id = None
+        if created:
+            try:
+                file_id = _win_file_id(handle)
+            except PrivateStorageError:
+                pass
+        _win_close(handle)
+        if file_id is not None:
+            _win_discard_named(parent, name, file_id)
+        raise
+
+
+def _win_discard_named(parent, name, file_id):
+    try:
+        handle = _win_child(parent, name, _DELETE | _FILE_READ_ATTRIBUTES, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE,
+                            False)
+    except OSError:
+        return
+    try:
+        if _win_file_id(handle) == file_id:
+            _win_set_delete(handle)
+    except PrivateStorageError:
+        pass
+    finally:
+        _win_close(handle)
 
 
 def _win_mkdir(parent, name):
@@ -1473,17 +1638,24 @@ def _win_remove(parent, name, expect):
             return 'changed'
         raise _refuse('open') from None
     try:
+        facts = _win_facts(handle)
         try:
-            _win_kind(_win_facts(handle), False, 'file')
+            _win_kind(facts, False, 'file')
         except PrivateStorageError:
             return 'changed'
-        fd = _win_fd(_win_duplicate(handle), os.O_RDONLY | getattr(os, 'O_BINARY', 0))
+        # expect gets a duplicate that can only read, so it cannot change or delete what it is shown.
+        fd = _win_fd(_win_duplicate(handle, _FILE_GENERIC_READ), os.O_RDONLY | getattr(os, 'O_BINARY', 0))
         try:
             if not expect(fd):
                 return 'changed'
         finally:
             _close_fd(fd)
-        way = _win_set_delete(handle)
+        try:
+            way = _win_set_delete(handle)
+        except PrivateStorageError:
+            if facts[0] & _READONLY:
+                return 'changed'          # only the older deletion is available, and it cannot delete a read-only file
+            raise
     finally:
         _win_close(handle)
     if way == 'posix':
@@ -1513,7 +1685,6 @@ def sync_file(fd):
     os.fsync(fd)
 
 
-_FILE_READ_DATA = 0x1
 # Access that can change a file: write or append data, extended attributes, attributes, delete, access list, owner.
 _CHANGE_ACCESS = 0x2 | 0x4 | 0x10 | 0x100 | _DELETE | 0x40000 | 0x80000
 
@@ -1536,8 +1707,9 @@ def _win_access_mask(handle):
 
 
 def read_only(fd):
-    """True if the descriptor can read its file and cannot change it. POSIX: ``fcntl(F_GETFL) & O_ACCMODE ==
-    O_RDONLY``. Windows: the handle's granted access includes reading data and none of the change rights."""
+    """True if the file descriptor ``fd`` (a file's, not a folder's) can read its file and cannot change it. POSIX:
+    ``fcntl(F_GETFL) & O_ACCMODE == O_RDONLY``. Windows: the handle's granted access includes reading data and none
+    of the change rights."""
     if WIN:
         granted = _win_access_mask(_win_handle_of(fd))
         return bool(granted & _FILE_READ_DATA) and not granted & _CHANGE_ACCESS
@@ -1560,11 +1732,30 @@ def unwritable(fd, system_owned=False):
             raise PrivateStorageError(str(e), e.reason, subject) from None
         return
     info = os.fstat(fd)
-    subject = 'folder' if stat.S_ISDIR(info.st_mode) else 'file'
+    _posix_unwritable(info, system_owned, 'folder' if stat.S_ISDIR(info.st_mode) else 'file')
+
+
+def _posix_unwritable(info, system_owned, subject):
     if info.st_uid != (0 if system_owned else os.getuid()):
         raise _refuse('owner', subject)
     if info.st_mode & 0o022:
         raise _refuse('access', subject)
+
+
+# Opens that meet something other than a file: a link (ELOOP; EMLINK is FreeBSD's O_NOFOLLOW), a socket (ENXIO on
+# Linux, EOPNOTSUPP on macOS) or a device that is not there (ENODEV).
+_NOT_A_FILE_OPEN = frozenset(getattr(errno, name) for name in ('ELOOP', 'EMLINK', 'ENXIO', 'EOPNOTSUPP', 'ENODEV')
+                             if hasattr(errno, name))
+
+
+def _as_link(info):
+    """``info`` with its type changed to a symbolic link, all else kept (Windows' fstat gives a reparse point the type
+    of what it stands for)."""
+    shown = ('st_mode', 'st_ino', 'st_dev', 'st_nlink', 'st_uid', 'st_gid', 'st_size')
+    extra = {name: getattr(info, name) for name in dir(info) if name.startswith('st_') and name not in shown}
+    fields = list(info)
+    fields[0] = stat.S_IFLNK | stat.S_IMODE(info.st_mode)
+    return os.stat_result(fields, extra)
 
 
 def _sid_text(sid):

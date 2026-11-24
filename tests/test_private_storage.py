@@ -344,6 +344,35 @@ class CreationCleanup(unittest.TestCase):
         self.assertNotIn(('close', 7), calls, 'closed only by the discard')
 
 
+class WindowsDeletionCalls(unittest.TestCase):
+    """_win_set_delete's order of calls, with SetFileInformationByHandle replaced; runs on every system."""
+
+    def run_with(self, accepted, posix=True):
+        calls = []
+
+        class Kernel:
+            @staticmethod
+            def SetFileInformationByHandle(handle, info_class, pointer, size):
+                value = pointer._obj.value
+                calls.append((info_class, value, size))
+                return (info_class, value) in accepted
+        with patch.object(ps, '_win_api', lambda: (None, Kernel)), patch.object(ps, '_POSIX_DELETE', posix):
+            try:
+                return ps._win_set_delete(7), calls
+            except ps.PrivateStorageError as e:
+                return e.reason, calls
+
+    def test_posix_deletion_first_with_read_only_ignored_then_without_then_the_older_call(self):
+        ex, old = ps._FILE_DISPOSITION_INFO_EX, ps._FILE_DISPOSITION_INFO
+        full, plain = 0x1 | 0x2 | 0x10, 0x1 | 0x2
+        tries = [(ex, full, 4), (ex, plain, 4), (old, 1, 1)]
+        self.assertEqual(self.run_with({(ex, full)}), ('posix', tries[:1]))
+        self.assertEqual(self.run_with({(ex, plain)}), ('posix', tries[:2]), 'a system without the read-only flag')
+        self.assertEqual(self.run_with({(old, 1)}), ('legacy', tries), 'a system without POSIX deletion')
+        self.assertEqual(self.run_with(set()), ('open', tries))
+        self.assertEqual(self.run_with({(ex, full), (old, 1)}, posix=False), ('legacy', tries[2:]))
+
+
 class ReadWrite(unittest.TestCase):
     """open_private_rw: agent messaging opens its lock and database with it."""
 
@@ -694,6 +723,13 @@ class PosixChanges(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.elsewhere), 'nothing was made through the link')
         with open(os.path.join(self.state, 'new'), 'rb') as made:
             self.assertEqual(made.read(), b'abc')
+        previous = os.umask(0o377)                     # a umask that would leave the owner without write
+        try:
+            with self.writable() as state:
+                os.close(state.create('under-umask'))
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.state, 'under-umask')).st_mode), 0o600)
 
     def test_a_refused_new_file_is_removed(self):
         with self.no_leaks(), self.writable() as state:
@@ -734,16 +770,21 @@ class PosixChanges(unittest.TestCase):
         self.assertEqual(os.stat(os.path.join(self.state, 'sub')).st_mode & 0o077, 0)
 
     def test_remove_deletes_only_the_file_it_recognised(self):
+        import socket
         os.symlink(self.secret, os.path.join(self.state, 'link'))
         os.mkdir(os.path.join(self.state, 'sub'))
         os.mkfifo(os.path.join(self.state, 'pipe'))
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(os.path.join(self.state, 'sock'))
         seen = []
 
         def expect(fd):
+            self.assertTrue(ps.read_only(fd))
             seen.append(os.read(fd, 100))
             return True
         with self.no_leaks(), self.writable() as state:
-            for name in ('link', 'sub', 'pipe'):
+            for name in ('link', 'sub', 'pipe', 'sock'):
                 with self.subTest(name=name):
                     self.assertEqual(state.remove(name, expect), 'changed')     # the pipe is opened without hanging
             self.assertEqual(seen, [], 'expect is asked only about a regular file')
@@ -753,7 +794,47 @@ class PosixChanges(unittest.TestCase):
             self.assertEqual(seen, [b'fixture\n'])
             self.assertEqual(state.remove('secret', expect), 'absent')
             state.sync()
-        self.assertEqual(sorted(os.listdir(self.state)), ['link', 'pipe', 'sub'])
+        self.assertEqual(sorted(os.listdir(self.state)), ['link', 'pipe', 'sock', 'sub'])
+
+    def test_open_append_is_the_exclusion_files_open(self):
+        exclude = os.path.join(self.state, 'exclude')
+        with open(exclude, 'wb') as out:
+            out.write(b'# fixture\n')
+        os.chmod(exclude, 0o644)                       # readable by others is fine; changeable is not
+        os.symlink(exclude, os.path.join(self.state, 'link'))
+        os.link(self.secret, os.path.join(self.state, 'second-name'))
+        os.mkdir(os.path.join(self.state, 'sub'))
+        with self.no_leaks(), self.writable() as state:
+            fd, created = state.open_append('exclude')
+            try:
+                import fcntl
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                self.assertEqual((flags & os.O_ACCMODE, bool(flags & os.O_APPEND), created), (os.O_RDWR, True, False))
+                self.assertEqual(os.read(fd, 100), b'# fixture\n')
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b'/rule/\n')               # appended whatever the offset
+            finally:
+                os.close(fd)
+            fd, created = state.open_append('new-exclude')
+            os.close(fd)
+            self.assertTrue(created)
+            with self.assertRaises(FileNotFoundError):
+                state.open_append('missing', create=False)
+            with self.assertRaises(OSError) as raised:
+                state.open_append('link')
+            self.assertEqual(raised.exception.errno, errno.ELOOP)
+            reason(self, lambda: state.open_append('second-name'), 'links')
+            with self.assertRaises(IsADirectoryError):
+                state.open_append('sub')                # the system's own refusal of O_RDWR on a folder
+            os.chmod(exclude, 0o664)
+            reason(self, lambda: state.open_append('exclude'), 'access')
+            with patch.object(ps, '_posix_unwritable', side_effect=ps.PrivateStorageError('refused', 'owner')):
+                reason(self, lambda: state.open_append('refused'), 'owner')
+        with open(exclude, 'rb') as kept:
+            self.assertEqual(kept.read(), b'# fixture\n/rule/\n')
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.state, 'new-exclude')).st_mode) & 0o077, 0)
+        self.assertFalse(os.path.lexists(os.path.join(self.state, 'missing')))
+        self.assertFalse(os.path.lexists(os.path.join(self.state, 'refused')), 'a refused new file is removed again')
 
     def test_a_name_swapped_after_the_check_is_left_alone(self):
         def swap(fd):
@@ -912,7 +993,7 @@ class SimulatedWindowsWalk(unittest.TestCase):
         self.handles, self.open_now, self.closed, self.fds, self.checked = {}, set(), [], [], []
         self.log = []          # (name, access, share, [held handles at that moment])
         self.during_open = None
-        self.created, self.flushed, self.closed_fds = [], [], []
+        self.created, self.flushed, self.closed_fds, self.duplicated = [], [], [], []
         self.posix_delete, self.refuse_new = True, False
 
         def new_handle(node, name, access, share, parent=None):
@@ -943,7 +1024,8 @@ class SimulatedWindowsWalk(unittest.TestCase):
                 raise error
             return new_handle(node, path, access, share)
 
-        def fake_child(parent, name, access, share, directory, disposition=ps._NT_FILE_OPEN, options=0, descriptor=None):
+        def fake_child(parent, name, access, share, directory, disposition=ps._NT_FILE_OPEN, options=0, descriptor=None,
+                       information=None):
             self.assertIn(parent, self.open_now, 'opened relative to a closed handle')
             if self.during_open:
                 self.during_open(name)
@@ -958,6 +1040,7 @@ class SimulatedWindowsWalk(unittest.TestCase):
                 self.assertEqual(descriptor, 'private-descriptor', 'a new name gets the private access list')
             if node is not None and node.get('pending'):
                 fail(ps._NT_DELETE_PENDING)
+            made = node is None
             if node is None:
                 if disposition == ps._NT_FILE_OPEN:
                     fail(0xC0000034)
@@ -978,6 +1061,8 @@ class SimulatedWindowsWalk(unittest.TestCase):
                 fail(0xC00000BA)
             if conflicts(node, access, share):
                 fail(ps._NT_SHARING_VIOLATION)
+            if information is not None:
+                information.append(ps._FILE_CREATED if made else ps._FILE_OPENED)
             return new_handle(node, name, access, share, folder)
 
         def fake_close(handle):
@@ -995,6 +1080,8 @@ class SimulatedWindowsWalk(unittest.TestCase):
             node, name, access, _, folder = self.handles[handle]
             self.assertIn(handle, self.open_now)
             self.assertTrue(access & ps._DELETE, 'deleting through a handle needs DELETE access')
+            if node['kind'] == 'readonly-file' and not self.posix_delete:
+                raise ps.PrivateStorageError('refused', 'open')     # the older deletion cannot delete a read-only file
             if self.posix_delete:
                 if folder['children'].get(name) is node:
                     del folder['children'][name]
@@ -1006,12 +1093,18 @@ class SimulatedWindowsWalk(unittest.TestCase):
             self.assertTrue(self.handles[handle][2] & ps._FILE_ADD_FILE, 'FlushFileBuffers needs write access')
             self.flushed.append(self.handles[handle][1])
 
-        def fake_duplicate(handle):
-            node, name, access, share, folder = self.handles[handle]
-            return new_handle(node, name, access, share, folder)
+        def fake_duplicate(handle, access=None):
+            node, name, held_access, share, folder = self.handles[handle]
+            self.duplicated.append(access)
+            return new_handle(node, name, held_access if access is None else access, share, folder)
 
         def fake_fstat(handle):
-            return ('stat', self.handles[handle][0]['kind'], id(self.handles[handle][0]))
+            """As Windows' fstat: a reparse point gets the type of what it stands for, and only the attributes (here
+            the model's facts) say it is one."""
+            node = self.handles[handle][0]
+            folder = node['kind'] in ('folder', 'link-folder')
+            mode = (stat.S_IFDIR | 0o700) if folder else (stat.S_IFREG | 0o600)
+            return os.stat_result((mode, id(node), 1, fake_facts(handle)[1], 0, 0, 0, 0, 0, 0))
 
         @contextmanager
         def fake_descriptor():
@@ -1023,7 +1116,7 @@ class SimulatedWindowsWalk(unittest.TestCase):
             kind = self.handles[handle][0]['kind']
             return {'folder': (ps.DIRECTORY, 1, 1), 'file': (0x20, 1, 1), 'two-names': (0x20, 2, 1),
                     'link-folder': (ps.DIRECTORY | ps.REPARSE_POINT, 1, 1), 'link-file': (ps.REPARSE_POINT | 0x20, 1, 1),
-                    'device': (0x20, 1, 2)}[kind]
+                    'device': (0x20, 1, 2), 'readonly-file': (ps._READONLY | 0x20, 1, 1)}[kind]
 
         def fake_security(handle, directory=False):
             node = self.handles[handle][0]
@@ -1055,7 +1148,8 @@ class SimulatedWindowsWalk(unittest.TestCase):
                         patch.object(ps, '_close_fd', self.closed_fds.append),
                         patch.object(ps, '_win_handle_of', lambda fd: fd - 9000),
                         patch.object(ps, '_win_access_mask', lambda handle: self.handles[handle][2]),
-                        patch.object(ps, '_private_descriptor', fake_descriptor)]
+                        patch.object(ps, '_private_descriptor', fake_descriptor),
+                        patch.object(ps, '_win_file_id', lambda handle: id(self.handles[handle][0]))]
         for p in self.patches:
             p.start()
 
@@ -1351,8 +1445,15 @@ class SimulatedWindowsWalk(unittest.TestCase):
 
     def test_remove_deletes_through_the_handle_it_checked(self):
         expect, seen = self.expecting(self.chat)
-        with ps.open_folder(self.CLAUDE, writable=True) as folder:
-            self.assertEqual(folder.remove('chat.jsonl', expect), 'removed')
+        shown_read_only = []
+
+        def recognise(fd):
+            shown_read_only.append(ps.read_only(fd))
+            return expect(fd)
+        with ps.open_folder(self.CLAUDE, writable=True) as folder, patch.object(ps, '_win_access_mask', self.granted):
+            self.assertEqual(folder.remove('chat.jsonl', recognise), 'removed')
+            self.assertEqual((self.duplicated, shown_read_only), ([ps._FILE_GENERIC_READ], [True]),
+                             'expect is shown a duplicate that can only read')
             self.assertNotIn('chat.jsonl', self.claude()['children'])
             opened = [entry for entry in self.log if entry[0] == 'chat.jsonl'][0]
             self.assertEqual(opened[1:3], (ps._GENERIC_READ | ps._DELETE, ps._SHARE_READ), 'no writer while it is checked')
@@ -1415,14 +1516,95 @@ class SimulatedWindowsWalk(unittest.TestCase):
             self.assertNotIn('other.json', claude['children'])
         self.assert_nothing_open()
 
+    def test_a_read_only_file_goes_with_posix_deletion_and_is_left_by_the_older_one(self):
+        claude = self.claude()
+        for posix, result in ((True, 'removed'), (False, 'changed')):
+            self.posix_delete = posix
+            marked = self.node('readonly-file')
+            claude['children']['marked.json'] = marked
+            with self.subTest(posix=posix), ps.open_folder(self.CLAUDE, writable=True) as folder:
+                self.assertEqual(folder.remove('marked.json', self.expecting(marked)[0]), result)
+                self.assertEqual('marked.json' in claude['children'], not posix)
+        self.assert_nothing_open()
+
+    def test_open_or_create_removes_a_new_file_it_refused_and_keeps_an_old_one(self):
+        self.refuse_new = True
+        claude = self.claude()
+        with ps.open_folder(self.CLAUDE, writable=True) as folder:
+            reason(self, lambda: folder.open_or_create('new.lock'), 'access')
+            self.assertNotIn('new.lock', claude['children'])
+            reopened = [entry for entry in self.log if entry[0] == 'new.lock']
+            self.assertEqual([entry[1] for entry in reopened],
+                             [ps._GENERIC_READ | ps._GENERIC_WRITE, ps._DELETE | ps._FILE_READ_ATTRIBUTES],
+                             'the open has no DELETE access; the new file is removed by name after it closes')
+            self.public.add(id(self.chat))
+            reason(self, lambda: folder.open_or_create('chat.jsonl'), 'access')
+            self.assertIs(claude['children']['chat.jsonl'], self.chat, 'an existing file is never removed')
+            swapped = self.node('file')
+
+            def swap_after_check(handle, directory=False):
+                node = self.handles[handle][0]
+                if node is not self.chat:                         # the new file: someone replaces it before the undo
+                    claude['children']['other.lock'] = swapped
+                raise ps.PrivateStorageError('private storage unavailable', 'access')
+            with patch.object(ps, 'windows_handle_security', swap_after_check):
+                reason(self, lambda: folder.open_or_create('other.lock'), 'access')
+            self.assertIs(claude['children']['other.lock'], swapped, 'a name that changed file is left alone')
+            self.chat['pending'] = (claude, 'chat.jsonl')
+            reason(self, lambda: folder.open_or_create('chat.jsonl'), 'changed')
+        self.assert_nothing_open()
+
+    def test_open_append_opens_for_appending_and_applies_the_unwritable_rule(self):
+        claude = self.claude()
+        claude['children'].update({'link': self.node('link-file'), 'two': self.node('two-names'), 'sub': self.node('folder')})
+        checked = []
+
+        def collector(handle, system_owned=False):
+            checked.append((self.handles[handle][1], system_owned))
+            if id(self.handles[handle][0]) in self.public:
+                raise ps.PrivateStorageError('storage others can change', 'access')
+        everyone = ps._SHARE_READ | ps._SHARE_WRITE | ps._SHARE_DELETE
+        with patch.object(ps, 'windows_handle_unwritable', collector), \
+                ps.open_folder(self.CLAUDE, writable=True) as folder:
+            fd, created = folder.open_append('chat.jsonl')
+            self.assertEqual((fd - 9000, created), (max(self.handles), False))
+            self.assertEqual(self.log[-1][:3], ('chat.jsonl', ps._APPEND_ACCESS, everyone))
+            self.assertFalse(ps._APPEND_ACCESS & 0x2, 'append-only data access: no FILE_WRITE_DATA')
+            fd, created = folder.open_append('exclude')
+            self.assertTrue(created)
+            self.assertEqual(claude['children']['exclude']['descriptor'], 'private-descriptor')
+            with self.assertRaises(FileNotFoundError):
+                folder.open_append('missing', create=False)
+            reason(self, lambda: folder.open_append('link'), 'link')
+            reason(self, lambda: folder.open_append('two'), 'links')
+            reason(self, lambda: folder.open_append('sub'), 'not_regular')
+            self.assertEqual(checked, [('chat.jsonl', False), ('exclude', False)], 'checked as unwritable, not private')
+            self.assertEqual(self.checked, [], 'the private rule is not applied')
+            self.public.add(id(self.chat))
+            reason(self, lambda: folder.open_append('chat.jsonl'), 'access')
+            self.assertIn('chat.jsonl', claude['children'])
+            self.refuse_new = True
+            reason(self, lambda: folder.open_append('refused'), 'access')
+            self.assertNotIn('refused', claude['children'], 'a refused new file is removed again')
+        with ps.open_folder(self.CLAUDE) as held:
+            reason(self, lambda: held.open_append('chat.jsonl'), 'unavailable', 'folder')
+        self.assertNotIn('missing', claude['children'])
+        self.assert_nothing_open()
+
     def test_child_stat_reads_the_name_itself_with_attribute_access_only(self):
         claude = self.claude()
         claude['children'].update({'link.json': self.node('link-file'), 'sub': self.node('folder')})
+        claude['children']['junction'] = self.node('link-folder')
         with ps.open_folder(self.CLAUDE) as folder:
-            self.assertEqual(folder.child_stat('chat.jsonl'), ('stat', 'file', id(self.chat)))
+            info = folder.child_stat('chat.jsonl')
+            self.assertEqual((stat.S_ISREG(info.st_mode), info.st_ino), (True, id(self.chat)))
             self.assertEqual(self.log[-1][1:3], (ps._READ_CONTROL | ps._FILE_READ_ATTRIBUTES, 7))
-            self.assertEqual(folder.child_stat('link.json')[1], 'link-file', 'a link is reported as itself')
-            self.assertEqual(folder.child_stat('sub')[1], 'folder')
+            for name in ('link.json', 'junction'):     # fstat says file or folder; the reparse attribute makes it a link
+                with self.subTest(name=name):
+                    info = folder.child_stat(name)
+                    self.assertTrue(stat.S_ISLNK(info.st_mode), 'a link is reported as itself')
+                    self.assertEqual(info.st_ino, id(claude['children'][name]))
+            self.assertTrue(stat.S_ISDIR(folder.child_stat('sub').st_mode))
             with self.assertRaises(FileNotFoundError):
                 folder.child_stat('absent')
             reason(self, lambda: folder.child_stat('a\\b'), 'unavailable')
@@ -1749,6 +1931,9 @@ class WindowsChanges(unittest.TestCase):
         return result
 
     def test_create_mkdir_and_open_or_create_through_a_writable_hold(self):
+        """A writable hold asks only for FILE_ADD_FILE, so this also proves that making a folder through it needs no
+        FILE_ADD_SUBDIRECTORY on the handle."""
+        self.assertEqual(ps._WRITE_HOLD, ps._FILE_ADD_FILE)
         new, sub, lock = (os.path.join(self.state, name) for name in ('new', 'sub', 'fixture.lock'))
         with self.writable() as state:
             fd = state.create('new')
@@ -1797,9 +1982,8 @@ class WindowsChanges(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.base)), ['state'], 'nothing was made through the junction')
 
     def test_whether_a_traversal_only_hold_could_create_and_flush(self):
-        """The open question, answered in the log. Motet asks for FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY and
-        FILE_DELETE_CHILD on every hold it changes through, so it does not depend on the answer; anything other than
-        success or access denied fails here."""
+        """The open question, answered in the log. Motet asks for FILE_ADD_FILE on every hold it changes through (for
+        the flush), so it does not depend on the answer; anything other than success or access denied fails here."""
         with ps.open_folder(self.state) as held:       # traversal only, as every hold was before section (h)
             with ps._private_descriptor() as descriptor:
                 try:
@@ -1861,7 +2045,9 @@ class WindowsChanges(unittest.TestCase):
                 reader = None
                 self.assertEqual(self.until_settled(lambda: state.remove('secret', lambda fd: True)), 'absent')
                 os.close(state.create('secret'))
-                self.assertEqual(self.until_settled(lambda: state.remove('secret', lambda fd: True)), 'removed')
+                # Removed at once, or (if another program glanced at the new file) pending, then gone.
+                self.assertIn(self.until_settled(lambda: state.remove('secret', lambda fd: True)), ('removed', 'absent'))
+                self.assertNotIn('secret', os.listdir(self.state))
         finally:
             if reader is not None:
                 os.close(reader)
@@ -1883,7 +2069,13 @@ class WindowsChanges(unittest.TestCase):
                     self.assertEqual(state.remove(name, lambda fd: True), 'changed')
             self.assertEqual(state.remove('absent', lambda fd: True), 'absent')
             self.assertTrue(os.path.isfile(self.path))
-            self.assertEqual(self.until_settled(lambda: state.remove('secret', lambda fd: True)), 'removed')
+            shown = []
+
+            def recognise(fd):
+                shown.append(ps.read_only(fd))
+                return True
+            self.assertIn(self.until_settled(lambda: state.remove('secret', recognise)), ('removed', 'absent'))
+            self.assertEqual(set(shown), {True}, 'expect is shown a descriptor that can only read')
         self.assertEqual(sorted(os.listdir(self.state)), ['junction', 'sub'])
         self.assertTrue(os.path.isdir(self.base))
 
@@ -1891,14 +2083,82 @@ class WindowsChanges(unittest.TestCase):
         junction(os.path.join(self.state, 'junction'), self.base)
         with ps.open_folder(self.state) as state:
             info = state.child_stat('secret')
+            self.assertTrue(stat.S_ISREG(info.st_mode))
             self.assertTrue(os.path.samestat(info, os.stat(self.path)))
             self.assertEqual(info.st_ino, os.stat(self.path).st_ino)
             self.assertNotEqual(info.st_ino, 0)
             link = state.child_stat('junction')
+            self.assertTrue(stat.S_ISLNK(link.st_mode), 'a junction is reported as a link')
             self.assertTrue(link.st_file_attributes & ps.REPARSE_POINT)
             self.assertFalse(os.path.samestat(link, os.stat(self.base)), 'the junction itself, not where it points')
             with self.assertRaises(FileNotFoundError):
                 state.child_stat('absent')
+
+    def test_child_stat_reports_a_file_symbolic_link_as_a_link(self):
+        try:
+            os.symlink(self.path, os.path.join(self.state, 'link'))
+        except OSError as e:
+            self.skipTest('creating a file symbolic link needs Developer Mode or the symlink privilege (%s)' % type(e).__name__)
+        with ps.open_folder(self.state) as state:
+            link = state.child_stat('link')
+            self.assertTrue(stat.S_ISLNK(link.st_mode))
+            self.assertFalse(os.path.samestat(link, os.stat(self.path)), 'the link itself, not its target')
+
+    def test_open_append_reads_appends_and_applies_the_unwritable_rule(self):
+        exclude = os.path.join(self.state, 'exclude')
+        with open(exclude, 'wb') as out:
+            out.write(b'# fixture\n')                 # follows the folder's list, like a file Git made: not private
+        if not self.owned_by_me(exclude):             # an elevated runner's default owner can be Administrators
+            subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % exclude, shell=True, check=True,
+                           capture_output=True, timeout=30)
+        junction(os.path.join(self.state, 'junction'), self.base)
+        with self.writable() as state:
+            fd, created = state.open_append('exclude')
+            try:
+                self.assertFalse(created)
+                self.assertEqual(os.read(fd, 100), b'# fixture\n')
+                os.lseek(fd, 0, os.SEEK_SET)
+                self.assertEqual(os.write(fd, b'/rule/\n'), 7)      # append-only access: written at the end
+            finally:
+                os.close(fd)
+            fd, created = state.open_append('new-exclude')
+            os.close(fd)
+            self.assertTrue(created)
+            with self.assertRaises(FileNotFoundError):
+                state.open_append('missing', create=False)
+            with self.assertRaises(ps.PrivateStorageError) as raised:
+                state.open_append('junction')
+            self.assertIn(raised.exception.reason, ('link', 'not_regular'))
+        with open(exclude, 'rb') as kept:
+            self.assertEqual(kept.read(), b'# fixture\n/rule/\n')
+        ps.check_private(os.path.join(self.state, 'new-exclude'), single_link=True)
+        icacls(exclude, '/grant', '*S-1-1-0:(W)')     # Everyone may write
+        with self.writable() as state:
+            reason(self, lambda: state.open_append('exclude'), 'access')
+
+    def owned_by_me(self, path):
+        try:
+            ps.windows_security(path)
+            return True
+        except ps.PrivateStorageError as e:
+            return e.reason != 'owner'
+
+    def test_a_read_only_file_is_removed_by_posix_deletion_and_left_by_the_older_one(self):
+        """FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: the newer call removes a file someone marked read-only; the
+        older call cannot, and remove leaves it and says 'changed'."""
+        marked = os.path.join(self.state, 'marked')
+        os.close(ps.create_private_file(marked))
+        os.chmod(self.path, stat.S_IREAD)              # sets the read-only attribute
+        os.chmod(marked, stat.S_IREAD)
+        try:
+            with self.writable() as state:
+                self.assertEqual(self.until_settled(lambda: state.remove('secret', lambda fd: True)), 'removed')
+                with patch.object(ps, '_POSIX_DELETE', False):
+                    self.assertEqual(state.remove('marked', lambda fd: True), 'changed')
+            self.assertFalse(os.path.lexists(self.path))
+            self.assertTrue(os.path.isfile(marked))
+        finally:
+            os.chmod(marked, stat.S_IREAD | stat.S_IWRITE)
 
     def test_read_only_and_unwritable_on_real_handles(self):
         fd = ps.open_no_links(self.path)
