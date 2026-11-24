@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import peer_bridge
 import peer_lifecycle
+import private_storage
 
 
 def inspect(state_dir):
@@ -18,9 +19,16 @@ def inspect(state_dir):
     path = directory / 'officer-messages.sqlite3'
     if directory.resolve() != directory or path.resolve() != path:
         raise ValueError('Use a plain private state directory.')
+    if private_storage.WIN:
+        # Owner and access list, checked on handles opened without following a link or junction.
+        try:
+            private_storage.check_private(str(directory), directory=True)
+            private_storage.check_private(str(path))
+        except private_storage.PrivateStorageError:
+            raise ValueError('State must be private and owned by the current user.') from None
     for candidate, regular in ((directory, False), (path, True)):
         info = candidate.stat()
-        if (info.st_uid != os.getuid() or info.st_mode & 0o077
+        if (not private_storage.WIN and (info.st_uid != os.getuid() or info.st_mode & 0o077)
                 or (not stat.S_ISREG(info.st_mode) if regular else not stat.S_ISDIR(info.st_mode))):
             raise ValueError('State must be private and owned by the current user.')
     identity = path.stat()

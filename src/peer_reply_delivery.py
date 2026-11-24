@@ -9,6 +9,7 @@ import time
 import uuid
 
 import peer_bridge as p
+import private_storage
 
 FIELDS = {'version', 'provider', 'native_id', 'source_scope', 'tool_use_id', 'request_id',
           'target_agent_id', 'target_identity_revision', 'created_at', 'args_sha256', 'observed_at', 'duplicate'}
@@ -277,21 +278,31 @@ def handle_http(handler, delivery):
 
 
 def _offline(state_dir, action):
-    """Hold the existing private lifetime lock through DB and caller filesystem work."""
-    if os.name == 'nt':
-        raise ValueError('Reply-hook provisioning requires POSIX private storage.')
-    import fcntl
+    """Hold the existing private lifetime lock through DB and caller filesystem work.
+
+    It is the lock file Motet holds while it runs, taken the same way (private_storage.try_lock: flock on POSIX, a
+    byte lock on Windows), so this refuses while Motet runs on every system."""
     directory = p.private_directory(state_dir, True)
-    fd = os.open(os.path.join(directory, 'officer-messages.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock = os.path.join(directory, 'officer-messages.lock')
+    if private_storage.WIN:
+        try:
+            fd = private_storage.open_lock_file(lock)
+        except private_storage.PrivateStorageError:
+            raise ValueError('Invalid reply-hook lifetime lock.') from None
+    else:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     db, undo = None, None
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
-            raise ValueError('Invalid reply-hook lifetime lock.')
+        if not private_storage.WIN:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+                raise ValueError('Invalid reply-hook lifetime lock.')
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held = private_storage.try_lock(fd)
         except OSError:
-            raise ValueError('Stop Motet before provisioning reply hooks.') from None
+            held = False
+        if not held:
+            raise ValueError('Stop Motet before provisioning reply hooks.')
         db = p.open_database(directory)
         with p.transaction(db):
             create_schema(db)
@@ -304,7 +315,7 @@ def _offline(state_dir, action):
     finally:
         if db is not None:
             db.close()
-        os.close(fd)
+        private_storage.close_lock(fd)
 
 
 def provision(state_dir, providers, port=8793, install=None):

@@ -20,6 +20,7 @@ import uuid
 
 import claude_channel
 import codex_transcript
+import private_storage
 
 RETENTION = 86400
 TTL = 900
@@ -31,6 +32,14 @@ MAX_TOMBSTONES = 100000
 MAX_CHALLENGE_ENTRIES = 4096
 PEER_WARNING = 'This session may have received peer input before answering.'
 HEX = re.compile(r'[0-9a-f]{64}\Z')
+# One reason, shown wherever the bridge refuses on a system without the handle-based folder walk (Windows for now).
+BRIDGE_UNAVAILABLE = ('The agent-to-agent bridge is not available on Windows yet. It finds chats by opening their '
+                      'folders one by one and refusing links on the way, which Motet cannot do on Windows yet, so '
+                      'agents cannot list or message each other through Motet here. Your own messages to Claude chats '
+                      'on the stage still work.')
+# Windows refusals from private_storage, in fixed words (the POSIX checks keep their own, older words).
+STATE_FOLDER_REFUSED = 'Motet bridge storage must be a private folder owned by you.'
+STATE_FILE_REFUSED = 'Motet bridge storage must be a private file owned by you.'
 
 
 class PeerError(Exception):
@@ -97,8 +106,37 @@ def transaction(db, lock=None):
             lock.release()
 
 
+def bridge_available():
+    """False where chats cannot be found for the bridge: the chat directory needs the handle-based folder walk."""
+    return claude_channel.folder_walk_available()
+
+
+def _make_private_folders(path):
+    """Windows: make ``path`` and any missing folders above it, each with a private access list from the start."""
+    if os.path.lexists(path):
+        return
+    parent = os.path.dirname(path)
+    if parent != path:
+        _make_private_folders(parent)
+    try:
+        private_storage.make_private_folder(path)
+    except OSError:
+        if not os.path.lexists(path):   # something else made it first: it is checked like any other
+            raise
+
+
 def private_directory(path, create=False):
     path = os.path.abspath(path)
+    if private_storage.WIN:
+        # No folder walk here: the folder itself is opened without following a link or junction and its owner and
+        # access list are checked on that handle. Folders above it are not checked, as for agent messaging's folder.
+        if create:
+            _make_private_folders(path)
+        try:
+            private_storage.check_private(path, directory=True)
+        except private_storage.PrivateStorageError:
+            raise claude_channel.ChannelError(STATE_FOLDER_REFUSED) from None
+        return path
     if create:
         os.makedirs(path, mode=0o700, exist_ok=True)
     fd = claude_channel._directory(path)
@@ -109,9 +147,30 @@ def private_directory(path, create=False):
     return path
 
 
+def windows_state_file(path, create=True):
+    """Windows: a read-write descriptor for a private file with one name, never through a link or junction."""
+    try:
+        return private_storage.open_private_rw(path, create)
+    except private_storage.PrivateStorageError:
+        raise claude_channel.ChannelError(STATE_FILE_REFUSED) from None
+
+
 def open_database(state):
     state = private_directory(state, True)
     path = os.path.join(state, 'officer-messages.sqlite3')
+    if private_storage.WIN:
+        # The checked handle stays open, without delete sharing, while SQLite opens the same name, so the file
+        # cannot be renamed or replaced in between; a linked journal would let SQLite write elsewhere.
+        fd = windows_state_file(path)
+        try:
+            if not private_storage.sqlite_companions_plain(path):
+                raise claude_channel.ChannelError(STATE_FILE_REFUSED)
+            db = sqlite3.connect(path, timeout=DB_TIMEOUT)
+        finally:
+            os.close(fd)
+        with transaction(db):
+            schema(db)
+        return db
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         claude_channel._private(os.fstat(fd))
@@ -637,19 +696,20 @@ def update_service_policy(state, changes):
     The next start constructs a fresh directory. Retained history, credentials,
     ledger key and deduplication records are intentionally not changed.
     """
-    import fcntl
     import chat_directory
     if (not isinstance(changes, dict) or not changes or
             not set(changes) <= {'providers', 'history_days', 'project_allow', 'project_deny'}):
         raise PeerError(400, 'Specify at least one supported discovery policy change.')
     state = private_directory(state)
-    fd = os.open(os.path.join(state, 'officer-messages.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock = os.path.join(state, 'officer-messages.lock')
+    # The same lock file and kind of lock Motet holds for its lifetime (private_storage.try_lock: flock on POSIX,
+    # a byte lock on Windows), so this refuses while Motet runs on every system.
+    fd = windows_state_file(lock) if private_storage.WIN else os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        claude_channel._private(os.fstat(fd))
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise PeerError(409, 'Stop Motet before updating discovery policy, then restart it afterward.') from None
+        if not private_storage.WIN:
+            claude_channel._private(os.fstat(fd))
+        if not private_storage.try_lock(fd):
+            raise PeerError(409, 'Stop Motet before updating discovery policy, then restart it afterward.')
         db = open_database(state)
         try:
             with transaction(db):
@@ -664,7 +724,7 @@ def update_service_policy(state, changes):
         finally:
             db.close()
     finally:
-        os.close(fd)  # Releases ownership on both success and every failure path.
+        private_storage.close_lock(fd)  # Releases ownership on both success and every failure path.
 
 
 def issue_service_credential(db):
@@ -790,6 +850,9 @@ class SharedBridge:
         method, args = request['method'], request['params']
         if isinstance(method, str) and method in self.inbox.methods:
             return self.inbox.rpc(method, args, credential_id, self.run_id, nonce, inbox_target)
+        if method in ('list_agents', 'send_message') and not bridge_available():
+            # Refused before any reservation: no chat can be found or addressed here. Saved requests stay readable.
+            raise PeerError(409, BRIDGE_UNAVAILABLE + (' Nothing was sent.' if method == 'send_message' else ''))
         self.ensure_directory()
         if method == 'list_agents' and set(args) <= {'query', 'provider', 'project_id', 'cursor'}:
             if self.directory is None:

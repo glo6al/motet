@@ -589,5 +589,234 @@ class PeerTests(unittest.TestCase):
                 thread.join()
 
 
+class OfflinePolicyLock(unittest.TestCase):
+    """The offline policy update takes Motet's own lifetime lock, as the store does, on every system."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self.temp.name)
+        self.state = os.path.join(self.base, 'state')
+        self.sessions = os.path.join(self.base, 'sessions')
+        db = p.open_database(self.state)
+        try:
+            p.initialize_service(db, {'providers': ['claude'], 'history_days': 14})
+        finally:
+            db.close()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_refused_while_motet_runs_then_applied_once_it_stops(self):
+        store = m.MessagingStore(self.state, self.sessions)
+        try:
+            with self.assertRaises(p.PeerError) as raised:
+                p.update_service_policy(self.state, {'history_days': 'all'})
+            self.assertEqual((raised.exception.status, str(raised.exception)),
+                             (409, 'Stop Motet before updating discovery policy, then restart it afterward.'))
+        finally:
+            store.close()
+        self.assertEqual(p.update_service_policy(self.state, {'history_days': 'all'})['history_days'], 'all')
+        # The lock was released: the store starts again.
+        m.MessagingStore(self.state, self.sessions).close()
+
+    def test_lock_taken_the_way_the_store_takes_it_is_respected(self):
+        import private_storage
+        held = private_storage.open_lock_file(os.path.join(self.state, 'officer-messages.lock'))
+        try:
+            self.assertTrue(private_storage.try_lock(held))
+            with self.assertRaises(p.PeerError):
+                p.update_service_policy(self.state, {'history_days': 'all'})
+        finally:
+            private_storage.close_lock(held)
+
+
+class BridgeRefusal(unittest.TestCase):
+    """Where chats cannot be found, list_agents and send_message refuse with one reason before any reservation."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        base = os.path.realpath(self.temp.name)
+        self.store = m.MessagingStore(os.path.join(base, 'state'), os.path.join(base, 'sessions'))
+        self.credential = p.initialize_service(self.store.db, {'providers': ['claude'], 'history_days': 14})['credential_id']
+
+    def tearDown(self):
+        self.store.close()
+        self.temp.cleanup()
+
+    def check_refused(self):
+        rpc = self.store.shared.rpc
+        with self.assertRaises(p.PeerError) as listed:
+            rpc(self.credential, {'method': 'list_agents', 'params': {}})
+        self.assertEqual((listed.exception.status, str(listed.exception)), (409, p.BRIDGE_UNAVAILABLE))
+        with self.assertRaises(p.PeerError) as sent:
+            rpc(self.credential, {'method': 'send_message', 'params': {
+                'agent_id': 'c:' + uid(), 'identity_revision': 'a' * 64, 'text': 'Fictional question?', 'request_id': uid()}})
+        self.assertEqual((sent.exception.status, str(sent.exception)), (409, p.BRIDGE_UNAVAILABLE + ' Nothing was sent.'))
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM shared_bridge_requests').fetchone()[0], 0)
+        # Saved history stays readable.
+        self.assertEqual(rpc(self.credential, {'method': 'list_requests', 'params': {}})['requests'], [])
+        self.assertIn('not available on Windows yet', p.BRIDGE_UNAVAILABLE)
+        self.assertLessEqual(len(p.BRIDGE_UNAVAILABLE + ' Nothing was sent.'), 512)   # the adapter's error bound
+
+    @unittest.skipIf(os.name == 'nt', 'real Windows is checked below')
+    def test_simulated_system_without_the_folder_walk(self):
+        with patch.object(p.claude_channel, 'folder_walk_available', return_value=False):
+            self.check_refused()
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows')
+    def test_windows(self):
+        self.check_refused()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX')
+    def test_posix_keeps_its_directory_message(self):
+        with self.assertRaises(p.PeerError) as listed:
+            self.store.shared.rpc(self.credential, {'method': 'list_agents', 'params': {}})
+        self.assertEqual((listed.exception.status, str(listed.exception)), (503, 'The chat directory is unavailable.'))
+
+
+@unittest.skipIf(os.name == 'nt', 'POSIX')
+class LinuxSimulation(unittest.TestCase):
+    """Linux has the folder walk, so the chat directory is built and Claude chats can be reached through the plugin.
+    Codex recipients stay Mac-only: its queue command ships inside the Mac app. (CI's Ubuntu jobs run the full
+    Claude bridge integration; this checks the platform decisions without a Linux machine.)"""
+
+    def test_directory_is_configured_and_codex_stays_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = os.path.realpath(temp)
+            store = m.MessagingStore(os.path.join(base, 'state'), os.path.join(base, 'sessions'))
+            try:
+                store.available = True
+                codex = 'x:' + uid()
+                with patch.object(server.sys, 'platform', 'linux'), \
+                        patch.object(server.subprocess, 'run', side_effect=AssertionError('Mac app probe on Linux')), \
+                        patch.dict(server.AGENTS, {codex: {'runtime': 'Codex'}}, clear=True):
+                    self.assertTrue(p.bridge_available())
+                    snapshot = server.shared_directory_snapshot(store)
+                    server.configure_shared_directory(store, base)
+                self.assertEqual(snapshot['__codex_transport__']['capability'], 'unavailable')
+                self.assertEqual(snapshot[codex]['capability'], 'unavailable')
+                self.assertIsNotNone(store.shared.directory_factory)
+            finally:
+                store.close()
+
+
+@unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS and Linux; real Windows is tested below')
+class SimulatedWindowsStorage(unittest.TestCase):
+    """The Windows branches use private_storage only: no folder walk, fcntl or os.getuid."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from windows_simulation import simulated_windows
+        self.simulated_windows = simulated_windows
+        self.temp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(os.path.realpath(self.temp.name), 'home', '.live-room')
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_folders_database_and_policy_lock(self):
+        import private_storage
+        with self.simulated_windows() as calls:
+            db = p.open_database(self.state)
+            try:
+                p.initialize_service(db, {'providers': ['claude'], 'history_days': 14})
+            finally:
+                db.close()
+            self.assertEqual(p.update_service_policy(self.state, {'history_days': 'all'})['history_days'], 'all')
+        for name in ('make_private_folder', 'check_private', 'open_private_rw', 'sqlite_companions_plain', 'try_lock', 'close_lock'):
+            self.assertIn(name, calls)
+        for folder in (self.state, os.path.dirname(self.state)):            # each new level made private
+            self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+        held = private_storage.open_lock_file(os.path.join(self.state, 'officer-messages.lock'))
+        try:
+            self.assertTrue(private_storage.try_lock(held))
+            with self.simulated_windows(), self.assertRaises(p.PeerError) as raised:
+                p.update_service_policy(self.state, {'history_days': 14})
+            self.assertEqual(raised.exception.status, 409)
+        finally:
+            private_storage.close_lock(held)
+
+    def test_refusals_in_fixed_words(self):
+        os.makedirs(self.state, mode=0o700)
+        os.chmod(self.state, 0o755)
+        with self.simulated_windows(), self.assertRaises(p.claude_channel.ChannelError) as raised:
+            p.open_database(self.state)
+        self.assertEqual(str(raised.exception), p.STATE_FOLDER_REFUSED)
+        os.chmod(self.state, 0o700)
+        lock = os.path.join(self.state, 'officer-messages.lock')
+        open(lock, 'w').close()
+        os.chmod(lock, 0o644)
+        with self.simulated_windows(), self.assertRaises(p.claude_channel.ChannelError) as raised:
+            p.update_service_policy(self.state, {'history_days': 14})
+        self.assertEqual(str(raised.exception), p.STATE_FILE_REFUSED)
+        os.chmod(lock, 0o600)
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        os.symlink(os.path.join(self.state, 'elsewhere'), database + '-journal')
+        with self.simulated_windows(), self.assertRaises(p.claude_channel.ChannelError) as raised:
+            p.open_database(self.state)
+        self.assertEqual(str(raised.exception), p.STATE_FILE_REFUSED)
+        self.assertFalse(os.path.lexists(os.path.join(self.state, 'elsewhere')))
+
+
+def _icacls(*args):
+    import subprocess
+    subprocess.run(['icacls'] + list(args), check=True, capture_output=True, timeout=30)
+
+
+def _junction(link, target):
+    import subprocess
+    subprocess.run(['cmd', '/c', 'mklink', '/J', link, target], check=True, capture_output=True, timeout=30)
+
+
+@unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists and reparse points')
+class WindowsStorage(unittest.TestCase):
+    EVERYONE_READ = '*S-1-1-0:(R)'      # a SID, so the test does not depend on the system language
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self.temp.name)
+        self.state = os.path.join(self.base, 'state')
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_new_folder_and_database_are_private(self):
+        import private_storage
+        p.open_database(self.state).close()
+        private_storage.windows_security(self.state, True)
+        private_storage.windows_security(os.path.join(self.state, 'officer-messages.sqlite3'))
+
+    def test_lock_open_to_others_is_refused(self):
+        p.open_database(self.state).close()
+        lock = os.path.join(self.state, 'officer-messages.lock')
+        import private_storage
+        os.close(private_storage.open_lock_file(lock))
+        _icacls(lock, '/grant', self.EVERYONE_READ)
+        with self.assertRaises(p.claude_channel.ChannelError) as raised:
+            p.update_service_policy(self.state, {'history_days': 'all'})
+        self.assertEqual(str(raised.exception), p.STATE_FILE_REFUSED)
+
+    def test_junction_in_place_of_the_state_folder_is_refused(self):
+        import private_storage
+        target = os.path.join(self.base, 'real-state')
+        private_storage.make_private_folder(target)
+        _junction(self.state, target)
+        with self.assertRaises(p.claude_channel.ChannelError) as raised:
+            p.open_database(self.state)
+        self.assertEqual(str(raised.exception), p.STATE_FOLDER_REFUSED)
+        self.assertEqual(os.listdir(target), [])
+
+    def test_link_in_place_of_the_lock_is_refused(self):
+        p.open_database(self.state).close()
+        lock = os.path.join(self.state, 'officer-messages.lock')
+        try:
+            os.symlink(os.path.join(self.base, 'elsewhere.lock'), lock)
+        except (OSError, NotImplementedError):
+            self.skipTest('this Windows account may not create symbolic links')
+        with self.assertRaises((OSError, p.claude_channel.ChannelError)):
+            p.update_service_policy(self.state, {'history_days': 'all'})
+        self.assertFalse(os.path.lexists(os.path.join(self.base, 'elsewhere.lock')))
+
+
 if __name__ == '__main__':
     unittest.main()

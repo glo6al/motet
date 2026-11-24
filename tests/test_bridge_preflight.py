@@ -63,5 +63,33 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
 
 
+class WindowsPreflight(unittest.TestCase):
+    """On Windows the state checks are private_storage's: owner and access list, no link or junction."""
+
+    def inspect_new_state(self, context):
+        with tempfile.TemporaryDirectory() as temp:
+            state = os.path.join(os.path.realpath(temp), 'state')
+            with context():
+                preflight.peer_bridge.open_database(state).close()
+                result = preflight.inspect(state)
+            self.assertTrue(result['read_only'])
+            self.assertEqual(result['execution_counts'], {})
+            if os.name != 'nt':
+                os.chmod(state, 0o755)
+                with context(), self.assertRaisesRegex(ValueError, '^State must be private and owned by the current user.$'):
+                    preflight.inspect(state)
+
+    @unittest.skipIf(os.name == 'nt', 'real Windows is checked below')
+    def test_simulated_windows(self):
+        sys.path.insert(0, str(ROOT / 'tests'))
+        from windows_simulation import simulated_windows
+        self.inspect_new_state(simulated_windows)
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows')
+    def test_windows(self):
+        import contextlib
+        self.inspect_new_state(contextlib.nullcontext)
+
+
 if __name__ == '__main__':
     unittest.main()

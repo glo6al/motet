@@ -15,6 +15,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'src'))
 import peer_bridge as p
 import claude_channel
+import private_storage
+
+# Commands that set up or use bridge messaging. Where the bridge cannot find chats (Windows for now) they refuse
+# with one reason; status and revoke still read and turn off saved access.
+NEEDS_BRIDGE = ('init', 'rotate', 'config', 'enroll', 'policy')
+
+
+class BridgeUnavailable(ValueError):
+    """A refusal whose fixed words are safe to print as they are."""
 
 
 def parser():
@@ -94,7 +103,11 @@ def write_credential(state, credential, port):
         raise ValueError('Use a valid Motet port.')
     directory = p.private_directory(os.path.join(state, 'bridge-credentials' if credential['version'] == 2 else 'peer-credentials'), True)
     path = os.path.join(directory, credential.get('credential_id', credential.get('endpoint_id')) + '.json')
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    if private_storage.WIN:
+        # New only (an existing name or link is refused), with a protected this-user/SYSTEM access list from the start.
+        fd = private_storage.create_private_file(path)
+    else:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as f:
         json.dump(dict(credential, port=port), f)
         f.flush()
@@ -129,15 +142,28 @@ def read_credential(path, *, exact_mode=False):
     path = os.path.abspath(path)
     directory = p.private_directory(os.path.dirname(path))
     p.private_directory(os.path.dirname(directory))
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        info = os.fstat(fd)
-        claude_channel._private(info)
-        if exact_mode and stat.S_IMODE(info.st_mode) != 0o600:
-            raise ValueError('Use an owner-only read-write credential file.')
-        raw = os.read(fd, 8193)
-    finally:
-        os.close(fd)
+    if private_storage.WIN:
+        # The folder is held open (no rename or replacement) until the file is open; the file is opened without
+        # following a link or junction, and its owner, access list and single name are checked on that handle. The
+        # access-list rule (only this user and SYSTEM, nothing inherited) is already owner-only, so exact_mode adds nothing.
+        try:
+            fd, info = private_storage.open_private_file(path, folder=True, single_link=True)
+        except private_storage.PrivateStorageError:
+            raise claude_channel.ChannelError(p.STATE_FILE_REFUSED) from None
+        try:
+            raw = os.read(fd, 8193)
+        finally:
+            os.close(fd)
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            claude_channel._private(info)
+            if exact_mode and stat.S_IMODE(info.st_mode) != 0o600:
+                raise ValueError('Use an owner-only read-write credential file.')
+            raw = os.read(fd, 8193)
+        finally:
+            os.close(fd)
     data = json.loads(raw)
     if isinstance(data, dict) and data.get('version') == 2:
         if (len(raw) > 8192 or set(data) != {'version', 'credential_id', 'secret', 'port'}
@@ -298,6 +324,8 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if not 1 <= args.port <= 65535:
         raise ValueError('Use a valid Motet port.')
+    if args.command in NEEDS_BRIDGE and not p.bridge_available():
+        raise BridgeUnavailable(p.BRIDGE_UNAVAILABLE)
     if args.command == 'config':
         if args.inbox_credential and args.client != 'antigravity':
             raise ValueError('Inbox receiving is configured only for the Antigravity plugin.')
@@ -404,7 +432,7 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         main()
-    except AntigravityPathError as error:
+    except (AntigravityPathError, BridgeUnavailable) as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
     except Exception:

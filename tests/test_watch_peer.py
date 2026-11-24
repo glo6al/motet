@@ -11,6 +11,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import watch_peer as w
 import watch_claude as c
 
@@ -264,6 +265,148 @@ class CliTests(unittest.TestCase):
         os.symlink(path, link)
         with self.assertRaises(OSError):
             w.read_credential(link)
+
+
+class Refusal(unittest.TestCase):
+    """Where chats cannot be found (Windows for now) setup refuses with one printed reason; no traceback."""
+
+    def test_setup_commands_refuse_with_the_bridge_reason_before_any_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = os.path.join(os.path.realpath(temp), 'state')
+            with patch.object(w.p, 'bridge_available', return_value=False), \
+                    patch.object(w.p, 'open_database', side_effect=AssertionError('database opened')), \
+                    patch.object(w.p, 'update_service_policy', side_effect=AssertionError('policy opened')):
+                for argv in (['init', '--providers', 'claude'], ['rotate', str(uuid.uuid4())], ['config', 'fictional.json'],
+                             ['policy', '--history', 'all'],
+                             ['enroll', '--label', 'Fictional', '--session', str(uuid.uuid4()), '--project', temp]):
+                    with self.subTest(command=argv[0]), self.assertRaises(w.BridgeUnavailable) as raised:
+                        w.main(['--state-dir', state] + argv)
+                    self.assertEqual(str(raised.exception), w.p.BRIDGE_UNAVAILABLE)
+            self.assertFalse(os.path.lexists(state))
+
+    def test_the_command_line_prints_the_reason_alone(self):
+        import runpy
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, patch.object(sys, 'argv', ['watch_peer.py', '--state-dir', temp, 'init', '--providers', 'claude']), \
+                patch('peer_bridge.bridge_available', return_value=False), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as code:
+            runpy.run_path(w.__file__, run_name='__main__')
+        self.assertEqual((code.exception.code, err.getvalue()), (1, w.p.BRIDGE_UNAVAILABLE + '\n'))
+        self.assertIn('not available on Windows yet', err.getvalue())
+
+
+@unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS and Linux; real Windows is tested below')
+class SimulatedWindowsCredentials(unittest.TestCase):
+    """The Windows branches go through private_storage only: no folder walk, fcntl or os.getuid."""
+
+    def setUp(self):
+        from windows_simulation import simulated_windows
+        self.simulated_windows = simulated_windows
+        self.temp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(os.path.realpath(self.temp.name), 'state')
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_credentials_are_written_and_read_through_private_storage(self):
+        credential = {'version': 2, 'credential_id': str(uuid.uuid4()), 'secret': 'a' * 64}
+        with self.simulated_windows() as calls:
+            path = w.write_credential(self.state, credential, 8793)
+            self.assertEqual(w.read_credential(path), dict(credential, port=8793))
+            self.assertEqual(w.read_credential(path, exact_mode=True)['credential_id'], credential['credential_id'])
+        self.assertIn('make_private_folder', calls)
+        self.assertIn('create_private_file', calls)
+        self.assertIn('open_private_file', calls)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
+
+    def test_refusals_map_to_one_plain_message(self):
+        credential = {'version': 2, 'credential_id': str(uuid.uuid4()), 'secret': 'b' * 64}
+        with self.simulated_windows():
+            path = w.write_credential(self.state, credential, 8793)
+            with self.assertRaises(OSError):
+                w.write_credential(self.state, credential, 8793)          # never replaces an existing file
+        os.chmod(path, 0o644)                                             # open to others
+        with self.simulated_windows(), self.assertRaises(w.claude_channel.ChannelError) as raised:
+            w.read_credential(path)
+        self.assertEqual(str(raised.exception), w.p.STATE_FILE_REFUSED)
+        os.chmod(path, 0o600)
+        link = path + '-link'
+        os.symlink(path, link)                                            # a link in place of the file
+        with self.simulated_windows(), self.assertRaises(w.claude_channel.ChannelError):
+            w.read_credential(link)
+        os.chmod(os.path.dirname(path), 0o755)                            # the folder open to others
+        with self.simulated_windows(), self.assertRaises(w.claude_channel.ChannelError) as raised:
+            w.read_credential(path)
+        self.assertEqual(str(raised.exception), w.p.STATE_FOLDER_REFUSED)
+
+
+def icacls(*args):
+    import subprocess
+    subprocess.run(['icacls'] + list(args), check=True, capture_output=True, timeout=30)
+
+
+def junction(link, target):
+    """A directory junction needs no special privilege, unlike a symbolic link."""
+    import subprocess
+    subprocess.run(['cmd', '/c', 'mklink', '/J', link, target], check=True, capture_output=True, timeout=30)
+
+
+EVERYONE_READ = '*S-1-1-0:(R)'      # a SID, so the test does not depend on the system language
+
+
+@unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists and reparse points')
+class WindowsCredentials(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self.temp.name)
+        self.state = os.path.join(self.base, 'state')
+        self.credential = {'version': 2, 'credential_id': str(uuid.uuid4()), 'secret': 'c' * 64}
+        self.path = w.write_credential(self.state, self.credential, 8793)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_private_credential_round_trip(self):
+        w.private_storage.check_private(self.state, directory=True)
+        w.private_storage.check_private(os.path.dirname(self.path), directory=True)
+        w.private_storage.check_private(self.path, single_link=True)
+        self.assertEqual(w.read_credential(self.path), dict(self.credential, port=8793))
+        with self.assertRaises(OSError):
+            w.write_credential(self.state, self.credential, 8793)
+
+    def test_credential_open_to_others_is_refused(self):
+        icacls(self.path, '/grant', EVERYONE_READ)
+        with self.assertRaises(w.claude_channel.ChannelError) as raised:
+            w.read_credential(self.path)
+        self.assertEqual(str(raised.exception), w.p.STATE_FILE_REFUSED)
+
+    def test_credential_folder_open_to_others_is_refused(self):
+        icacls(os.path.dirname(self.path), '/grant', EVERYONE_READ)
+        with self.assertRaises(w.claude_channel.ChannelError) as raised:
+            w.read_credential(self.path)
+        self.assertEqual(str(raised.exception), w.p.STATE_FOLDER_REFUSED)
+
+    def test_junction_in_place_of_the_credential_folder_is_refused(self):
+        moved = os.path.join(self.base, 'elsewhere')
+        os.rename(os.path.dirname(self.path), moved)
+        junction(os.path.dirname(self.path), moved)
+        with self.assertRaises(w.claude_channel.ChannelError):
+            w.read_credential(self.path)
+
+    def test_link_in_place_of_the_credential_is_refused(self):
+        link = os.path.join(os.path.dirname(self.path), 'link.json')
+        try:
+            os.symlink(self.path, link)
+        except (OSError, NotImplementedError):
+            self.skipTest('this Windows account may not create symbolic links')
+        with self.assertRaises(w.claude_channel.ChannelError):
+            w.read_credential(link)
+
+    def test_setup_refuses_with_the_bridge_reason(self):
+        with self.assertRaises(w.BridgeUnavailable) as raised:
+            w.main(['--state-dir', self.state, 'init', '--providers', 'claude'])
+        self.assertEqual(str(raised.exception), w.p.BRIDGE_UNAVAILABLE)
 
 
 if __name__ == '__main__':
