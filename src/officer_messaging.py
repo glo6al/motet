@@ -147,8 +147,14 @@ def private_state_folder(state_dir):
             except OSError:
                 if not os.path.lexists(state_dir):   # something else made it first: check that one instead
                     raise
-    else:
-        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        try:
+            # The folders above are resolved once (a moved profile often uses a junction); then the walk opens each
+            # folder by handle and checks this one's owner and access list on its handle.
+            os.close(private_storage.open_no_links(private_storage.anchored(state_dir), directory=True, private=True))
+        except OSError:
+            raise OSError(STATE_FOLDER_REFUSED) from None
+        return
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
     try:
         private_storage.check_private(state_dir, directory=True)
     except private_storage.PrivateStorageError:

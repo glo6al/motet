@@ -128,13 +128,13 @@ def _make_private_folders(path):
 def private_directory(path, create=False):
     path = os.path.abspath(path)
     if private_storage.WIN:
-        # No folder walk here: the folder itself is opened without following a link or junction and its owner and
-        # access list are checked on that handle. Folders above it are not checked, as for agent messaging's folder.
+        # The folders above are resolved once (a moved profile often uses a junction), then the walk opens every
+        # folder by handle, refusing a link or junction at this folder, and checks its owner and access list there.
         if create:
             _make_private_folders(path)
         try:
-            private_storage.check_private(path, directory=True)
-        except private_storage.PrivateStorageError:
+            os.close(private_storage.open_no_links(private_storage.anchored(path), directory=True, private=True))
+        except OSError:
             raise claude_channel.ChannelError(STATE_FOLDER_REFUSED) from None
         return path
     if create:

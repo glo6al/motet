@@ -2,9 +2,11 @@
 """Print one Motet bridge credential for the bridge adapter, after Motet's own privacy checks. Windows only in use.
 
 Node cannot read a Windows access list, so on Windows integrations/claude/peer.mjs runs this script (with ``-I``)
-instead of opening its credential file itself. The file is read through watch_peer.read_credential: its folder is
-held open, the file is opened without following a link or junction, and its owner, protected this-user/SYSTEM
-access list and single name are checked on the opened handle (on macOS and Linux: owner and mode instead). Only a
+instead of opening its credential file itself. The file is read through watch_peer.read_credential, which on Windows
+uses private_storage's no-link walk: the folders above Motet's state folder are resolved once, then the state
+folder, the credential folder and the file are opened by handle, each relative to the folder above, never through a
+link or junction, and the folders' and the file's owner and protected this-user/SYSTEM access list (and the file's
+single name) are checked on the opened handles. On macOS and Linux it checks owner and mode instead. Only a
 shared-service credential (version 2) is printed, as one line of JSON on standard output. A refusal prints one
 fixed line on standard error, never a path or the file's contents.
 

@@ -143,21 +143,29 @@ def enroll_launch(state, session, instance, project, label, port=8793):
 
 def read_credential(path, *, exact_mode=False):
     path = os.path.abspath(path)
-    directory = p.private_directory(os.path.dirname(path))
-    p.private_directory(os.path.dirname(directory))
     if private_storage.WIN:
-        # The folder is held open (no rename or replacement) until the file is open; the file is opened without
-        # following a link or junction, and its owner, access list and single name are checked on that handle. The
-        # access-list rule (only this user and SYSTEM, nothing inherited) is already owner-only, so exact_mode adds nothing.
+        # The no-link walk: the folders above Motet's state folder are resolved once (a moved profile often uses a
+        # junction); then the state folder, the credential folder and the file are each opened by handle relative to
+        # the one above, never through a link or junction, with the folders held until the file is open. Owner and
+        # access list are checked on the state and credential folders' handles, and owner, access list and a single
+        # name on the file's. The access-list rule (only this user and SYSTEM, nothing inherited) is already
+        # owner-only, so exact_mode adds nothing.
+        folder, name = os.path.split(path)
+        state, credentials = os.path.split(folder)
         try:
-            fd, info = private_storage.open_private_file(path, folder=True, single_link=True)
-        except private_storage.PrivateStorageError:
-            raise claude_channel.ChannelError(p.STATE_FILE_REFUSED) from None
+            with private_storage.open_folder(private_storage.anchored(state), private=True) as held, \
+                    held.folder(credentials, private=True) as inner:
+                fd = inner.open(name, single_link=True, private=True)
+        except OSError as error:
+            folder_refused = getattr(error, 'subject', 'file') == 'folder'
+            raise claude_channel.ChannelError(p.STATE_FOLDER_REFUSED if folder_refused else p.STATE_FILE_REFUSED) from None
         try:
             raw = os.read(fd, 8193)
         finally:
             os.close(fd)
     else:
+        directory = p.private_directory(os.path.dirname(path))
+        p.private_directory(os.path.dirname(directory))
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             info = os.fstat(fd)

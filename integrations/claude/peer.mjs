@@ -31,8 +31,10 @@ class MessageLengthError extends Error {}
 class PeerDeadlineError extends Error {}
 const OPERATION_FAILED='Peer operation could not be confirmed. No request was retried.';
 // Node cannot read a Windows access list, so on Windows the adapter never opens its credential file itself: Motet's
-// Python checks it (owner, a protected this-user/SYSTEM list, no link or junction, one name) and hands it over on a
-// pipe. Without the Python path that `watch_peer.py config` writes, the adapter refuses before touching the file.
+// Python opens it through its no-link walk (state folder, credential folder and file each opened by handle, never
+// through a link or junction; folders above the state folder are resolved once), checks owner, a protected
+// this-user/SYSTEM list and one name on the handles, and hands it over on a pipe. Without the Python path that
+// `watch_peer.py config` writes, the adapter refuses before touching the file.
 export const WINDOWS_PYTHON_REQUIRED='On Windows the Motet bridge adapter needs Python to check that its credential file is private to you, and none was given. Run python scripts\\watch_peer.py config again and use the configuration it prints.';
 export function platformRefusal(platform=process.platform,python=null){return platform==='win32'&&!python?WINDOWS_PYTHON_REQUIRED:null}
 const HELPER=path.join(path.dirname(fileURLToPath(import.meta.url)),'..','..','scripts','watch_peer_credential.py');
@@ -42,8 +44,8 @@ export function parseArgs(argv){
   for(let i=0;i<argv.length;i+=2){if(!names.has(argv[i])||argv[i] in out||typeof argv[i+1]!=='string'||!argv[i+1])throw fail();out[argv[i]]=argv[i+1]}
   return {credential:out['--credential'],inbox:out['--inbox-credential']??null,python:out['--python']??null};
 }
-// Windows: Motet's Python opens the file without following a link or junction anywhere, checks its owner and access
-// list on the opened handle (and its folders'), and prints the validated credential; nothing else is trusted.
+// Windows: Motet's Python reads the file as described above and prints the validated credential; nothing else is
+// trusted.
 export async function readCredentialChecked(file,python,helper=HELPER){
   if(!path.isAbsolute(file)||path.resolve(file)!==file||!path.isAbsolute(python)||path.resolve(python)!==python)throw fail();
   const raw=await new Promise((resolve,reject)=>{

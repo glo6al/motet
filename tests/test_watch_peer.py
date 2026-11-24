@@ -316,7 +316,8 @@ class SimulatedWindowsCredentials(unittest.TestCase):
             self.assertEqual(w.read_credential(path, exact_mode=True)['credential_id'], credential['credential_id'])
         self.assertIn('make_private_folder', calls)
         self.assertIn('create_private_file', calls)
-        self.assertIn('open_private_file', calls)
+        self.assertIn('open_folder', calls)                              # read through the no-link walk
+        self.assertNotIn('open_private_file', calls)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
 

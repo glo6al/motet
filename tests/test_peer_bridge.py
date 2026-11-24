@@ -762,7 +762,7 @@ class SimulatedWindowsStorage(unittest.TestCase):
             finally:
                 db.close()
             self.assertEqual(p.update_service_policy(self.state, {'history_days': 'all'})['history_days'], 'all')
-        for name in ('make_private_folder', 'check_private', 'open_private_rw', 'sqlite_companions_plain', 'try_lock', 'close_lock'):
+        for name in ('make_private_folder', 'anchored', 'open_no_links', 'open_private_rw', 'sqlite_companions_plain', 'try_lock', 'close_lock'):
             self.assertIn(name, calls)
         for folder in (self.state, os.path.dirname(self.state)):            # each new level made private
             self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
