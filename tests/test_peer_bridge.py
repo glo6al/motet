@@ -758,6 +758,57 @@ class SimulatedWindowsStorage(unittest.TestCase):
         self.assertFalse(os.path.lexists(os.path.join(self.state, 'elsewhere')))
 
 
+class ClosesWhatItOpens(unittest.TestCase):
+    """The bridge's storage paths close every database, descriptor and lock themselves, on success and refusal.
+    Windows cannot remove or replace a file left open, so this runs on real POSIX, on simulated Windows, and on
+    real Windows (where only the ResourceWarning half applies)."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from handle_leaks import no_leaked_handles
+        self.no_leaks = lambda: no_leaked_handles(self)
+        self.temp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(os.path.realpath(self.temp.name), 'state')
+
+    def tearDown(self):
+        self.temp.cleanup()     # on Windows this fails if anything is still open
+
+    def check(self, context):
+        import private_storage
+        with context():
+            with self.no_leaks():
+                db = p.open_database(self.state)
+                p.initialize_service(db, {'providers': ['claude'], 'history_days': 14})
+                db.close()
+            with self.no_leaks():
+                p.update_service_policy(self.state, {'history_days': 'all'})
+            with self.no_leaks(), patch.object(p, 'schema', side_effect=sqlite3.OperationalError('fixture')), \
+                    self.assertRaises(sqlite3.OperationalError):
+                p.open_database(self.state)                       # a failed schema step closes the connection
+        held = private_storage.open_lock_file(os.path.join(self.state, 'officer-messages.lock'))
+        try:
+            self.assertTrue(private_storage.try_lock(held))
+            with context(), self.no_leaks(), self.assertRaises(p.PeerError):
+                p.update_service_policy(self.state, {'history_days': 14})
+        finally:
+            private_storage.close_lock(held)
+
+    @unittest.skipIf(os.name == 'nt', 'real Windows is checked below')
+    def test_posix(self):
+        import contextlib
+        self.check(contextlib.nullcontext)
+
+    @unittest.skipIf(os.name == 'nt', 'real Windows is checked below')
+    def test_simulated_windows(self):
+        from windows_simulation import simulated_windows
+        self.check(simulated_windows)
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows')
+    def test_windows(self):
+        import contextlib
+        self.check(contextlib.nullcontext)
+
+
 def _icacls(*args):
     import subprocess
     subprocess.run(['icacls'] + list(args), check=True, capture_output=True, timeout=30)

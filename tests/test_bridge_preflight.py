@@ -10,6 +10,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import watch_bridge_preflight as preflight
+sys.path.insert(0, str(ROOT / 'tests'))
+from handle_leaks import no_leaked_handles
 
 
 @unittest.skipIf(os.name == 'nt', 'POSIX state ownership')
@@ -63,6 +65,18 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
 
 
+class ClosesWhatItOpens(unittest.TestCase):
+    """The inspection closes its read-only connection itself; Windows cannot remove a database left open."""
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX modes; real Windows is checked below')
+    def test_inspection_leaves_nothing_open(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = os.path.join(os.path.realpath(temp), 'state')
+            preflight.peer_bridge.open_database(state).close()
+            with no_leaked_handles(self):
+                preflight.inspect(state)
+
+
 class WindowsPreflight(unittest.TestCase):
     """On Windows the state checks are private_storage's: owner and access list, no link or junction."""
 
@@ -70,13 +84,16 @@ class WindowsPreflight(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             state = os.path.join(os.path.realpath(temp), 'state')
             with context():
-                preflight.peer_bridge.open_database(state).close()
-                result = preflight.inspect(state)
+                with no_leaked_handles(self):
+                    preflight.peer_bridge.open_database(state).close()
+                with no_leaked_handles(self):
+                    result = preflight.inspect(state)
             self.assertTrue(result['read_only'])
             self.assertEqual(result['execution_counts'], {})
             if os.name != 'nt':
                 os.chmod(state, 0o755)
-                with context(), self.assertRaisesRegex(ValueError, '^State must be private and owned by the current user.$'):
+                with context(), no_leaked_handles(self), \
+                        self.assertRaisesRegex(ValueError, '^State must be private and owned by the current user.$'):
                     preflight.inspect(state)
 
     @unittest.skipIf(os.name == 'nt', 'real Windows is checked below')
