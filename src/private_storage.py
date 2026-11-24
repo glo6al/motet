@@ -514,13 +514,18 @@ def create_private_temp(directory, prefix):
 
 
 # ---------------------------------------------------------------------------
-# (d) A non-blocking exclusive lock on a private lock file.
-# Not called yet: these are for the coming messaging and bridge migration off fcntl.flock.
+# (d) Open an existing private file for reading and writing, or create one.
 
-def open_lock_file(path):
-    """Open or create a private lock file (never through a link) and return its descriptor."""
+def open_private_rw(path, create=False):
+    """Open ``path`` for reading and writing (never through a link) and return its descriptor; the caller closes it.
+
+    With ``create`` a missing file is made private from the start (mode 0600, or a protected this-user/SYSTEM
+    access list); an existing file is only checked, never repaired. Either way the opened file must be a private
+    regular file with one name. A failed open itself raises the system's own OSError, unchanged. On Windows the
+    handle does not share delete, so while it is open nobody can rename or replace the file behind it."""
     if not WIN:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
+        flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0) | (os.O_CREAT if create else 0)
+        fd = os.open(path, flags, 0o600)
         try:
             posix_verdict(os.fstat(fd), False, True)
         except BaseException:
@@ -528,13 +533,22 @@ def open_lock_file(path):
             raise
         return fd
     with _CurrentUser() as user, _PrivateAttributes(user) as sa:   # the access list applies only if the file is new
-        handle = _win_open(path, _GENERIC_READ | _GENERIC_WRITE, _SHARE_READ | _SHARE_WRITE, _OPEN_ALWAYS, _ATTRIBUTE_NORMAL, sa)
+        handle = _win_open(path, _GENERIC_READ | _GENERIC_WRITE, _SHARE_READ | _SHARE_WRITE,
+                           _OPEN_ALWAYS if create else _OPEN_EXISTING, _ATTRIBUTE_NORMAL, sa if create else None)
     try:
         _win_check_handle(handle, False, 'file', True)
     except BaseException:
         _win_close(handle)
         raise
     return _win_fd(handle)
+
+
+# ---------------------------------------------------------------------------
+# (e) A non-blocking exclusive lock on a private lock file. Agent messaging holds one for its lifetime.
+
+def open_lock_file(path):
+    """Open or create a private lock file (never through a link) and return its descriptor."""
+    return open_private_rw(path, create=True)
 
 
 def try_lock(fd):
