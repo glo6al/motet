@@ -41,17 +41,19 @@ EDGE = r'\\/._~@-'
 
 
 def _name_regex(name):
-    """A name of 5+ letters that is not an everyday word matches anywhere (a pipe name may embed it).
-    A very short or common name matches only when it sits next to a path or name separator, so
-    ordinary words are left alone; anything else matches as a whole word."""
+    """How a name is found in the output.
+    4+ characters and not an everyday word: anywhere (a pipe name may embed it).
+    2-3 characters and not an everyday word: anywhere it is not part of a longer word of letters.
+    1 character, or an everyday word: only next to a path or name separator, so ordinary words are left alone."""
     esc = re.escape(name)
-    if len(name) >= 5 and name.lower() not in COMMON_WORDS:
+    common = name.lower() in COMMON_WORDS
+    if len(name) >= 4 and not common:
         return re.compile(esc, re.IGNORECASE)
-    if len(name) <= 3 or name.lower() in COMMON_WORDS:
-        edge = '[' + EDGE + ']'
-        return re.compile('(?:(?<=' + edge + ')' + esc + r'(?![A-Za-z0-9])|(?<![A-Za-z0-9])' + esc + '(?=' + edge + '))',
-                          re.IGNORECASE)
-    return re.compile(r'(?<![A-Za-z0-9])' + esc + r'(?![A-Za-z0-9])', re.IGNORECASE)
+    if len(name) >= 2 and not common:
+        return re.compile(r'(?<![A-Za-z])' + esc + r'(?![A-Za-z])', re.IGNORECASE)
+    edge = '[' + EDGE + ']'
+    return re.compile('(?:(?<=' + edge + ')' + esc + r'(?![A-Za-z0-9])|(?<![A-Za-z0-9])' + esc + '(?=' + edge + '))',
+                      re.IGNORECASE)
 
 
 EMAIL = re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+')
@@ -60,9 +62,9 @@ PREFIXED_KEY = re.compile(
     r'\b(?:sk|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abprs]|AKIA|AIza)[-_A-Za-z0-9]{8,}')
 JWT = re.compile(r'\beyJ[\w-]{5,}\.[\w-]{5,}(?:\.[\w-]*)?')
 BEARER = re.compile(r'(?i)\b(bearer|basic)\s+[\w.~+/=-]{8,}')
-# A label followed by a value that is not one of the probe's own status words.
-ASSIGNED = re.compile(r'(?i)\b(token|secret|password|passwd|api[_-]?key)(\s*[=:]\s*)'
-                      r'(?!(?:not|found|yes|no|none|set|error|n/a|skipped)\b)[^\s<]{6,}')
+# A secret label followed by any value, unless the value is only one of the probe's own status phrases.
+ASSIGNED = re.compile(r'(?im)\b(token|secret|password|passwd|api[_-]?key|apikey)(["\']?\s*[=:]\s*["\']?)'
+                      r'(?!(?:not|found|yes|no|none|set|error|n/a|skipped)(?=$|[\s;(]))[^\s<"\']+')
 LONG_HEX = re.compile(r'\b[0-9a-fA-F]{16,}\b')
 LONG_RUN = re.compile(r'[A-Za-z0-9+/_=-]{32,}')
 
@@ -78,6 +80,33 @@ def _short_path(path):
         return buf.value if 0 < n < 1024 else ''
     except Exception:
         return ''
+
+
+def _name_variants(name):
+    """A name as it may appear: as given, without separators, dotted, joined and URL-encoded."""
+    if not name:
+        return []
+    out = {name}
+    out.add(re.sub(r'[\s._-]+', '', name))
+    for sep in ('.', '_', '-'):
+        out.add(re.sub(r'\s+', sep, name))
+    out.add(name.replace(' ', '%20'))
+    try:
+        from urllib.parse import quote
+        out.add(quote(name))
+    except Exception:
+        pass
+    return [v for v in out if v]
+
+
+def _short_stems(name):
+    """The first six characters an 8.3 short name may keep (spaces and dots are dropped, _ and - stay)."""
+    stems = set()
+    for pattern in (r'[^A-Za-z0-9_-]', r'[^A-Za-z0-9]'):
+        stem = re.sub(pattern, '', name or '')[:6]
+        if stem:
+            stems.add(stem)
+    return stems
 
 
 def make_context(env=None):
@@ -138,16 +167,15 @@ def redact(text, ctx=None):
     base = [p for p in re.split(r'[\\/]+', profile) if p][-1:] if profile else []
     names = {}
     for a in [user] + base:
-        if a:
-            names[a] = '<user>'
+        for v in _name_variants(a):
+            names[v] = '<user>'
     pc = ctx.get('pc') or ''
     if pc:
         names[pc] = '<pc>'
     for alias in sorted(names, key=len, reverse=True):      # longest first: a PC name may contain the user name
         text = _name_regex(alias).sub(lambda m, v=names[alias]: mark(v), text)
-    short = re.sub(r'[^A-Za-z0-9]', '', user)[:6]            # an 8.3 short form: first six letters, ~1, ~2 ...
-    if short:
-        text = re.compile(r'(?<![A-Za-z0-9])' + re.escape(short) + r'~\d+(?![A-Za-z0-9])', re.IGNORECASE).sub(
+    for stem in _short_stems(user):                          # 8.3 short forms: first six characters, ~1, ~2 ...
+        text = re.compile(r'(?<![A-Za-z0-9])' + re.escape(stem) + r'~\d+(?![A-Za-z0-9])', re.IGNORECASE).sub(
             lambda m: mark('<user>'), text)
     text = UUID.sub('<id>', text)
     text = JWT.sub('<key>', text)
@@ -169,16 +197,21 @@ SYSTEM32 = os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', 'System32
 POWERSHELL = os.path.join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 
 
-def which(name):
-    """Find a command on PATH only (never the current folder). Returns a path or None."""
-    exts = ['', '.exe', '.cmd', '.bat', '.com'] if os.name == 'nt' else ['']
+def which(name, windows=None):
+    """Find a command on PATH only (never the current folder). Returns a path or None.
+    On Windows only names with an extension from PATHEXT count (an extensionless script beside name.cmd is no program)."""
+    windows = (os.name == 'nt') if windows is None else windows
+    if windows:
+        exts = [e for e in (os.environ.get('PATHEXT') or '.COM;.EXE;.BAT;.CMD').split(';') if e]
+    else:
+        exts = ['']
     for d in os.environ.get('PATH', '').split(os.pathsep):
         d = d.strip('"')
         if not d or not os.path.isabs(d):
             continue
         for ext in exts:
             cand = os.path.join(d, name + ext)
-            if os.path.isfile(cand) and (os.name == 'nt' or os.access(cand, os.X_OK)):
+            if os.path.isfile(cand) and (windows or os.access(cand, os.X_OK)):
                 return cand
     return None
 

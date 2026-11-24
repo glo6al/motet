@@ -104,6 +104,39 @@ class RedactionTests(unittest.TestCase):
         r = probe.redact(r'C:\Users\demo\x and %LOCALAPPDATA%', ctx)
         self.assertIn('%USERPROFILE%\\x', r)
 
+    def test_names_of_any_length_inside_other_text(self):
+        def ctx_for(name):
+            return dict(CTX, user=name, profile='D:\\Profiles\\' + name, localappdata='', appdata='', pc='PC1')
+        cases = {'andy': ['cursor-andy2-sock', 'andy123'], 'Mike': ['MikeRoss'],
+                 'anna': ['anna7'], 'bob': ['Claude (bob)', 'x "bob" y', 'mcp:bob:sock', 'bob1']}
+        for name, texts in cases.items():
+            for text in texts:
+                r = probe.redact(text, ctx_for(name))
+                self.assertNotIn(name.lower(), r.lower(), text)
+                self.assertIn('<user>', r)
+        self.assertEqual(probe.redact('bobby and Bobcat', ctx_for('bob')), 'bobby and Bobcat')
+
+    def test_assigned_secrets(self):
+        for text in ('secret: not-a-secret-value', 'password: none-of-your-business', 'token=abc',
+                     'password=x', 'api_key: ab', '"token": "abc"'):
+            r = probe.redact(text, CTX)
+            self.assertIn('<key>', r, text)
+            self.assertNotIn('abc', r.replace('api_key', ''), text)
+        for text in ('token: not found', 'secret: found', 'password: yes', 'token: none', 'token: not set (x)',
+                     'password: skipped; later'):
+            self.assertEqual(probe.redact(text, CTX), text)
+
+    def test_user_name_variants(self):
+        ctx = dict(CTX, user='john_smith', profile=r'D:\Profiles\john_smith', localappdata='', appdata='')
+        self.assertEqual(probe.redact('JOHN_S~1', ctx), '<user>')
+        self.assertEqual(probe.redact('john_s~2', ctx), '<user>')
+        self.assertEqual(probe.redact('x-JOHN_S~10-y', ctx), 'x-<user>-y')
+        ctx = dict(CTX, user='John Smith', profile=r'D:\Profiles\John Smith', localappdata='', appdata='')
+        for text in ('JohnSmith', 'John.Smith', 'John%20Smith', 'john_smith', 'John-Smith', 'pipe-JohnSmith-1'):
+            r = probe.redact(text, ctx)
+            self.assertIn('<user>', r, text)
+            self.assertNotIn('john', r.lower(), text)
+
 
 @unittest.skipIf(os.name == 'nt', 'uses a POSIX shell script as the fake tool')
 class ToolTests(unittest.TestCase):
@@ -182,6 +215,26 @@ class RunTests(unittest.TestCase):
         for secret in (ctx['profile'], ctx['user'], ctx['pc']):
             if len(secret) >= 4:
                 self.assertNotIn(secret.lower(), out)
+
+    def test_which_on_windows_ignores_extensionless_script(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, d, True)
+        for n in ('claude', 'claude.cmd'):
+            with open(os.path.join(d, n), 'w') as f:
+                f.write('x')
+        old = {k: os.environ.get(k) for k in ('PATH', 'PATHEXT')}
+        try:
+            os.environ['PATH'] = d
+            os.environ['PATHEXT'] = '.com;.exe;.bat;.cmd'
+            self.assertEqual(probe.which('claude', windows=True), os.path.join(d, 'claude.cmd'))
+            os.remove(os.path.join(d, 'claude.cmd'))
+            self.assertIsNone(probe.which('claude', windows=True))
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == '__main__':
