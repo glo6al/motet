@@ -70,7 +70,7 @@ class SimulatedWindowsOpen(unittest.TestCase):
         self.path = os.path.join(self.folder, 'secret')
         with open(self.path, 'w') as out:
             out.write('fixture')
-        self.opened, self.closed, self.verdicts = [], [], {}
+        self.opened, self.closed, self.verdicts, self.access = [], [], {}, {}
         self.fd_for = lambda handle: os.open(self.path, os.O_RDONLY)
 
         def fake_open(path, access, share, disposition, flags, sa=None):
@@ -79,6 +79,7 @@ class SimulatedWindowsOpen(unittest.TestCase):
                 raise error
             handle = 100 + len(self.opened)
             self.opened.append((handle, path, share))
+            self.access[handle] = access
             return handle
 
         def fake_check(handle, directory, subject, single_link=False):
@@ -113,6 +114,8 @@ class SimulatedWindowsOpen(unittest.TestCase):
         (folder_handle, folder_path, folder_share), (file_handle, file_path, file_share) = self.opened
         self.assertEqual((folder_path, file_path), (self.folder, self.path))
         self.assertFalse(folder_share & 4, 'folder must not share delete (rename) while held')
+        self.assertTrue(self.access[folder_handle] & (ps._FILE_LIST_DIRECTORY | ps._FILE_TRAVERSE),
+                        'Windows applies sharing only to an open that asks for data access')
         self.assertEqual(file_share, 1, 'file shares read only while it is read')
         self.assert_all_closed()
 
@@ -543,36 +546,61 @@ class PosixWalk(unittest.TestCase):
 
 
 class SimulatedWindowsWalk(unittest.TestCase):
-    """The Windows walk's decisions with the Win32 calls replaced by a model of a drive; runs on every system.
+    """The Windows walk's decisions with the Win32 and NT calls replaced by a model of a drive; runs on every system.
 
-    The model records each open's path, access and sharing, which handles are held when each name is opened,
-    and every close, so the tests can show that each folder on the way is held without delete sharing until the
-    last name is open, that nothing is left open on any path, and that a refusal stops the walk where it happens."""
-    FOLDER, FILE, LINK_FOLDER, LINK_FILE, DEVICE, TWO_NAMES, BUSY = 'folder', 'file', 'link-folder', 'link-file', 'device', 'two-names', 'busy'
+    The model is a tree of folder and file objects. A handle names an object, and NtCreateFile's relative open
+    looks the child up in the folder object the parent handle names, as Windows does, so renaming or swapping a
+    name in a folder changes nothing already open. Renames follow Windows' sharing rule: a rename needs DELETE
+    access, which is refused while another handle that asked for data access does not share delete; a handle that
+    asked only for READ_CONTROL or attributes holds nothing."""
+    DATA_ACCESS = 0x1 | 0x2 | 0x4 | 0x20 | 0x10000      # read/list, write, append, execute/traverse, delete
+
+    def node(self, kind, **children):
+        return {'kind': kind, 'children': children}
 
     def setUp(self):
-        self.tree = {
-            'C:\\': self.FOLDER, 'C:\\Users': self.FOLDER, 'C:\\Users\\example': self.FOLDER,
-            'C:\\Users\\example\\.claude': self.FOLDER, 'C:\\Users\\example\\.claude\\chat.jsonl': self.FILE,
-        }
-        self.public = set()
+        n = self.node
+        self.chat = n('file')
+        self.root = n('folder', Users=n('folder', example=n('folder', **{'.claude': n('folder', **{'chat.jsonl': self.chat})})))
+        self.drives = {'C:\\': self.root}
+        self.public, self.verify_root = set(), {}
         self.handles, self.open_now, self.closed, self.fds, self.checked = {}, set(), [], [], []
-        self.log = []          # (path, access, share, handles held at that moment)
+        self.log = []          # (name, access, share, [held handles at that moment])
+        self.during_open = None
+
+        def new_handle(node, name, access, share):
+            handle = 500 + len(self.handles)
+            self.log.append((name, access, share, sorted(self.open_now)))
+            self.handles[handle] = (node, name, access, share)
+            self.open_now.add(handle)
+            return handle
 
         def fake_open(path, access, share, disposition, flags, sa=None):
             self.assertEqual((disposition, flags, sa), (ps._OPEN_EXISTING, 0, None))
-            kind = self.tree.get(path)
-            if kind is None:
-                error = OSError('missing'); error.winerror = 2
+            node = self.drives.get(path)
+            if node is None:
+                error = OSError('missing'); error.winerror = 3
                 raise error
-            if kind == self.BUSY:
-                error = OSError('sharing violation'); error.winerror = 32
+            return new_handle(node, path, access, share)
+
+        def fake_child(parent, name, access, share, directory):
+            self.assertIn(parent, self.open_now, 'opened relative to a closed handle')
+            if self.during_open:
+                self.during_open(name)
+            node = self.handles[parent][0]['children'].get(name)
+            def fail(status):
+                error = OSError('nt'); error.ntstatus = status
                 raise error
-            handle = 500 + len(self.handles)
-            self.log.append((path, access, share, {self.handles[h][0]: self.handles[h][2] for h in self.open_now}))
-            self.handles[handle] = (path, access, share)
-            self.open_now.add(handle)
-            return handle
+            if node is None:
+                fail(0xC0000034)
+            if node['kind'] == 'busy':
+                fail(0xC0000043)                         # STATUS_SHARING_VIOLATION
+            is_folder = node['kind'] in ('folder', 'link-folder')
+            if directory and not is_folder:
+                fail(0xC0000103)
+            if not directory and node['kind'] == 'folder':
+                fail(0xC00000BA)
+            return new_handle(node, name, access, share)
 
         def fake_close(handle):
             if handle is not None:
@@ -581,24 +609,34 @@ class SimulatedWindowsWalk(unittest.TestCase):
                 self.closed.append(handle)
 
         def fake_facts(handle):
-            kind = self.tree[self.handles[handle][0]]
-            return {self.FOLDER: (ps.DIRECTORY, 1, 1), self.FILE: (0x20, 1, 1), self.TWO_NAMES: (0x20, 2, 1),
-                    self.LINK_FOLDER: (ps.DIRECTORY | ps.REPARSE_POINT, 1, 1), self.LINK_FILE: (ps.REPARSE_POINT | 0x20, 1, 1),
-                    self.DEVICE: (0x20, 1, 2)}[kind]
+            kind = self.handles[handle][0]['kind']
+            return {'folder': (ps.DIRECTORY, 1, 1), 'file': (0x20, 1, 1), 'two-names': (0x20, 2, 1),
+                    'link-folder': (ps.DIRECTORY | ps.REPARSE_POINT, 1, 1), 'link-file': (ps.REPARSE_POINT | 0x20, 1, 1),
+                    'device': (0x20, 1, 2)}[kind]
 
         def fake_security(handle, directory=False):
-            path = self.handles[handle][0]
-            self.checked.append(path)
-            if path in self.public:
+            node = self.handles[handle][0]
+            self.checked.append(self.handles[handle][1])
+            if id(node) in self.public:
                 raise ps.PrivateStorageError('private storage unavailable', 'access')
+
+        def fake_root(handle, root):
+            problem = self.verify_root.get(root)
+            if problem:
+                raise ps.PrivateStorageError('private storage unavailable', 'unavailable', 'folder')
+
+        def fake_list(handle):
+            return sorted(self.handles[handle][0]['children'])
 
         def fake_fd(handle, flags=0):
             self.assertIn(handle, self.open_now)
             self.open_now.discard(handle)               # the descriptor owns the handle now
-            self.fds.append(self.handles[handle][0])
+            self.fds.append(self.handles[handle][1])
             return 9000 + handle
 
         self.patches = [patch.object(ps, 'WIN', True), patch.object(ps, '_win_open', fake_open),
+                        patch.object(ps, '_win_child', fake_child), patch.object(ps, '_win_root_verified', fake_root),
+                        patch.object(ps, '_win_list', fake_list),
                         patch.object(ps, '_win_close', fake_close), patch.object(ps, '_win_facts', fake_facts),
                         patch.object(ps, 'windows_handle_security', fake_security), patch.object(ps, '_win_fd', fake_fd)]
         for p in self.patches:
@@ -608,6 +646,14 @@ class SimulatedWindowsWalk(unittest.TestCase):
         for p in reversed(self.patches):
             p.stop()
 
+    def rename_allowed(self, node):
+        """Windows' sharing rule for a rename or delete of ``node`` (DELETE access) while handles are open on it."""
+        for handle in self.open_now:
+            held, _, access, share = self.handles[handle]
+            if held is node and access & self.DATA_ACCESS and not share & ps._SHARE_DELETE:
+                return False
+        return True
+
     def assert_nothing_open(self):
         self.assertEqual(self.open_now, set(), 'a handle was left open')
 
@@ -615,87 +661,140 @@ class SimulatedWindowsWalk(unittest.TestCase):
         return [entry[0] for entry in self.log]
 
     FILE_PATH = 'C:\\Users\\example\\.claude\\chat.jsonl'
-    CHAIN = ['C:\\', 'C:\\Users', 'C:\\Users\\example', 'C:\\Users\\example\\.claude']
+    NAMES = ['C:\\', 'Users', 'example', '.claude']
 
-    def test_each_folder_is_held_without_delete_sharing_until_the_file_is_open(self):
+    def folder_nodes(self):
+        users = self.root['children']['Users']
+        example = users['children']['example']
+        return [self.root, users, example, example['children']['.claude']]
+
+    def test_each_name_opens_relative_to_the_held_folder_above(self):
         fd = ps.open_no_links(self.FILE_PATH, single_link=True)
         self.assertEqual(fd - 9000, max(self.handles))
-        self.assertEqual(self.opened(), self.CHAIN + [self.FILE_PATH])
+        self.assertEqual(self.opened(), self.NAMES + ['chat.jsonl'])
         no_delete = ps._SHARE_READ | ps._SHARE_WRITE
-        for n, (path, access, share, held) in enumerate(self.log):
-            self.assertEqual(sorted(held), sorted(self.CHAIN[:n]), 'every folder above is held when a name is opened')
-            self.assertTrue(all(s == no_delete for s in held.values()), 'held folders do not share delete')
-            if path in self.CHAIN:
-                self.assertEqual((access, share), (ps._READ_CONTROL | ps._FILE_READ_ATTRIBUTES, no_delete))
+        for n, (name, access, share, held) in enumerate(self.log):
+            self.assertEqual(len(held), n, 'every folder above is still held when a name is opened')
+            if n < len(self.NAMES):
+                self.assertEqual((access, share), (ps._HOLD_ACCESS, no_delete))
+                self.assertTrue(access & (ps._FILE_LIST_DIRECTORY | ps._FILE_TRAVERSE),
+                                'a hold must ask for data access, or Windows does not apply its sharing')
             else:
                 self.assertEqual((access, share), (ps._GENERIC_READ, no_delete | ps._SHARE_DELETE))
-        self.assertEqual(self.fds, [self.FILE_PATH])
+        self.assertEqual(self.fds, ['chat.jsonl'])
         self.assertEqual(self.checked, [], 'no access-list check unless asked')
         self.assert_nothing_open()
 
+    def test_held_folders_cannot_be_renamed_and_a_hold_without_data_access_would_not_hold(self):
+        seen = []
+        def try_renames(name):
+            if name == 'chat.jsonl':
+                seen.append([self.rename_allowed(node) for node in self.folder_nodes()])
+        self.during_open = try_renames
+        ps.open_no_links(self.FILE_PATH)
+        self.assertEqual(seen, [[False, False, False, False]])
+        # The rule the hold depends on: attribute-only access records no sharing.
+        handle = 900
+        self.handles[handle] = (self.root, 'C:\\', ps._READ_CONTROL | ps._FILE_READ_ATTRIBUTES, ps._SHARE_READ | ps._SHARE_WRITE)
+        self.open_now.add(handle)
+        self.assertTrue(self.rename_allowed(self.root))
+        self.open_now.discard(handle)
+
+    def test_a_name_swapped_after_its_folder_was_opened_changes_nothing(self):
+        users = self.root['children']['Users']
+        original = users['children']['example']
+        def swap(name):
+            if name == 'example':           # Users is open; replace example in it by a junction to elsewhere
+                users['children']['example'] = self.node('link-folder')
+                users['children']['example-moved'] = original
+            if name == '.claude':           # example is open; a new link at its old name is never looked at again
+                self.assertEqual(users['children']['example']['kind'], 'link-folder')
+        # The swap happens just before 'example' is looked up, so the walk meets the junction and refuses it ...
+        self.during_open = swap
+        reason(self, lambda: ps.open_no_links(self.FILE_PATH), 'link', 'folder')
+        self.assert_nothing_open()
+        # ... and once 'example' is open, renaming names in Users no longer reaches the walk at all.
+        users['children'] = {'example': original}
+        def late_swap(name):
+            if name == '.claude':
+                users['children'] = {'example': self.node('link-folder'), 'example-moved': original}
+        self.during_open = late_swap
+        ps.open_no_links(self.FILE_PATH)
+        self.assertEqual(self.fds[-1], 'chat.jsonl')
+        self.assert_nothing_open()
+
     def test_a_reparse_point_in_any_position_stops_the_walk_there(self):
-        for n, path in enumerate(self.CHAIN[1:] + [self.FILE_PATH], 1):
-            with self.subTest(position=path):
+        positions = [('Users', self.root), ('example', self.root['children']['Users']),
+                     ('.claude', self.root['children']['Users']['children']['example']),
+                     ('chat.jsonl', self.root['children']['Users']['children']['example']['children']['.claude'])]
+        for n, (name, parent) in enumerate(positions, 1):
+            with self.subTest(position=name):
                 self.log.clear()
-                original = self.tree[path]
-                self.tree[path] = self.LINK_FILE if path == self.FILE_PATH else self.LINK_FOLDER
+                original = parent['children'][name]
+                parent['children'][name] = self.node('link-file' if name == 'chat.jsonl' else 'link-folder')
                 try:
-                    subject = 'file' if path == self.FILE_PATH else 'folder'
-                    reason(self, lambda: ps.open_no_links(self.FILE_PATH), 'link', subject)
-                    self.assertEqual(self.opened(), (self.CHAIN + [self.FILE_PATH])[:n + 1], 'nothing opened beyond it')
+                    reason(self, lambda: ps.open_no_links(self.FILE_PATH), 'link', 'file' if name == 'chat.jsonl' else 'folder')
+                    self.assertEqual(self.opened(), (self.NAMES + ['chat.jsonl'])[:n + 1], 'nothing opened beyond it')
                     self.assert_nothing_open()
                 finally:
-                    self.tree[path] = original
+                    parent['children'][name] = original
 
     def test_wrong_types_second_names_missing_and_busy(self):
+        claude = self.folder_nodes()[3]
         reason(self, lambda: ps.open_no_links('C:\\Users\\example\\.claude'), 'not_regular')
         reason(self, lambda: ps.open_folder(self.FILE_PATH), 'not_regular', 'folder')
-        self.tree['C:\\Users\\example\\.claude\\console'] = self.DEVICE
-        reason(self, lambda: ps.open_no_links('C:\\Users\\example\\.claude\\console'), 'not_regular')
-        self.tree[self.FILE_PATH] = self.TWO_NAMES
+        claude['children']['console.log'] = self.node('device')
+        reason(self, lambda: ps.open_no_links('C:\\Users\\example\\.claude\\console.log'), 'not_regular')
+        claude['children']['chat.jsonl'] = self.node('two-names')
         reason(self, lambda: ps.open_no_links(self.FILE_PATH, single_link=True), 'links')
         ps.open_no_links(self.FILE_PATH)                       # allowed unless asked
         with self.assertRaises(FileNotFoundError):
             ps.open_no_links('C:\\Users\\example\\absent\\chat.jsonl')
-        self.tree['C:\\Users\\example\\.claude'] = self.BUSY
-        reason(self, lambda: ps.open_no_links(self.FILE_PATH), 'open', 'folder')
+        with self.assertRaises(FileNotFoundError):
+            ps.open_no_links('E:\\chat.jsonl')
+        claude['children']['busy.jsonl'] = self.node('busy')
+        reason(self, lambda: ps.open_no_links('C:\\Users\\example\\.claude\\busy.jsonl'), 'open')
+        self.assert_nothing_open()
+
+    def test_a_drive_that_is_not_a_local_volume_root_is_refused(self):
+        self.verify_root['C:\\'] = 'subst or network'
+        reason(self, lambda: ps.open_no_links(self.FILE_PATH), 'unavailable', 'folder')
+        self.assertEqual(self.opened(), ['C:\\'])
         self.assert_nothing_open()
 
     def test_access_lists_are_checked_on_the_opened_handles_when_asked(self):
         ps.open_no_links(self.FILE_PATH, private=True)
-        self.assertEqual(self.checked, [self.FILE_PATH])
+        self.assertEqual(self.checked, ['chat.jsonl'])
         self.checked.clear()
         ps.open_no_links('C:\\Users\\example\\.claude', directory=True, private=True)
-        self.assertEqual(self.checked, ['C:\\Users\\example\\.claude'], 'only the folder asked for, not its parents')
-        self.public.add(self.FILE_PATH)
+        self.assertEqual(self.checked, ['.claude'], 'only the folder asked for, not its parents')
+        self.public.add(id(self.chat))
         reason(self, lambda: ps.open_no_links(self.FILE_PATH, private=True), 'access')
-        self.public.add('C:\\Users\\example')
+        self.public.add(id(self.folder_nodes()[2]))
         reason(self, lambda: ps.open_folder('C:\\Users\\example', private=True), 'access', 'folder')
         self.assert_nothing_open()
 
     def test_a_folder_descriptor_keeps_only_its_own_handle(self):
         ps.open_no_links('C:\\Users\\example', directory=True)
-        self.assertEqual(self.fds, ['C:\\Users\\example'])
+        self.assertEqual(self.fds, ['example'])
         self.assert_nothing_open()
 
-    def test_held_folders_list_by_name_and_open_children_through_the_hold(self):
-        with patch.object(ps.os, 'listdir', side_effect=lambda path: ['chat.jsonl'] if path == 'C:\\Users\\example\\.claude' else 1 / 0):
-            with ps.open_folder('C:\\Users\\example') as home:
-                with home.folder('.claude') as claude:
-                    self.assertEqual(claude.names(), ['chat.jsonl'])
-                    claude.open('chat.jsonl', single_link=True)
-                    held = self.log[-1][3]
-                    self.assertEqual(sorted(held), sorted(self.CHAIN))
-                for name in ('..', 'a\\b', 'chat.jsonl:secret', 'trailing.', 'trailing '):
-                    with self.subTest(name=name):
-                        reason(self, lambda: home.open(name), 'unavailable')
-            reason(self, lambda: claude.open('chat.jsonl'), 'changed', 'folder')   # its parent's hold is gone
+    def test_held_folders_list_through_the_handle_and_open_children_through_the_hold(self):
+        with ps.open_folder('C:\\Users\\example') as home:
+            with home.folder('.claude') as claude:
+                self.assertEqual(claude.names(), ['chat.jsonl'])
+                claude.open('chat.jsonl', single_link=True)
+                self.assertEqual(len(self.log[-1][3]), 4, 'root, Users, example and .claude held')
+            for name in ('..', 'a\\b', 'chat.jsonl:secret', 'trailing.', 'trailing ', 'CON', 'nul.txt', 'COM1.jsonl', 'conout$'):
+                with self.subTest(name=name):
+                    reason(self, lambda: home.open(name), 'unavailable')
+        reason(self, lambda: claude.open('chat.jsonl'), 'changed', 'folder')   # its parent's hold is gone
         self.assert_nothing_open()
 
     def test_paths_outside_plain_drive_paths_are_refused_before_any_open(self):
         for path in ('\\\\server\\share\\chat.jsonl', '\\\\?\\C:\\Users\\example\\chat.jsonl', '\\\\.\\C:\\chat.jsonl',
                      '//server/share/chat.jsonl', 'C:\\Users\\example\\chat.jsonl:stream',
-                     'C:\\Users\\example.\\chat.jsonl', '1:\\chat.jsonl'):
+                     'C:\\Users\\example.\\chat.jsonl', '1:\\chat.jsonl', 'C:\\Users\\AUX\\chat.jsonl'):
             with self.subTest(path=path):
                 with self.assertRaises(ps.PrivateStorageError) as raised:
                     ps.open_folder(path)
@@ -712,7 +811,6 @@ class SimulatedWindowsWalk(unittest.TestCase):
             with self.assertRaises(ps.PrivateStorageError):
                 ps.open_no_links(self.FILE_PATH)
         self.assert_nothing_open()
-
 
 def icacls(*args):
     subprocess.run(['icacls'] + list(args), check=True, capture_output=True, timeout=30)
@@ -895,6 +993,37 @@ class WindowsWalk(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.rename(self.middle, self.middle + '-moved')
         os.rename(self.top, self.top + '-moved')                 # released once closed
+
+    def test_paths_longer_than_260_characters_open_through_the_walk(self):
+        import shutil
+        deep = os.path.join(self.base, *(['long-folder-name-for-the-walk'] * 10))
+        self.assertGreater(len(deep), 300)
+        os.makedirs('\\\\?\\' + deep)
+        try:
+            with open('\\\\?\\' + os.path.join(deep, 'notes.jsonl'), 'w') as out:
+                out.write('deep\n')
+            self.assertEqual(self.read(ps.open_no_links(os.path.join(deep, 'notes.jsonl'))), b'deep\n')
+        finally:
+            shutil.rmtree('\\\\?\\' + os.path.join(self.base, 'long-folder-name-for-the-walk'))
+
+    def test_a_subst_drive_standing_for_a_folder_is_refused(self):
+        import string
+        free = [letter for letter in reversed(string.ascii_uppercase[3:]) if not os.path.exists(letter + ':\\')]
+        if not free:
+            self.skipTest('no free drive letter')
+        drive = free[0] + ':'
+        subprocess.run(['subst', drive, self.top], check=True, capture_output=True, timeout=30)
+        try:
+            self.assertTrue(os.path.exists(drive + '\\middle\\notes.jsonl'))
+            reason(self, lambda: os.close(ps.open_no_links(drive + '\\middle\\notes.jsonl')), 'unavailable', 'folder')
+        finally:
+            subprocess.run(['subst', drive, '/d'], capture_output=True, timeout=30)
+
+    def test_reserved_device_names_are_refused(self):
+        with ps.open_folder(self.middle) as middle:
+            for name in ('NUL', 'con.txt', 'COM1.jsonl'):
+                with self.subTest(name=name):
+                    reason(self, lambda: middle.open(name), 'unavailable')
 
     def test_second_name_and_privacy(self):
         os.link(self.file, os.path.join(self.middle, 'second-name'))

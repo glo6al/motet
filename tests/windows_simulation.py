@@ -16,13 +16,33 @@ import private_storage as ps
 
 CALLS = ('check_private', 'make_private_folder', 'create_private_file', 'open_private_file', 'open_private_rw',
          'open_lock_file', 'try_lock', 'unlock', 'close_lock', 'sqlite_companions_plain', 'folder_walk_available',
-         'open_folder', 'open_no_links')
+         'open_folder', 'open_no_links', 'anchored')
 
 
 def _forbidden(name):
     def refuse(*args, **kwargs):
         raise AssertionError('Windows branch used ' + name)
     return refuse
+
+
+class _PosixFolder:
+    """A held folder from the POSIX walk whose methods also run as POSIX (they check owner and mode)."""
+
+    def __init__(self, folder, as_posix):
+        self._folder, self._as_posix = folder, as_posix
+
+    def __getattr__(self, name):
+        value = getattr(self._folder, name)
+        if callable(value):
+            return lambda *args, **kwargs: self._as_posix(value, *args, **kwargs)
+        return value
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._folder.close()
+        return False
 
 
 @contextmanager
@@ -34,12 +54,16 @@ def simulated_windows(folder_walk=True):
     real = {name: getattr(ps, name) for name in CALLS}
     real_getuid = os.getuid
 
+    def as_posix(function, *args, **kwargs):
+        with patch.object(ps, 'WIN', False), patch.object(os, 'getuid', real_getuid), \
+                patch.dict(sys.modules, {'fcntl': fcntl}):
+            result = function(*args, **kwargs)
+        return _PosixFolder(result, as_posix) if isinstance(result, ps.NoLinkFolder) else result
+
     def posix(name):
         def call(*args, **kwargs):
             calls.append(name)
-            with patch.object(ps, 'WIN', False), patch.object(os, 'getuid', real_getuid), \
-                    patch.dict(sys.modules, {'fcntl': fcntl}):
-                return real[name](*args, **kwargs)
+            return as_posix(real[name], *args, **kwargs)
         return call
 
     with ExitStack() as stack:

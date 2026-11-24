@@ -20,8 +20,8 @@ new ones private from the start; anything already there is checked and refused.
 
 Section (g) is the one folder walk every caller uses to open a path with no link
 followed anywhere in it (``open_folder``, ``open_no_links``): by ``dir_fd`` on POSIX,
-and on Windows by opening each folder from the drive root while holding the ones
-above it without delete sharing.
+and on Windows by opening each name relative to the folder handle above it
+(``NtCreateFile``), holding those folders without delete sharing.
 """
 import ctypes
 import errno
@@ -136,7 +136,33 @@ def _win_api():
     kernel.GetFileType.restype = w.DWORD
     kernel.SetFileInformationByHandle.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
     kernel.SetFileInformationByHandle.restype = w.BOOL
-    _API = (adv, kernel, w, SA, FILEINFO)
+    kernel.GetFileInformationByHandleEx.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
+    kernel.GetFileInformationByHandleEx.restype = w.BOOL
+    kernel.GetFinalPathNameByHandleW.argtypes = [w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD]
+    kernel.GetFinalPathNameByHandleW.restype = w.DWORD
+    kernel.GetDriveTypeW.argtypes = [w.LPCWSTR]
+    kernel.GetDriveTypeW.restype = w.UINT
+    kernel.DuplicateHandle.argtypes = [w.HANDLE, w.HANDLE, w.HANDLE, ctypes.POINTER(w.HANDLE), w.DWORD, w.BOOL, w.DWORD]
+    kernel.DuplicateHandle.restype = w.BOOL
+
+    # NtCreateFile opens a name relative to an open folder handle: Windows' equivalent of openat(2) with dir_fd.
+    nt = ctypes.WinDLL('ntdll')
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [('Length', w.USHORT), ('MaximumLength', w.USHORT), ('Buffer', w.LPVOID)]
+
+    class OBJECT_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [('Length', w.ULONG), ('RootDirectory', w.HANDLE), ('ObjectName', ctypes.POINTER(UNICODE_STRING)),
+                    ('Attributes', w.ULONG), ('SecurityDescriptor', w.LPVOID), ('SecurityQualityOfService', w.LPVOID)]
+
+    class IO_STATUS_BLOCK(ctypes.Structure):
+        _fields_ = [('Status', w.LPVOID), ('Information', ctypes.c_size_t)]
+
+    nt.NtCreateFile.argtypes = [ctypes.POINTER(w.HANDLE), w.DWORD, ctypes.POINTER(OBJECT_ATTRIBUTES),
+                                ctypes.POINTER(IO_STATUS_BLOCK), w.LPVOID, w.ULONG, w.ULONG, w.ULONG, w.ULONG, w.LPVOID, w.ULONG]
+    nt.NtCreateFile.restype = ctypes.c_long
+    nt.structures = (UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK)
+    _API = (adv, kernel, w, SA, FILEINFO, nt)
     return _API
 
 
@@ -269,6 +295,10 @@ def windows_handle_security(handle, directory=False):
 # Win32 constants for handle-based opens.
 _GENERIC_READ, _GENERIC_WRITE, _READ_CONTROL, _FILE_READ_ATTRIBUTES = 0x80000000, 0x40000000, 0x20000, 0x80
 _DELETE = 0x10000
+# Data access. Windows records a handle's sharing (and so refuses a conflicting rename or delete) only for an open
+# that asks for data, execute or delete access; READ_CONTROL and FILE_READ_ATTRIBUTES alone hold nothing.
+_FILE_LIST_DIRECTORY, _FILE_TRAVERSE, _SYNCHRONIZE = 0x1, 0x20, 0x100000
+_HOLD_ACCESS = _READ_CONTROL | _FILE_READ_ATTRIBUTES | _FILE_LIST_DIRECTORY | _FILE_TRAVERSE
 _FILE_DISPOSITION_INFO = 4     # FILE_INFO_BY_HANDLE_CLASS FileDispositionInfo
 _SHARE_READ, _SHARE_WRITE, _SHARE_DELETE = 1, 2, 4
 _CREATE_NEW, _OPEN_EXISTING, _OPEN_ALWAYS = 1, 3, 4
@@ -423,8 +453,9 @@ def open_private_file(path, folder=False, single_link=False, expect=None):
     try:
         if folder:
             try:
-                # Without FILE_SHARE_DELETE nobody can rename or remove the folder while it is held.
-                folder_handle = _win_open(os.path.dirname(path) or '.', _READ_CONTROL | _FILE_READ_ATTRIBUTES,
+                # Without FILE_SHARE_DELETE nobody can rename or remove the folder while it is held. The open asks for
+                # data access (listing, traversal), without which Windows would not apply the sharing at all.
+                folder_handle = _win_open(os.path.dirname(path) or '.', _HOLD_ACCESS,
                                           _SHARE_READ | _SHARE_WRITE, _OPEN_EXISTING, 0)
             except OSError as e:
                 raise _refuse('missing' if getattr(e, 'winerror', 0) in _NOT_FOUND else 'open', 'folder') from None
@@ -627,22 +658,23 @@ def sqlite_companions_plain(path):
 # POSIX: each folder is opened from "/" by handle (``O_DIRECTORY | O_NOFOLLOW`` with ``dir_fd``), so a link in
 # any position fails the open, and each next name is looked up in the folder already opened, never by path again.
 #
-# Windows has no ``dir_fd``. Instead every folder from the drive root down is opened in turn by its full path
-# with ``FILE_FLAG_OPEN_REPARSE_POINT`` (a reparse point at that name is opened itself, never followed). Its
-# handle is refused if it is a reparse point (symbolic link, junction, mount point or other) or not a folder, and
-# it is kept open without ``FILE_SHARE_DELETE``. Renaming, removing or replacing a file or folder needs DELETE
-# access to it, which Windows refuses while another handle on it does not share delete. So while the chain is
-# held, every name on the way still means the folder that was checked, and the next full-path open can only pass
-# through those checked folders. (A held folder also cannot become a junction: it is not empty, since it holds
-# the next name.) The last name is opened the same way and checked on its handle (type, a single name, and with
-# ``private`` the owner and access list), then handed out as a C runtime descriptor; the chain is released after
-# that. A folder is listed by name (``os.listdir``) while its chain is held, and each child is then opened
-# through the held folder, so a listing can never lead a reader through a link.
+# Windows does the same with handles. The drive root is opened by name, and refused unless it is the root of a
+# local volume (not a network drive, and not a ``subst`` drive that stands for a folder somewhere else). Every
+# name below it is opened with ``NtCreateFile`` relative to the folder handle above (``RootDirectory``), one
+# component at a time, with ``FILE_OPEN_REPARSE_POINT``: a reparse point (symbolic link, junction, mount point,
+# cloud placeholder or other) is opened itself, never followed, and refused on its handle, as is the wrong type.
+# So a name is never looked up by path again, and swapping a folder on the way changes nothing already opened.
+# Folders are also held while the walk goes on, with data access (listing, traversal) and without
+# ``FILE_SHARE_DELETE``, so nobody can rename or remove them meanwhile (Windows applies sharing only to opens
+# that ask for data access). The last name is checked on its handle (type, a single name, and with ``private``
+# the owner and access list), then handed out as a C runtime descriptor. A held folder is listed through its
+# handle (``GetFileInformationByHandleEx``), never by path. Opening by handle also means paths longer than 260
+# characters work below the root.
 #
 # Windows paths must be plain drive paths (``C:\...``). UNC shares (``\\server\share``) and device paths
 # (``\\?\``, ``\\.\``) are refused: they skip or change Win32's normal path handling, and Motet's own folders do
-# not need them. So are "." and "..", names Win32 would silently rewrite (a trailing dot or space), and names
-# with ":", which open an alternate data stream of a file rather than a file.
+# not need them. So are "." and "..", names Win32 would rewrite (a trailing dot or space) or treat as a device
+# (CON, NUL, COM1 and the like, with any extension), and names with ":", which open an alternate data stream.
 
 _CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
 
@@ -661,12 +693,19 @@ def folder_walk_available():
             and os.open in os.supports_dir_fd)
 
 
+_DEVICE_NAMES = frozenset(['CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'] + ['COM%d' % n for n in range(1, 10)]
+                          + ['LPT%d' % n for n in range(1, 10)])
+
+
 def _plain_name(name, windows):
     """One path component naming a child: never the folder itself, its parent, or (on Windows) a data stream."""
     if not isinstance(name, str) or name in ('', '.', '..') or '/' in name or '\0' in name:
         return False
     if windows:
-        return not ('\\' in name or ':' in name or name[-1] in '. ')
+        if '\\' in name or ':' in name or name[-1] in '. ':
+            return False
+        stem = name.split('.', 1)[0].rstrip(' ').upper()
+        return stem not in _DEVICE_NAMES
     return os.sep not in name
 
 
@@ -710,19 +749,79 @@ def _win_kind(facts, directory, subject, single_link=False):
         raise _refuse('links', subject)
 
 
-def _win_open_checked(path, directory, subject, single_link=False, private=False):
-    """Open one name without following a reparse point there and check the handle. A missing name raises
-    FileNotFoundError; any other failed open raises PrivateStorageError('open')."""
-    if directory:   # held: no delete sharing, so nobody can rename, remove or replace it while it is open
-        access, share = _READ_CONTROL | _FILE_READ_ATTRIBUTES, _SHARE_READ | _SHARE_WRITE
-    else:           # the handle is what is checked and read; what later happens to the name does not change it
-        access, share = _GENERIC_READ, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE
-    try:
-        handle = _win_open(path, access, share, _OPEN_EXISTING, 0)
-    except OSError as e:
-        if getattr(e, 'winerror', 0) in _NOT_FOUND:
-            raise FileNotFoundError(errno.ENOENT, 'private storage: %s missing' % subject) from None
-        raise _refuse('open', subject) from None
+_NT_FILE_OPEN = 1
+_NT_DIRECTORY_FILE, _NT_SYNCHRONOUS_IO_NONALERT, _NT_NON_DIRECTORY_FILE, _NT_OPEN_REPARSE_POINT = 0x1, 0x20, 0x40, 0x200000
+_OBJ_CASE_INSENSITIVE = 0x40
+_NT_NOT_FOUND = (0xC0000034, 0xC000003A)        # STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND
+_NT_WRONG_TYPE = (0xC0000103, 0xC00000BA)       # STATUS_NOT_A_DIRECTORY, STATUS_FILE_IS_A_DIRECTORY
+_DRIVE_REMOTE = 4
+
+
+def _missing(subject):
+    error = FileNotFoundError(errno.ENOENT, 'private storage: %s missing' % subject)
+    error.subject = subject
+    return error
+
+
+def _win_child(parent, name, access, share, directory):
+    """Open ``name`` (one component) inside the folder ``parent`` is a handle to, never following a reparse point
+    there. Raises OSError carrying ``ntstatus`` on failure."""
+    adv, kernel, w, SA, FILEINFO, nt = _win_api()
+    UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK = nt.structures
+    raw = name.encode('utf-16-le')
+    buffer = ctypes.create_string_buffer(raw + b'\0\0')
+    text = UNICODE_STRING(len(raw), len(raw) + 2, ctypes.cast(buffer, w.LPVOID))
+    attributes = OBJECT_ATTRIBUTES(ctypes.sizeof(OBJECT_ATTRIBUTES), parent, ctypes.pointer(text), _OBJ_CASE_INSENSITIVE, None, None)
+    handle, status_block = w.HANDLE(), IO_STATUS_BLOCK()
+    options = (_NT_DIRECTORY_FILE if directory else _NT_NON_DIRECTORY_FILE) | _NT_SYNCHRONOUS_IO_NONALERT | _NT_OPEN_REPARSE_POINT
+    status = nt.NtCreateFile(ctypes.byref(handle), access | _SYNCHRONIZE, ctypes.byref(attributes), ctypes.byref(status_block),
+                             None, 0, share, _NT_FILE_OPEN, options, None, 0) & 0xFFFFFFFF
+    if status >= 0x80000000 or not handle.value:     # NT_ERROR / NT_WARNING
+        if handle.value:
+            _win_close(handle.value)
+        error = OSError('private storage open failed')
+        error.ntstatus = status
+        raise error
+    return handle.value
+
+
+def _win_root_verified(handle, root):
+    """Refuse a drive whose root is not the root of a local volume: a network drive, or a ``subst`` drive standing for
+    a folder (whose path could pass through links that this walk never saw)."""
+    kernel, w = _win_api()[1:3]
+    if kernel.GetDriveTypeW(root) == _DRIVE_REMOTE:
+        raise _refuse('unavailable', 'folder')
+    buffer = ctypes.create_unicode_buffer(1024)
+    length = kernel.GetFinalPathNameByHandleW(handle, buffer, 1024, 0x4)   # FILE_NAME_NORMALIZED | VOLUME_NAME_NONE
+    if not length or length >= 1024 or buffer.value != '\\':
+        raise _refuse('unavailable', 'folder')
+
+
+def _win_list(handle):
+    """The names in the folder this handle is open on, read through the handle (FILE_FULL_DIR_INFO records)."""
+    kernel = _win_api()[1]
+    names, info_class, size = [], 15, 65536            # FileFullDirectoryRestartInfo, then FileFullDirectoryInfo
+    buffer = (ctypes.c_ulonglong * (size // 8))()       # the records need 8-byte alignment
+    while True:
+        if not kernel.GetFileInformationByHandleEx(handle, info_class, buffer, size):
+            if ctypes.get_last_error() == 18:          # ERROR_NO_MORE_FILES
+                return names
+            raise _unavailable('folder')
+        info_class, offset, raw = 14, 0, bytes(buffer)
+        while True:
+            following = int.from_bytes(raw[offset:offset + 4], 'little')
+            length = int.from_bytes(raw[offset + 60:offset + 64], 'little')
+            name = raw[offset + 68:offset + 68 + length].decode('utf-16-le', 'surrogatepass')
+            if name not in ('.', '..'):
+                names.append(name)
+            if not following:
+                break
+            offset += following
+
+
+def _win_checked(handle, directory, subject, single_link=False, private=False):
+    """Check an opened handle (type, reparse point, one name, and with ``private`` the owner and access list);
+    closes it and raises on refusal."""
     try:
         _win_kind(_win_facts(handle), directory, subject, single_link)
         if private:
@@ -734,6 +833,41 @@ def _win_open_checked(path, directory, subject, single_link=False, private=False
         _win_close(handle)
         raise
     return handle
+
+
+def _win_open_root(root, private=False):
+    """The drive root, held, checked and verified to be a local volume's root."""
+    try:
+        handle = _win_open(root, _HOLD_ACCESS, _SHARE_READ | _SHARE_WRITE, _OPEN_EXISTING, 0)
+    except OSError as e:
+        if getattr(e, 'winerror', 0) in _NOT_FOUND:
+            raise _missing('folder') from None
+        raise _refuse('open', 'folder') from None
+    _win_checked(handle, True, 'folder', private=private)
+    try:
+        _win_root_verified(handle, root)
+    except BaseException:
+        _win_close(handle)
+        raise
+    return handle
+
+
+def _win_open_checked(parent, name, directory, subject, single_link=False, private=False):
+    """Open the child ``name`` of the held folder ``parent`` and check it. A folder is held (data access, no delete
+    sharing); a file shares everything, since its handle is what is read. A missing name raises FileNotFoundError;
+    the wrong type ``not_regular``; any other failed open PrivateStorageError('open')."""
+    if directory:
+        access, share = _HOLD_ACCESS, _SHARE_READ | _SHARE_WRITE
+    else:
+        access, share = _GENERIC_READ, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE
+    try:
+        handle = _win_child(parent, name, access, share, directory)
+    except OSError as e:
+        status = getattr(e, 'ntstatus', 0)
+        if status in _NT_NOT_FOUND:
+            raise _missing(subject) from None
+        raise _refuse('not_regular' if status in _NT_WRONG_TYPE else 'open', subject) from None
+    return _win_checked(handle, directory, subject, single_link, private)
 
 
 def _posix_kind(info, directory, subject, single_link=False, private=False):
@@ -781,14 +915,20 @@ class NoLinkFolder:
             folder = folder._parent
 
     def stat(self):
-        """The held folder's own stat result (on Windows read by its name, which the hold keeps on this folder)."""
+        """The held folder's own stat result, read through its handle."""
         self._held()
-        return os.stat(self.path, follow_symlinks=False) if self._windows else os.fstat(self._fd)
+        if not self._windows:
+            return os.fstat(self._fd)
+        fd = _win_fd(_win_duplicate(self._handles[-1]), os.O_RDONLY)
+        try:
+            return os.fstat(fd)
+        finally:
+            os.close(fd)
 
     def names(self):
-        """The names in this folder, read while it is held (POSIX: through its descriptor)."""
+        """The names in this folder, read through its handle while it is held."""
         self._held()
-        return os.listdir(self.path if self._windows else self._fd)
+        return _win_list(self._handles[-1]) if self._windows else os.listdir(self._fd)
 
     def open(self, name, directory=False, single_link=False, private=False, subject=None):
         """A read-only descriptor for the child ``name``: a regular file (with one name only, if ``single_link``),
@@ -799,7 +939,7 @@ class NoLinkFolder:
         if not _plain_name(name, self._windows):
             raise _refuse('unavailable', subject)
         if self._windows:
-            return _win_fd(_win_open_checked(self._child(name), directory, subject, single_link, private), os.O_RDONLY)
+            return _win_fd(_win_open_checked(self._handles[-1], name, directory, subject, single_link, private), os.O_RDONLY)
         flags = os.O_RDONLY | os.O_NOFOLLOW | _CLOEXEC | (os.O_DIRECTORY if directory else os.O_NONBLOCK)
         fd = os.open(name, flags, dir_fd=self._fd)      # non-blocking: a pipe cannot hang the open
         try:
@@ -815,12 +955,21 @@ class NoLinkFolder:
         if not _plain_name(name, self._windows):
             raise _refuse('unavailable', 'folder')
         if self._windows:
-            path = self._child(name)
-            return NoLinkFolder(path, True, handles=[_win_open_checked(path, True, 'folder', private=private)], parent=self)
+            handle = _win_open_checked(self._handles[-1], name, True, 'folder', private=private)
+            return NoLinkFolder(self._child(name), True, handles=[handle], parent=self)
         return NoLinkFolder(os.path.join(self.path, name), False, fd=self.open(name, True, private=private))
 
     def _child(self, name):
         return self.path + name if self.path.endswith('\\') else self.path + '\\' + name
+
+
+def _win_duplicate(handle):
+    """A second handle on the same folder, for a descriptor that closes on its own."""
+    kernel, w = _win_api()[1:3]
+    process, copy = kernel.GetCurrentProcess(), w.HANDLE()
+    if not kernel.DuplicateHandle(process, handle, process, ctypes.byref(copy), 0, False, 2):   # DUPLICATE_SAME_ACCESS
+        raise _unavailable('folder')
+    return copy.value
 
 
 def _path_module():
@@ -840,10 +989,10 @@ def open_folder(path, private=False):
         root, names = _win_parts(path)
         handles, current = [], root
         try:
-            handles.append(_win_open_checked(current, True, 'folder', private=private and not names))
+            handles.append(_win_open_root(root, private=private and not names))
             for n, name in enumerate(names):
                 current = current + name if current.endswith('\\') else current + '\\' + name
-                handles.append(_win_open_checked(current, True, 'folder', private=private and n == len(names) - 1))
+                handles.append(_win_open_checked(handles[-1], name, True, 'folder', private=private and n == len(names) - 1))
         except BaseException:
             for handle in reversed(handles):
                 _win_close(handle)
@@ -862,6 +1011,16 @@ def open_folder(path, private=False):
         os.close(fd)
         raise
     return NoLinkFolder(path, False, fd=fd)
+
+
+def anchored(path):
+    """``path`` with the folders above its last name resolved once (``realpath``), for a walk over Motet's own
+    folders on Windows. Those folders are the user's profile and above, which are often moved with a junction; they
+    are resolved here, then the walk opens the resolved path by handle and holds it, so nothing in it can change
+    afterwards, and a link or junction at the last name itself is still refused."""
+    module = _path_module()
+    path = module.abspath(path)
+    return module.join(module.realpath(module.dirname(path)), module.basename(path))
 
 
 def open_no_links(path, directory=False, single_link=False, private=False):
