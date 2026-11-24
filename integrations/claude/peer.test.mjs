@@ -10,7 +10,7 @@ import {randomUUID,createHash,createHmac} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
-import {readCredential,validArgs,safeResult,validRequestId,instructions,nativeInstructions} from './peer.mjs';
+import {readCredential,validArgs,safeResult,validRequestId,instructions,nativeInstructions,platformRefusal,WINDOWS_UNAVAILABLE} from './peer.mjs';
 const here=path.dirname(new URL(import.meta.url).pathname),script=process.env.WATCH_PEER_TEST_SCRIPT||path.join(here,'peer.mjs');
 const {PeerClient}=await import(new URL(script,'file://').href);
 const hash=v=>createHash('sha256').update(v).digest('hex');
@@ -289,6 +289,18 @@ test('signed bounded server rejections are distinct from uncertain transport fai
   f.setMode('reject409');const result=await client.callTool({name:'list_requests',arguments:{}});assert.equal(result.isError,true);assert.equal(result.content[0].text,'Peer request rejected (409): Answer your incoming peer request first.');
   f.setMode('altered');const invalid=await client.callTool({name:'list_requests',arguments:{}});assert.equal(invalid.isError,true);assert.equal(invalid.content[0].text,'Peer operation could not be confirmed. No request was retried.');
  }finally{if(connected)await client.close();await f.close()}
+});
+test('Windows refuses with one plain reason before the credential file is read',async()=>{
+ assert.equal(platformRefusal('win32'),WINDOWS_UNAVAILABLE);
+ for(const platform of ['darwin','linux'])assert.equal(platformRefusal(platform),null);
+ assert.match(WINDOWS_UNAVAILABLE,/^The agent-to-agent bridge is not available on Windows yet\./);
+ const f=await fixture();try{
+  // Simulated Windows: the adapter must stop before it reads (or reports on) the real credential file.
+  const simulate='data:text/javascript,Object.defineProperty(process,"platform",{value:"win32"})';
+  const result=await new Promise(resolve=>{const p=spawn(process.execPath,['--import',simulate,path.join(here,'peer.mjs'),'--credential',f.file],{cwd:here,stdio:['ignore','pipe','pipe']});let stdout='',stderr='';p.stdout.on('data',b=>stdout+=b);p.stderr.on('data',b=>stderr+=b);p.on('exit',code=>resolve({code,stdout,stderr}))});
+  assert.equal(result.code,1);assert.equal(result.stdout,'');assert.equal(result.stderr,WINDOWS_UNAVAILABLE+'\n');
+  for(const privateValue of [f.root,f.file,f.credential.secret,f.credential.credential_id])assert.equal(result.stderr.includes(privateValue),false);
+ }finally{await f.close()}
 });
 test('unsafe service credential startup prints no paths, credentials or stdout',async()=>{
  const f=await fixture();try{

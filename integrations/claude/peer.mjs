@@ -29,6 +29,11 @@ const RPC_DEADLINE_MS=10000, STARTUP_DISCOVERY_DEADLINE_MS=1500;
 class MessageLengthError extends Error {}
 class PeerDeadlineError extends Error {}
 const OPERATION_FAILED='Peer operation could not be confirmed. No request was retried.';
+// Kept in step with peer_bridge.BRIDGE_UNAVAILABLE. Node cannot check a Windows access list, and Motet cannot find
+// chats there yet, so the adapter refuses before reading the credential file.
+export const WINDOWS_UNAVAILABLE='The agent-to-agent bridge is not available on Windows yet. It finds chats by opening their folders one by one and refusing links on the way, which Motet cannot do on Windows yet, so agents cannot list or message each other through Motet here. Your own messages to Claude chats on the stage still work.';
+export function platformRefusal(platform=process.platform){return platform==='win32'?WINDOWS_UNAVAILABLE:null}
+class PlatformRefusal extends Error {}
 const fail=()=>new Error(OPERATION_FAILED);
 class PeerReplyError extends Error{
   constructor(status,reason,inbox=false){
@@ -229,6 +234,8 @@ export async function discoverInboxes(client){
   }
 }
 export async function main(){
+  const refusal=platformRefusal();
+  if(refusal)throw new PlatformRefusal(refusal);
   if(![4,6].includes(process.argv.length)||process.argv[2]!=='--credential'||(process.argv.length===6&&process.argv[4]!=='--inbox-credential'))throw fail();
   const credential=await readCredential(process.argv[3]);
   let inboxCredential=null;
@@ -267,4 +274,4 @@ export async function main(){
   });
   await server.connect(new StdioServerTransport());
 }
-if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(()=>{console.error('Motet shared bridge adapter could not start.');process.exitCode=1});
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(error=>{console.error(error instanceof PlatformRefusal?error.message:'Motet shared bridge adapter could not start.');process.exitCode=1});

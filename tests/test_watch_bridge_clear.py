@@ -24,6 +24,29 @@ AGENT = 'x:22222222-2222-4222-8222-222222222222'
 KEY = 'fictional-owner-test-key'
 
 
+class WindowsRefusalTests(unittest.TestCase):
+    """Windows refuses with one plain reason, before the key is read or anything is sent; no traceback."""
+
+    def run_refused(self, argv):
+        err = io.StringIO()
+        with patch.object(cli, 'read_owner_key', side_effect=AssertionError('key read')), \
+                patch.object(cli, 'owner_request', side_effect=AssertionError('request sent')), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()) as out:
+            code = cli.main(argv)
+        self.assertEqual((code, out.getvalue(), err.getvalue()), (1, '', cli.UNAVAILABLE + '\n'))
+
+    def test_simulated_windows_refuses_inspect_and_apply(self):
+        with patch.object(cli, 'bridge_available', return_value=False):
+            self.run_refused(['--port', '1', '--request-id', PUBLIC])
+            self.run_refused(['--port', '1', '--transport-id', TID, '--expected-agent', AGENT, '--apply'])
+        self.assertIn('not available on Windows yet', cli.UNAVAILABLE)
+        self.assertNotIn('Traceback', cli.UNAVAILABLE)
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows')
+    def test_windows_refuses(self):
+        self.run_refused(['--port', '1', '--request-id', PUBLIC])
+
+
 @unittest.skipIf(os.name != 'posix', 'Private owner key on POSIX host')
 class ClearTests(unittest.TestCase):
     def setUp(self):

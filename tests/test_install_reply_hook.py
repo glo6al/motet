@@ -113,4 +113,63 @@ class InstallTests(unittest.TestCase):
         for path in self.store.glob('backup-*.json'):self.assertEqual(path.stat().st_mode&0o777,0o600)
 
 
+class NoHookFolders(unittest.TestCase):
+    """Windows (no handle-based folder walk): nothing was ever installed, so removal says so; revocation still runs
+    under Motet's own lifetime lock. Checked here by simulation and below on real Windows."""
+
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.home=Path(os.path.realpath(self.tmp.name))
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
+        sys.path.insert(0,str(Path(__file__).resolve().parent))
+        import peer_bridge,peer_reply_delivery,private_storage
+        self.bridge,self.backend,self.storage=peer_bridge,peer_reply_delivery,private_storage
+
+    def tearDown(self):self.tmp.cleanup()
+
+    def run_main(self,*extra):
+        out=io.StringIO()
+        with patch.object(sys,'argv',['install_reply_hook.py','--provider','both',*extra]),patch.object(installer.Path,'home',return_value=self.home),\
+                patch.object(installer,'hook_folders_available',return_value=False),contextlib.redirect_stdout(out):
+            installer.main()
+        return out.getvalue()
+
+    def seed(self):
+        db=self.bridge.open_database(str(self.home/'.live-room'))
+        try:
+            with self.bridge.transaction(db):
+                self.backend.create_schema(db)
+                db.execute('INSERT INTO peer_reply_hook_credentials VALUES (?,?,1,?,?)',('fictional-id','fictional-secret','["claude"]',1))
+        finally:db.close()
+
+    def active(self):
+        db=sqlite3.connect(str(self.home/'.live-room'/'officer-messages.sqlite3'))
+        try:return db.execute('SELECT id FROM peer_reply_hook_credentials WHERE active=1').fetchall()
+        finally:db.close()
+
+    def check(self,context):
+        with context():
+            self.assertEqual(self.run_main('--remove'),installer.NONE_ON_WINDOWS+'\n')
+        self.assertEqual(list(self.home.iterdir()),[],'removal alone touches nothing')
+        with context():self.seed()
+        lock=self.storage.open_lock_file(str(self.home/'.live-room'/'officer-messages.lock'))
+        try:
+            self.assertTrue(self.storage.try_lock(lock))      # Motet running
+            with context(),self.assertRaisesRegex(ValueError,'^Stop Motet before provisioning reply hooks.$'):self.run_main('--remove','--revoke')
+        finally:self.storage.close_lock(lock)
+        self.assertEqual(self.active(),[('fictional-id',)])
+        with context():
+            self.assertEqual(self.run_main('--remove','--revoke'),installer.NONE_ON_WINDOWS+' Saved reply-notice access was turned off.\n')
+        self.assertEqual(self.active(),[])
+        for name in ('.codex','.claude'):self.assertFalse((self.home/name).exists())
+
+    @unittest.skipIf(os.name=='nt','real Windows is checked below')
+    def test_simulated_windows(self):
+        from windows_simulation import simulated_windows
+        self.check(simulated_windows)
+
+    @unittest.skipUnless(os.name=='nt','real Windows')
+    def test_windows(self):
+        self.check(contextlib.nullcontext)
+
+
 if __name__=='__main__':unittest.main()
