@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -29,10 +30,31 @@ const RPC_DEADLINE_MS=10000, STARTUP_DISCOVERY_DEADLINE_MS=1500;
 class MessageLengthError extends Error {}
 class PeerDeadlineError extends Error {}
 const OPERATION_FAILED='Peer operation could not be confirmed. No request was retried.';
-// Kept in step with peer_bridge.BRIDGE_UNAVAILABLE. Node cannot check a Windows access list, and Motet cannot find
-// chats there yet, so the adapter refuses before reading the credential file.
-export const WINDOWS_UNAVAILABLE='The agent-to-agent bridge is not available on Windows yet. It finds chats by opening their folders one by one and refusing links on the way, which Motet cannot do on Windows yet, so agents cannot list or message each other through Motet here. Your own messages to Claude chats on the stage still work.';
-export function platformRefusal(platform=process.platform){return platform==='win32'?WINDOWS_UNAVAILABLE:null}
+// Node cannot read a Windows access list, so on Windows the adapter never opens its credential file itself: Motet's
+// Python opens it through its no-link walk (state folder, credential folder and file each opened by handle, never
+// through a link or junction; folders above the state folder are resolved once), checks owner, a protected
+// this-user/SYSTEM list and one name on the handles, and hands it over on a pipe. Without the Python path that
+// `watch_peer.py config` writes, the adapter refuses before touching the file.
+export const WINDOWS_PYTHON_REQUIRED='On Windows the Motet bridge adapter needs Python to check that its credential file is private to you, and none was given. Run python scripts\\watch_peer.py config again and use the configuration it prints.';
+export function platformRefusal(platform=process.platform,python=null){return platform==='win32'&&!python?WINDOWS_PYTHON_REQUIRED:null}
+const HELPER=path.join(path.dirname(fileURLToPath(import.meta.url)),'..','..','scripts','watch_peer_credential.py');
+export function parseArgs(argv){
+  const out={},names=new Set(['--credential','--inbox-credential','--python']);
+  if(argv.length<2||argv.length%2||argv[0]!=='--credential')throw fail();
+  for(let i=0;i<argv.length;i+=2){if(!names.has(argv[i])||argv[i] in out||typeof argv[i+1]!=='string'||!argv[i+1])throw fail();out[argv[i]]=argv[i+1]}
+  return {credential:out['--credential'],inbox:out['--inbox-credential']??null,python:out['--python']??null};
+}
+// Windows: Motet's Python reads the file as described above and prints the validated credential; nothing else is
+// trusted.
+export async function readCredentialChecked(file,python,helper=HELPER){
+  if(!path.isAbsolute(file)||path.resolve(file)!==file||!path.isAbsolute(python)||path.resolve(python)!==python)throw fail();
+  const raw=await new Promise((resolve,reject)=>{
+    execFile(python,['-I',helper,file],{windowsHide:true,timeout:10000,maxBuffer:8192,encoding:'utf8'},(error,stdout)=>error?reject(fail()):resolve(stdout));
+  });
+  let d;try{d=JSON.parse(raw)}catch{throw fail()}
+  if(!object(d)||Object.keys(d).sort().join(',')!=='credential_id,port,secret,version'||d.version!==2||!isUuid(d.credential_id)||!isHex(d.secret)||!Number.isInteger(d.port)||d.port<1||d.port>65535)throw fail();
+  return d;
+}
 class PlatformRefusal extends Error {}
 const fail=()=>new Error(OPERATION_FAILED);
 class PeerReplyError extends Error{
@@ -234,12 +256,14 @@ export async function discoverInboxes(client){
   }
 }
 export async function main(){
-  const refusal=platformRefusal();
+  const args=parseArgs(process.argv.slice(2));
+  const refusal=platformRefusal(process.platform,args.python);
   if(refusal)throw new PlatformRefusal(refusal);
-  if(![4,6].includes(process.argv.length)||process.argv[2]!=='--credential'||(process.argv.length===6&&process.argv[4]!=='--inbox-credential'))throw fail();
-  const credential=await readCredential(process.argv[3]);
+  // --python is used only on Windows; elsewhere Node checks owner and mode itself.
+  const credential=process.platform==='win32'?await readCredentialChecked(args.credential,args.python):await readCredential(args.credential);
   let inboxCredential=null;
-  if(process.argv.length===6){try{inboxCredential=await readInboxCredential(process.argv[5]);}catch{/* Optional receiving must not disable ordinary shared messaging. */}}
+  // The Antigravity inbox is macOS and Linux only: on Windows its POSIX check fails and receiving stays off.
+  if(args.inbox){try{inboxCredential=await readInboxCredential(args.inbox);}catch{/* Optional receiving must not disable ordinary shared messaging. */}}
   const client=new PeerClient(credential,inboxCredential);
   const inboxes=await discoverInboxes(client),inboxEnabled=inboxes.length>0;
   const receiverEnabled=!!inboxCredential&&inboxes.some(b=>b.inbox_id===inboxCredential.inbox_id&&b.inbox_revision===inboxRevision(inboxCredential));

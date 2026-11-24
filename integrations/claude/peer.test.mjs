@@ -10,7 +10,8 @@ import {randomUUID,createHash,createHmac} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
-import {readCredential,validArgs,safeResult,validRequestId,instructions,nativeInstructions,platformRefusal,WINDOWS_UNAVAILABLE} from './peer.mjs';
+import {readCredential,validArgs,safeResult,validRequestId,instructions,nativeInstructions,platformRefusal,parseArgs,WINDOWS_PYTHON_REQUIRED} from './peer.mjs';
+import {execFileSync} from 'node:child_process';
 const here=path.dirname(new URL(import.meta.url).pathname),script=process.env.WATCH_PEER_TEST_SCRIPT||path.join(here,'peer.mjs');
 const {PeerClient}=await import(new URL(script,'file://').href);
 const hash=v=>createHash('sha256').update(v).digest('hex');
@@ -290,16 +291,45 @@ test('signed bounded server rejections are distinct from uncertain transport fai
   f.setMode('altered');const invalid=await client.callTool({name:'list_requests',arguments:{}});assert.equal(invalid.isError,true);assert.equal(invalid.content[0].text,'Peer operation could not be confirmed. No request was retried.');
  }finally{if(connected)await client.close();await f.close()}
 });
-test('Windows refuses with one plain reason before the credential file is read',async()=>{
- assert.equal(platformRefusal('win32'),WINDOWS_UNAVAILABLE);
+// Simulated Windows: process.platform reads win32 inside the adapter; the path module and files stay this system's.
+const simulateWindows='data:text/javascript,Object.defineProperty(process,"platform",{value:"win32"})';
+function python(){try{return execFileSync('python3',['-c','import sys;print(sys.executable)'],{encoding:'utf8'}).trim()}catch{return null}}
+function startAdapter(args){
+ return new Promise(resolve=>{const p=spawn(process.execPath,['--import',simulateWindows,path.join(here,'peer.mjs'),...args],{cwd:here,stdio:['ignore','pipe','pipe']});let stdout='',stderr='';p.stdout.on('data',b=>stdout+=b);p.stderr.on('data',b=>stderr+=b);p.on('exit',code=>resolve({code,stdout,stderr}))});
+}
+test('adapter arguments are exact pairs, with the credential first',()=>{
+ assert.deepEqual(parseArgs(['--credential','/a.json']),{credential:'/a.json',inbox:null,python:null});
+ assert.deepEqual(parseArgs(['--credential','/a.json','--python','/p/python','--inbox-credential','/i.json']),{credential:'/a.json',inbox:'/i.json',python:'/p/python'});
+ for(const bad of [[],['--credential'],['--python','/p','--credential','/a.json'],['--credential','/a.json','--credential','/b.json'],['--credential','/a.json','--other','x'],['--credential','']])
+  assert.throws(()=>parseArgs(bad),/could not be confirmed/);
+});
+test('Windows without a Python to check the credential refuses before the file is read',async()=>{
+ assert.equal(platformRefusal('win32'),WINDOWS_PYTHON_REQUIRED);
+ assert.equal(platformRefusal('win32','C:\\Python312\\python.exe'),null);
  for(const platform of ['darwin','linux'])assert.equal(platformRefusal(platform),null);
- assert.match(WINDOWS_UNAVAILABLE,/^The agent-to-agent bridge is not available on Windows yet\./);
+ assert.match(WINDOWS_PYTHON_REQUIRED,/^On Windows the Motet bridge adapter needs Python/);
  const f=await fixture();try{
-  // Simulated Windows: the adapter must stop before it reads (or reports on) the real credential file.
-  const simulate='data:text/javascript,Object.defineProperty(process,"platform",{value:"win32"})';
-  const result=await new Promise(resolve=>{const p=spawn(process.execPath,['--import',simulate,path.join(here,'peer.mjs'),'--credential',f.file],{cwd:here,stdio:['ignore','pipe','pipe']});let stdout='',stderr='';p.stdout.on('data',b=>stdout+=b);p.stderr.on('data',b=>stderr+=b);p.on('exit',code=>resolve({code,stdout,stderr}))});
-  assert.equal(result.code,1);assert.equal(result.stdout,'');assert.equal(result.stderr,WINDOWS_UNAVAILABLE+'\n');
+  await fs.chmod(f.file,0o000);   // were it read, this would fail differently
+  const result=await startAdapter(['--credential',f.file]);
+  assert.equal(result.code,1);assert.equal(result.stdout,'');assert.equal(result.stderr,WINDOWS_PYTHON_REQUIRED+'\n');
   for(const privateValue of [f.root,f.file,f.credential.secret,f.credential.credential_id])assert.equal(result.stderr.includes(privateValue),false);
+ }finally{await fs.chmod(f.file,0o600);await f.close()}
+});
+test('Windows reads the credential only through Motet\'s Python check',async t=>{
+ const interpreter=python();if(!interpreter){t.skip('python3 is not available');return}
+ const f=await fixture(),client=new Client({name:'simulated Windows host',version:'1'});let connected=false;try{
+  await client.connect(new StdioClientTransport({command:process.execPath,args:['--import',simulateWindows,path.join(here,'peer.mjs'),'--credential',f.file,'--python',interpreter],cwd:here,stderr:'pipe'}));connected=true;
+  f.setMode('reject409');const result=await client.callTool({name:'list_requests',arguments:{}});
+  assert.equal(result.content[0].text,'Peer request rejected (409): Answer your incoming peer request first.','the signed request used the checked credential');
+ }finally{if(connected)await client.close()}
+ try{
+  await fs.chmod(f.file,0o644);   // not private: Python refuses, so the adapter never starts
+  const refused=await startAdapter(['--credential',f.file,'--python',interpreter]);
+  assert.equal(refused.code,1);assert.equal(refused.stdout,'');assert.equal(refused.stderr,'Motet shared bridge adapter could not start.\n');
+  for(const privateValue of [f.root,f.file,f.credential.secret,f.credential.credential_id])assert.equal(refused.stderr.includes(privateValue),false);
+  await fs.chmod(f.file,0o600);
+  const relative=await startAdapter(['--credential',f.file,'--python','python3']);   // only an absolute interpreter
+  assert.equal(relative.code,1);assert.equal(relative.stderr,'Motet shared bridge adapter could not start.\n');
  }finally{await f.close()}
 });
 test('unsafe service credential startup prints no paths, credentials or stdout',async()=>{

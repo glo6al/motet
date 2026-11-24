@@ -10,6 +10,7 @@ import uuid
 
 import claude_channel
 import peer_bridge as bridge
+import private_storage
 
 
 CONFIG_NAME = 'antigravity-inbox.json'
@@ -90,7 +91,7 @@ def read_config_file(path):
     if os.name != 'posix':
         raise OSError('Inbox configuration requires a POSIX system.')
     path = os.path.abspath(os.path.expanduser(path))
-    directory = claude_channel._directory(os.path.dirname(path))
+    directory = private_storage.open_no_links(os.path.dirname(path), directory=True)
     try:
         claude_channel._private(os.fstat(directory), True)
         return read_config(directory, os.path.basename(path))

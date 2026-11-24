@@ -17,9 +17,12 @@ import peer_bridge as p
 import claude_channel
 import private_storage
 
-# Commands that set up or use bridge messaging. Where the bridge cannot find chats (Windows for now) they refuse
-# with one reason; status and revoke still read and turn off saved access.
+# Commands that set up or use bridge messaging. Where the bridge cannot find chats (a system without the no-link
+# folder walk) they refuse with one reason; status and revoke still read and turn off saved access.
 NEEDS_BRIDGE = ('init', 'rotate', 'config', 'enroll', 'policy')
+# The Antigravity plugin and its pull inbox check their files with POSIX owner and mode bits only.
+ANTIGRAVITY_UNAVAILABLE = ('The Antigravity plugin and inbox need macOS or Linux. On Windows, connect Codex or '
+                           'Claude Code to the bridge with --client codex or --client claude instead.')
 
 
 class BridgeUnavailable(ValueError):
@@ -140,21 +143,29 @@ def enroll_launch(state, session, instance, project, label, port=8793):
 
 def read_credential(path, *, exact_mode=False):
     path = os.path.abspath(path)
-    directory = p.private_directory(os.path.dirname(path))
-    p.private_directory(os.path.dirname(directory))
     if private_storage.WIN:
-        # The folder is held open (no rename or replacement) until the file is open; the file is opened without
-        # following a link or junction, and its owner, access list and single name are checked on that handle. The
-        # access-list rule (only this user and SYSTEM, nothing inherited) is already owner-only, so exact_mode adds nothing.
+        # The no-link walk: the folders above Motet's state folder are resolved once (a moved profile often uses a
+        # junction); then the state folder, the credential folder and the file are each opened by handle relative to
+        # the one above, never through a link or junction, with the folders held until the file is open. Owner and
+        # access list are checked on the state and credential folders' handles, and owner, access list and a single
+        # name on the file's. The access-list rule (only this user and SYSTEM, nothing inherited) is already
+        # owner-only, so exact_mode adds nothing.
+        folder, name = os.path.split(path)
+        state, credentials = os.path.split(folder)
         try:
-            fd, info = private_storage.open_private_file(path, folder=True, single_link=True)
-        except private_storage.PrivateStorageError:
-            raise claude_channel.ChannelError(p.STATE_FILE_REFUSED) from None
+            with private_storage.open_folder(private_storage.anchored(state), private=True) as held, \
+                    held.folder(credentials, private=True) as inner:
+                fd = inner.open(name, single_link=True, private=True)
+        except OSError as error:
+            folder_refused = getattr(error, 'subject', 'file') == 'folder'
+            raise claude_channel.ChannelError(p.STATE_FOLDER_REFUSED if folder_refused else p.STATE_FILE_REFUSED) from None
         try:
             raw = os.read(fd, 8193)
         finally:
             os.close(fd)
     else:
+        directory = p.private_directory(os.path.dirname(path))
+        p.private_directory(os.path.dirname(directory))
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             info = os.fstat(fd)
@@ -179,13 +190,16 @@ def read_credential(path, *, exact_mode=False):
     return data
 
 
-def config(path, node=None):
+def config(path, node=None, python=None):
     read_credential(path)
     node = node or shutil.which('node')
     if not node:
         raise ValueError('Node.js is required.')
-    return {'mcpServers': {'watch-peer': {'command': os.path.abspath(node),
-            'args': [str(ROOT / 'integrations/claude/peer.mjs'), '--credential', os.path.abspath(path)]}}}
+    args = [str(ROOT / 'integrations/claude/peer.mjs'), '--credential', os.path.abspath(path)]
+    if private_storage.WIN:
+        # Node cannot read a Windows access list: the adapter asks this Python to check and read the credential.
+        args += ['--python', os.path.abspath(python or sys.executable)]
+    return {'mcpServers': {'watch-peer': {'command': os.path.abspath(node), 'args': args}}}
 
 
 class AntigravityPathError(ValueError):
@@ -327,6 +341,8 @@ def main(argv=None):
     if args.command in NEEDS_BRIDGE and not p.bridge_available():
         raise BridgeUnavailable(p.BRIDGE_UNAVAILABLE)
     if args.command == 'config':
+        if args.client == 'antigravity' and private_storage.WIN:
+            raise BridgeUnavailable(ANTIGRAVITY_UNAVAILABLE)
         if args.inbox_credential and args.client != 'antigravity':
             raise ValueError('Inbox receiving is configured only for the Antigravity plugin.')
         if args.client == 'antigravity':

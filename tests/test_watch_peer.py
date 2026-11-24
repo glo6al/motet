@@ -268,7 +268,7 @@ class CliTests(unittest.TestCase):
 
 
 class Refusal(unittest.TestCase):
-    """Where chats cannot be found (Windows for now) setup refuses with one printed reason; no traceback."""
+    """Where chats cannot be found (no no-link folder walk) setup refuses with one printed reason; no traceback."""
 
     def test_setup_commands_refuse_with_the_bridge_reason_before_any_state(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -292,7 +292,7 @@ class Refusal(unittest.TestCase):
                 self.assertRaises(SystemExit) as code:
             runpy.run_path(w.__file__, run_name='__main__')
         self.assertEqual((code.exception.code, err.getvalue()), (1, w.p.BRIDGE_UNAVAILABLE + '\n'))
-        self.assertIn('not available on Windows yet', err.getvalue())
+        self.assertIn('not available on this system', err.getvalue())
 
 
 @unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS and Linux; real Windows is tested below')
@@ -316,7 +316,8 @@ class SimulatedWindowsCredentials(unittest.TestCase):
             self.assertEqual(w.read_credential(path, exact_mode=True)['credential_id'], credential['credential_id'])
         self.assertIn('make_private_folder', calls)
         self.assertIn('create_private_file', calls)
-        self.assertIn('open_private_file', calls)
+        self.assertIn('open_folder', calls)                              # read through the no-link walk
+        self.assertNotIn('open_private_file', calls)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
 
@@ -332,6 +333,23 @@ class SimulatedWindowsCredentials(unittest.TestCase):
         os.chmod(path, 0o644)
         with self.simulated_windows(), no_leaked_handles(self), self.assertRaises(w.claude_channel.ChannelError):
             w.read_credential(path)
+
+    def test_config_hands_the_adapter_this_python_and_antigravity_is_refused(self):
+        credential = {'version': 2, 'credential_id': str(uuid.uuid4()), 'secret': 'e' * 64}
+        with self.simulated_windows():
+            path = w.write_credential(self.state, credential, 8793)
+            self.assertTrue(w.p.bridge_available())
+            settings = w.config(path, node=sys.executable)['mcpServers']['watch-peer']
+            self.assertEqual(settings['args'][1:], ['--credential', path, '--python', os.path.abspath(sys.executable)])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                w.main(['--state-dir', self.state, 'config', path, '--node', sys.executable, '--client', 'claude'])
+            self.assertIn('--python', out.getvalue())
+            with self.assertRaises(w.BridgeUnavailable) as raised:
+                w.main(['--state-dir', self.state, 'config', path, '--client', 'antigravity'])
+            self.assertEqual(str(raised.exception), w.ANTIGRAVITY_UNAVAILABLE)
+        posix = w.config(path, node=sys.executable)['mcpServers']['watch-peer']['args']
+        self.assertNotIn('--python', posix)
 
     def test_refusals_map_to_one_plain_message(self):
         credential = {'version': 2, 'credential_id': str(uuid.uuid4()), 'secret': 'b' * 64}
@@ -352,6 +370,35 @@ class SimulatedWindowsCredentials(unittest.TestCase):
         with self.simulated_windows(), self.assertRaises(w.claude_channel.ChannelError) as raised:
             w.read_credential(path)
         self.assertEqual(str(raised.exception), w.p.STATE_FOLDER_REFUSED)
+
+
+class CredentialHelper(unittest.TestCase):
+    """scripts/watch_peer_credential.py: what the bridge adapter runs on Windows instead of reading the file itself."""
+    SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts', 'watch_peer_credential.py')
+
+    @classmethod
+    def helper(cls, *args):
+        import subprocess
+        return subprocess.run([sys.executable, '-I', os.path.abspath(cls.SCRIPT)] + list(args), capture_output=True,
+                              text=True, timeout=60)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX private state; real Windows is checked in WindowsCredentials')
+    def test_prints_a_private_shared_credential_and_refuses_anything_else(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = os.path.join(os.path.realpath(temp), 'state')
+            credential = {'version': 2, 'credential_id': str(uuid.uuid4()), 'secret': 'f' * 64}
+            w.p.private_directory(state, True)
+            path = w.write_credential(state, credential, 8793)
+            done = self.helper(path)
+            self.assertEqual((done.returncode, done.stderr), (0, ''))
+            self.assertEqual(json.loads(done.stdout), dict(credential, port=8793))
+            refused = 'Motet bridge credential refused: it must be a private shared-service credential file owned by you.\n'
+            os.chmod(path, 0o644)
+            for args in ([path], [], ['relative.json'], [path, path]):
+                with self.subTest(args=len(args)):
+                    done = self.helper(*args)
+                    self.assertEqual((done.returncode, done.stdout, done.stderr), (1, '', refused))
+            self.assertNotIn(credential['secret'], done.stderr)
 
 
 def icacls(*args):
@@ -416,10 +463,20 @@ class WindowsCredentials(unittest.TestCase):
         with self.assertRaises(w.claude_channel.ChannelError):
             w.read_credential(link)
 
-    def test_setup_refuses_with_the_bridge_reason(self):
+    def test_bridge_is_available_and_config_names_this_python(self):
+        self.assertTrue(w.p.bridge_available())
+        settings = w.config(self.path, node=sys.executable)['mcpServers']['watch-peer']
+        self.assertEqual(settings['args'][-2:], ['--python', os.path.abspath(sys.executable)])
         with self.assertRaises(w.BridgeUnavailable) as raised:
-            w.main(['--state-dir', self.state, 'init', '--providers', 'claude'])
-        self.assertEqual(str(raised.exception), w.p.BRIDGE_UNAVAILABLE)
+            w.main(['--state-dir', self.state, 'config', self.path, '--client', 'antigravity'])
+        self.assertEqual(str(raised.exception), w.ANTIGRAVITY_UNAVAILABLE)
+
+    def test_the_adapter_helper_prints_the_checked_credential(self):
+        helper = CredentialHelper.helper(self.path)
+        self.assertEqual((helper.returncode, json.loads(helper.stdout)), (0, dict(self.credential, port=8793)))
+        icacls(self.path, '/grant', EVERYONE_READ)
+        helper = CredentialHelper.helper(self.path)
+        self.assertEqual((helper.returncode, helper.stdout), (1, ''))
 
 
 if __name__ == '__main__':

@@ -1,9 +1,10 @@
 """Run the bridge's Windows branches on macOS or Linux, for tests only.
 
 ``private_storage.WIN`` is set, so callers take their Windows branch, but each private_storage call they make is
-answered by the POSIX implementation (links, owner and mode still refused). The handle-based folder walk, fcntl and
-os.getuid are made to fail loudly, so a Windows branch that still reached for them would show up as an error. This
-checks the wiring only; the access-list rules themselves are tested on real Windows (skipUnless nt).
+answered by the POSIX implementation (links, owner and mode still refused), including the no-link folder walk
+(``open_folder``, ``open_no_links``). fcntl and os.getuid are made to fail loudly, so a Windows branch that still
+reached for them would show up as an error. This checks the wiring only; the Windows walk's own decisions are
+tested with the Win32 calls replaced (test_private_storage.py), and the access-list rules on real Windows.
 """
 from contextlib import ExitStack, contextmanager
 import os
@@ -11,11 +12,11 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-import claude_channel
 import private_storage as ps
 
 CALLS = ('check_private', 'make_private_folder', 'create_private_file', 'open_private_file', 'open_private_rw',
-         'open_lock_file', 'try_lock', 'unlock', 'close_lock', 'sqlite_companions_plain')
+         'open_lock_file', 'try_lock', 'unlock', 'close_lock', 'sqlite_companions_plain', 'folder_walk_available',
+         'open_folder', 'open_no_links', 'anchored')
 
 
 def _forbidden(name):
@@ -24,28 +25,53 @@ def _forbidden(name):
     return refuse
 
 
+class _PosixFolder:
+    """A held folder from the POSIX walk whose methods also run as POSIX (they check owner and mode)."""
+
+    def __init__(self, folder, as_posix):
+        self._folder, self._as_posix = folder, as_posix
+
+    def __getattr__(self, name):
+        value = getattr(self._folder, name)
+        if callable(value):
+            return lambda *args, **kwargs: self._as_posix(value, *args, **kwargs)
+        return value
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._folder.close()
+        return False
+
+
 @contextmanager
-def simulated_windows(folder_walk=False):
-    """Yield the list of private_storage calls made while simulating Windows."""
+def simulated_windows(folder_walk=True):
+    """Yield the list of private_storage calls made while simulating Windows; ``folder_walk=False`` simulates a
+    Windows whose walk calls did not load."""
     import fcntl                       # only ever simulated on POSIX
     calls = []
     real = {name: getattr(ps, name) for name in CALLS}
     real_getuid = os.getuid
 
+    def as_posix(function, *args, **kwargs):
+        with patch.object(ps, 'WIN', False), patch.object(os, 'getuid', real_getuid), \
+                patch.dict(sys.modules, {'fcntl': fcntl}):
+            result = function(*args, **kwargs)
+        return _PosixFolder(result, as_posix) if isinstance(result, ps.NoLinkFolder) else result
+
     def posix(name):
         def call(*args, **kwargs):
             calls.append(name)
-            with patch.object(ps, 'WIN', False), patch.object(os, 'getuid', real_getuid), \
-                    patch.dict(sys.modules, {'fcntl': fcntl}):
-                return real[name](*args, **kwargs)
+            return as_posix(real[name], *args, **kwargs)
         return call
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(ps, 'WIN', True))
         for name in CALLS:
             stack.enter_context(patch.object(ps, name, posix(name)))
-        stack.enter_context(patch.object(claude_channel, 'folder_walk_available', return_value=folder_walk))
-        stack.enter_context(patch.object(claude_channel, '_directory', _forbidden('the handle-based folder walk')))
+        if not folder_walk:
+            stack.enter_context(patch.object(ps, 'folder_walk_available', return_value=False))
         stack.enter_context(patch.dict(sys.modules, {'fcntl': None}))     # import fcntl now fails
         stack.enter_context(patch.object(os, 'getuid', _forbidden('os.getuid'), create=True))
         yield calls

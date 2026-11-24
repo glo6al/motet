@@ -126,6 +126,12 @@ def public(row):
     return result
 
 
+def posix_records_checkable():
+    """Attachment and managed-chat records, and Codex reply tracking, are checked with the POSIX folder walk, owner
+    and mode bits (and fcntl): macOS and Linux only."""
+    return not private_storage.WIN and private_storage.folder_walk_available()
+
+
 def private_state_folder(state_dir):
     """Make the messaging state folder if it is missing, then refuse it unless it is private to this user.
 
@@ -141,8 +147,14 @@ def private_state_folder(state_dir):
             except OSError:
                 if not os.path.lexists(state_dir):   # something else made it first: check that one instead
                     raise
-    else:
-        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        try:
+            # The folders above are resolved once (a moved profile often uses a junction); then the walk opens each
+            # folder by handle and checks this one's owner and access list on its handle.
+            os.close(private_storage.open_no_links(private_storage.anchored(state_dir), directory=True, private=True))
+        except OSError:
+            raise OSError(STATE_FOLDER_REFUSED) from None
+        return
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
     try:
         private_storage.check_private(state_dir, directory=True)
     except private_storage.PrivateStorageError:
@@ -284,9 +296,10 @@ class MessagingStore:
                       root / 'managed-claude' / 'registry.sqlite3')
         if not any(present(path) for path in candidates):
             return None
-        if not claude_channel.folder_walk_available():
-            # The fence opens these records by handle-based folder walk (and fcntl), which Windows lacks. They can
-            # only have come from a Mac or Linux copy of this folder; refuse rather than open the database unfenced.
+        if not posix_records_checkable():
+            # The fence opens these records by the POSIX folder walk and fcntl, so it runs on macOS and Linux only.
+            # Elsewhere they can only have come from a Mac or Linux copy of this folder; refuse rather than open the
+            # database unfenced.
             raise MessagingStorageUnavailable(RETAINED_STATE_UNAVAILABLE)
         from attachments_native_namespace import NativeNamespaceFence
         fence = NativeNamespaceFence(state_dir)
@@ -1709,9 +1722,10 @@ class MessagingStore:
         for row in rows:
             if row.get('transport') == claude_mod.TRANSPORT:
                 continue  # HTTP claims/events exclusively own these rows; no stale tick writeback.
-            if row.get('runtime') == 'codex' and not claude_channel.folder_walk_available():
-                # Windows: a Codex row can only have come from a copy of a Mac's folder. Sending and reply
-                # tracking read its transcript by a folder walk Windows lacks; leave the row exactly as it is.
+            if row.get('runtime') == 'codex' and not posix_records_checkable():
+                # Windows: a Codex row can only have come from a copy of a Mac's folder, since sending to Codex needs
+                # the Mac app. Its sending and reply tracking check transcripts with POSIX owner and mode rules;
+                # leave the row exactly as it is.
                 continue
             if self.stop.is_set():
                 break

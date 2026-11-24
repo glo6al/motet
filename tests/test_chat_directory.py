@@ -18,6 +18,75 @@ def uid():
     return str(uuid.uuid4())
 
 
+class PortableDirectoryTests(unittest.TestCase):
+    """Listing through the no-link folder walk on every system, including real Windows (where a folder link is a
+    junction) and Windows simulated on macOS and Linux."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.realpath(self.tmp.name)
+        self.codex = os.path.join(self.root, 'codex')
+        self.sessions = os.path.join(self.codex, 'sessions')
+        self.claude = os.path.join(self.root, 'claude-projects')
+        os.makedirs(os.path.join(self.sessions, '2026', '11', '24'))
+        os.makedirs(os.path.join(self.claude, 'project-key'))
+        self.outside = os.path.join(self.root, 'outside')
+        os.makedirs(self.outside)
+
+    def tearDown(self):
+        self.tmp.cleanup()     # on Windows this fails if a transcript was left open
+
+    def append(self, path, record):
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record) + '\n')
+
+    def chats(self):
+        codex = uid()
+        self.append(os.path.join(self.sessions, '2026', '11', '24', 'rollout-' + codex + '.jsonl'),
+                    {'type': 'session_meta', 'payload': {'id': codex, 'cwd': self.root, 'source': 'vscode'}})
+        self.append(os.path.join(self.codex, 'session_index.jsonl'), {'id': codex, 'thread_name': 'Atlas'})
+        claude = uid()
+        self.append(os.path.join(self.claude, 'project-key', claude + '.jsonl'),
+                    {'type': 'custom-title', 'customTitle': 'Vega', 'sessionId': claude, 'cwd': self.root})
+        hidden = uid()                       # reachable only through a folder link
+        self.append(os.path.join(self.outside, hidden + '.jsonl'),
+                    {'type': 'custom-title', 'customTitle': 'Hidden', 'sessionId': hidden, 'cwd': self.root})
+        return 'x:' + codex, 'c:' + claude
+
+    def folder_link(self, link, target):
+        if os.name == 'nt':
+            import subprocess
+            subprocess.run(['cmd', '/c', 'mklink', '/J', link, target], check=True, capture_output=True, timeout=30)
+        else:
+            os.symlink(target, link)
+
+    def listed(self):
+        directory = d.ChatDirectory(self.codex, self.claude, policy={'history_days': 'all'}, cache_seconds=100)
+        for _ in range(200):
+            if directory.refresh(force=True)['complete']:
+                break
+        return {e['agent_id']: e['name'] for e in directory.list_agents()['agents']}
+
+    def check(self):
+        codex, claude = self.chats()
+        self.folder_link(os.path.join(self.claude, 'linked-project'), self.outside)
+        self.assertEqual(self.listed(), {codex: 'Atlas', claude: 'Vega'})
+        # A transcript name opened through a folder link is refused, whatever the listing proposed.
+        with self.assertRaises(OSError):
+            d._open(self.claude, os.path.join(self.claude, 'linked-project', os.listdir(self.outside)[0]))
+
+    @unittest.skipIf(os.name == 'nt', 'real Windows runs test_this_system')
+    def test_simulated_windows(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from windows_simulation import simulated_windows
+        with simulated_windows() as calls:
+            self.check()
+        self.assertIn('open_no_links', calls)
+
+    def test_this_system(self):
+        self.check()
+
+
 @unittest.skipIf(os.name == 'nt', 'POSIX native metadata path validation')
 class DirectoryTests(unittest.TestCase):
     def setUp(self):

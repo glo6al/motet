@@ -14,13 +14,15 @@ import uuid
 
 MAX_RESPONSE = 16384
 CONFIRM = 'retire_unknown_without_resend'
-# Kept in step with peer_bridge.BRIDGE_UNAVAILABLE; this script reads nothing from src.
-UNAVAILABLE = ('Bridge holds cannot be inspected or cleared on Windows. The agent-to-agent bridge is not available on '
-               'Windows yet, so no chat can be on hold through it here. Nothing was changed.')
+# This script reads nothing from src. Its owner key check uses POSIX owner and mode bits, so it stays off on Windows;
+# the bridge itself works there, and Settings in Motet clears a chat on hold on every system.
+UNAVAILABLE = ('Bridge holds cannot be inspected or cleared with this command on Windows yet: it checks Motet\'s owner '
+               'key with Mac and Linux owner and permission rules. To free a chat on hold, use Settings, Connections, '
+               'Chats on hold in Motet. Nothing was changed.')
 
 
 def bridge_available():
-    """The bridge runs only where chats can be found by handle-based folder walk: macOS and Linux for now."""
+    """This command's private key check needs POSIX owner and mode bits: macOS and Linux."""
     return os.name == 'posix'
 
 

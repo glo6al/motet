@@ -218,14 +218,24 @@ jobs:
         timeout-minutes: 5
       - run: python tests/test_watch_claude.py
         if: ${{ !cancelled() }}
-      # Off on Windows: these drive the bridge's MCP adapter, the Claude MCP channel or the Antigravity inbox end to
-      # end. All three find chats or files by handle-based folder walk (dir_fd), which Windows lacks, so on Windows
-      # the adapter and server refuse with one reason instead (the refusal itself, the credential files and the
-      # offline locks are checked on Windows by test_watch_peer.py, test_peer_bridge.py, test_install_reply_hook.py,
-      # test_peer_recovery.py, test_watch_bridge_clear.py and test_bridge_preflight.py above). Messaging Claude
-      # through the plugin is covered on Windows by test_claude_mod.py and test_claude_global_integration.py above.
+      # The adapter's dependencies install on every system. On Windows the adapter reads its credential only
+      # through Motet's Python check (Node cannot read an access list); peer-credential.test.mjs starts it there
+      # with a credential Python made private, and checks that one readable by everyone is refused.
       - run: npm --prefix integrations/claude ci --ignore-scripts --no-audit --no-fund
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
+      - name: Check the bridge adapter reads its credential through Motet's Python check on Windows
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        timeout-minutes: 5
+        env:
+          PYTHON: python
+        run: node --test integrations/claude/peer-credential.test.mjs
+      # Off on Windows: these drive the bridge end to end with POSIX private state (owner and mode bits), the older
+      # Claude channel (scripts/watch_claude.py; its files are written by Node, which cannot make a Windows file
+      # private) or the Antigravity inbox (macOS and Linux only). On Windows the bridge's directory, credential files,
+      # adapter start-up and refusals are checked by test_chat_directory.py, test_private_storage.py,
+      # test_watch_peer.py, test_peer_bridge.py, test_peer_recovery.py, test_watch_bridge_clear.py and
+      # test_bridge_preflight.py above and the adapter step just above. Messaging Claude through the plugin is
+      # covered on Windows by test_claude_mod.py and test_claude_global_integration.py above.
       - run: python tests/test_peer_refusal_compatibility.py -v
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: npm --prefix integrations/claude test

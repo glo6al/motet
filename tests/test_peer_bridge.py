@@ -655,20 +655,16 @@ class BridgeRefusal(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM shared_bridge_requests').fetchone()[0], 0)
         # Saved history stays readable.
         self.assertEqual(rpc(self.credential, {'method': 'list_requests', 'params': {}})['requests'], [])
-        self.assertIn('not available on Windows yet', p.BRIDGE_UNAVAILABLE)
+        self.assertIn('not available on this system', p.BRIDGE_UNAVAILABLE)
         self.assertLessEqual(len(p.BRIDGE_UNAVAILABLE + ' Nothing was sent.'), 512)   # the adapter's error bound
 
-    @unittest.skipIf(os.name == 'nt', 'real Windows is checked below')
     def test_simulated_system_without_the_folder_walk(self):
-        with patch.object(p.claude_channel, 'folder_walk_available', return_value=False):
+        with patch.object(p.private_storage, 'folder_walk_available', return_value=False):
             self.check_refused()
 
-    @unittest.skipUnless(os.name == 'nt', 'real Windows')
-    def test_windows(self):
-        self.check_refused()
-
-    @unittest.skipIf(os.name == 'nt', 'POSIX')
-    def test_posix_keeps_its_directory_message(self):
+    def test_this_system_reaches_its_directory(self):
+        """macOS, Linux and Windows have the walk: the call reaches the (here unconfigured) chat directory."""
+        self.assertTrue(p.bridge_available())
         with self.assertRaises(p.PeerError) as listed:
             self.store.shared.rpc(self.credential, {'method': 'list_agents', 'params': {}})
         self.assertEqual((listed.exception.status, str(listed.exception)), (503, 'The chat directory is unavailable.'))
@@ -700,6 +696,49 @@ class LinuxSimulation(unittest.TestCase):
                 store.close()
 
 
+@unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS and Linux; real Windows runs BridgeRefusal above')
+class WindowsSimulationDirectory(unittest.TestCase):
+    """Windows has the no-link walk now: the chat directory is built, a Claude chat is listed, and Codex recipients
+    stay unavailable (delivery to Codex needs the Mac app)."""
+
+    def test_directory_is_configured_lists_claude_and_codex_stays_unavailable(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from windows_simulation import simulated_windows
+        with tempfile.TemporaryDirectory() as temp:
+            base = os.path.realpath(temp)
+            project = os.path.join(base, 'project')
+            os.mkdir(project)
+            ident = uid()
+            folder = os.path.join(base, '.claude', 'projects', 'project-key')
+            os.makedirs(folder)
+            with open(os.path.join(folder, ident + '.jsonl'), 'w') as out:
+                out.write(json.dumps({'type': 'user', 'cwd': project, 'sessionId': ident}) + '\n')
+                out.write(json.dumps({'type': 'custom-title', 'customTitle': 'Vega', 'sessionId': ident}) + '\n')
+            store = m.MessagingStore(os.path.join(base, 'state'), os.path.join(base, 'sessions'))
+            try:
+                store.available = True
+                codex = 'x:' + uid()
+                with simulated_windows() as calls, patch.object(server.sys, 'platform', 'win32'), \
+                        patch.object(server.subprocess, 'run', side_effect=AssertionError('Mac app probe on Windows')), \
+                        patch.dict(server.AGENTS, {codex: {'runtime': 'Codex'}}, clear=True):
+                    self.assertTrue(p.bridge_available())
+                    snapshot = server.shared_directory_snapshot(store)
+                    server.configure_shared_directory(store, base)
+                    directory = store.shared.directory_factory({'providers': ['claude'], 'history_days': 'all'})
+                    for _ in range(200):
+                        if directory.refresh(force=True)['complete']:
+                            break
+                    listed = directory.list_agents()['agents']
+                    store.stop.set()
+                    store.shared.readiness_thread.join(5)
+                self.assertEqual(snapshot['__codex_transport__']['capability'], 'unavailable')
+                self.assertEqual(snapshot[codex]['capability'], 'unavailable')
+                self.assertEqual([(a['agent_id'], a['name']) for a in listed], [('c:' + ident, 'Vega')])
+                self.assertIn('open_no_links', calls)
+            finally:
+                store.close()
+
+
 @unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS and Linux; real Windows is tested below')
 class SimulatedWindowsStorage(unittest.TestCase):
     """The Windows branches use private_storage only: no folder walk, fcntl or os.getuid."""
@@ -723,7 +762,7 @@ class SimulatedWindowsStorage(unittest.TestCase):
             finally:
                 db.close()
             self.assertEqual(p.update_service_policy(self.state, {'history_days': 'all'})['history_days'], 'all')
-        for name in ('make_private_folder', 'check_private', 'open_private_rw', 'sqlite_companions_plain', 'try_lock', 'close_lock'):
+        for name in ('make_private_folder', 'anchored', 'open_no_links', 'open_private_rw', 'sqlite_companions_plain', 'try_lock', 'close_lock'):
             self.assertIn(name, calls)
         for folder in (self.state, os.path.dirname(self.state)):            # each new level made private
             self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)

@@ -903,14 +903,21 @@ class CodexOffMac(unittest.TestCase):
             with self.assertRaises(m.MessagingError):
                 self.store._target_log(self.codex[2:])
 
+    def test_posix_record_checks_follow_the_system(self):
+        self.assertEqual(m.posix_records_checkable(), os.name == 'posix')
+        if os.name != 'nt':
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from windows_simulation import simulated_windows
+            with simulated_windows():
+                self.assertFalse(m.posix_records_checkable())
+
     def test_retained_codex_rows_are_left_alone_without_a_folder_walk(self):
         row = dict(request_id=str(uuid.uuid4()), agent=self.codex, name='Aster', question='Fictional question',
                    state='sending', reply='', error='', created=time.time(), launched=False, runtime='codex',
                    path=os.path.join(self.store.sessions_dir, 'rollout-x.jsonl'), cursor=0)
         with self.store.lock:
             self.store._save(row)
-        import claude_channel
-        with patch.object(claude_channel, 'folder_walk_available', return_value=False), \
+        with patch.object(m, 'posix_records_checkable', return_value=False), \
                 patch.object(self.store, '_send', side_effect=AssertionError('not sent')), \
                 patch.object(self.store, '_poll', side_effect=AssertionError('not tracked')):
             self.store.tick()
@@ -1018,12 +1025,11 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
             attachments.close()
 
     def test_retained_attachment_state_without_a_folder_walk_is_refused_with_its_own_reason(self):
-        import claude_channel
         import private_storage
         state = os.path.join(self.home, '.live-room')
         private_storage.make_private_folder(state)
         open(os.path.join(state, 'native-attachment-namespace.expected'), 'w').close()
-        with patch.object(claude_channel, 'folder_walk_available', return_value=False):
+        with patch.object(m, 'posix_records_checkable', return_value=False):
             store, reason = server.start_messaging()
         self.assertIsNone(store)
         self.assertEqual(reason, 'Agent messaging cannot start here: its state folder holds attachment or '

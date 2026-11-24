@@ -32,11 +32,11 @@ MAX_TOMBSTONES = 100000
 MAX_CHALLENGE_ENTRIES = 4096
 PEER_WARNING = 'This session may have received peer input before answering.'
 HEX = re.compile(r'[0-9a-f]{64}\Z')
-# One reason, shown wherever the bridge refuses on a system without the handle-based folder walk (Windows for now).
-BRIDGE_UNAVAILABLE = ('The agent-to-agent bridge is not available on Windows yet. It finds chats by opening their '
-                      'folders one by one and refusing links on the way, which Motet cannot do on Windows yet, so '
-                      'agents cannot list or message each other through Motet here. Your own messages to Claude chats '
-                      'on the stage still work.')
+# One reason, shown wherever the bridge refuses on a system that cannot open folders by handle without following
+# links (macOS, Linux and Windows all can; this is for anything else, or a Windows whose system calls do not load).
+BRIDGE_UNAVAILABLE = ('The agent-to-agent bridge is not available on this system. It finds chats by opening their '
+                      'folders one by one and refusing links on the way, which Motet cannot do here, so agents cannot '
+                      'list or message each other through Motet. Your own messages to Claude chats on the stage still work.')
 # Windows refusals from private_storage, in fixed words (the POSIX checks keep their own, older words).
 STATE_FOLDER_REFUSED = 'Motet bridge storage must be a private folder owned by you.'
 STATE_FILE_REFUSED = 'Motet bridge storage must be a private file owned by you.'
@@ -108,7 +108,7 @@ def transaction(db, lock=None):
 
 def bridge_available():
     """False where chats cannot be found for the bridge: the chat directory needs the handle-based folder walk."""
-    return claude_channel.folder_walk_available()
+    return private_storage.folder_walk_available()
 
 
 def _make_private_folders(path):
@@ -128,18 +128,18 @@ def _make_private_folders(path):
 def private_directory(path, create=False):
     path = os.path.abspath(path)
     if private_storage.WIN:
-        # No folder walk here: the folder itself is opened without following a link or junction and its owner and
-        # access list are checked on that handle. Folders above it are not checked, as for agent messaging's folder.
+        # The folders above are resolved once (a moved profile often uses a junction), then the walk opens every
+        # folder by handle, refusing a link or junction at this folder, and checks its owner and access list there.
         if create:
             _make_private_folders(path)
         try:
-            private_storage.check_private(path, directory=True)
-        except private_storage.PrivateStorageError:
+            os.close(private_storage.open_no_links(private_storage.anchored(path), directory=True, private=True))
+        except OSError:
             raise claude_channel.ChannelError(STATE_FOLDER_REFUSED) from None
         return path
     if create:
         os.makedirs(path, mode=0o700, exist_ok=True)
-    fd = claude_channel._directory(path)
+    fd = private_storage.open_no_links(path, directory=True)
     try:
         claude_channel._private(os.fstat(fd), True)
     finally:
