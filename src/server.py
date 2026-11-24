@@ -55,7 +55,7 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from officer_policy import AUTOMATIC, RoutingSnapshot, load_policy
 from officer_instructions import BUILTIN_PLAIN_ENGLISH, BUILTIN_OFFICER_SYSTEM, load_instructions, load_skill, skill_menu
-from officer_messaging import (MessageNotSubmitted, MessagingError, MessagingStore,
+from officer_messaging import (MessageNotSubmitted, MessagingError, MessagingStorageUnavailable, MessagingStore,
                                validate_question, validate_target, valid_uuid)
 from officer_capabilities import (ANSWER_CHARS, ANSWER_SCHEMA, EVIDENCE_SYSTEM, EVIDENCE_TOOLS, READ_NAMES, EvidenceAliases, parse_answer,
                                   live_view as officer_live_projection, sign_receipt, verify_receipt, authenticate_receipt, receipt_refs, record_fingerprint)
@@ -328,14 +328,24 @@ def load_key():
     """On macOS the key lives in a directory and a regular file forced to private modes and checked to be owned by
     you. On Windows the server checks neither owner nor permissions: it relies on the user profile's default
     permissions, which keep other non-administrator accounts out unless they have been changed, and refuses only a
-    link or junction in the folder's place. Creation is serialised with a lock and each file is published by rename, so two servers starting together agree on one key and a hook never
+    link or junction in the folder's place. A folder this function creates on Windows gets a private access list
+    (this user and SYSTEM) from the start, so the files made in it inherit only those. Creation is serialised with a lock and each file is published by rename, so two servers starting together agree on one key and a hook never
     reads a half-written header. Unlock files old enough to be dead are removed; a younger one may belong to a
     server that is still running, and is left for it."""
     import stat as _st, tempfile
     d = os.path.join(HOME, '.live-room')
-    os.makedirs(d, mode=0o700, exist_ok=True)
-    # Windows has no owner ids or modes here, and nothing is checked: the folder is as private as the user profile's
-    # default permissions make it. Links are refused on both.
+    if WIN and not os.path.lexists(d):
+        os.makedirs(HOME, exist_ok=True)
+        try:
+            private_storage.make_private_folder(d)
+        except OSError:
+            if not os.path.lexists(d):    # another server made it first: it is checked below like any other
+                raise
+    else:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    # Here only a link (or, on Windows, a junction) is refused on both systems; POSIX also requires the folder to be
+    # ours. On Windows a folder made above starts with a private access list; one made earlier keeps the profile's
+    # permissions. Motet's answers and agent messaging check the folder's owner and access list themselves.
     if os.path.islink(d) or (WIN and os.lstat(d).st_file_attributes & _st.FILE_ATTRIBUTE_REPARSE_POINT) \
             or (not WIN and os.stat(d).st_uid != os.getuid()):
         raise SystemExit('~/.live-room is a link' if WIN else '~/.live-room is not a private directory owned by you; refusing to start')
@@ -5888,7 +5898,12 @@ def shared_directory_snapshot(store):
 
 def configure_shared_directory(store, home):
     import chat_directory
+    import claude_channel
     import claude_mod
+    if not claude_channel.folder_walk_available():
+        # The shared chat directory reads transcripts by handle-based folder walk, which Windows lacks for now.
+        # Without it the bridge has no directory; owner messaging to Claude chats on the stage is unaffected.
+        return
     def factory(policy):
         live = {'snapshot': {'__claude_transport__': {'capability': 'unavailable', 'reason': claude_mod.PEER_UNAVAILABLE}}}
         def capture():
@@ -6349,6 +6364,40 @@ def start_native_attachment_maintenance(messaging, attachments):
     return bind_owner_runtime(messaging, allow_install=allow_install)
 
 
+MESSAGING_STORAGE_WHY = ('Agent messaging needs a private readable state folder and database in '
+                         + ('%USERPROFILE%\\.live-room. If Motet was first started as administrator, make the folder '
+                            'yours with: icacls "%USERPROFILE%\\.live-room" /setowner "%USERDOMAIN%\\%USERNAME%"'
+                            if WIN else '~/.live-room.'))
+
+
+def start_messaging():
+    """Agent messaging on every system: ``(store, None)``, or ``(None, plain reason)``.
+
+    Claude chats are messaged through the watch-owner plugin on macOS, Linux and Windows. Codex needs the Codex
+    desktop app on a Mac; elsewhere the store reports it unavailable with that reason instead of failing.
+    Attachment maintenance binds before the worker starts; a retained attachment guard that cannot be
+    enforced still keeps messaging off (fail closed). Windows has no attachments yet, so nothing binds there."""
+    store = None
+    try:
+        store = MessagingStore(os.path.join(HOME, '.live-room'), os.path.join(HOME, '.codex', 'sessions'),
+                               managed=CLAUDE_MANAGED)
+        store.history_observer = officer_history_outcome
+        configure_shared_directory(store, HOME)
+        start_native_attachment_maintenance(store, ATTACHMENTS)
+        store.start()
+        return store, None
+    except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, ImportError, NotImplementedError) as error:
+        if store is not None:
+            if getattr(ATTACHMENTS, '_native_legacy_managed_storage', None) is not None:
+                # Binding may have left a check that reads this store's database; it is about to close.
+                ATTACHMENTS._native_legacy_managed_storage = None
+            try:
+                store.close()    # releases the database and the lifetime lock, and stops attachment runtimes
+            except Exception:
+                store.stop_native_attachment_runtime()
+        return None, str(error) if isinstance(error, MessagingStorageUnavailable) else MESSAGING_STORAGE_WHY
+
+
 def start_new_chat():
     """No native calls on startup; rollout and installed-provider capabilities stay gated."""
     if sys.platform != 'darwin':
@@ -6386,21 +6435,8 @@ if __name__ == '__main__':
         history_arm()
     except (OSError, sqlite3.Error, ValueError):
         HISTORY_WHY = 'Deck Log needs private local storage.'
-    if sys.platform == 'darwin':
-        try:
-            MESSAGING = MessagingStore(os.path.join(HOME, '.live-room'), os.path.join(HOME, '.codex', 'sessions'),
-                                       managed=CLAUDE_MANAGED)
-            MESSAGING.history_observer = officer_history_outcome
-            configure_shared_directory(MESSAGING, HOME)
-            start_native_attachment_maintenance(MESSAGING, ATTACHMENTS)
-            MESSAGING.start()
-        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
-            if MESSAGING is not None:
-                MESSAGING.stop_native_attachment_runtime()
-            MESSAGING = None
-            MESSAGING_WHY = 'Agent messaging needs a private readable state folder and database in ~/.live-room.'
-    else:
-        MESSAGING_WHY = 'Agent messaging currently requires Codex desktop on macOS.'
+    MESSAGING, reason = start_messaging()
+    MESSAGING_WHY = reason or MESSAGING_WHY
     load_links()
     apply_watch(True)
     load_officer_key()

@@ -19,7 +19,25 @@ import server
 from legacy_claude_fixture import seed_legacy_claude
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX-private channel discovery')
+class ChannelWithoutFolderWalk(unittest.TestCase):
+    """Windows has no handle-based folder walk yet: channel discovery is off with a plain reason, never a crash."""
+
+    def test_discovery_is_off_with_a_reason_and_configured_is_false(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, 'claude-channels')
+            os.mkdir(root)
+            os.mkdir(os.path.join(root, str(uuid.uuid4())))
+            with patch.object(channel, 'folder_walk_available', return_value=False):
+                with self.assertRaises(channel.ChannelError) as refused:
+                    channel.discover(root, str(uuid.uuid4()))
+                self.assertEqual(str(refused.exception), channel.FOLDER_WALK_UNAVAILABLE)
+                self.assertFalse(channel.any_configured(root))
+
+    def test_this_system_reports_the_walk_truthfully(self):
+        self.assertEqual(channel.folder_walk_available(), os.name == 'posix')
+
+
+@unittest.skipIf(os.name == 'nt', 'Channel discovery walks folders by handle (dir_fd), which Windows lacks')
 class ClaudeChannelTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

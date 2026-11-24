@@ -50,6 +50,8 @@ def pure_text(content, role):
 
 def open_regular(root, path):
     """Validate every component and keep the descriptor used to read evidence."""
+    if not (hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW') and os.open in os.supports_dir_fd):
+        raise Unavailable('Codex transcripts are read by a handle-based folder walk, which this system lacks.')
     root, path = os.path.abspath(root), os.path.abspath(path)
     if os.path.commonpath((root, path)) != root:
         raise Unavailable('Codex transcript is outside its configured root.')

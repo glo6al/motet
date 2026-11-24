@@ -13,6 +13,8 @@ PEER_IDENTITY_REASON = 'Claude peer receiving is unavailable: native conversatio
 START_HINT = ('Start a new owner-connected Claude session with python3 scripts/watch_claude.py; already-open sessions cannot attach. '
               'After /clear, /resume or a fork, owner messages go to the conversation currently open in that process; close and relaunch to restore targeting.')
 MAX_RESPONSE = 100000
+FOLDER_WALK_UNAVAILABLE = ('Claude channel sessions started with scripts/watch_claude.py need macOS or Linux for now. '
+                           'On this system, message Claude chats through the Motet plugin instead.')
 
 
 class ChannelError(Exception):
@@ -24,6 +26,12 @@ def is_uuid(value):
         return isinstance(value, str) and str(uuid.UUID(value)) == value
     except (ValueError, AttributeError):
         return False
+
+
+def folder_walk_available():
+    """Channel discovery opens every folder by handle, refusing links on the way (``dir_fd``); Windows has no such walk yet."""
+    return (os.name == 'posix' and hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW')
+            and os.open in os.supports_dir_fd)
 
 
 def _private(st, directory=False):
@@ -51,6 +59,8 @@ def _directory(path):
 def discover(root, session_id):
     if not is_uuid(session_id):
         raise ChannelError('Invalid Claude session identifier.')
+    if not folder_walk_available():
+        raise ChannelError(FOLDER_WALK_UNAVAILABLE)
     root_fd = session_fd = fd = None
     try:
         root_fd = _directory(root)
@@ -95,6 +105,8 @@ def pinned(root, expected):
 
 
 def any_configured(root):
+    if not folder_walk_available():
+        return False
     try:
         # Capability reporting only; sends always revalidate their exact descriptor.
         with os.scandir(root) as entries:

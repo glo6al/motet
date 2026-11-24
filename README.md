@@ -112,7 +112,7 @@ We would rather name the gaps than let you find them.
 |---|---|---|---|---|
 | See what it is doing | Yes | Yes | Yes, without tool results | Yes, without tool outcomes |
 | Open the chat in its own app | Yes, in the desktop app | Yes, in the desktop app | Not yet | With an optional connector |
-| Send it a message | With the optional plugin | Yes, for eligible chats | Not yet | Not yet |
+| Send it a message | With the optional plugin | Yes, for eligible chats, on a Mac | Not yet | Not yet |
 | Answer its permission prompts | With the optional hooks | Not yet | Not yet | Not yet |
 | Send it a PDF or a picture | With the plugin, for eligible chats | On a verified app version, for eligible chats | Not yet | Not yet |
 | Start a new chat | No self-serve setup yet | On a verified app version | Not yet | Not yet |
@@ -133,7 +133,7 @@ A chat has to qualify before Motet will send to it. When something isn't availab
 - **Motet thinks with one provider.** Its own answers run on Anthropic's models only.
 - **Cursor and Antigravity are watch-only.** Motet can see them but cannot message them.
 - **No live browser.** You see the pages an agent opened, not the page as it is right now.
-- **Mac and Windows, and only coding sessions on this computer.** On Windows, Motet watches and answers. Allow and Deny are new there and checked only by automated tests so far, not yet on a real PC. Messaging between agents, New chat, files and dictation are still to come. Web chats are not brought in.
+- **Mac and Windows, and only coding sessions on this computer.** On Windows, Motet watches and answers, and it can message a Claude chat through the plugin. Allow and Deny and Claude messaging are new there and checked only by automated tests so far, not yet on a real PC. Messaging Codex stays Mac-only for now. The bridge between agents, New chat, files and dictation are still to come on Windows. Claude messaging also starts on Linux now. Web chats are not brought in.
 
 **Designed, not built yet**
 

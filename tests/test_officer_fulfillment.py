@@ -20,9 +20,13 @@ def ident():
     return str(uuid.uuid4())
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX store')
+@unittest.skipIf(os.name == 'nt', 'Codex fulfillment reads transcripts by handle-based folder walk; Codex messaging needs the Mac app')
 class FulfillmentTests(unittest.TestCase):
     def setUp(self):
+        # Codex live controls exist only with the Mac app; these tests mock its bridge, so they run as a Mac.
+        mac = patch.object(sys, 'platform', 'darwin')
+        mac.start()
+        self.addCleanup(mac.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.sessions = os.path.join(self.tmp.name, 'sessions')
         os.mkdir(self.sessions)

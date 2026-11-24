@@ -24,7 +24,6 @@ def uid():
     return str(uuid.uuid4())
 
 
-@unittest.skipIf(os.name == 'nt', 'Owner outbox requires POSIX private storage')
 class ClaudeModTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -34,6 +33,7 @@ class ClaudeModTests(unittest.TestCase):
         legacy_host.start()
         self.addCleanup(legacy_host.stop)
         self.project = os.path.realpath(self.temp.name)
+        self.wrong_project = os.path.join(self.project, 'fictional-wrong')   # canonical on every system
         self.sid, self.aid = uid(), None
         self.aid = 'c:'+self.sid
         self.agents = {self.aid: {'runtime': 'Claude', 'name': 'Fictional', 'cwd': self.project}}
@@ -171,7 +171,7 @@ class ClaudeModTests(unittest.TestCase):
         self.assertNotEqual(stored,enrollment['token'])
         pair = self.store.mods.pair(self.aid,self.agents,server.PORT)
         self.assertEqual(self.http('/claude-mod/enroll',dict(body,code=pair['pair_code'],native_id=uid()))[0],403)
-        self.assertEqual(self.http('/claude-mod/enroll',dict(body,code=pair['pair_code'],project='/fictional/wrong'))[0],403)
+        self.assertEqual(self.http('/claude-mod/enroll',dict(body,code=pair['pair_code'],project=self.wrong_project))[0],403)
         self.store.db.execute('UPDATE claude_mod_pairs SET expires=0');self.store.db.commit()
         self.assertEqual(self.http('/claude-mod/enroll',dict(body,code=pair['pair_code']))[0],403)
 
@@ -433,6 +433,8 @@ class ClaudeModTests(unittest.TestCase):
             project=self.project,accept=accept,client_id=client),token=self.token)
 
     def shared_progress_request(self):
+        if os.name == 'nt':
+            self.skipTest('Shared bridge discovery reads transcripts by handle-based folder walk; the bridge comes to Windows later')
         import chat_directory
         import peer_bridge
         root = self.base/'claude'/'fictional'
@@ -836,7 +838,7 @@ class ClaudeModTests(unittest.TestCase):
 
     def test_global_eligibility_drift_stops_claims_preserves_event_recovery(self):
         _,grant=self.global_setup()
-        for flags in ({'runtime':'Codex'},{'sub':True},{'parent':'c:'+uid()},{'observed':True},{'cwd':'/fictional/wrong'}):
+        for flags in ({'runtime':'Codex'},{'sub':True},{'parent':'c:'+uid()},{'observed':True},{'cwd':self.wrong_project}):
             server.AGENTS[self.aid]=dict(self.agents[self.aid],**flags)
             status,value,_=self.register_global(grant)
             self.assertEqual((status,value['error_code']),(409,'identity_rejected'))

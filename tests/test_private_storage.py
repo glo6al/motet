@@ -290,8 +290,78 @@ class CreationCleanup(unittest.TestCase):
         self.assertNotIn(('close', 7), calls, 'closed only by the discard')
 
 
+class ReadWrite(unittest.TestCase):
+    """open_private_rw: agent messaging opens its lock and database with it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = os.path.join(os.path.realpath(self.tmp.name), 'state')
+        ps.make_private_folder(self.folder)
+        self.path = os.path.join(self.folder, 'fixture.sqlite3')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_create_then_reopen_for_writing(self):
+        with self.assertRaises(OSError):
+            ps.open_private_rw(self.path)                 # without create a missing file is an error
+        self.assertFalse(os.path.lexists(self.path))
+        fd = ps.open_private_rw(self.path, create=True)
+        try:
+            os.write(fd, b'fixture')
+        finally:
+            os.close(fd)
+        ps.check_private(self.path, single_link=True)
+        if os.name == 'nt':
+            ps.windows_security(self.path)
+        else:
+            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        fd = ps.open_private_rw(self.path)
+        try:
+            self.assertEqual(os.read(fd, 100), b'fixture')
+        finally:
+            os.close(fd)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX owner and mode bits')
+    def test_posix_refusals(self):
+        os.close(ps.open_private_rw(self.path, create=True))
+        os.chmod(self.path, 0o644)
+        reason(self, lambda: ps.open_private_rw(self.path), 'access')
+        reason(self, lambda: ps.open_private_rw(self.path, create=True), 'access')
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o644, 'an existing file is never repaired')
+        os.chmod(self.path, 0o600)
+        os.link(self.path, self.path + '.second')
+        reason(self, lambda: ps.open_private_rw(self.path), 'links')
+        os.unlink(self.path + '.second')
+        link = os.path.join(self.folder, 'link')
+        os.symlink(self.path, link)
+        with self.assertRaises(OSError) as raised:      # the open refuses the link: the system's own error
+            ps.open_private_rw(link, create=True)
+        self.assertNotIsInstance(raised.exception, ps.PrivateStorageError)
+        with patch.object(ps.os, 'getuid', return_value=os.getuid() + 1):
+            reason(self, lambda: ps.open_private_rw(self.path), 'owner')
+
+    @unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists and reparse points')
+    def test_windows_refusals_and_held_name(self):
+        os.close(ps.open_private_rw(self.path, create=True))
+        fd = ps.open_private_rw(self.path)
+        try:
+            with self.assertRaises(OSError):
+                os.replace(self.path, self.path + '.moved')   # the handle does not share delete
+        finally:
+            os.close(fd)
+        icacls(self.path, '/grant', EVERYONE_READ)
+        reason(self, lambda: ps.open_private_rw(self.path), 'access')
+        reason(self, lambda: ps.open_private_rw(self.path, create=True), 'access')
+        target = os.path.join(os.path.dirname(self.folder), 'target')
+        os.mkdir(target)
+        reason(self, lambda: ps.open_private_rw(target), 'not_regular')
+        junction(os.path.join(self.folder, 'junction'), target)
+        reason(self, lambda: ps.open_private_rw(os.path.join(self.folder, 'junction')), 'link')
+
+
 class Lock(unittest.TestCase):
-    """open_lock_file, try_lock and unlock have no callers yet; this keeps them working until messaging uses them."""
+    """open_lock_file, try_lock and unlock: agent messaging holds its lifetime lock with them."""
 
     def test_exclusive_non_blocking_lock(self):
         with tempfile.TemporaryDirectory() as tmp:

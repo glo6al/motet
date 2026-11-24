@@ -49,7 +49,7 @@ class LauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder).resolve()
             output = io.StringIO()
-            with patch.object(m.sys, 'platform', 'darwin'), patch.object(m.sys.stdin, 'isatty', return_value=True), \
+            with patch.object(m.sys.stdin, 'isatty', return_value=True), \
                     patch.object(m, 'executable', side_effect=['/fixture/claude', '/fixture/node']), \
                     patch.object(m, 'check_runtime'), patch.object(m.Path, 'home', return_value=home), \
                     patch.object(m.Path, 'is_file', return_value=True), patch.object(m.os, 'execv') as execute, \
@@ -61,6 +61,13 @@ class LauncherTests(unittest.TestCase):
             self.assertNotIn('Existing tools, permissions, model settings and project instructions remain in effect', notice)
             self.assertIn('does not preserve a prior session', notice)
             execute.assert_called_once()
+
+    def test_launcher_needs_posix_and_names_the_plugin_otherwise(self):
+        with patch.object(m.os, 'name', 'nt'), patch.object(m, 'executable') as executable, \
+                patch.object(m, 'ensure_private') as private, patch.object(m.os, 'execv') as execv:
+            with self.assertRaisesRegex(ValueError, '^This Motet Claude launcher needs macOS or Linux. On Windows, use the Motet plugin in Claude instead.$'):
+                m.main([])
+        executable.assert_not_called(); private.assert_not_called(); execv.assert_not_called()
 
     def test_bad_name(self):
         for name in ('\nname', ' ' * 3, 'a' * 121):

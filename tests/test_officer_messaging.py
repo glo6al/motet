@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """No live sends: mocked CLI, temporary transcripts and an ephemeral HTTP server."""
 import concurrent.futures
+import errno
 import http.client
 import inspect
 import json
@@ -50,7 +51,7 @@ class PublicTimestampTests(unittest.TestCase):
         self.assertFalse(result.wasSuccessful(), 'Removing the public field must break the serializer contract test')
 
 
-@unittest.skipIf(os.name == "nt", "POSIX-private Codex messaging storage; Windows startup leaves it unavailable")
+@unittest.skipIf(os.name == "nt", "Codex flows read transcripts by handle-based folder walk; Codex messaging needs the Mac app")
 class MessagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -579,6 +580,495 @@ class MessagingTests(unittest.TestCase):
             httpd.shutdown(); httpd.server_close(); thread.join()
             server.KEY, server.MESSAGING, server.PORT = old_key, old_store, old_port
             server.AGENTS.clear(); server.AGENTS.update(old_agents)
+
+
+# The exact texts the store has always given on POSIX. Written out here, not read from the module,
+# so these tests fail if a refactor changes what the owner sees.
+STATE_REFUSED = 'Messaging state directory must be private and owned by you.'
+LOCK_REFUSED = 'Messaging lock must be a private regular file.'
+DATABASE_REFUSED = 'Messaging database must be a private regular file.'
+
+
+class StoreStorageCommon(unittest.TestCase):
+    """Behaviour every system shares: creation, the lifetime lock, and reopening after close."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self.temp.name)
+        self.state = os.path.join(self.base, 'state')
+        self.sessions = os.path.join(self.base, 'sessions')
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def open(self):
+        return m.MessagingStore(self.state, self.sessions)
+
+    def test_new_state_is_private_and_a_second_store_is_refused_until_the_first_closes(self):
+        import private_storage
+        store = self.open()
+        try:
+            private_storage.check_private(self.state, directory=True)
+            for name in ('officer-messages.lock', 'officer-messages.sqlite3'):
+                private_storage.check_private(os.path.join(self.state, name), single_link=True)
+            with self.assertRaises(BlockingIOError) as held:
+                self.open()
+            self.assertIn(held.exception.errno, (errno.EWOULDBLOCK, errno.EAGAIN))
+        finally:
+            store.close()
+        again = self.open()                                # the lock was released by close()
+        again.close()
+
+    def test_missing_parent_folders_are_made(self):
+        self.state = os.path.join(self.base, 'home', '.live-room')
+        self.open().close()
+        import private_storage
+        private_storage.check_private(self.state, directory=True)
+
+
+@unittest.skipIf(os.name == 'nt', 'POSIX owner and mode bits')
+class StoreStoragePosix(StoreStorageCommon):
+    """The refusals and their texts, unchanged from the store's own POSIX checks before the shared layer."""
+
+    def refused(self, text):
+        with self.assertRaises(OSError) as raised:
+            self.open()
+        self.assertEqual(str(raised.exception), text)
+        self.assertNotIsInstance(raised.exception, BlockingIOError)
+
+    def make_state(self):
+        os.mkdir(self.state, 0o700)
+
+    def test_created_modes(self):
+        old = os.umask(0o022)
+        try:
+            self.open().close()
+        finally:
+            os.umask(old)
+        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
+        for name in ('officer-messages.lock', 'officer-messages.sqlite3'):
+            self.assertEqual(os.stat(os.path.join(self.state, name)).st_mode & 0o777, 0o600)
+
+    def test_state_folder_open_to_others_or_linked_or_not_mine_is_refused(self):
+        self.make_state()
+        os.chmod(self.state, 0o755)
+        self.refused(STATE_REFUSED)
+        os.chmod(self.state, 0o700)
+        real = self.state
+        self.state = os.path.join(self.base, 'linked-state')
+        os.symlink(real, self.state)
+        self.refused(STATE_REFUSED)
+        self.state = real
+        with patch('os.getuid', return_value=os.getuid() + 1):
+            self.refused(STATE_REFUSED)
+        self.state = os.path.join(self.base, 'plain-file')
+        open(self.state, 'w').close()
+        with self.assertRaises(FileExistsError):       # makedirs refuses a file in the folder's place first
+            self.open()
+
+    def test_lock_file_that_is_shared_open_to_others_or_linked_is_refused(self):
+        self.make_state()
+        lock = os.path.join(self.state, 'officer-messages.lock')
+        fd = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+        os.chmod(lock, 0o644)
+        self.refused(LOCK_REFUSED)
+        os.chmod(lock, 0o600)
+        os.link(lock, lock + '.second')
+        self.refused(LOCK_REFUSED)
+        os.unlink(lock + '.second')
+        with patch('os.getuid', return_value=os.getuid() + 1):
+            self.refused(STATE_REFUSED)               # the folder is checked first
+        os.unlink(lock)
+        os.symlink(os.path.join(self.state, 'elsewhere'), lock)
+        with self.assertRaises(OSError) as raised:     # the open itself refuses a link: the system's own error
+            self.open()
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
+        self.assertFalse(os.path.lexists(os.path.join(self.state, 'elsewhere')))
+        os.unlink(lock)
+        os.mkdir(lock, 0o700)
+        with self.assertRaises(OSError) as raised:
+            self.open()
+        self.assertEqual(raised.exception.errno, errno.EISDIR)
+
+    def test_database_that_is_shared_open_to_others_or_linked_is_refused(self):
+        self.open().close()
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        os.chmod(database, 0o640)
+        self.refused(DATABASE_REFUSED)
+        os.chmod(database, 0o600)
+        os.link(database, database + '.second')
+        self.refused(DATABASE_REFUSED)
+        os.unlink(database + '.second')
+        os.rename(database, database + '.moved')
+        os.symlink(database + '.moved', database)
+        with self.assertRaises(OSError) as raised:
+            self.open()
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
+        os.unlink(database)
+        os.rename(database + '.moved', database)
+        self.open().close()                            # the original file is accepted again
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'officer-messages.lock')))
+
+    def test_refused_lock_or_database_releases_the_lock(self):
+        self.open().close()
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        os.chmod(database, 0o644)
+        self.refused(DATABASE_REFUSED)
+        os.chmod(database, 0o600)
+        self.open().close()                            # not left holding the lifetime lock
+
+
+def _icacls(*args):
+    subprocess.run(['icacls'] + list(args), check=True, capture_output=True, timeout=30)
+
+
+def _junction(link, target):
+    """A directory junction needs no special privilege, unlike a symbolic link."""
+    subprocess.run(['cmd', '/c', 'mklink', '/J', link, target], check=True, capture_output=True, timeout=30)
+
+
+@unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists and junctions')
+class StoreStorageWindows(StoreStorageCommon):
+    EVERYONE_READ = '*S-1-1-0:(R)'      # a SID, so the test does not depend on the system language
+
+    def refused(self, text):
+        with self.assertRaises(OSError) as raised:
+            self.open()
+        self.assertEqual(str(raised.exception), text)
+
+    def test_new_files_have_protected_private_access_lists(self):
+        import private_storage
+        self.open().close()
+        private_storage.windows_security(self.state, True)
+        for name in ('officer-messages.lock', 'officer-messages.sqlite3'):
+            private_storage.windows_security(os.path.join(self.state, name))
+
+    def test_state_folder_open_to_everyone_is_refused(self):
+        import private_storage
+        private_storage.make_private_folder(self.state)
+        _icacls(self.state, '/grant', self.EVERYONE_READ)
+        self.refused(STATE_REFUSED)
+        self.assertEqual(os.listdir(self.state), [], 'nothing is created in a refused folder')
+
+    def test_junction_in_place_of_the_state_folder_is_refused(self):
+        import private_storage
+        target = os.path.join(self.base, 'real-state')
+        private_storage.make_private_folder(target)
+        _junction(self.state, target)
+        self.refused(STATE_REFUSED)
+        self.assertEqual(os.listdir(target), [], 'nothing is created behind the junction')
+
+    def test_existing_private_folder_is_accepted(self):
+        import private_storage
+        private_storage.make_private_folder(self.state)
+        self.open().close()
+
+    def test_database_open_to_everyone_is_refused(self):
+        self.open().close()
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        _icacls(database, '/grant', self.EVERYONE_READ)
+        self.refused(DATABASE_REFUSED)
+
+    def test_lock_open_to_everyone_is_refused(self):
+        self.open().close()
+        _icacls(os.path.join(self.state, 'officer-messages.lock'), '/grant', self.EVERYONE_READ)
+        self.refused(LOCK_REFUSED)
+
+    def test_journal_junction_is_refused(self):
+        self.open().close()
+        elsewhere = os.path.join(self.base, 'elsewhere')
+        os.mkdir(elsewhere)
+        _junction(os.path.join(self.state, 'officer-messages.sqlite3-journal'), elsewhere)
+        self.refused(DATABASE_REFUSED)
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_journal_with_a_second_name_is_refused(self):
+        self.open().close()
+        journal = os.path.join(self.state, 'officer-messages.sqlite3-journal')
+        open(journal, 'wb').close()
+        os.link(journal, os.path.join(self.base, 'elsewhere-journal'))
+        self.refused(DATABASE_REFUSED)
+
+    def test_open_database_cannot_be_swapped_while_sqlite_opens_it(self):
+        import private_storage
+        self.open().close()
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        fd = private_storage.open_private_rw(database)
+        try:
+            with self.assertRaises(OSError):
+                os.replace(database, database + '.moved')   # the checked handle does not share delete
+        finally:
+            os.close(fd)
+
+
+class DatabaseCompanions(unittest.TestCase):
+    """The Windows journal check itself, on whatever system runs the tests."""
+
+    def test_plain_journal_is_kept_and_linked_or_extra_named_ones_are_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = os.path.realpath(temp)
+            database = os.path.join(base, 'fixture.sqlite3')
+            m.check_database_companions(database)                     # none present
+            with open(database + '-journal', 'wb') as out:
+                out.write(b'fixture')
+            m.check_database_companions(database)                     # a plain leftover journal is kept
+            os.link(database + '-journal', os.path.join(base, 'second-name'))
+            with self.assertRaisesRegex(OSError, '^' + DATABASE_REFUSED + '$'):
+                m.check_database_companions(database)
+            os.unlink(os.path.join(base, 'second-name'))
+            os.mkdir(database + '-wal')
+            with self.assertRaisesRegex(OSError, '^' + DATABASE_REFUSED + '$'):
+                m.check_database_companions(database)
+            os.rmdir(database + '-wal')
+            try:
+                os.symlink(database + '-journal', database + '-shm')
+            except (OSError, NotImplementedError):
+                return                                                # Windows without the symlink privilege
+            with self.assertRaisesRegex(OSError, '^' + DATABASE_REFUSED + '$'):
+                m.check_database_companions(database)
+
+
+class CodexOffMac(unittest.TestCase):
+    """Off a Mac the store still starts: Claude through the plugin, Codex unavailable with a plain reason."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        base = os.path.realpath(self.temp.name)
+        self.store = m.MessagingStore(os.path.join(base, 'state'), os.path.join(base, 'sessions'))
+        self.codex = 'x:' + str(uuid.uuid4())
+        self.claude = 'c:' + str(uuid.uuid4())
+        self.agents = {self.codex: {'runtime': 'Codex', 'name': 'Aster'},
+                       self.claude: {'runtime': 'Claude', 'name': 'Birch', 'cwd': base}}
+
+    def tearDown(self):
+        self.store.close()
+        self.temp.cleanup()
+
+    def test_codex_is_reported_unavailable_with_a_plain_reason(self):
+        for platform in ('linux', 'win32'):
+            with self.subTest(platform=platform), patch.object(m.sys, 'platform', platform), \
+                    patch.object(m.subprocess, 'run') as run:
+                self.store.codex_available, self.store.reason = self.store.probe()
+                run.assert_not_called()
+                self.assertEqual((self.store.codex_available, self.store.reason),
+                                 (False, 'Messaging Codex needs the Codex desktop app on a Mac for now.'))
+                snapshot = self.store.snapshot()
+                self.assertFalse(snapshot['available'])
+                self.assertEqual(snapshot['reason'], 'Messaging Codex needs the Codex desktop app on a Mac for now. '
+                                                     'Claude chats can be messaged once Claude is set up in Motet.')
+                self.assertEqual(snapshot['capabilities'], {'codex': False, 'claude': False})
+                actions = self.store.owner_capabilities(self.codex, self.agents)['actions']
+                self.assertEqual(actions['queue'], {'available': False, 'mode': 'queue',
+                                 'reason': 'Messaging Codex needs the Codex desktop app on a Mac for now.'})
+                self.assertEqual(actions['steer']['reason'], 'Live controls for Codex need the Codex desktop app on a Mac for now.')
+                with self.assertRaises(m.MessagingError) as refused:
+                    self.store.submit(self.codex, 'A fictional question.', str(uuid.uuid4()), self.agents)
+                self.assertEqual((refused.exception.status, str(refused.exception)),
+                                 (503, 'Messaging Codex needs the Codex desktop app on a Mac for now.'))
+
+    def test_codex_controls_are_refused_before_any_read_or_save(self):
+        for platform in ('linux', 'win32'):
+            for action, text in (('steer', 'A fictional instruction.'), ('interrupt', '')):
+                request = str(uuid.uuid4())
+                with self.subTest(platform=platform, action=action), patch.object(m.sys, 'platform', platform), \
+                        patch.object(self.store, '_control_target', side_effect=AssertionError('no transcript read')):
+                    with self.assertRaises(m.MessagingError) as refused:
+                        self.store.owner_action(action, self.codex, text, request, self.agents)
+                    self.assertEqual((refused.exception.status, str(refused.exception)),
+                                     (409, 'Live controls for Codex need the Codex desktop app on a Mac for now.'))
+                    self.assertEqual(self.store._controls(), [], 'nothing was saved')
+                    with self.assertRaises(m.MessagingError) as again:          # a replay is refused the same way
+                        self.store.owner_action(action, self.codex, text, request, self.agents)
+                    self.assertEqual(again.exception.status, 409)
+
+    def test_codex_transcripts_without_a_folder_walk_are_unavailable_not_a_crash(self):
+        import codex_transcript
+        with patch.object(codex_transcript.os, 'supports_dir_fd', set()):
+            with self.assertRaises(codex_transcript.Unavailable):
+                codex_transcript.open_regular(self.store.sessions_dir, os.path.join(self.store.sessions_dir, 'x.jsonl'))
+            with self.assertRaises(m.MessagingError):
+                self.store._target_log(self.codex[2:])
+
+    def test_retained_codex_rows_are_left_alone_without_a_folder_walk(self):
+        row = dict(request_id=str(uuid.uuid4()), agent=self.codex, name='Aster', question='Fictional question',
+                   state='sending', reply='', error='', created=time.time(), launched=False, runtime='codex',
+                   path=os.path.join(self.store.sessions_dir, 'rollout-x.jsonl'), cursor=0)
+        with self.store.lock:
+            self.store._save(row)
+        import claude_channel
+        with patch.object(claude_channel, 'folder_walk_available', return_value=False), \
+                patch.object(self.store, '_send', side_effect=AssertionError('not sent')), \
+                patch.object(self.store, '_poll', side_effect=AssertionError('not tracked')):
+            self.store.tick()
+        self.assertEqual(self.store._rows()[0]['state'], 'sending')
+        self.assertFalse(self.store._rows()[0]['launched'])
+
+    def test_reason_after_claude_setup_says_to_connect_a_chat(self):
+        with patch.object(m.sys, 'platform', 'win32'):
+            self.store.codex_available, self.store.reason = self.store.probe()
+        with self.store.lock, self.store.db:
+            self.store.db.execute('INSERT INTO claude_mod_grants (id, token_hash, created, active) VALUES (?,?,?,1)',
+                                  (str(uuid.uuid4()), 'f' * 64, time.time()))
+        snapshot = self.store.snapshot()
+        self.assertFalse(snapshot['available'])
+        self.assertEqual(snapshot['reason'], 'Messaging Codex needs the Codex desktop app on a Mac for now. '
+                                             'Claude chats can be messaged once one connects through the Motet plugin.')
+
+    def test_claude_chats_still_offer_setup(self):
+        with patch.object(m.sys, 'platform', 'win32'):
+            self.store.codex_available, self.store.reason = self.store.probe()
+        capability = self.store.owner_capabilities(self.claude, self.agents)
+        self.assertEqual(capability['claude_setup']['state'], 'setup_needed')
+        self.assertEqual(capability['actions']['queue']['reason'], 'Set up Claude once in Motet to connect eligible local chats.')
+        self.assertEqual(capability['actions']['steer']['reason'], 'Live controls support local parent Codex desktop chats only.')
+
+    def test_mac_reason_is_unchanged(self):
+        self.store.codex_available, self.store.reason = False, 'The bundled Codex executable is unavailable.'
+        self.assertEqual(self.store.snapshot()['reason'], 'The bundled Codex executable is unavailable.')
+
+
+class ServerStartsMessagingEverywhere(unittest.TestCase):
+    """server.start_messaging on each system, with a temporary home and no attachments or managed chats."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = os.path.realpath(self.temp.name)
+        self.host = patch.multiple(server, HOME=self.home, CLAUDE_MANAGED=None, ATTACHMENTS=None)
+        self.host.start()
+
+    def tearDown(self):
+        self.host.stop()
+        self.temp.cleanup()
+
+    def test_store_starts_and_reports_codex_truthfully_off_a_mac(self):
+        for platform in ('linux', 'win32'):
+            with self.subTest(platform=platform), patch.object(m.sys, 'platform', platform):
+                store, reason = server.start_messaging()
+                try:
+                    self.assertIsNotNone(store)
+                    self.assertIsNone(reason)
+                    self.assertEqual(store.reason, 'Messaging Codex needs the Codex desktop app on a Mac for now.')
+                    self.assertFalse(store.worker_failed)
+                    self.assertTrue(store.thread.is_alive())
+                    self.assertIs(store.history_observer, server.officer_history_outcome)
+                finally:
+                    store.close()
+
+    @unittest.skipIf(os.name == 'nt', 'Attachments need the handle-based folder walk, which Windows lacks')
+    def test_linux_binds_attachment_maintenance_before_the_worker_starts(self):
+        os.mkdir(os.path.join(self.home, '.live-room'), 0o700)       # made by load_key() in a real start
+        with patch.object(m.sys, 'platform', 'linux'), patch.object(server, 'KEY', 'fictional-owner-key-for-attachments'):
+            attachments = server.start_attachments()
+            self.assertIsNotNone(attachments)
+            try:
+                with patch.object(server, 'ATTACHMENTS', attachments):
+                    store, reason = server.start_messaging()
+                try:
+                    self.assertIsNone(reason)
+                    self.assertIsNotNone(store._attachment_guard)
+                    self.assertIsNotNone(store._native_owner_runtime)
+                    self.assertIsNone(store._native_owner_error)
+                    self.assertEqual(store.reason, 'Messaging Codex needs the Codex desktop app on a Mac for now.')
+                finally:
+                    store.close()
+            finally:
+                attachments.close()
+
+    @unittest.skipIf(os.name == 'nt', 'Attachments need the handle-based folder walk, which Windows lacks')
+    def test_failed_attachment_binding_leaves_no_closure_over_the_closed_store(self):
+        import attachments_native_composition
+        os.mkdir(os.path.join(self.home, '.live-room'), 0o700)
+        with patch.object(server, 'KEY', 'fictional-owner-key-for-attachments'):
+            attachments = server.start_attachments()
+        self.assertIsNotNone(attachments)
+        seen = []
+        def fail_after_setup(*args, **kwargs):
+            seen.append(attachments._native_legacy_managed_storage)
+            raise OSError('fictional binding failure')
+        try:
+            with patch.object(server, 'ATTACHMENTS', attachments), \
+                    patch.object(attachments_native_composition, 'bind_owner_runtime', side_effect=fail_after_setup):
+                self.assertEqual(server.start_messaging(), (None, server.MESSAGING_STORAGE_WHY))
+            self.assertIsNotNone(seen[0], 'binding had installed the closure before it failed')
+            self.assertIsNone(attachments._native_legacy_managed_storage)
+            with self.assertRaises(Exception) as refused:              # the ordinary refusal, not a closed database
+                attachments.native_selection('fictional-destination')
+            self.assertEqual(getattr(refused.exception, 'code', None), 'attachments_disabled')
+        finally:
+            attachments.close()
+
+    def test_retained_attachment_state_without_a_folder_walk_is_refused_with_its_own_reason(self):
+        import claude_channel
+        import private_storage
+        state = os.path.join(self.home, '.live-room')
+        private_storage.make_private_folder(state)
+        open(os.path.join(state, 'native-attachment-namespace.expected'), 'w').close()
+        with patch.object(claude_channel, 'folder_walk_available', return_value=False):
+            store, reason = server.start_messaging()
+        self.assertIsNone(store)
+        self.assertEqual(reason, 'Agent messaging cannot start here: its state folder holds attachment or '
+                                 'managed-chat records that this system cannot check safely yet.')
+        self.assertFalse(os.path.lexists(os.path.join(state, 'officer-messages.sqlite3')), 'the database was not opened')
+        lock = private_storage.open_lock_file(os.path.join(state, 'officer-messages.lock'))
+        try:
+            self.assertTrue(private_storage.try_lock(lock), 'the refusal released the lifetime lock')
+            private_storage.unlock(lock)
+        finally:
+            os.close(lock)
+
+    @unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists')
+    def test_windows_key_folder_is_created_private_and_messaging_accepts_it(self):
+        import private_storage
+        server.load_key()
+        state = os.path.join(self.home, '.live-room')
+        private_storage.windows_security(state, True)            # owned by this user, private access list
+        store, reason = server.start_messaging()
+        try:
+            self.assertIsNone(reason)
+        finally:
+            store.close()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX modes')
+    def test_posix_key_folder_is_still_made_0700(self):
+        server.load_key()
+        self.assertEqual(os.stat(os.path.join(self.home, '.live-room')).st_mode & 0o777, 0o700)
+
+    def test_import_failure_is_caught(self):
+        with patch.object(server, 'MessagingStore', side_effect=ImportError('fictional')):
+            self.assertEqual(server.start_messaging(), (None, server.MESSAGING_STORAGE_WHY))
+
+    def test_failure_after_the_store_is_built_closes_it(self):
+        built = []
+        real = server.MessagingStore
+        def build(*args, **kwargs):
+            built.append(real(*args, **kwargs))
+            return built[-1]
+        with patch.object(server, 'MessagingStore', side_effect=build), \
+                patch.object(server, 'start_native_attachment_maintenance', side_effect=OSError('fictional')):
+            self.assertEqual(server.start_messaging(), (None, server.MESSAGING_STORAGE_WHY))
+        self.assertIsNone(built[0].owner_fd, 'the lifetime lock was released')
+        with self.assertRaises(Exception):
+            built[0].db.execute('SELECT 1')                            # the database connection is closed
+        store, reason = server.start_messaging()                       # a later start can take the lock again
+        try:
+            self.assertIsNone(reason)
+        finally:
+            store.close()
+
+    def test_refused_state_folder_leaves_messaging_off_with_the_storage_reason(self):
+        state = os.path.join(self.home, '.live-room')
+        if os.name == 'nt':
+            import private_storage
+            private_storage.make_private_folder(state)
+            _icacls(state, '/grant', StoreStorageWindows.EVERYONE_READ)
+            expected = ('Agent messaging needs a private readable state folder and database in %USERPROFILE%\\.live-room. '
+                        'If Motet was first started as administrator, make the folder yours with: '
+                        'icacls "%USERPROFILE%\\.live-room" /setowner "%USERDOMAIN%\\%USERNAME%"')
+        else:
+            os.mkdir(state, 0o755)
+            expected = 'Agent messaging needs a private readable state folder and database in ~/.live-room.'
+        self.assertEqual(server.start_messaging(), (None, expected))
 
 
 if __name__ == '__main__':

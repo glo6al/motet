@@ -232,7 +232,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(later['updated_at'], later['actions'][0]['observed_at'])
         self.assertFalse(self.store.officer_finish(token,{'text':'Late answer cannot cross restart'}))
 
-    @unittest.skipIf(os.name == 'nt', 'Existing messaging storage is POSIX only')
+    @unittest.skipIf(os.name == 'nt', 'Codex reply tracking reads transcripts by handle-based folder walk')
     def test_idle_messaging_ticks_preserve_the_recorded_outcome(self):
         sessions = os.path.join(self.tmp.name, 'sessions')
         os.mkdir(sessions)
@@ -305,7 +305,8 @@ class HistoryTests(unittest.TestCase):
             out=server.officer_ask([{'role':'user','content':'Other fictional question'}])
             self.assertEqual(out['history_status'],'unavailable')
 
-    @unittest.skipIf(os.name=='nt','Existing messaging execution is POSIX only')
+    @unittest.skipIf(os.name=='nt','Codex messages and controls read transcripts by handle-based folder walk')
+    @patch.object(sys, 'platform', 'darwin')   # Codex live controls exist only with the Mac app; its bridge is mocked
     def test_real_messaging_save_and_control_observers(self):
         sessions=os.path.join(self.tmp.name,'sessions'); os.mkdir(sessions)
         sid, turn=str(uuid.uuid4()),str(uuid.uuid4()); aid='x:'+sid

@@ -4,6 +4,7 @@ Queue acceptance is not delivery. Only the exact outgoing user envelope followed
 by a matching completed turn can produce an answer. Uncertain sends are never retried.
 """
 import copy
+import errno
 import hmac
 import json
 import math
@@ -29,6 +30,7 @@ import peer_inbox
 import peer_lifecycle
 import peer_progress
 import codex_transcript
+import private_storage
 
 CLI = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
 ACTIVE = ('sending', 'queued', 'awaiting_reply', 'unknown', 'expired')
@@ -36,6 +38,15 @@ MAX_RECORDS, MAX_PENDING, MAX_LINE, MAX_READ = 256, 8, 1_000_000, 2_000_000
 TTL, RETENTION = 900, 86400
 CODEX_REPLY_EXPIRED = 'No matching reply yet. The question may still be queued; Motet will not resend.'
 CODEX_PREVIOUS_SOURCE_UNAVAILABLE = 'The original Codex transcript is temporarily unavailable. Motet will check it again.'
+CODEX_NEEDS_MAC = 'Messaging Codex needs the Codex desktop app on a Mac for now.'
+CODEX_CONTROLS_NEED_MAC = 'Live controls for Codex need the Codex desktop app on a Mac for now.'
+CLAUDE_SETUP_HINT = 'Claude chats can be messaged once Claude is set up in Motet.'
+CLAUDE_CONNECT_HINT = 'Claude chats can be messaged once one connects through the Motet plugin.'
+RETAINED_STATE_UNAVAILABLE = ('Agent messaging cannot start here: its state folder holds attachment or managed-chat '
+                              'records that this system cannot check safely yet.')
+STATE_FOLDER_REFUSED = 'Messaging state directory must be private and owned by you.'
+LOCK_REFUSED = 'Messaging lock must be a private regular file.'
+DATABASE_REFUSED = 'Messaging database must be a private regular file.'
 CLAUDE_OWNER_UNAVAILABLE = ("Exact named-chat delivery requires the official Motet plugin connected in this Claude chat. "
                            "Connect it before sending. Nothing was sent.")
 
@@ -48,6 +59,10 @@ class MessagingError(Exception):
 
 class MessageNotSubmitted(MessagingError):
     """The server rejected the message before writing a queue entry."""
+
+
+class MessagingStorageUnavailable(OSError):
+    """The store refused to start for a reason the owner can be shown as it is (fixed words, no paths)."""
 
 
 def valid_uuid(value):
@@ -111,6 +126,64 @@ def public(row):
     return result
 
 
+def private_state_folder(state_dir):
+    """Make the messaging state folder if it is missing, then refuse it unless it is private to this user.
+
+    POSIX: created 0700 (with any missing parents); it must be a real folder (not a link), owned by this user,
+    with nothing for group or others. Windows: created with a protected this-user/SYSTEM access list; it must not
+    be a link or junction, must be owned by this user, and its list may name only this user, SYSTEM,
+    Administrators and OWNER RIGHTS. An existing folder is checked, never loosened or repaired."""
+    if private_storage.WIN:
+        os.makedirs(os.path.dirname(os.path.abspath(state_dir)), exist_ok=True)
+        if not os.path.lexists(state_dir):
+            try:
+                private_storage.make_private_folder(state_dir)
+            except OSError:
+                if not os.path.lexists(state_dir):   # something else made it first: check that one instead
+                    raise
+    else:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    try:
+        private_storage.check_private(state_dir, directory=True)
+    except private_storage.PrivateStorageError:
+        raise OSError(STATE_FOLDER_REFUSED) from None
+
+
+def private_state_file(path, create, refused):
+    """A read-write descriptor for a private regular file with one name, opened without following a link.
+
+    A refused file raises ``OSError(refused)``; a failed open raises the system's own error, as before."""
+    try:
+        return private_storage.open_private_rw(path, create)
+    except private_storage.PrivateStorageError:
+        raise OSError(refused) from None
+
+
+def check_database_companions(path):
+    """Windows only: SQLite makes its rollback journal by name next to the database, with the folder's
+    inherited access list. Refuse a journal (or a stray -wal/-shm) that is a link, junction, not a plain file or a
+    file with a second name, so SQLite never writes through one to somewhere outside the private folder. A plain leftover journal is kept: SQLite needs it to
+    roll back an interrupted write."""
+    for suffix in ('-journal', '-wal', '-shm'):
+        try:
+            info = os.lstat(path + suffix)
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & private_storage.REPARSE_POINT
+                or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+            raise OSError(DATABASE_REFUSED)
+
+
+def close_owner_lock(fd):
+    """Release the lifetime lock and close it. Windows may hold a lock for a while after its file closes."""
+    if private_storage.WIN:
+        try:
+            private_storage.unlock(fd)
+        except OSError:
+            pass   # not held: closing is all that is left
+    os.close(fd)
+
+
 class MessagingStore:
     def __init__(self, state_dir, sessions_dir, cli=CLI, channel_root=None, managed=None):
         self.managed = managed  # Independent owner ledger; never fed to legacy/peer workers.
@@ -128,30 +201,26 @@ class MessagingStore:
         self._native_composition_lock = threading.Lock()
         self._native_composition = None
         self._native_composition_error = None
-        os.makedirs(state_dir, mode=0o700, exist_ok=True)
-        st = os.lstat(state_dir)
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-            raise OSError('Messaging state directory must be private and owned by you.')
+        private_state_folder(state_dir)
         # A second WATCH process must not launch the same persisted request. The
         # lifetime lock also protects recovery from marking another worker unknown.
-        import fcntl
-        self.owner_fd = os.open(os.path.join(state_dir, 'officer-messages.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        self.owner_fd = private_state_file(os.path.join(state_dir, 'officer-messages.lock'), True, LOCK_REFUSED)
         self.db = None
         try:
-            st = os.fstat(self.owner_fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or st.st_mode & 0o077:
-                raise OSError('Messaging lock must be a private regular file.')
-            fcntl.flock(self.owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not private_storage.try_lock(self.owner_fd):
+                raise BlockingIOError(errno.EWOULDBLOCK, os.strerror(errno.EWOULDBLOCK))
             path = os.path.join(state_dir, 'officer-messages.sqlite3')
             fence = self._retained_namespace_before_open(state_dir)
             with self.lock, (fence.owner_open() if fence is not None else nullcontext()) as expected:
-                flags = os.O_RDWR | os.O_NOFOLLOW | (0 if expected is not None else os.O_CREAT)
-                fd = os.open(path, flags, 0o600)
+                # The checked descriptor stays open while SQLite opens the same name. On Windows it does not
+                # share delete, so the file cannot be renamed or replaced in between.
+                fd = private_state_file(path, expected is None, DATABASE_REFUSED)
                 try:
                     st = os.fstat(fd)
-                    if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or st.st_mode & 0o077
-                            or expected is not None and [st.st_dev, st.st_ino] != expected):
-                        raise OSError('Messaging database must be a private regular file.')
+                    if expected is not None and [st.st_dev, st.st_ino] != expected:
+                        raise OSError(DATABASE_REFUSED)
+                    if private_storage.WIN:
+                        check_database_companions(path)
                     if expected is not None:
                         self.db = sqlite3.connect(Path(path).absolute().as_uri() + '?mode=rw', uri=True,
                                                   check_same_thread=False, timeout=peer_bridge.DB_TIMEOUT)
@@ -205,7 +274,7 @@ class MessagingStore:
         except BaseException:
             if self.db is not None:
                 self.db.close()
-            os.close(self.owner_fd)
+            close_owner_lock(self.owner_fd)
             self.owner_fd = None
             raise
 
@@ -226,6 +295,10 @@ class MessagingStore:
                       root / 'managed-claude' / 'registry.sqlite3')
         if not any(present(path) for path in candidates):
             return None
+        if not claude_channel.folder_walk_available():
+            # The fence opens these records by handle-based folder walk (and fcntl), which Windows lacks. They can
+            # only have come from a Mac or Linux copy of this folder; refuse rather than open the database unfenced.
+            raise MessagingStorageUnavailable(RETAINED_STATE_UNAVAILABLE)
         from attachments_native_namespace import NativeNamespaceFence
         fence = NativeNamespaceFence(state_dir)
         return fence if fence.detected() else None
@@ -443,7 +516,8 @@ class MessagingStore:
 
     def probe(self):
         if sys.platform != 'darwin':
-            return False, 'Agent messaging currently requires Codex desktop on macOS.'
+            # The Codex queue command ships inside the macOS app; Claude chats are messaged through the plugin.
+            return False, CODEX_NEEDS_MAC
         try:
             version = subprocess.run([self.cli, '--version'], capture_output=True, timeout=5, text=True)
             help_result = subprocess.run([self.cli, 'queue', '--help'], capture_output=True, timeout=5, text=True)
@@ -490,7 +564,7 @@ class MessagingStore:
                 raise RuntimeError('Messaging worker is still stopping; ownership retained.')
             self.db.close()
             if self.owner_fd is not None:
-                os.close(self.owner_fd)
+                close_owner_lock(self.owner_fd)
                 self.owner_fd = None
 
     def _metadata(self, path, ident):
@@ -530,10 +604,18 @@ class MessagingStore:
             return {'requests': [self._public_request(r) for r in sorted((r for r in self._rows() if r.get('origin') != 'peer'), key=lambda x: x['created'])] + managed_requests,
                     'controls': [self._public_control(r) for r in sorted(retained, key=lambda x: (x['created'], x['request_id']))],
                     'available': codex_ready or claude_ready or managed_ready,
-                    'reason': '' if codex_ready or claude_ready or managed_ready else self.reason,
+                    'reason': '' if codex_ready or claude_ready or managed_ready else self._unavailable_reason(),
                     'managed_error': managed_error,
                     'capabilities': {'codex': codex_ready, 'claude': claude_ready or managed_ready,
                                      **({'claude_managed': managed_ready} if self.managed is not None else {})}}
+
+    def _unavailable_reason(self):
+        # Off a Mac only Codex is out of reach: say how Claude chats become reachable instead.
+        if self.reason == CODEX_NEEDS_MAC:
+            set_up = self.db.execute('SELECT 1 FROM claude_mod_grants WHERE active=1 UNION ALL '
+                                     'SELECT 1 FROM claude_mod_enrollments WHERE active=1 LIMIT 1').fetchone()
+            return CODEX_NEEDS_MAC + ' ' + (CLAUDE_CONNECT_HINT if set_up else CLAUDE_SETUP_HINT)
+        return self.reason
 
     def owner_capabilities(self, agent, agents):
         """Advisory eligibility only; never starts native observation or resolves a turn."""
@@ -573,7 +655,7 @@ class MessagingStore:
         if not reason and (not codex or agents[agent].get('sub') or agents[agent].get('parent')):
             control_reason = 'Live controls support local parent Codex desktop chats only.'
         elif not reason and sys.platform != 'darwin':
-            control_reason = 'Codex desktop controls require macOS.'
+            control_reason = CODEX_CONTROLS_NEED_MAC
         result = {'agent': agent, 'actions': {
             'queue': {'available': not bool(queue_reason), 'reason': queue_reason, 'mode': 'queue'},
             'steer': {'supported': not bool(control_reason), 'reason': control_reason, 'mode': 'new_instruction'},
@@ -780,6 +862,10 @@ class MessagingStore:
                 return self._public_control(old)
             if self.db.execute('SELECT 1 FROM requests WHERE id=?', (request_id,)).fetchone():
                 raise MessagingError(409, 'That request identifier already belongs to a queued message.')
+            if sys.platform != 'darwin':
+                # Live controls drive the Codex desktop app's local bridge, which only exists on a Mac. Refuse
+                # before reading any transcript or saving a control, so nothing is left 'sending'.
+                raise MessagingError(409, CODEX_CONTROLS_NEED_MAC)
             now = time.time()
             rows = self._controls()
             retained = [r for r in rows if now - r['created'] <= RETENTION or r['state'] == 'sending']
@@ -1634,6 +1720,10 @@ class MessagingStore:
         for row in rows:
             if row.get('transport') == claude_mod.TRANSPORT:
                 continue  # HTTP claims/events exclusively own these rows; no stale tick writeback.
+            if row.get('runtime') == 'codex' and not claude_channel.folder_walk_available():
+                # Windows: a Codex row can only have come from a copy of a Mac's folder. Sending and reply
+                # tracking read its transcript by a folder walk Windows lacks; leave the row exactly as it is.
+                continue
             if self.stop.is_set():
                 break
             peer = row.get('origin') == 'peer'
