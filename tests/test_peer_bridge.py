@@ -741,7 +741,7 @@ class WindowsSimulationDirectory(unittest.TestCase):
 
 @unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS and Linux; real Windows is tested below')
 class SimulatedWindowsStorage(unittest.TestCase):
-    """The Windows branches use private_storage only: no folder walk, fcntl or os.getuid."""
+    """The Windows branches use private_storage only (its walk included): no dir_fd walk of their own, fcntl or os.getuid."""
 
     def setUp(self):
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

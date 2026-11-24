@@ -64,7 +64,7 @@ class PublicTimestampTests(unittest.TestCase):
         self.assertFalse(result.wasSuccessful(), 'Removing the public field must break the serializer contract test')
 
 
-@unittest.skipIf(os.name == "nt", "Codex flows read transcripts by handle-based folder walk; Codex messaging needs the Mac app")
+@unittest.skipIf(os.name == "nt", "Codex messaging needs the Mac app, and these flows check transcripts with POSIX owner and mode rules")
 class MessagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -897,11 +897,25 @@ class CodexOffMac(unittest.TestCase):
 
     def test_codex_transcripts_without_a_folder_walk_are_unavailable_not_a_crash(self):
         import codex_transcript
-        with patch.object(codex_transcript.os, 'supports_dir_fd', set()):
+        missing = os.path.join(self.store.sessions_dir, 'x.jsonl')
+        with patch.object(codex_transcript.private_storage, 'folder_walk_available', return_value=False):
             with self.assertRaises(codex_transcript.Unavailable):
-                codex_transcript.open_regular(self.store.sessions_dir, os.path.join(self.store.sessions_dir, 'x.jsonl'))
+                codex_transcript.open_regular(self.store.sessions_dir, missing)
             with self.assertRaises(m.MessagingError):
                 self.store._target_log(self.codex[2:])
+
+    def test_a_missing_codex_transcript_through_the_walk_is_refused_not_a_crash(self):
+        """With the walk (macOS, Linux and now Windows) a missing sessions folder or transcript is an ordinary
+        refusal: open_regular raises FileNotFoundError and the store turns it into a 409."""
+        import codex_transcript
+        import shutil
+        self.assertTrue(codex_transcript.private_storage.folder_walk_available())
+        shutil.rmtree(self.store.sessions_dir, ignore_errors=True)
+        with self.assertRaises(FileNotFoundError):
+            codex_transcript.open_regular(self.store.sessions_dir, os.path.join(self.store.sessions_dir, 'x.jsonl'))
+        with self.assertRaises(m.MessagingError) as refused:
+            self.store._target_log(self.codex[2:])
+        self.assertEqual(refused.exception.status, 409)
 
     def test_posix_record_checks_follow_the_system(self):
         self.assertEqual(m.posix_records_checkable(), os.name == 'posix')
@@ -975,7 +989,7 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
                 finally:
                     store.close()
 
-    @unittest.skipIf(os.name == 'nt', 'Attachments need the handle-based folder walk, which Windows lacks')
+    @unittest.skipIf(os.name == 'nt', 'Attachments are not on Windows yet')
     def test_linux_binds_attachment_maintenance_before_the_worker_starts(self):
         os.mkdir(os.path.join(self.home, '.live-room'), 0o700)       # made by load_key() in a real start
         with patch.object(m.sys, 'platform', 'linux'), patch.object(server, 'KEY', 'fictional-owner-key-for-attachments'):
@@ -1000,7 +1014,7 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
             finally:
                 attachments.close()
 
-    @unittest.skipIf(os.name == 'nt', 'Attachments need the handle-based folder walk, which Windows lacks')
+    @unittest.skipIf(os.name == 'nt', 'Attachments are not on Windows yet')
     @unittest.skipUnless(native_attachments_sqlite(), "This Python's SQLite cannot run native attachments, so binding never reaches the failure")
     def test_failed_attachment_binding_leaves_no_closure_over_the_closed_store(self):
         import attachments_native_composition

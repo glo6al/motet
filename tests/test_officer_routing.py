@@ -16,7 +16,7 @@ import server
 from officer_messaging import MessagingStore
 
 
-@unittest.skipIf(os.name == 'nt', 'Codex routing reads transcripts by handle-based folder walk; Codex messaging needs the Mac app')
+@unittest.skipIf(os.name == 'nt', 'Codex routing needs Codex messaging, which needs the Mac app')
 class RoutingTests(unittest.TestCase):
     def setUp(self):
         # Codex live controls exist only with the Mac app; these tests mock its bridge, so they run as a Mac.

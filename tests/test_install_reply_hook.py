@@ -114,7 +114,7 @@ class InstallTests(unittest.TestCase):
 
 
 class NoHookFolders(unittest.TestCase):
-    """Windows (no handle-based folder walk): nothing was ever installed, so removal says so; revocation still runs
+    """Windows: reply hooks were never installed there, so removal says so; revocation still runs
     under Motet's own lifetime lock. Checked here by simulation and below on real Windows."""
 
     def setUp(self):

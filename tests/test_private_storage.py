@@ -843,7 +843,8 @@ class SimulatedWindowsWalk(unittest.TestCase):
     def test_paths_outside_plain_drive_paths_are_refused_before_any_open(self):
         for path in ('\\\\server\\share\\chat.jsonl', '\\\\?\\C:\\Users\\example\\chat.jsonl', '\\\\.\\C:\\chat.jsonl',
                      '//server/share/chat.jsonl', 'C:\\Users\\example\\chat.jsonl:stream',
-                     'C:\\Users\\example.\\chat.jsonl', '1:\\chat.jsonl'):
+                     'C:\\Users\\example.\\chat.jsonl', 'C:\\Users\\example \\chat.jsonl', '1:\\chat.jsonl',
+                     'C:\\Users\\example\\NUL', 'C:\\Users\\example\\con.txt', 'C:\\Users\\example\\chat.jsonl.'):
             with self.subTest(path=path):
                 with self.assertRaises(ps.PrivateStorageError) as raised:
                     ps.open_folder(path)
@@ -993,8 +994,8 @@ class WindowsWalk(unittest.TestCase):
         self.middle = os.path.join(self.top, 'middle')
         os.makedirs(self.middle)
         self.file = os.path.join(self.middle, 'notes.jsonl')
-        with open(self.file, 'w') as out:
-            out.write('fixture\n')
+        with open(self.file, 'wb') as out:
+            out.write(b'fixture\n')
 
     def tearDown(self):
         self.tmp.cleanup()     # fails if the walk left anything open
@@ -1050,8 +1051,8 @@ class WindowsWalk(unittest.TestCase):
         self.assertGreater(len(deep), 300)
         os.makedirs('\\\\?\\' + deep)
         try:
-            with open('\\\\?\\' + os.path.join(deep, 'notes.jsonl'), 'w') as out:
-                out.write('deep\n')
+            with open('\\\\?\\' + os.path.join(deep, 'notes.jsonl'), 'wb') as out:
+                out.write(b'deep\n')
             self.assertEqual(self.read(ps.open_no_links(os.path.join(deep, 'notes.jsonl'))), b'deep\n')
         finally:
             shutil.rmtree('\\\\?\\' + os.path.join(self.base, 'long-folder-name-for-the-walk'))

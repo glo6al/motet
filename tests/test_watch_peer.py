@@ -297,7 +297,7 @@ class Refusal(unittest.TestCase):
 
 @unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS and Linux; real Windows is tested below')
 class SimulatedWindowsCredentials(unittest.TestCase):
-    """The Windows branches go through private_storage only: no folder walk, fcntl or os.getuid."""
+    """The Windows branches go through private_storage only (its walk included): no dir_fd walk of their own, fcntl or os.getuid."""
 
     def setUp(self):
         from windows_simulation import simulated_windows

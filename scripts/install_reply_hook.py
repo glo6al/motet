@@ -16,8 +16,9 @@ NONE_ON_WINDOWS = 'No reply hooks to remove: automatic reply notices were never 
 
 
 def hook_folders_available():
-    """Removal opens each folder by handle, refusing links on the way (dir_fd); Windows has no such walk yet. Reply
-    notices were retired before they could be installed there, so a Windows profile has none to remove."""
+    """Removal opens each folder by handle with this script's own dir_fd walk, refusing links on the way, so it runs
+    on macOS and Linux. Reply notices were retired before they could be installed on Windows, so a Windows profile
+    has none to remove."""
     return os.name == 'posix'
 
 

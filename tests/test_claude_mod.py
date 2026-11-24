@@ -433,8 +433,6 @@ class ClaudeModTests(unittest.TestCase):
             project=self.project,accept=accept,client_id=client),token=self.token)
 
     def shared_progress_request(self):
-        if os.name == 'nt':
-            self.skipTest('Shared bridge discovery reads transcripts by handle-based folder walk; the bridge comes to Windows later')
         import chat_directory
         import peer_bridge
         root = self.base/'claude'/'fictional'

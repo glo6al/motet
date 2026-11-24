@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import officer_messaging as m
 
 
-@unittest.skipIf(os.name == 'nt', 'Codex live controls need the Mac app and read transcripts by handle-based folder walk')
+@unittest.skipIf(os.name == 'nt', 'Codex live controls need the Mac app')
 class ControlTests(unittest.TestCase):
     def setUp(self):
         # Codex live controls exist only with the Mac app; these tests mock its bridge, so they run as a Mac.
