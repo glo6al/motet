@@ -237,6 +237,33 @@ if (process.platform === 'win32') console.log('Officer document page: VM checks 
   const h=await harness({gate}).mount();gate.documents_enabled=false;gate.attachments_enabled=false;h.controller.reset();await tick();
   assert.equal(h.controller.routing,'ordinary');h.input.value='Ordinary with the file gate off';await h.context.ofSend();assert.equal(h.context.OF.turns.length,1);
  });
+ await test('a gate turned off by its host says why on the file route, with no Look again, and ordinary Send stays',async()=>{
+  const reason='Sending files is not available on Windows yet. Ordinary messages still work.';
+  const gate={schemaVersion:1,selected_model:'claude-haiku-5-5',selection_available:true,attachments_enabled:true,documents_enabled:true,attachments_reason:null};
+  const h=await harness({gate}).mount();assert.ok(h.controller.chooseFiles(true));
+  Object.assign(gate,{attachments_enabled:false,documents_enabled:false,attachments_reason:reason});h.controller.reset();await tick();
+  const note=h.doc.body.all().find(n=>n.classList.contains('workspace-attachments-recipient-note'));
+  assert.ok(note,'the existing recipient note carries the reason');assert.equal(note.textContent,reason);
+  assert.equal(note.classList.contains('workspace-live-document-read-recovery'),false);
+  assert.equal(note.querySelectorAll('button').length,0,'nothing to look at again');
+  assert.equal(h.calls.filter(c=>Array.isArray(c)&&['addFiles','send','refresh'].includes(c[0])).length,0);
+  assert.equal(h.controller.chooseFiles(false),true);await tick();
+  assert.equal(h.controller.routing,'ordinary');assert.equal(h.doc.body.all().some(n=>n.classList.contains('workspace-attachments-recipient-note')),false);
+  h.input.value='Ordinary with files off on this host';await h.context.ofSend();assert.equal(h.context.OF.turns.length,1);
+ });
+ await test('a gate reason is refused while attachments are on, or when it is not plain bounded text',async()=>{
+  for(const extra of [{attachments_enabled:true,attachments_reason:'Files are off.'},{attachments_enabled:false,documents_enabled:false,attachments_reason:7},
+    {attachments_enabled:false,documents_enabled:false,attachments_reason:'  '},{attachments_enabled:false,documents_enabled:false,attachments_reason:'x'.repeat(241)}]){
+   const gate={schemaVersion:1,selected_model:'claude-haiku-5-5',selection_available:true,attachments_enabled:true,documents_enabled:true,...extra};
+   const h=await harness({gate}).mount();await tick();
+   assert.ok(h.calls.some(c=>Array.isArray(c)&&c[0]==='fetch'&&c[1]==='/officer/model-selection'));
+   assert.equal(h.clients.length,0,'a refused gate opens no file client');assert.equal(h.controller.attachmentsActive(),false);
+  }
+  const valid=await harness({gate:{schemaVersion:1,selected_model:'claude-haiku-5-5',selection_available:true,attachments_enabled:true,documents_enabled:true,attachments_reason:null}}).mount();await tick();
+  assert.equal(valid.clients.length,1);assert.equal(valid.controller.attachmentsActive(),true);
+  const off=await harness({gate:{schemaVersion:1,selected_model:'@automatic',selection_available:true,attachments_enabled:false,documents_enabled:false,attachments_reason:null}}).mount();await tick();
+  assert.equal(off.controller.routing,'ordinary');assert.equal(off.clients.length,0);assert.equal(off.controller.chooseFiles(true),false);
+ });
  await test('partial upload local Remove calls client, preserves ready siblings',async()=>{const s=snapshot();s.draft=draft();s.uploads=[{id:'local-one',name:'fictional.pdf',mediaType:'application/pdf',bytes:40,state:'ready',fileId:ids.file,error:null,progress:null},{id:'local-two',name:'failed.png',mediaType:'image/png',bytes:10,state:'failed',fileId:null,error:{code:'upload_failed',message:'Not confirmed uploaded.'},progress:null}];const h=await harness({state:s}).mount();h.find('Remove failed.png').click();assert.deepEqual(h.calls.find(c=>Array.isArray(c)&&c[0]==='removeUpload'),['removeUpload','local-two']);assert.match(h.doc.body.textContent,/failed.png/);const after=h.clients[0].snapshot();after.uploads=after.uploads.slice(0,1);await h.resolve('removeUpload',after);assert.doesNotMatch(h.doc.body.textContent,/failed.png/);assert.match(h.doc.body.textContent,/fictional.pdf/);});
  await test('explicit Resume does not happen on connect and preserves intervening input',async()=>{const s=snapshot();s.savedDrafts=[{id:ids.draft,state:'active',revision:4,writerGeneration:1,createdAt:100,updatedAt:101,fileCount:1,totalBytes:40,readOnly:true}];const h=await harness({state:s}).mount();assert.equal(h.calls.some(c=>Array.isArray(c)&&c[0]==='resume'),false);h.find('Resume draft').click();h.input.value='new local text';h.input.event('input');const after=h.clients[0].snapshot();after.draft=draft();await h.resolve('resume',after);assert.equal(h.input.value,'new local text');});
  await test('an uncertain prepared request holds new file questions and leaves ordinary Send enabled',async()=>{

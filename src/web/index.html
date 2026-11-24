@@ -9844,7 +9844,8 @@ function createWorkspaceOfficerDocumentsController(o){
     if(!current()||gatePending)return;const e=env(),stamp=identity;gatePending=true;notice='Checking Motet files…';paint();const abort=new o.AbortController();gateAbort=abort;
     try{const response=await o.fetch('/officer/model-selection',{headers:{'X-Live-Room-Key':owner},cache:'no-store',credentials:'same-origin',signal:abort.signal});const g=await response.json();
       if(stamp!==identity||!current())return;
-      if(!response.ok||!workspaceLiveDocumentsObject(g,['schemaVersion','selected_model','selection_available','attachments_enabled','documents_enabled'])||g.schemaVersion!==1||typeof g.selected_model!=='string'||!g.selected_model||g.selected_model.length>160||typeof g.selection_available!=='boolean'||typeof g.attachments_enabled!=='boolean'||typeof g.documents_enabled!=='boolean'||g.documents_enabled&&!g.attachments_enabled)throw Error();
+      const gateKeys=['schemaVersion','selected_model','selection_available','attachments_enabled','documents_enabled'];if(g&&typeof g==='object'&&Object.hasOwn(g,'attachments_reason'))gateKeys.push('attachments_reason');
+      if(!response.ok||!workspaceLiveDocumentsObject(g,gateKeys)||g.attachments_reason!==undefined&&g.attachments_reason!==null&&(g.attachments_enabled||typeof g.attachments_reason!=='string'||!g.attachments_reason.trim()||g.attachments_reason.length>240)||g.schemaVersion!==1||typeof g.selected_model!=='string'||!g.selected_model||g.selected_model.length>160||typeof g.selection_available!=='boolean'||typeof g.attachments_enabled!=='boolean'||typeof g.documents_enabled!=='boolean'||g.documents_enabled&&!g.attachments_enabled)throw Error();
       gate=g;gatePending=false;gateAbort=null;needsRead=false;context={scopeId:e.scopeId,modelId:g.selection_available?g.selected_model:null};modelGateGeneration=identity;o.modelDisplayChanged?.();
       if(!g.attachments_enabled){readRecovery=route()==='documents';snapshot=null;notice='';paint();return;}
       startJournal();
@@ -9902,6 +9903,7 @@ function createWorkspaceOfficerDocumentsController(o){
     if(code?.startsWith('pending_'))return {text:'Motet could not save this file question’s status. Your draft is still here.',read:true};
     if(code==='crypto_unavailable')return {text:'This browser cannot attach files securely, so files and file questions are off here.'};
     if(readingLine&&(gatePending||operation?.name==='refresh'))return readingLine;
+    if(gate&&!gate.attachments_enabled&&gate.attachments_reason)return {text:gate.attachments_reason};
     if(readRecovery)return {text:"Motet could not read this conversation's files, so nothing is being sent yet.",read:true};
     if(gatePending||snapshot?.busy||operation){if(!gatePending&&['addFiles','addRefused'].includes(operation?.name)&&uploadingCount()&&!failedSelections()&&!pendingAttempt&&!snapshot.requests.some(r=>['prepared','preparing','unknown'].includes(r.state))&&!snapshot.deletions.some(d=>d.uncertain||d.state==='deleting'))return null;return {text:"Motet is still reading this conversation's files."};}
     if(pendingAttempt)return {text:'An earlier file question has no confirmed recording yet. Look again before sending another.',read:true};
