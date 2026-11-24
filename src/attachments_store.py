@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 
-from attachments_files import PrivateFiles, identity, private
+from attachments_files import PrivateFiles
 from attachments_prepare import prepare
 from attachments_relay import original_relay, RELAY_FORMATS
 from attachments_officer_storage import OfficerDirectRetentionProfile, prepare_original, validate_binding
@@ -512,8 +512,7 @@ class AttachmentStore:
             used = self.db.execute('SELECT bytes FROM quota WHERE id=1').fetchone()[0]
             if used + metadata['bytes'] > self.limits['bytes']:
                 fail('storage_capacity', 'Attachment storage has no room for this file.', 429)
-            free = os.fstatvfs(self.files.objects_fd)
-            if free.f_bavail * free.f_frsize < metadata['bytes']:
+            if self.files.free_bytes() < metadata['bytes']:
                 fail('disk_capacity', 'This computer has insufficient free storage.', 429)
             self._capacity()
             fid, uid, ts = secrets.token_hex(16), secrets.token_hex(16), now(self.clock)
@@ -587,7 +586,7 @@ class AttachmentStore:
             try:
                 self.checkpoint('upload_claimed')
                 fd = self.files.create(fid)
-                created_identity = private(os.fstat(fd))
+                created_identity = self.files.private_fd(fd)
                 with self._transaction():
                     self.db.execute('UPDATE files SET identity=? WHERE id=?', (canonical(created_identity), fid))
             except BaseException:
@@ -626,7 +625,7 @@ class AttachmentStore:
             if received != f['bytes'] or hasher.hexdigest() != f['digest']:
                 fail('upload_digest', 'The upload does not match its reserved content.', 422)
             os.fsync(fd)
-            final_identity = private(os.fstat(fd))
+            final_identity = self.files.private_fd(fd)
             if final_identity[:2] != created_identity[:2]:
                 fail('source_changed', 'The upload identity changed.')
             self.checkpoint('upload_written')
@@ -664,13 +663,13 @@ class AttachmentStore:
     def _owned_partial(self, f):
         if f['identity'] is None:
             try:
-                os.stat(f['id'], dir_fd=self.files.objects_fd, follow_symlinks=False)
+                self.files.object_stat(f['id'])
             except FileNotFoundError:
                 return None
             fail('source_changed', 'An incomplete attachment identity is unknown.')
         expected = json.loads(f['identity'])
         try:
-            current = private(os.stat(f['id'], dir_fd=self.files.objects_fd, follow_symlinks=False))
+            current = self.files.object_identity(f['id'])
         except FileNotFoundError:
             return None
         if current[:2] != expected[:2] or current[2] > f['bytes']:

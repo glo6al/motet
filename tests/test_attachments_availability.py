@@ -17,7 +17,22 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 import server
+import private_storage
 from attachments_types import AttachmentError
+
+sys.path.insert(0, str(ROOT / 'tests'))
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
+
+
+def private_live_room(home):
+    """``~/.live-room`` for a test home, private to this user: mode 0700 on POSIX; on Windows a protected access list
+    owned by this user (an elevated runner's new folders can otherwise belong to Administrators)."""
+    path = home / '.live-room'
+    if os.name == 'nt':
+        private_storage.make_private_folder(str(path))
+    else:
+        path.mkdir(mode=0o700)
+    return path
 
 KEY = 'fictional-owner-key-for-availability-tests'
 WINDOWS = 'Sending files is not available on Windows yet. Ordinary messages still work.'
@@ -81,7 +96,7 @@ class ReportedStateTests(unittest.TestCase):
             self.assertNotRegex(words, r'[/\\~]', 'no paths or builder words in the reason')
 
 
-@unittest.skipUnless(os.name == 'posix', 'Starts the real attachment store, which needs POSIX folder handles.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class StartupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -105,7 +120,7 @@ class StartupTests(unittest.TestCase):
         return service
 
     def test_started_store_reports_on_and_reading_off_without_its_policy(self):
-        (self.home / '.live-room').mkdir(mode=0o700)
+        private_live_room(self.home)
         service = self.start()
         self.assertIsNotNone(service)
         self.assertIsNone(server.ATTACHMENTS_OFF)
@@ -118,7 +133,7 @@ class StartupTests(unittest.TestCase):
     def test_reading_turns_off_when_the_policy_is_refused_at_start(self):
         # Kept on purpose: with the store running but the reading policy missing, unreadable or out of date, the page is
         # told documents_enabled is false (2a2d902 said true), so a staged file question gets the "current setting" line.
-        (self.home / '.live-room').mkdir(mode=0o700)
+        private_live_room(self.home)
         expired = AttachmentError('policy_unavailable', 'Fictional expired policy.', 503)
         with mock.patch('officer_document_policy.load_allowance', side_effect=expired) as load:
             service = self.start()
@@ -129,6 +144,7 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(value, {'schemaVersion': 1, 'selected_model': 'claude-haiku-5-5', 'selection_available': True,
                                  'attachments_enabled': True, 'documents_enabled': False})
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_failed_store_on_a_mac_or_linux_reports_the_storage_reason(self):
         (self.home / '.live-room').mkdir(mode=0o755)        # not private, so the store refuses it
         with mock.patch.object(server, 'WIN', False):
@@ -138,9 +154,10 @@ class StartupTests(unittest.TestCase):
             self.assertEqual(model_selection()['attachments_reason'], STORAGE)
 
     def test_windows_store_refusal_reports_the_windows_reason(self):
-        (self.home / '.live-room').mkdir(mode=0o700)
-        # The real refusal Windows meets in PrivateFiles: this host cannot open files relative to a folder handle.
-        with mock.patch.object(server, 'WIN', True), mock.patch.object(os, 'supports_dir_fd', frozenset()):
+        private_live_room(self.home)
+        # The refusal a Windows meets in PrivateFiles when the walk's system calls did not load there.
+        with mock.patch.object(server, 'WIN', True), mock.patch.object(private_storage, 'folder_walk_available',
+                                                                       return_value=False):
             self.assertIsNone(self.start())
         self.assertEqual(server.ATTACHMENTS_OFF, 'attachments_windows_unavailable')
         with mock.patch.object(server, 'ATTACHMENTS', None):
@@ -185,26 +202,35 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(seen, [{'native': None}], 'the default code and words: attachments_disabled, as before')
 
 
-@unittest.skipUnless(os.name == 'nt', 'The real Windows refusal; simulated on POSIX by StartupTests')
+@unittest.skipUnless(os.name == 'nt', 'The real Windows start; simulated on POSIX by tests/test_attachments_windows_store.py')
 class RealWindowsStartupTests(unittest.TestCase):
-    def test_real_start_attachments_reports_windows_unavailable(self):
+    def test_real_start_attachments_starts_the_store_and_keeps_agent_delivery_off(self):
         with tempfile.TemporaryDirectory() as temporary:
-            with mock.patch.multiple(server, HOME=temporary, KEY=KEY, ATTACHMENTS_ENABLED=True,
+            home = Path(os.path.realpath(temporary))
+            private_live_room(home)
+            with mock.patch.multiple(server, HOME=str(home), KEY=KEY, ATTACHMENTS_ENABLED=True,
                                      OFFICER_DOCUMENTS_ENABLED=True), mock.patch.dict(os.environ, {'WATCH_DEMO': '0'}):
+                service = None
                 try:
-                    self.assertIsNone(server.start_attachments())
-                    self.assertEqual(server.ATTACHMENTS_OFF, 'attachments_windows_unavailable')
-                    with mock.patch.object(server, 'ATTACHMENTS', None):
-                        self.assertEqual(model_selection()['attachments_reason'], WINDOWS)
+                    service = server.start_attachments()
+                    self.assertIsNotNone(service)
+                    self.assertIsNone(server.ATTACHMENTS_OFF)
+                    with mock.patch.object(server, 'ATTACHMENTS', service):
+                        value = model_selection()
+                    # Motet's own file reading still refuses at its policy on Windows (step 6c.3).
+                    self.assertEqual((value['attachments_enabled'], value['documents_enabled']), (True, False))
+                    self.assertNotIn('attachments_reason', value)
+                    self.assertIs(server.NATIVE_ATTACHMENT_DELIVERY_HOST, False)
                 finally:
+                    if service is not None:
+                        service.close()
                     server.ATTACHMENTS_OFF = 'attachments_disabled'
-            self.assertEqual(os.listdir(temporary), [], 'refused before touching disk')
 
 
 class RefusalCodeTests(unittest.TestCase):
     def test_requests_get_the_reason_code_while_the_store_is_off(self):
         seen = []
-        def handle(handler, service, key, port, *, native=None, unavailable):
+        def handle(handler, service, key, port, *, native=None, unavailable, **options):
             seen.append((service, unavailable))
         for off in ('attachments_windows_unavailable', 'attachments_storage_unavailable', 'attachments_disabled', None):
             with mock.patch.object(server, 'ATTACHMENTS', None), mock.patch.object(server, 'ATTACHMENTS_OFF', off), \
@@ -215,7 +241,7 @@ class RefusalCodeTests(unittest.TestCase):
 
     def test_native_helper_is_chosen_only_where_the_host_may_deliver(self):
         seen = []
-        def handle(handler, service, key, port, *, native=None, unavailable):
+        def handle(handler, service, key, port, *, native=None, unavailable, **options):
             seen.append(native)
         helper = object()
         messaging = mock.Mock(_native_composition=mock.Mock(claude=helper))
@@ -259,6 +285,61 @@ class RefusalCodeTests(unittest.TestCase):
         default = Handler(KEY)
         attachments_http.handle_http(default, None, KEY, 18801)
         self.assertEqual(default.sent[1]['error']['code'], 'attachments_disabled')
+
+    def test_agent_chat_file_requests_get_the_windows_reason_while_the_store_runs(self):
+        """With the store running but delivery to agent chats off (Windows), the page's first request for an agent
+        chat answers with the Windows reason, which it shows as a quiet refusal, not "could not read your saved
+        drafts"."""
+        seen = []
+
+        def handle(handler, service, key, port, *, native=None, unavailable, **options):
+            seen.append(options)
+        for host, expected in ((False, {'native_unavailable': ('attachments_windows_unavailable', WINDOWS)}), (True, {})):
+            with mock.patch.multiple(server, ATTACHMENTS=mock.Mock(), ATTACHMENTS_OFF=None, ATTACHMENTS_ENABLED=True,
+                                     NATIVE_AGENT_ATTACHMENTS_ENABLED=True, NATIVE_ATTACHMENT_DELIVERY_HOST=host), \
+                    mock.patch.dict(os.environ, {'WATCH_DEMO': '0'}), mock.patch('attachments_http.handle_http', side_effect=handle):
+                server.H.attachments_http(Request())
+            self.assertEqual(seen.pop(), expected)
+
+    def test_http_answers_agent_chat_requests_with_that_reason_and_others_from_the_store(self):
+        import attachments_http
+
+        class Headers:
+            def __init__(self, values):
+                self.values = values
+
+            def get_all(self, name, default):
+                return self.values.get(name, default)
+
+            def __iter__(self):
+                return iter(self.values)
+
+        class Handler:
+            command = 'GET'
+            connection = mock.Mock()
+
+            def __init__(self, path):
+                self.path = '/api/attachments' + path
+                self.headers = Headers({'X-Live-Room-Key': [KEY], 'Host': ['127.0.0.1:18801']})
+                self.sent = None
+
+            def send(self, code, body, kind=None, extra=()):
+                self.sent = code, json.loads(body)
+
+        refused = ('attachments_windows_unavailable', WINDOWS)
+        service = mock.Mock()
+        service.operation.return_value.__enter__ = mock.Mock(return_value=None)
+        service.operation.return_value.__exit__ = mock.Mock(return_value=False)
+        service.native_selection.side_effect = AssertionError('the store was asked about agent delivery')
+        for path in ('/native/selection?destinationId=fictional', '/native/requests?destinationId=fictional&scopeId=fictional-orchard'):
+            handler = Handler(path)
+            attachments_http.handle_http(handler, service, KEY, 18801, native_unavailable=refused)
+            self.assertEqual((handler.sent[0], handler.sent[1]['error']),
+                             (503, {'code': refused[0], 'message': WINDOWS, 'retryable': False}))
+        service.storage.return_value = {'fictional': True}
+        handler = Handler('/storage')
+        attachments_http.handle_http(handler, service, KEY, 18801, native_unavailable=refused)
+        self.assertNotEqual(handler.sent[1].get('error', {}).get('code'), refused[0], 'the store still answers the rest')
 
     def test_page_words_each_code_exactly_as_the_server_does(self):
         client = (ROOT / 'src' / 'web' / 'native-agent-attachments-client.js').read_text(encoding='utf-8')

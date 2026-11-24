@@ -311,6 +311,11 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_attachments_store_boundary.py
         if: ${{ !cancelled() }}
+      # The store's Windows branch: simulated on macOS and Linux, and on Windows against real junctions, inherited
+      # access lists, a file held open by another program and held folders.
+      - run: python tests/test_attachments_windows_store.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_attachments_requests.py
         if: ${{ !cancelled() }}
       - run: python tests/test_attachments_owner_transport.py
@@ -342,7 +347,8 @@ jobs:
       - run: python tests/test_attachments_availability.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-      # Off on Windows: attachments store files by handle-based folder walk (dir_fd), so they stay off on Windows for now.
+      # Off on Windows: delivery to agent chats (the native composition, and the fixture-only deletion built on it) is
+      # not ported, and NATIVE_ATTACHMENT_DELIVERY_HOST keeps it off there. The attachment store itself runs on Windows.
       - run: python tests/test_attachments_native_composition.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_attachments_native_deletion.py
@@ -369,7 +375,7 @@ jobs:
         timeout-minutes: 5
       - run: python tests/test_attachments_proof_generator.py
         if: ${{ !cancelled() }}
-      # Off on Windows: attachment storage needs the handle-based folder walk.
+      # Off on Windows: the proof harness writes its own fixtures with POSIX folder descriptors (scripts/attachments_proof).
       - run: python tests/test_attachments_proof_harness.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
@@ -385,7 +391,8 @@ jobs:
       - run: python tests/test_codex_attachment_integration.py
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         timeout-minutes: 5
-      # Off on Windows: attachment storage and the managed namespace need the handle-based folder walk.
+      # Off on Windows: delivery to Claude chats (workspace copies, Git exclusion) and the managed namespace are not
+      # ported yet (step 6c.4 and 6c.5).
       - run: python tests/test_claude_attachment_adapter.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_claude_attachment_integration.py
@@ -429,13 +436,13 @@ jobs:
         run: node --test docs/fixtures/attachments/fixture-vm-probe.test.mjs
       - run: node tests/test_attachments_client.js
         if: ${{ !cancelled() }}
-      # Off on Windows: attachment storage needs the handle-based folder walk.
+      # Off on Windows: delivery to agent chats stays off there (NATIVE_ATTACHMENT_DELIVERY_HOST).
       - run: node tests/test_claude_attachment_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
       - run: node tests/test_native_agent_attachments_client.js
         if: ${{ !cancelled() }}
-      # Off on Windows: attachment storage needs the handle-based folder walk.
+      # Off on Windows: delivery to agent chats stays off there (NATIVE_ATTACHMENT_DELIVERY_HOST).
       - run: node tests/test_native_agent_attachments_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
@@ -443,7 +450,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: node tests/test_native_agent_attachments_page.js
         if: ${{ !cancelled() }}
-      # Off on Windows: attachment storage needs the handle-based folder walk.
+      # Off on Windows: delivery to agent chats stays off there (NATIVE_ATTACHMENT_DELIVERY_HOST).
       - run: node tests/test_native_agent_attachments_stage23_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
@@ -454,7 +461,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: node tests/test_officer_documents_client.js
         if: ${{ !cancelled() }}
-      # Off on Windows: Motet's document files use attachment storage, which needs the handle-based folder walk.
+      # Off on Windows: Motet's file reading stays off there until its reading policy can be read (step 6c.3).
       - run: node tests/test_officer_documents_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5

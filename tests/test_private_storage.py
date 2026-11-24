@@ -856,6 +856,24 @@ class PosixChanges(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 state.child_stat('absent')
 
+    def test_check_private_fd_alone_and_file_system(self):
+        with self.no_leaks():
+            fd = ps.open_no_links(self.secret)
+            try:
+                ps.check_private_fd(fd, single_link=True)
+                os.chmod(self.secret, 0o640)
+                reason(self, lambda: ps.check_private_fd(fd), 'access')
+                reason(self, lambda: ps.check_private_fd(fd, directory=True), 'not_regular', 'folder')
+            finally:
+                os.close(fd)
+            with ps.open_folder(self.base) as base:
+                state = base.folder('state', writable=True, alone=True)
+            try:
+                os.close(state.create('after-the-parent-closed'))     # POSIX holds are one descriptor either way
+                self.assertIsNone(state.file_system())
+            finally:
+                state.close()
+
     def test_read_only_and_unwritable(self):
         with self.no_leaks():
             fd = ps.open_no_links(self.secret)
@@ -1152,7 +1170,9 @@ class SimulatedWindowsWalk(unittest.TestCase):
                         patch.object(ps, '_win_handle_of', lambda fd: fd - 9000),
                         patch.object(ps, '_win_access_mask', lambda handle: self.handles[handle][2]),
                         patch.object(ps, '_private_descriptor', fake_descriptor),
-                        patch.object(ps, '_win_file_id', lambda handle: id(self.handles[handle][0]))]
+                        patch.object(ps, '_win_file_id', lambda handle: id(self.handles[handle][0])),
+                        patch.object(ps, '_win_file_system', lambda handle: self.file_systems.get(self.handles[handle][1], 'NTFS'))]
+        self.file_systems = {}
         for p in self.patches:
             p.start()
 
@@ -1658,6 +1678,47 @@ class SimulatedWindowsWalk(unittest.TestCase):
                 ps._win_close(handle)
         self.assert_nothing_open()
 
+    def test_a_hold_alone_keeps_only_its_own_handle(self):
+        with ps.open_folder(self.CLAUDE, writable=True, alone=True) as claude:
+            self.assertEqual([self.handles[h][1] for h in self.open_now], ['.claude'],
+                             'the folders above are let go once this one is open')
+            self.assertEqual(self.log[-1][:2], ('.claude', ps._HOLD_ACCESS | ps._WRITE_HOLD))
+            claude.create('new.json')
+        with ps.open_folder('C:\\Users\\example') as home:
+            claude = home.folder('.claude', writable=True, alone=True)
+        try:
+            self.assertEqual([self.handles[h][1] for h in self.open_now], ['.claude'])
+            claude.create('later.json')               # still usable after the folder it came from was closed
+        finally:
+            claude.close()
+        with ps.open_folder('C:\\Users\\example') as home:
+            claude = home.folder('.claude')
+        reason(self, lambda: claude.create('x'), 'changed', 'folder')    # without alone it depends on that hold
+        claude.close()
+        self.assert_nothing_open()
+
+    def test_the_file_system_is_read_through_the_held_handle(self):
+        with ps.open_folder(self.CLAUDE) as claude:
+            self.assertEqual(claude.file_system(), 'NTFS')
+        self.file_systems['.claude'] = 'ReFS'
+        with ps.open_folder(self.CLAUDE) as claude:
+            self.assertEqual(claude.file_system(), 'ReFS')
+        self.assert_nothing_open()
+
+    def test_check_private_fd_reads_the_handle(self):
+        fd = ps.open_no_links(self.FILE_PATH)
+        ps.check_private_fd(fd, single_link=True)
+        self.assertEqual(self.checked, ['chat.jsonl'])
+        self.public.add(id(self.chat))
+        reason(self, lambda: ps.check_private_fd(fd), 'access')
+        self.claude()['children']['two'] = self.node('two-names')
+        two = ps.open_no_links(self.CLAUDE + '\\two')
+        reason(self, lambda: ps.check_private_fd(two, single_link=True), 'links')
+        folder = ps.open_no_links(self.CLAUDE, directory=True)
+        reason(self, lambda: ps.check_private_fd(folder), 'not_regular')
+        ps.check_private_fd(folder, directory=True)
+        self.assert_nothing_open()
+
     def test_unwritable_checks_the_opened_handle_and_names_what_was_refused(self):
         calls = []
 
@@ -1901,6 +1962,26 @@ class WindowsWalk(unittest.TestCase):
         os.close(ps.open_no_links(private, directory=True, private=True))
         icacls(secret, '/grant', EVERYONE_READ)
         reason(self, lambda: os.close(ps.open_no_links(secret, private=True)), 'access')
+
+    def test_a_hold_alone_keeps_the_folders_above_in_place_and_reports_ntfs(self):
+        with ps.open_folder(self.middle, writable=True, alone=True) as middle:
+            self.assertEqual(len(middle._handles), 1, 'only its own handle is kept')
+            self.assertEqual(middle.file_system(), 'NTFS')
+            with self.assertRaises(OSError, msg='the one handle still keeps the folder above in place'):
+                os.rename(self.top, self.top + '-moved')
+            fd = middle.create('made-alone')
+            try:
+                ps.check_private_fd(fd, single_link=True)
+            finally:
+                os.close(fd)
+        plain = os.path.join(self.middle, 'notes.jsonl')       # made by Python: the folder's inherited list
+        fd = ps.open_no_links(plain)
+        try:
+            with self.assertRaises(ps.PrivateStorageError):
+                ps.check_private_fd(fd)
+        finally:
+            os.close(fd)
+        os.rename(self.top, self.top + '-moved')
 
     def test_a_held_folder_or_an_open_file_inside_blocks_renaming_the_folders_above(self):
         """NTFS refuses to rename a folder while anything below it is open, whatever that open shares. Attachment

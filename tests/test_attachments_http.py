@@ -15,6 +15,7 @@ from attachments_service import AttachmentService, UnqualifiedResolver
 from attachments_store import AttachmentStore
 from attachments_types import AttachmentError
 from test_attachments_foundation import BINDING, EPOCH, fence, metadata
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 KEY = 'fictional-owner-key'
 SELECTION = {'destinationId': BINDING['id'], 'scopeId': BINDING['scopeId'], 'modelId': None,
@@ -60,11 +61,11 @@ class Handler:
         self.response = status, json.loads(body), dict(extra)
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires qualified POSIX primitives.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class BoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(os.path.realpath(self.temp.name))
+        self.root = state_root(self.temp.name)
         self.store = AttachmentStore(self.root, enabled=True, owner_epoch=EPOCH)
         self.resolver = Resolver()
         self.service = AttachmentService(self.store, resolver=self.resolver)

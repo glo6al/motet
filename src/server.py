@@ -5268,8 +5268,14 @@ class H(BaseHTTPRequestHandler):
         if os.environ.get('WATCH_DEMO') == '1':
             return attachments_http.handle_http(self, ATTACHMENTS, KEY, PORT, native=native)     # as before
         off = ATTACHMENTS_OFF or 'attachments_disabled'
+        options = {}
+        if not NATIVE_ATTACHMENT_DELIVERY_HOST:
+            # The store runs here (Windows), but files sent to agent chats cannot be delivered: those requests get the
+            # Windows reason, as they did while the store was off, not a generic refusal the page reads as a fault.
+            options['native_unavailable'] = ('attachments_windows_unavailable',
+                                             ATTACHMENTS_OFF_WHY['attachments_windows_unavailable'])
         return attachments_http.handle_http(self, ATTACHMENTS, KEY, PORT, native=native,
-                                            unavailable=(off, ATTACHMENTS_OFF_WHY[off]))
+                                            unavailable=(off, ATTACHMENTS_OFF_WHY[off]), **options)
 
     def do_PUT(self):
         if self.path.startswith('/api/dictation/'):

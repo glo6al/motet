@@ -194,6 +194,9 @@ def _win_api():
     kernel.DuplicateHandle.restype = w.BOOL
     kernel.FlushFileBuffers.argtypes = [w.HANDLE]
     kernel.FlushFileBuffers.restype = w.BOOL
+    kernel.GetVolumeInformationByHandleW.argtypes = [w.HANDLE, w.LPWSTR, w.DWORD, ctypes.POINTER(w.DWORD),
+                                                     ctypes.POINTER(w.DWORD), ctypes.POINTER(w.DWORD), w.LPWSTR, w.DWORD]
+    kernel.GetVolumeInformationByHandleW.restype = w.BOOL
 
     # NtCreateFile opens a name relative to an open folder handle: Windows' equivalent of openat(2) with dir_fd.
     nt = ctypes.WinDLL('ntdll')
@@ -1100,16 +1103,18 @@ class NoLinkFolder:
             raise
         return fd
 
-    def folder(self, name, private=False, listing=False, writable=False):
+    def folder(self, name, private=False, listing=False, writable=False, alone=False):
         """The child folder ``name``, held like this one; close it before this one. ``listing`` lets ``names()`` list
-        it on Windows; ``writable`` lets it be changed through (section h)."""
+        it on Windows; ``writable`` lets it be changed through (section h). ``alone`` makes a hold that may outlive
+        this folder (see ``open_folder``)."""
         self._held()
         if not _plain_name(name, self._windows):
             raise _refuse('unavailable', 'folder')
         if self._windows:
             handle = _win_open_checked(self._handles[-1], name, True, 'folder', private=private, listing=listing,
                                        writable=writable)
-            return NoLinkFolder(self._child(name), True, handles=[handle], parent=self, listing=listing, writable=writable)
+            return NoLinkFolder(self._child(name), True, handles=[handle], parent=None if alone else self,
+                                listing=listing, writable=writable)
         return NoLinkFolder(os.path.join(self.path, name), False, fd=self.open(name, True, private=private),
                             writable=writable)
 
@@ -1309,6 +1314,12 @@ class NoLinkFolder:
             return
         _win_flush(self._handles[-1])
 
+    def file_system(self):
+        """Windows: the name of the file system this folder is on ('NTFS', 'ReFS', 'FAT32' and so on), read through
+        its handle. POSIX: None (nothing here depends on it)."""
+        self._held()
+        return _win_file_system(self._handles[-1]) if self._windows else None
+
     def _child(self, name):
         return self.path + name if self.path.endswith('\\') else self.path + '\\' + name
 
@@ -1379,11 +1390,17 @@ def _absolute(path):
     return _path_module().abspath(path)
 
 
-def open_folder(path, private=False, listing=False, writable=False):
+def open_folder(path, private=False, listing=False, writable=False, alone=False):
     """Hold the folder at ``path`` (made absolute) with no link followed anywhere on the way; the caller closes
     it. ``private`` checks the folder itself (owner, and mode or access list); ``listing`` lets ``names()`` list it on
     Windows; ``writable`` lets it be changed through (section h), and on Windows asks for that access on its hold
-    only. A missing folder raises FileNotFoundError; on POSIX a link raises the system's own OSError (ELOOP)."""
+    only. A missing folder raises FileNotFoundError; on POSIX a link raises the system's own OSError (ELOOP).
+
+    ``alone`` is for a hold kept for a long time (attachment storage keeps its folders for its lifetime): on Windows
+    the folders above are let go once this one is open, so only this folder's own handle is kept. NTFS refuses to
+    rename or remove a folder while anything below it is open (the WindowsWalk tests check this on real Windows),
+    so that one handle still keeps every folder above it in place, without blocking them all for as long. On POSIX a
+    held folder is one descriptor either way."""
     path = _absolute(path)
     if WIN:
         root, names = _win_parts(path)
@@ -1400,6 +1417,10 @@ def open_folder(path, private=False, listing=False, writable=False):
             for handle in reversed(handles):
                 _win_close(handle)
             raise
+        if alone:
+            for handle in reversed(handles[:-1]):
+                _win_close(handle)
+            handles = handles[-1:]
         return NoLinkFolder(current, True, handles=handles, listing=listing, writable=writable)
     fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
     try:
@@ -1681,6 +1702,29 @@ def _win_remove(parent, name, expect):
 def _win_flush(handle):
     if not _win_api()[1].FlushFileBuffers(handle):
         raise _unavailable('folder')
+
+
+def _win_file_system(handle):
+    kernel = _win_api()[1]
+    name = ctypes.create_unicode_buffer(64)
+    if not kernel.GetVolumeInformationByHandleW(handle, None, 0, None, None, None, name, len(name)):
+        raise _unavailable('folder')
+    return name.value
+
+
+def check_private_fd(fd, directory=False, single_link=False):
+    """Raise PrivateStorageError unless the open descriptor ``fd`` is a private folder or regular file (one name only,
+    with ``single_link``): on POSIX ``posix_verdict`` on its ``fstat``; on Windows the type, reparse attribute, link
+    count, owner and access list read on its handle (the descriptor needs READ_CONTROL and attribute access, which
+    every descriptor from the walk and section (h) has). Windows' ``fstat`` has no owner or access bits, so this is
+    how a caller checks a descriptor it already holds."""
+    subject = 'folder' if directory else 'file'
+    if not WIN:
+        posix_verdict(os.fstat(fd), directory, single_link, subject)
+        return
+    handle = _win_handle_of(fd)
+    _win_kind(_win_facts(handle), directory, subject, single_link)
+    _win_private(handle, directory, subject)
 
 
 def sync_file(fd):

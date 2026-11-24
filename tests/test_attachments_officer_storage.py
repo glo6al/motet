@@ -23,6 +23,7 @@ import attachments_deletion_slots as slots
 import test_attachments_conversations as cf
 from test_attachments_foundation import EPOCH, BINDING, fence, metadata
 from test_attachments_requests import FakeLease
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 PDF = b'%PDF-1.7\nfictional original; no parsed content asserted'
 PNG = b'\x89PNG\r\n\x1a\nfictional original; no pixels decoded'
@@ -61,7 +62,7 @@ class PreparationTests(unittest.TestCase):
                          {'id','revision','purpose','capability_revision','media_types','file_count','file_bytes','draft_bytes'})
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class DirectStoreTests(unittest.TestCase):
     for _name in ('setUp','tearDown','open','key','error','revoke','officer','selection'):
         locals()[_name] = getattr(cf.ConversationTests,_name)
@@ -253,7 +254,7 @@ class DirectStoreTests(unittest.TestCase):
         self.assertFalse(result['available'])
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class MigrationTests(unittest.TestCase):
     for _name in ('tearDown','open','key','error','officer','selection','upload','draft','admit','native'):
         locals()[_name] = getattr(cf.ConversationTests,_name)

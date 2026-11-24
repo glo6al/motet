@@ -19,9 +19,10 @@ from attachments_types import AttachmentError
 import test_attachments_requests as fixtures
 from test_attachments_foundation import BINDING, EPOCH, fence, metadata
 from test_attachments_http import Handler, KEY
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires POSIX primitives.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class CatalogueTests(unittest.TestCase):
     # Reuse fixture setup/actions, not another TestCase's test methods/count.
     for _name in ('setUp', 'tearDown', 'open', 'key', 'error', 'draft', 'prepare', 'send',

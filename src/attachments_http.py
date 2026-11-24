@@ -73,8 +73,10 @@ class LimitedReader:
 
 
 def handle_http(handler, service, owner_key, port, *, native=None,
-                unavailable=('attachments_disabled', 'Attachments are unavailable.')):
-    """``unavailable`` is the (code, words) every request gets while ``service`` is None: why the store is not running."""
+                unavailable=('attachments_disabled', 'Attachments are unavailable.'), native_unavailable=None):
+    """``unavailable`` is the (code, words) every request gets while ``service`` is None: why the store is not running.
+    ``native_unavailable`` is the (code, words) requests for files sent to agent chats get while the store runs but
+    this host cannot deliver them (``native`` is None there)."""
     handler.close_connection = True
     def headers(name):
         return handler.headers.get_all(name, [])
@@ -221,6 +223,9 @@ def handle_http(handler, service, owner_key, port, *, native=None,
             capabilities = {name.lower() for name in handler.headers if name.lower().startswith('x-attachment-')}
             if capabilities != {expected_capability} or headers('Range') or headers('Content-Range'):
                 fail('invalid_request', 'Invalid native attachment Send headers.', 400)
+        if (native is None and native_unavailable is not None
+                and (route == '/native/selection' or native_receipt or native_request or native_send or native_prepare)):
+            return error(503, *native_unavailable)
         if native_request or native_send or native_prepare or native_receipt and native_receipt[1] == 'send_prepare':
             if native is None:
                 fail('attachments_disabled', 'Native agent attachments are unavailable.', 503)

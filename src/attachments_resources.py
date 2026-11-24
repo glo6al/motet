@@ -2,6 +2,10 @@
 
 Callers acquire outside every database/room lock. Leases protect WATCH's local
 handles, not a queued agent turn. Durable outcome pins are a separate policy.
+
+POSIX holds the lock folder by descriptor and locks with flock, exactly as before. Windows holds it through the
+no-link walk (one handle, which NTFS keeps from being renamed or removed, with every folder above it), checks each
+lock file's owner and access list on its handle, and locks with the byte-range lock in private_storage.
 """
 from contextlib import contextmanager
 import hashlib
@@ -13,6 +17,7 @@ import sys
 import threading
 import time
 
+import private_storage as ps
 from attachments_types import AttachmentError, add_note, fail
 
 KEY = re.compile(r'(request|source|copy|workspace):[a-f0-9]{32}\Z')
@@ -44,6 +49,18 @@ def _private(st, is_dir=False):
     return (st.st_dev, st.st_ino)
 
 
+def _refused():
+    fail('resource_unavailable', 'Attachment resource ownership is unavailable.', 503)
+
+
+def _windows_identity(st):
+    """(st_dev, st_ino) on Windows, where the owner and access list were checked on the handle; an id outside the
+    stored range is refused, as in attachments_files."""
+    if not (0 <= st.st_dev <= 2 ** 63 - 1 and 0 < st.st_ino <= 2 ** 63 - 1):
+        _refused()
+    return (st.st_dev, st.st_ino)
+
+
 class ResourceLease:
     def __init__(self, manager, keys, fds):
         self._manager, self._keys, self._fds = manager, frozenset(keys), fds
@@ -54,8 +71,7 @@ class ResourceLease:
             fail('resource_lease_required', 'An active attachment resource lease is required.', 409)
         self._manager._check()
         for name, fd, expected in self._fds:
-            if (_private(os.fstat(fd)) != expected or
-                    _private(os.stat(name, dir_fd=self._manager._fd, follow_symlinks=False)) != expected):
+            if self._manager._fd_identity(fd) != expected or self._manager._name_identity(name) != expected:
                 fail('resource_changed', 'An attachment resource lock changed.', 409)
 
 
@@ -67,9 +83,22 @@ class ResourceLocks:
     """
     def __init__(self, private_root, *, enabled=False):
         self._fd, self._identity, self._path = None, None, private_root
+        self._folder, self._windows = None, ps.WIN
         self._guard, self._leases, self._closed = threading.Lock(), 0, False
         self.enabled = enabled is True
         if not self.enabled:
+            return
+        if self._windows:
+            try:
+                self._folder = ps.open_folder(private_root, private=True, writable=True, alone=True)
+                self._identity = _windows_identity(self._folder.stat())
+            except BaseException as error:
+                if self._folder is not None:
+                    self._folder.close()
+                    self._folder = None
+                if isinstance(error, AttachmentError) or not isinstance(error, OSError):
+                    raise
+                fail('resource_unavailable', 'Attachment resource locking is unavailable.', 503)
             return
         try:
             import fcntl
@@ -91,9 +120,65 @@ class ResourceLocks:
                 raise
             fail('resource_unavailable', 'Attachment resource locking is unavailable.', 503)
 
+    def _fd_identity(self, fd):
+        """The identity of an open lock file, checked as private (on Windows on its handle)."""
+        if not self._windows:
+            return _private(os.fstat(fd))
+        try:
+            ps.check_private_fd(fd, single_link=True)
+        except ps.PrivateStorageError:
+            _refused()
+        return _windows_identity(os.fstat(fd))
+
+    def _name_identity(self, name):
+        """The identity of the lock file that ``name`` names now, not followed."""
+        if not self._windows:
+            return _private(os.stat(name, dir_fd=self._fd, follow_symlinks=False))
+        try:
+            fd = self._folder.open(name, single_link=True, private=True)
+        except ps.PrivateStorageError:
+            _refused()
+        try:
+            return _windows_identity(os.fstat(fd))
+        finally:
+            os.close(fd)
+
+    def _open_lock(self, name):
+        if not self._windows:
+            return os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self._fd)
+        try:
+            return self._folder.open_or_create(name)
+        except ps.PrivateStorageError:
+            _refused()
+
+    def _try_lock(self, fd):
+        if self._windows:
+            return ps.try_lock(fd)
+        try:
+            self._flock(fd, self._exclusive | self._nonblock)
+            return True
+        except BlockingIOError:
+            return False
+
+    def _release(self, fd):
+        if self._windows:
+            ps.unlock(fd)
+        else:
+            self._flock(fd, self._unlock)
+
     def _check(self):
-        if not self.enabled or self._closed or self._fd is None:
+        held = self._folder if self._windows else self._fd
+        if not self.enabled or self._closed or held is None:
             fail('attachments_disabled', 'Attachments are unavailable.', 503)
+        if self._windows:
+            try:
+                with ps.open_folder(self._path, private=True) as current:
+                    if (_windows_identity(current.stat()) != self._identity
+                            or _windows_identity(self._folder.stat()) != self._identity):
+                        fail('resource_changed', 'Attachment resource locking changed.', 409)
+            except OSError:
+                fail('resource_changed', 'Attachment resource locking changed.', 409)
+            return
         try:
             current = directory(self._path)
             try:
@@ -120,19 +205,15 @@ class ResourceLocks:
             for key in sorted(keys):
                 name = hashlib.sha256(key.encode('ascii')).hexdigest() + '.lock'
                 self._check()
-                fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self._fd)
+                fd = self._open_lock(name)
                 try:
-                    expected = _private(os.fstat(fd))
-                    if _private(os.stat(name, dir_fd=self._fd, follow_symlinks=False)) != expected:
+                    expected = self._fd_identity(fd)
+                    if self._name_identity(name) != expected:
                         fail('resource_changed', 'An attachment resource lock changed.', 409)
-                    while True:
-                        try:
-                            self._flock(fd, self._exclusive | self._nonblock)
-                            break
-                        except BlockingIOError:
-                            if time.monotonic() >= deadline:
-                                fail('resource_busy', 'An attachment operation still holds its files.', 409)
-                            time.sleep(min(.01, max(0, deadline - time.monotonic())))
+                    while not self._try_lock(fd):
+                        if time.monotonic() >= deadline:
+                            fail('resource_busy', 'An attachment operation still holds its files.', 409)
+                        time.sleep(min(.01, max(0, deadline - time.monotonic())))
                     fds.append((name, fd, expected))
                 except BaseException:
                     os.close(fd)
@@ -149,7 +230,7 @@ class ResourceLocks:
                 lease._active = False
             for _, fd, _ in reversed(fds):
                 try:
-                    self._flock(fd, self._unlock)
+                    self._release(fd)
                 except BaseException as error:
                     release_errors.append(error)
                 finally:
@@ -172,4 +253,7 @@ class ResourceLocks:
             if self._fd is not None:
                 os.close(self._fd)
                 self._fd = None
+            if self._folder is not None:
+                self._folder.close()
+                self._folder = None
             self._closed = True

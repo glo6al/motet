@@ -14,9 +14,19 @@ from attachments_store import AttachmentStore
 from attachments_service import AttachmentService
 from test_attachments_http import Resolver, KEY, SELECTION
 from test_attachments_foundation import EPOCH, fence, metadata
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires qualified POSIX primitives.')
+def live_room(home):
+    """A private ~/.live-room for a test home: mode 0700 on POSIX, a protected list owned by this user on Windows."""
+    if os.name == 'nt':
+        import private_storage
+        private_storage.make_private_folder(str(home / '.live-room'))
+    else:
+        (home / '.live-room').mkdir(mode=0o700)
+
+
+@unittest.skipUnless(STORE, STORE_WHY)
 class IntegrationTests(unittest.TestCase):
     def test_startup_disabled_and_demo_construct_nothing(self):
         for enabled,demo in ((False,'0'),(False,'1'),(True,'1')):
@@ -29,7 +39,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_enabled_test_startup_runtime_is_unqualified(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(os.path.realpath(temporary));(root/'.live-room').mkdir(mode=0o700)
+            root=Path(os.path.realpath(temporary));live_room(root)
             with mock.patch.object(server,'ATTACHMENTS_ENABLED',True),mock.patch.object(server,'HOME',str(root)),mock.patch.object(server,'KEY',KEY),mock.patch.dict(os.environ,{'WATCH_DEMO':'0'}):
                 service=server.start_attachments()
                 try:self.assertFalse(service.capabilities('fictional','room',None)['available'])
@@ -37,7 +47,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_real_http_binary_end_and_completed_retry_no_body_wait(self):
         with tempfile.TemporaryDirectory() as temporary:
-            store=AttachmentStore(Path(os.path.realpath(temporary)),enabled=True,owner_epoch=EPOCH)
+            store=AttachmentStore(state_root(temporary),enabled=True,owner_epoch=EPOCH)
             service=AttachmentService(store,resolver=Resolver())
             host=server.Server(('127.0.0.1',0),server.H);port=host.server_address[1]
             thread=threading.Thread(target=host.serve_forever,daemon=True)

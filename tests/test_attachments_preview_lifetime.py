@@ -8,9 +8,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import test_attachments_catalogue as catalogue_fixtures
 from test_attachments_foundation import fence
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment IO requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class PreviewLifetimeTests(unittest.TestCase):
     for _name in ('setUp', 'tearDown', 'open', 'key', 'error', 'draft', 'cap', 'publish'):
         locals()[_name] = getattr(catalogue_fixtures.CatalogueTests, _name)
@@ -48,6 +49,7 @@ class PreviewLifetimeTests(unittest.TestCase):
         self.store.remove_file(d['id'],d['capability'],fence(d),u['fileId'])
         self.assertEqual(self.store.storage()['usedBytes'],0)
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_failed_open_is_not_a_live_handle(self):
         d,u=self.draft();cap=self.cap(d,u['fileId']);opening=os.open
         def fail_source(path,*args,**kwargs):
@@ -84,6 +86,7 @@ class PreviewLifetimeTests(unittest.TestCase):
             if held:close(held[0])
             self.store.files._io.clear()
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_unlinked_remove_descriptor_close_failure_stays_charged(self):
         d,u=self.draft();fid=u['fileId'];before=self.store.storage()['usedBytes']
         read,close=os.read,os.close;held=[]
@@ -104,6 +107,7 @@ class PreviewLifetimeTests(unittest.TestCase):
             if held:close(held[0])
             self.store.files._io.clear()
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_remove_registration_blocks_new_read_before_unlink(self):
         d,u=self.draft();fid=u['fileId'];row=self.store.db.execute('SELECT * FROM files WHERE id=?',(fid,)).fetchone()
         unlink=os.unlink;seen=[]
@@ -118,6 +122,7 @@ class PreviewLifetimeTests(unittest.TestCase):
         self.assertEqual(seen,[fid]);self.assertFalse(self.store.files.io_active())
         self.assertEqual(self.store.storage()['usedBytes'],0)
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_close_fences_new_reads_and_removals_before_descriptor_teardown(self):
         d,u=self.draft();files=self.store.files;close=os.close;seen=[]
         def closing(fd):
