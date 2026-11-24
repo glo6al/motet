@@ -117,6 +117,9 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_check_privacy.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_windows_probe.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python scripts/check_privacy.py --all
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_memory.py
@@ -188,6 +191,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_install_reply_hook.py
         if: ${{ !cancelled() }}
+      - name: Check the portable Claude Code hook and both installer forms
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python tests/test_hooks_portable.py
       - run: python tests/test_codex_desktop_control.py
         if: ${{ !cancelled() }}
       - run: python tests/test_codex_native_input.py

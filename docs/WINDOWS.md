@@ -209,7 +209,7 @@ dir "$env:USERPROFILE\.cursor\projects"
 
 ## What does not work on Windows yet
 
-Motet **watches** on Windows: the live stage, risk flags, previews (page only, Python 3.12 or later) and Unlock all work. **Motet's own answers** and its model menu work too, once the key file is private (step 6); so far only the automated tests have checked them on Windows. Everything that **acts** on your agents is switched off for now. The goal is parity with the Mac, and these are still to come:
+Motet **watches** on Windows: the live stage, risk flags, previews (page only, Python 3.12 or later) and Unlock all work. **Motet's own answers** and its model menu work too, once the key file is private (step 6); so far only the automated tests have checked them on Windows. Everything that **acts** on your agents is switched off for now, apart from Allow / Deny, which is new and not yet checked on a real PC (see below). The goal is parity with the Mac, and these are still to come:
 
 - **Messaging between agents, and the bridge.**
 - **New chat.**
@@ -222,7 +222,7 @@ Motet **watches** on Windows: the live stage, risk flags, previews (page only, P
 
 Details on the rest:
 
-- **Answering permission prompts from the stage (Allow / Deny), and the hooks behind it.** The hooks are shell scripts, and how Claude Code runs hook commands on Windows has not been checked. `py scripts\install_hooks.py` says so and changes nothing. Motet still watches, and Claude asks in its own app as usual.
+- **Answering permission prompts from the stage (Allow / Deny), and the hooks behind it, are not yet checked on a real PC.** `py scripts\install_hooks.py` now installs them: Claude Code starts Python directly on `scripts\motet_hook.py`, with no shell in between. They need Claude Code 2.1.139 or later, and Python from winget or python.org, not the Microsoft Store. The installer refuses the Store's Python. It also refuses an older Claude Code when it can read the version (from `claude.exe`, or from an npm install's own files); otherwise it says the version could not be checked. The hooks name your Python and the Motet folder by their full paths, so if you move the folder or change Python, run `py scripts\install_hooks.py` again. Automated tests check them on Windows, but nobody has yet answered a real Claude Code prompt this way on a real PC. If you try it, please tell us what happened. `py scripts\install_hooks.py --remove` takes them out. Without them Motet still watches, and Claude asks in its own app as usual.
 - **Rendered previews show the page alone.** The styles, scripts and images it links to from files beside it are not served on Windows yet (inline ones still apply), so a previewed page can look unstyled; previews need Python 3.12 or later. A page reached through a link or junction, with more than one name (such as files pnpm hard-links into `node_modules`), or in `AppData` is refused. OneDrive-synced, network and ReFS/Dev Drive folders have not been tried: they may be refused by those checks, or may work. Please tell us which happen to you.
 - **Desktop app details** (session titles, permission mode, when you last looked at a session) come from the Claude desktop app's own records. On one Windows 11 PC they were under `%LOCALAPPDATA%\Claude-Data\<profile>\claude-code-sessions`, and `%APPDATA%\Claude` was empty, so Motet looks in both. Only the folder layout was checked there, not that the records read correctly.
 
@@ -248,6 +248,20 @@ Details on the rest:
 **To stop the server**, press **Ctrl+C** in its window (or close the window). **To remove Motet completely**, delete the project folder and `%USERPROFILE%\.live-room`. It changes nothing else on your PC.
 
 ---
+
+## Help us finish Windows support
+
+Some Windows features depend on facts only a real Windows PC can tell us (which apps are installed, how they name their pipes and links, and so on). If you have a Windows 11 PC, a one-minute check helps a lot:
+
+```powershell
+py scripts\windows_probe.py
+```
+
+Read the output, then paste it into a new [issue](https://github.com/glo6al/motet/issues/new) titled `Windows: probe output`.
+
+**What it does:** it prints a short report: your Windows and Python versions; whether the Codex, Claude, Cursor and Antigravity apps and command-line tools are installed (and their versions); which `.codex` folders exist; the names of related named pipes; which `claude://`, `codex://`, `cursor://` and `antigravity://` links have a handler; whether Git Bash and Windows Terminal are there; and which of those programs are running. To find that out it lists installed packages through PowerShell (`Get-AppxPackage`; PowerShell may update its own caches while doing so), lists running programs with `tasklist`, and runs `--version` or `--help` on a command-line tool only when it is a real program (never an app alias or a script shim). If a Codex program is running it checks that program's command line only for the presence of the words `exec-server` and `app-server`, and never prints the command line.
+
+**What it does not do:** it changes nothing of yours, writes no files, makes no network connection, opens no app window and sends no message. It reads no file contents beyond what each check needs, and prints none. It only checks whether `%USERPROFILE%\.claude\settings.json` has a hooks section, and prints just the hook event names. Your profile path, user name, computer name, e-mail addresses and anything that looks like a key are replaced before printing, but redaction is not perfect: **please read the output before you post it** and remove anything you would rather not share.
 
 ## Your feedback
 
