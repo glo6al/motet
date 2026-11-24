@@ -1607,6 +1607,7 @@ def named_private(path):
 
 
 _PRIVATE_TARGETS = (None, ())
+_PRIVATE_TARGETS_LOCK = threading.Lock()       # grants arrive on several log-tail threads at once
 PRIVATE_TARGETS_KEPT = 64
 
 
@@ -1615,22 +1616,25 @@ def record_private_targets():
     checks already follow them. A private folder that is a link or junction (~/.claude moved to another drive, say)
     is otherwise known only by its name, and the serving walk never follows it. The places are kept for this home
     and list of private folders, older ones too (up to PRIVATE_TARGETS_KEPT), so a folder a link pointed to when any
-    page was granted stays protected after the link is pointed elsewhere. Returns them all."""
+    page was granted stays protected after the link is pointed elsewhere. The places are resolved first, then
+    merged under a lock, so two grants at once cannot drop each other's older places. Returns them all."""
     global _PRIVATE_TARGETS
     key = (HOME, PRIVATE_ROOTS)
-    held_key, known = _PRIVATE_TARGETS
-    known = list(known) if held_key == key else []
+    found = []
     for name in private_names():
         try:
-            real = os.path.realpath(name.rstrip(os.sep))
+            found.append(os.path.realpath(name.rstrip(os.sep)))
         except (OSError, ValueError):
             continue
-        if real in known:
-            known.remove(real)
-        known.append(real)
-    known = known[-PRIVATE_TARGETS_KEPT:]
-    _PRIVATE_TARGETS = (key, tuple(known))
-    return _PRIVATE_TARGETS[1]
+    with _PRIVATE_TARGETS_LOCK:
+        held_key, known = _PRIVATE_TARGETS
+        known = list(known) if held_key == key else []
+        for real in found:
+            if real in known:
+                known.remove(real)
+            known.append(real)
+        _PRIVATE_TARGETS = (key, tuple(known[-PRIVATE_TARGETS_KEPT:]))
+        return _PRIVATE_TARGETS[1]
 
 
 def private_targets():
