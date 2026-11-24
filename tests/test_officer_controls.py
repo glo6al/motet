@@ -17,6 +17,10 @@ import officer_messaging as m
 @unittest.skipIf(os.name == 'nt', 'Codex live controls need the Mac app and read transcripts by handle-based folder walk')
 class ControlTests(unittest.TestCase):
     def setUp(self):
+        # Codex live controls exist only with the Mac app; these tests mock its bridge, so they run as a Mac.
+        mac = patch.object(sys, 'platform', 'darwin')
+        mac.start()
+        self.addCleanup(mac.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.sessions = os.path.join(self.tmp.name, 'sessions'); os.mkdir(self.sessions)
         self.sid, self.turn, self.rid = [str(uuid.uuid4()) for _ in range(3)]

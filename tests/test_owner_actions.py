@@ -22,6 +22,10 @@ import server
 @unittest.skipIf(os.name == 'nt', 'Codex relays read transcripts by handle-based folder walk; Codex messaging needs the Mac app')
 class OwnerActionsTests(unittest.TestCase):
     def setUp(self):
+        # Codex live controls exist only with the Mac app; these tests mock its bridge, so they run as a Mac.
+        mac = patch.object(sys, 'platform', 'darwin')
+        mac.start()
+        self.addCleanup(mac.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
         legacy_host = patch.multiple(server, HOME=str(self.base), CLAUDE_MANAGED=None,

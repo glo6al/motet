@@ -783,6 +783,13 @@ class StoreStorageWindows(StoreStorageCommon):
         self.refused(DATABASE_REFUSED)
         self.assertEqual(os.listdir(elsewhere), [])
 
+    def test_journal_with_a_second_name_is_refused(self):
+        self.open().close()
+        journal = os.path.join(self.state, 'officer-messages.sqlite3-journal')
+        open(journal, 'wb').close()
+        os.link(journal, os.path.join(self.base, 'elsewhere-journal'))
+        self.refused(DATABASE_REFUSED)
+
     def test_open_database_cannot_be_swapped_while_sqlite_opens_it(self):
         import private_storage
         self.open().close()
@@ -793,6 +800,33 @@ class StoreStorageWindows(StoreStorageCommon):
                 os.replace(database, database + '.moved')   # the checked handle does not share delete
         finally:
             os.close(fd)
+
+
+class DatabaseCompanions(unittest.TestCase):
+    """The Windows journal check itself, on whatever system runs the tests."""
+
+    def test_plain_journal_is_kept_and_linked_or_extra_named_ones_are_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = os.path.realpath(temp)
+            database = os.path.join(base, 'fixture.sqlite3')
+            m.check_database_companions(database)                     # none present
+            with open(database + '-journal', 'wb') as out:
+                out.write(b'fixture')
+            m.check_database_companions(database)                     # a plain leftover journal is kept
+            os.link(database + '-journal', os.path.join(base, 'second-name'))
+            with self.assertRaisesRegex(OSError, '^' + DATABASE_REFUSED + '$'):
+                m.check_database_companions(database)
+            os.unlink(os.path.join(base, 'second-name'))
+            os.mkdir(database + '-wal')
+            with self.assertRaisesRegex(OSError, '^' + DATABASE_REFUSED + '$'):
+                m.check_database_companions(database)
+            os.rmdir(database + '-wal')
+            try:
+                os.symlink(database + '-journal', database + '-shm')
+            except (OSError, NotImplementedError):
+                return                                                # Windows without the symlink privilege
+            with self.assertRaisesRegex(OSError, '^' + DATABASE_REFUSED + '$'):
+                m.check_database_companions(database)
 
 
 class CodexOffMac(unittest.TestCase):
@@ -832,6 +866,54 @@ class CodexOffMac(unittest.TestCase):
                     self.store.submit(self.codex, 'A fictional question.', str(uuid.uuid4()), self.agents)
                 self.assertEqual((refused.exception.status, str(refused.exception)),
                                  (503, 'Messaging Codex needs the Codex desktop app on a Mac for now.'))
+
+    def test_codex_controls_are_refused_before_any_read_or_save(self):
+        for platform in ('linux', 'win32'):
+            for action, text in (('steer', 'A fictional instruction.'), ('interrupt', '')):
+                request = str(uuid.uuid4())
+                with self.subTest(platform=platform, action=action), patch.object(m.sys, 'platform', platform), \
+                        patch.object(self.store, '_control_target', side_effect=AssertionError('no transcript read')):
+                    with self.assertRaises(m.MessagingError) as refused:
+                        self.store.owner_action(action, self.codex, text, request, self.agents)
+                    self.assertEqual((refused.exception.status, str(refused.exception)),
+                                     (409, 'Live controls for Codex need the Codex desktop app on a Mac for now.'))
+                    self.assertEqual(self.store._controls(), [], 'nothing was saved')
+                    with self.assertRaises(m.MessagingError) as again:          # a replay is refused the same way
+                        self.store.owner_action(action, self.codex, text, request, self.agents)
+                    self.assertEqual(again.exception.status, 409)
+
+    def test_codex_transcripts_without_a_folder_walk_are_unavailable_not_a_crash(self):
+        import codex_transcript
+        with patch.object(codex_transcript.os, 'supports_dir_fd', set()):
+            with self.assertRaises(codex_transcript.Unavailable):
+                codex_transcript.open_regular(self.store.sessions_dir, os.path.join(self.store.sessions_dir, 'x.jsonl'))
+            with self.assertRaises(m.MessagingError):
+                self.store._target_log(self.codex[2:])
+
+    def test_retained_codex_rows_are_left_alone_without_a_folder_walk(self):
+        row = dict(request_id=str(uuid.uuid4()), agent=self.codex, name='Aster', question='Fictional question',
+                   state='sending', reply='', error='', created=time.time(), launched=False, runtime='codex',
+                   path=os.path.join(self.store.sessions_dir, 'rollout-x.jsonl'), cursor=0)
+        with self.store.lock:
+            self.store._save(row)
+        import claude_channel
+        with patch.object(claude_channel, 'folder_walk_available', return_value=False), \
+                patch.object(self.store, '_send', side_effect=AssertionError('not sent')), \
+                patch.object(self.store, '_poll', side_effect=AssertionError('not tracked')):
+            self.store.tick()
+        self.assertEqual(self.store._rows()[0]['state'], 'sending')
+        self.assertFalse(self.store._rows()[0]['launched'])
+
+    def test_reason_after_claude_setup_says_to_connect_a_chat(self):
+        with patch.object(m.sys, 'platform', 'win32'):
+            self.store.codex_available, self.store.reason = self.store.probe()
+        with self.store.lock, self.store.db:
+            self.store.db.execute('INSERT INTO claude_mod_grants (id, token_hash, created, active) VALUES (?,?,?,1)',
+                                  (str(uuid.uuid4()), 'f' * 64, time.time()))
+        snapshot = self.store.snapshot()
+        self.assertFalse(snapshot['available'])
+        self.assertEqual(snapshot['reason'], 'Messaging Codex needs the Codex desktop app on a Mac for now. '
+                                             'Claude chats can be messaged once one connects through the Motet plugin.')
 
     def test_claude_chats_still_offer_setup(self):
         with patch.object(m.sys, 'platform', 'win32'):
@@ -892,6 +974,43 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
                     store.close()
             finally:
                 attachments.close()
+
+    def test_retained_attachment_state_without_a_folder_walk_is_refused_with_its_own_reason(self):
+        import claude_channel
+        import private_storage
+        state = os.path.join(self.home, '.live-room')
+        private_storage.make_private_folder(state)
+        open(os.path.join(state, 'native-attachment-namespace.expected'), 'w').close()
+        with patch.object(claude_channel, 'folder_walk_available', return_value=False):
+            store, reason = server.start_messaging()
+        self.assertIsNone(store)
+        self.assertEqual(reason, 'Agent messaging cannot start here: its state folder holds attachment or '
+                                 'managed-chat records that this system cannot check safely yet.')
+        self.assertFalse(os.path.lexists(os.path.join(state, 'officer-messages.sqlite3')), 'the database was not opened')
+        again, _ = server.start_messaging()        # the refusal released the lifetime lock
+        self.assertIsNone(again)
+
+    def test_import_failure_is_caught(self):
+        with patch.object(server, 'MessagingStore', side_effect=ImportError('fictional')):
+            self.assertEqual(server.start_messaging(), (None, server.MESSAGING_STORAGE_WHY))
+
+    def test_failure_after_the_store_is_built_closes_it(self):
+        built = []
+        real = server.MessagingStore
+        def build(*args, **kwargs):
+            built.append(real(*args, **kwargs))
+            return built[-1]
+        with patch.object(server, 'MessagingStore', side_effect=build), \
+                patch.object(server, 'start_native_attachment_maintenance', side_effect=OSError('fictional')):
+            self.assertEqual(server.start_messaging(), (None, server.MESSAGING_STORAGE_WHY))
+        self.assertIsNone(built[0].owner_fd, 'the lifetime lock was released')
+        with self.assertRaises(Exception):
+            built[0].db.execute('SELECT 1')                            # the database connection is closed
+        store, reason = server.start_messaging()                       # a later start can take the lock again
+        try:
+            self.assertIsNone(reason)
+        finally:
+            store.close()
 
     def test_refused_state_folder_leaves_messaging_off_with_the_storage_reason(self):
         state = os.path.join(self.home, '.live-room')

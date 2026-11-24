@@ -41,6 +41,9 @@ CODEX_PREVIOUS_SOURCE_UNAVAILABLE = 'The original Codex transcript is temporaril
 CODEX_NEEDS_MAC = 'Messaging Codex needs the Codex desktop app on a Mac for now.'
 CODEX_CONTROLS_NEED_MAC = 'Live controls for Codex need the Codex desktop app on a Mac for now.'
 CLAUDE_SETUP_HINT = 'Claude chats can be messaged once Claude is set up in Motet.'
+CLAUDE_CONNECT_HINT = 'Claude chats can be messaged once one connects through the Motet plugin.'
+RETAINED_STATE_UNAVAILABLE = ('Agent messaging cannot start here: its state folder holds attachment or managed-chat '
+                              'records that this system cannot check safely yet.')
 STATE_FOLDER_REFUSED = 'Messaging state directory must be private and owned by you.'
 LOCK_REFUSED = 'Messaging lock must be a private regular file.'
 DATABASE_REFUSED = 'Messaging database must be a private regular file.'
@@ -56,6 +59,10 @@ class MessagingError(Exception):
 
 class MessageNotSubmitted(MessagingError):
     """The server rejected the message before writing a queue entry."""
+
+
+class MessagingStorageUnavailable(OSError):
+    """The store refused to start for a reason the owner can be shown as it is (fixed words, no paths)."""
 
 
 def valid_uuid(value):
@@ -154,8 +161,8 @@ def private_state_file(path, create, refused):
 
 def check_database_companions(path):
     """Windows only: SQLite makes its rollback journal by name next to the database, with the folder's
-    inherited access list. Refuse a journal (or a stray -wal/-shm) that is a link, junction or not a plain file,
-    so SQLite never follows one out of the private folder. A plain leftover journal is kept: SQLite needs it to
+    inherited access list. Refuse a journal (or a stray -wal/-shm) that is a link, junction, not a plain file or a
+    file with a second name, so SQLite never writes through one to somewhere outside the private folder. A plain leftover journal is kept: SQLite needs it to
     roll back an interrupted write."""
     for suffix in ('-journal', '-wal', '-shm'):
         try:
@@ -163,7 +170,7 @@ def check_database_companions(path):
         except FileNotFoundError:
             continue
         if (stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & private_storage.REPARSE_POINT
-                or not stat.S_ISREG(info.st_mode)):
+                or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
             raise OSError(DATABASE_REFUSED)
 
 
@@ -288,6 +295,10 @@ class MessagingStore:
                       root / 'managed-claude' / 'registry.sqlite3')
         if not any(present(path) for path in candidates):
             return None
+        if not claude_channel.folder_walk_available():
+            # The fence opens these records by handle-based folder walk (and fcntl), which Windows lacks. They can
+            # only have come from a Mac or Linux copy of this folder; refuse rather than open the database unfenced.
+            raise MessagingStorageUnavailable(RETAINED_STATE_UNAVAILABLE)
         from attachments_native_namespace import NativeNamespaceFence
         fence = NativeNamespaceFence(state_dir)
         return fence if fence.detected() else None
@@ -601,7 +612,9 @@ class MessagingStore:
     def _unavailable_reason(self):
         # Off a Mac only Codex is out of reach: say how Claude chats become reachable instead.
         if self.reason == CODEX_NEEDS_MAC:
-            return CODEX_NEEDS_MAC + ' ' + CLAUDE_SETUP_HINT
+            set_up = self.db.execute('SELECT 1 FROM claude_mod_grants WHERE active=1 UNION ALL '
+                                     'SELECT 1 FROM claude_mod_enrollments WHERE active=1 LIMIT 1').fetchone()
+            return CODEX_NEEDS_MAC + ' ' + (CLAUDE_CONNECT_HINT if set_up else CLAUDE_SETUP_HINT)
         return self.reason
 
     def owner_capabilities(self, agent, agents):
@@ -849,6 +862,10 @@ class MessagingStore:
                 return self._public_control(old)
             if self.db.execute('SELECT 1 FROM requests WHERE id=?', (request_id,)).fetchone():
                 raise MessagingError(409, 'That request identifier already belongs to a queued message.')
+            if sys.platform != 'darwin':
+                # Live controls drive the Codex desktop app's local bridge, which only exists on a Mac. Refuse
+                # before reading any transcript or saving a control, so nothing is left 'sending'.
+                raise MessagingError(409, CODEX_CONTROLS_NEED_MAC)
             now = time.time()
             rows = self._controls()
             retained = [r for r in rows if now - r['created'] <= RETENTION or r['state'] == 'sending']
@@ -1703,6 +1720,10 @@ class MessagingStore:
         for row in rows:
             if row.get('transport') == claude_mod.TRANSPORT:
                 continue  # HTTP claims/events exclusively own these rows; no stale tick writeback.
+            if row.get('runtime') == 'codex' and not claude_channel.folder_walk_available():
+                # Windows: a Codex row can only have come from a copy of a Mac's folder. Sending and reply
+                # tracking read its transcript by a folder walk Windows lacks; leave the row exactly as it is.
+                continue
             if self.stop.is_set():
                 break
             peer = row.get('origin') == 'peer'
