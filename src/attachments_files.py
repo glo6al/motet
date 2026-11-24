@@ -300,10 +300,13 @@ class PrivateFiles:
                     fail('storage_unavailable', 'Attachment storage changed.', 503)
             finally:
                 os.close(fd)
-            # SQLite makes its journal by name, with the folder's inherited access list (private, but not protected
-            # as a file made here is), so the file rule would refuse it: it must be a plain file with one name, owned
-            # by this user, whose list names only this user, SYSTEM, Administrators or OWNER RIGHTS.
-            if not ps.sqlite_companions_private(str(self.root / 'ledger.sqlite3')):
+            # SQLite makes its journal by name with no security attributes of its own, so it takes the creating
+            # token's default owner (Administrators when Motet runs elevated) and the folder's inherited access list
+            # (private, but not protected as a file made here is). The file rule would refuse it, so the companion
+            # rule applies: a plain file with one name, owned by this user, Administrators or SYSTEM, whose list
+            # names only this user, SYSTEM, Administrators or OWNER RIGHTS. Do not narrow the owner back to this
+            # user: every write would then fail on an elevated Motet. Checked through the held storage folder.
+            if not ps.sqlite_companions_private(str(self.root / 'ledger.sqlite3'), folder=self._root):
                 _unavailable()
             return
         if _posix_private(os.stat('ledger.sqlite3', dir_fd=self.root_fd, follow_symlinks=False))[:2] != self.db_identity:

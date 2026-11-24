@@ -788,7 +788,7 @@ def _win_companion_check(handle):
             kernel.LocalFree(sd)
 
 
-def sqlite_companions_private(path):
+def sqlite_companions_private(path, folder=None):
     """``sqlite_companions_plain``, and each companion that exists must also be private.
 
     POSIX: the attachment store's own rule: a regular file with one name, owned by this user, mode exactly 0600
@@ -796,7 +796,9 @@ def sqlite_companions_private(path):
     a reparse point and checked on its handle: a plain file with one name, and ``companion_verdict`` (owner this
     user, Administrators or SYSTEM; the folder rule for the list, which need not be protected). A leftover journal
     someone opened up to others is refused. A companion that is being removed (delete pending, still open in a
-    scanner, say) counts as absent; any other failure to open one refuses."""
+    scanner, say) counts as absent; any other failure to open one refuses. On Windows ``folder`` may be the held
+    NoLinkFolder for ``path``'s folder (the walk refused any reparse point and checked it is a folder when it opened
+    it); the companions are then opened through that handle instead of opening the folder again by path."""
     if not WIN:
         for suffix in ('-journal', '-wal', '-shm'):
             try:
@@ -811,14 +813,25 @@ def sqlite_companions_private(path):
                 return False
         return True
     folder_path, base = os.path.split(path)
-    try:
-        folder = _win_open(folder_path or '.', _HOLD_ACCESS, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE, _OPEN_EXISTING, 0)
-    except OSError:
-        return False
+    if folder is not None:
+        folder._held()
+        parent, owned = folder._handles[-1], False
+    else:
+        try:
+            parent = _win_open(folder_path or '.', _HOLD_ACCESS, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE,
+                               _OPEN_EXISTING, 0)
+        except OSError:
+            return False
+        try:
+            _win_kind(_win_facts(parent), True, 'folder')      # a plain folder, not a junction to one
+        except PrivateStorageError:
+            _win_close(parent)
+            return False
+        owned = True
     try:
         for suffix in ('-journal', '-wal', '-shm'):
             try:
-                handle = _win_child(folder, base + suffix, _READ_CONTROL | _FILE_READ_ATTRIBUTES,
+                handle = _win_child(parent, base + suffix, _READ_CONTROL | _FILE_READ_ATTRIBUTES,
                                     _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE, None)
             except OSError as e:
                 status = getattr(e, 'ntstatus', 0)
@@ -834,7 +847,8 @@ def sqlite_companions_private(path):
                 _win_close(handle)
         return True
     finally:
-        _win_close(folder)
+        if owned:
+            _win_close(parent)
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ class DeletionTests(unittest.TestCase):
         self.workers = []
 
     def tearDown(self):
-        for worker in self.workers: worker.close(2)
+        for worker in self.workers: worker.close(30)
         self.f.tearDown()
 
     def add(self, raw=PDF):
@@ -263,8 +263,8 @@ class DeletionTests(unittest.TestCase):
         lease.close()
         with self.store.files._io_condition:
             # Event-based observation of removal completion; no production polling.
-            self.store.files._io_condition.wait_for(lambda: not (self.store.files.root / 'objects' / source).exists(), timeout=2)
-        worker.close(2)
+            self.store.files._io_condition.wait_for(lambda: not (self.store.files.root / 'objects' / source).exists(), timeout=30)   # generous: slow Windows runners
+        worker.close(30)
         self.assertEqual(self.status(p)['state'], 'deleted'); self.assertEqual(self.store.storage()['usedBytes'], used - len(PDF))
 
     def test_startup_recovery_visits_unknown_before_nonboundary_cursor(self):
@@ -284,8 +284,8 @@ class DeletionTests(unittest.TestCase):
             return result
         with mock.patch.object(self.store.files, 'remove', side_effect=remove):
             worker = DeletionWorker(self.l); self.workers.append(worker)
-            self.assertTrue(visited.wait(3), 'startup recovery skipped slot61 before cursor75')
-            worker.close(3)
+            self.assertTrue(visited.wait(30), 'startup recovery skipped slot61 before cursor75')   # returns once visited
+            worker.close(30)
         self.assertEqual(self.status(p)['state'], 'deleted')
 
     def test_deletion_uses_reserved_fence_space_at_actual_sqlite_full(self):

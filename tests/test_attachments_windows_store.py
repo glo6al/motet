@@ -321,9 +321,9 @@ class CleanupWorkerTests(unittest.TestCase):
         with mock.patch.object(store.files, 'remove', side_effect=remove):
             worker = DeletionWorker(deletions)
             try:
-                self.assertTrue(removed.wait(5), 'the worker never reached the file')
+                self.assertTrue(removed.wait(30), 'the worker never reached the file')   # returns once reached
             finally:
-                worker.close(5)
+                worker.close(30)
         self.assertIn((True, 'removed'), calls)
         self.assertFalse((store.files.root / 'objects' / source).exists())
         self.assertEqual(deletions.status(prepared['id'], prepared['capability'])['state'], 'deleted')
