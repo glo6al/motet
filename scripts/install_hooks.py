@@ -18,7 +18,8 @@ file in place of ~/.claude/settings.json (the tests use it).
 
 On macOS and Linux the hooks are shell commands that use curl. On Windows they are Claude Code's "exec form": this
 Python runs scripts/motet_hook.py directly, with no shell, and that script does what the curl commands do. Exec form
-needs Claude Code 2.1.139 or later; the installer refuses an older claude it can find.
+needs Claude Code 2.1.139 or later; the installer refuses an older one whose version it can read. The Windows
+hooks name this Python and this folder by their full paths: after moving either, run the installer again.
 
 The hooks trust whatever process is listening on that port: they send it the key, and the PermissionRequest hook
 passes on its Allow or Deny. Nothing here proves that process is Motet. While the server is not running, another
@@ -77,31 +78,65 @@ def windows_python(python):
     if low.endswith(('.cmd', '.bat')):
         return 'This Python is a .cmd or .bat file (%s), which Claude Code cannot start without a shell.' % python
     if low.rsplit('\\', 1)[-1] == 'pythonw.exe':
-        return 'Run this with python.exe or py, not pythonw.exe, so the hook has a console to answer on.'
+        return ('Run this with py or python.exe, not pythonw.exe: the hooks are installed with the Python that runs this, '
+                'and only the ordinary python.exe is checked by the tests.')
     if not os.path.isabs(python):
         return 'Python reports no full path for itself (%s), so the hook could not name it.' % python
     return ''
 
 
-def installed_claude_version():
-    """The version of the claude command on PATH, or None if there is none or it cannot be read quickly. A .cmd
-    shim (an npm install on Windows) needs a shell to run, so it is not asked."""
-    exe = shutil.which('claude')
-    if not exe or (os.name == 'nt' and not exe.lower().endswith('.exe')):
-        return None
+NPM_PACKAGE = ('node_modules', '@anthropic-ai', 'claude-code', 'package.json')     # beside npm's claude.cmd
+
+
+def find_claude(path=None, pathext=None):
+    """The claude program Windows would pick from PATH, or None. Only full folder names in PATH are searched: unlike
+    shutil.which on Windows, never the current folder, so a claude.exe left in it is never found or run."""
+    dirs = (os.environ.get('PATH', '') if path is None else path).split(os.pathsep)
+    exts = [e for e in ((os.environ.get('PATHEXT') or '.COM;.EXE;.BAT;.CMD') if pathext is None else pathext).split(';') if e]
+    for d in dirs:
+        d = d.strip().strip('"')
+        if not d or not os.path.isabs(d):
+            continue
+        for ext in exts:
+            p = os.path.join(d, 'claude' + ext.lower())
+            if os.path.lexists(p) and not os.path.isdir(p):
+                return p
+    return None
+
+
+def installed_claude_version(path=None, pathext=None):
+    """(version or None, the claude program found or ''). An npm install (claude.cmd) is read from its package.json,
+    since a .cmd needs a shell to run. An app execution alias (in a WindowsApps folder) may start an app, so it is
+    never run. Only a real .exe is asked for --version, with a short timeout."""
+    exe = find_claude(path, pathext)
+    if not exe:
+        return None, ''
+    low = exe.replace('/', '\\').lower()
+    if '\\windowsapps\\' in low:
+        return None, exe
+    if low.endswith(('.cmd', '.bat')):
+        try:
+            with open(os.path.join(os.path.dirname(exe), *NPM_PACKAGE), encoding='utf-8-sig') as f:
+                v = json.load(f).get('version')
+        except (OSError, ValueError, AttributeError):
+            return None, exe
+        m = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?:[-+].*)?', v) if isinstance(v, str) else None
+        return (tuple(int(x) for x in m.groups()) if m else None), exe
+    if not low.endswith('.exe'):
+        return None, exe
     try:
         out = subprocess.run([exe, '--version'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, timeout=10).stdout.decode('utf-8', 'replace')
     except (OSError, subprocess.SubprocessError):
-        return None
+        return None, exe
     m = re.search(r'(\d+)\.(\d+)\.(\d+)', out)
-    return tuple(int(x) for x in m.groups()) if m else None
+    return (tuple(int(x) for x in m.groups()) if m else None), exe
 
 
 def read(path):
     if not os.path.exists(path):
         return ''
-    with open(path, encoding='utf-8') as f:     # closed at once: Windows will not replace a file that is still open
+    with open(path, encoding='utf-8-sig') as f:     # closed at once: Windows will not replace a file that is still open
         return f.read()
 
 
@@ -120,13 +155,18 @@ def run(remove=False, win=None, settings=None, port=None, python=None, claude_ve
             sys.exit(why)
         TELL, ASK = exec_commands(PORT, python)
         if not remove:
-            have = claude_version() if claude_version else None
+            have, found = claude_version() if claude_version else (None, '')
             need = '.'.join(map(str, MIN_CLAUDE))
+            name = found.replace('\\', '/').rsplit('/', 1)[-1]
             if have is not None and have < MIN_CLAUDE:
-                sys.exit('Claude Code %s is installed; these hooks need %s or later. Update Claude Code, then run this again.'
-                         % ('.'.join(map(str, have)), need))
-            notes.append('These hooks need Claude Code %s or later%s. The Claude desktop app carries its own copy; keep '
-                         'it up to date too.' % (need, '' if have else ' (no claude command found to check)'))
+                sys.exit('Claude Code %s is installed (%s); these hooks need %s or later. Update Claude Code, then run this '
+                         'again.' % ('.'.join(map(str, have)), name, need))
+            seen = ('found %s %s' % (name, '.'.join(map(str, have))) if have else
+                    'found %s; its version could not be checked' % name if found else 'no claude command found to check')
+            notes.append('These hooks need Claude Code %s or later (%s). The Claude desktop app carries its own copy; '
+                         'keep it up to date too.' % (need, seen))
+            notes.append('The hooks name this Python and this folder by their full paths. If you move the folder or '
+                         'change Python, run this again.')
             notes.append('Checked by automated tests only, not yet against a real Claude Code prompt on a Windows PC.')
     else:
         TELL, ASK = shell_commands(PORT)
@@ -161,11 +201,18 @@ def run(remove=False, win=None, settings=None, port=None, python=None, claude_ve
     if now != before:
         os.unlink(tmp)
         sys.exit('settings.json changed while this was running; nothing written. Run it again.')
-    try:
-        os.replace(tmp, P)
-    except OSError:
-        os.unlink(tmp)
-        raise
+    for tries in range(5):
+        try:
+            os.replace(tmp, P)
+            break
+        except PermissionError:          # Windows refuses while another program (Claude Code, a virus scanner) has it open
+            if os.name != 'nt' or tries == 4:
+                os.unlink(tmp)
+                raise
+            time.sleep(0.2)
+        except OSError:
+            os.unlink(tmp)
+            raise
     return '\n'.join(['%s -> %s' % ('removed' if remove else 'installed', P)] + notes)
 
 

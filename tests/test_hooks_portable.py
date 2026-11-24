@@ -79,13 +79,12 @@ class HookTests(unittest.TestCase):
 
     def env(self, **extra):
         e = {k: v for k, v in os.environ.items() if not k.lower().endswith('_proxy')}
-        e.pop('MOTET_HOOK_TEST_TIMEOUT', None)
         e.update(HOME=str(self.home), USERPROFILE=str(self.home))
         e.update(extra)
         return e
 
-    def hook(self, mode, port=None, stdin=PAYLOAD, argv=None, **env):
-        argv = argv or [sys.executable, '-I', str(HOOK), mode, str(port or self.port), install_hooks.MARK]
+    def hook(self, mode, port=None, stdin=PAYLOAD, argv=None, extra=(), **env):
+        argv = argv or [sys.executable, '-I', str(HOOK), mode, str(port or self.port), install_hooks.MARK] + list(extra)
         r = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env(**env), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn(KEY.encode(), r.stdout + r.stderr)
@@ -136,8 +135,16 @@ class HookTests(unittest.TestCase):
     def test_ask_prints_nothing_when_the_server_is_too_slow(self):
         self.reply(ALLOW, kind='slow')
         start = time.time()
-        self.assertEqual(self.hook('ask', MOTET_HOOK_TEST_TIMEOUT='0.5'), b'')
+        self.assertEqual(self.hook('ask', extra=['--test-timeout=0.5']), b'')
         self.assertLess(time.time() - start, 20)
+
+    def test_the_time_limit_cannot_be_set_from_the_environment_or_lengthened(self):
+        import motet_hook
+        self.assertEqual(motet_hook.limit('ask', ['x', 'ask', '1', install_hooks.MARK]), 320)
+        self.assertEqual(motet_hook.limit('ask', ['x', 'ask', '1', '--test-timeout=9999']), 320)
+        self.assertEqual(motet_hook.limit('tell', ['x', 'tell', '1', '--test-timeout=0.25']), 0.25)
+        self.assertEqual(motet_hook.limit('ask', ['x', 'ask', '1', '--test-timeout=nan']), 320)
+        self.assertEqual(self.hook('ask', MOTET_HOOK_TEST_TIMEOUT='0.001'), ALLOW.encode())
 
     def test_missing_or_malformed_header_sends_nothing(self):
         header = self.home / '.live-room' / 'header'
@@ -180,7 +187,7 @@ class HookTests(unittest.TestCase):
     def test_installed_windows_entry_runs_as_written(self):
         """Run the exact program and arguments the installer writes for Windows, as Claude Code's exec form would."""
         settings = self.home / 'settings.json'
-        install_hooks.run(win=True, settings=str(settings), port=str(self.port), claude_version=lambda: None)
+        install_hooks.run(win=True, settings=str(settings), port=str(self.port), claude_version=lambda: (None, ''))
         hooks = json.loads(settings.read_text(encoding='utf-8'))['hooks']
         ask = hooks['PermissionRequest'][0]['hooks'][0]
         tell = hooks['Stop'][0]['hooks'][0]
@@ -221,9 +228,12 @@ class RealServerTests(unittest.TestCase):
         (self.home / '.live-room' / 'header').write_text('X-Live-Room-Key: %s\n' % KEY, encoding='utf-8')
         self.httpd = server.Server(('127.0.0.1', 0), server.H)
         self.port = self.httpd.server_port
+        self.errors = []                # what socketserver would print to Motet's console as a traceback
+        self.httpd.handle_error = lambda request, address: self.errors.append(sys.exc_info()[1])
         self.emitted = []
         self.patches = [patch.object(server, name, value) for name, value in (
             ('PORT', self.port), ('KEY', KEY), ('APPROVER', time.time() + 3600), ('PENDING', {}), ('AGENTS', {}), ('HOOKED', {}),
+            ('HOOK_SEEN', {'Stop', 'SubagentStop'}),
             ('describe', lambda aid, old=False, **kw: server.AGENTS.setdefault(aid, {})),
             ('emit', lambda aid, kind, old, **kw: self.emitted.append((kind, kw.get('how')))),
             ('claude_permission_ownership', lambda *a, **k: {'classification': 'unmanaged', 'checkRequired': False}))]
@@ -239,12 +249,14 @@ class RealServerTests(unittest.TestCase):
             p.stop()
         self.tmp.cleanup()
 
-    def hook(self, mode, **env):
+    def hook(self, mode, extra=()):
         e = {k: v for k, v in os.environ.items() if not k.lower().endswith('_proxy')}
-        e.pop('MOTET_HOOK_TEST_TIMEOUT', None)
-        e.update(HOME=str(self.home), USERPROFILE=str(self.home), **env)
-        return subprocess.Popen([sys.executable, '-I', str(HOOK), mode, str(self.port), install_hooks.MARK], stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e)
+        e.update(HOME=str(self.home), USERPROFILE=str(self.home))
+        return subprocess.Popen([sys.executable, '-I', str(HOOK), mode, str(self.port), install_hooks.MARK] + list(extra),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e)
+
+    def idle(self):
+        return self.wait_for(lambda: self.server_mod.Server.active == 0)
 
     def wait_for(self, check, seconds=15):
         end = time.time() + seconds
@@ -256,14 +268,21 @@ class RealServerTests(unittest.TestCase):
 
     def decide(self, allow):
         proc = self.hook('ask')
-        proc.stdin.write(self.PAYLOAD)
-        proc.stdin.close()
+        result = []                     # communicate() in a thread: it writes stdin, closes it, and collects the output
+        talk = threading.Thread(target=lambda: result.append(proc.communicate(self.PAYLOAD, timeout=60)), daemon=True)
+        talk.start()
         pending = self.server_mod.PENDING
-        self.assertTrue(self.wait_for(lambda: len(pending) == 1), 'the server never held the request')
-        (p,) = list(pending.values())
-        p['allow'] = allow
-        p['event'].set()
-        out, err = proc.communicate(timeout=30)
+        try:
+            self.assertTrue(self.wait_for(lambda: len(pending) == 1), 'the server never held the request')
+            (p,) = list(pending.values())
+            p['allow'] = allow
+            p['event'].set()
+            talk.join(60)
+            (out, err), = result
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
         self.assertEqual(proc.returncode, 0, err)
         return out
 
@@ -281,8 +300,26 @@ class RealServerTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: ('waiting', None) in self.emitted))
         self.assertIn('c:' + self.SESSION, self.server_mod.AGENTS)
 
+    def test_server_logs_no_error_when_the_hook_is_done(self):
+        """The hook reads the server's whole reply and asks for the connection to close, so the server never meets
+        a reset connection (which socketserver would print as a traceback on Motet's console)."""
+        body = json.dumps({'session_id': self.SESSION, 'hook_event_name': 'Stop'}).encode()
+        for _ in range(8):
+            out, err = self.hook('tell').communicate(body, timeout=30)
+            self.assertEqual(out, b'')
+        (self.home / '.live-room' / 'header').write_text('X-Live-Room-Key: wrong-key-0123456789abcdefghijk\n', encoding='utf-8')
+        for mode in ('tell', 'ask') * 4:                     # refused with 403: a reply the hook does not use
+            out, err = self.hook(mode).communicate(self.PAYLOAD, timeout=30)
+            self.assertEqual(out, b'')
+        self.assertTrue(self.idle())
+        self.assertEqual(self.errors, [])
+        (self.home / '.live-room' / 'header').write_text('X-Live-Room-Key: %s\n' % KEY, encoding='utf-8')
+        self.assertEqual(self.decide(True), ALLOW.encode())
+        self.assertTrue(self.idle())
+        self.assertEqual(self.errors, [])
+
     def test_hook_leaving_while_held_releases_the_request(self):
-        proc = self.hook('ask', MOTET_HOOK_TEST_TIMEOUT='1')
+        proc = self.hook('ask', ['--test-timeout=1'])
         out, err = proc.communicate(self.PAYLOAD, timeout=30)
         self.assertEqual((proc.returncode, out), (0, b''))
         pending = self.server_mod.PENDING
@@ -324,7 +361,7 @@ class InstallerTests(unittest.TestCase):
 
     def install(self, win, remove=False, python=None):
         return install_hooks.run(remove=remove, win=win, settings=str(self.settings), port='8123',
-                                 python=python or self.PYTHON, claude_version=lambda: None)
+                                 python=python or self.PYTHON, claude_version=lambda: (None, ''))
 
     def hooks(self):
         return json.loads(self.settings.read_text(encoding='utf-8')).get('hooks', {})
@@ -427,12 +464,56 @@ class InstallerTests(unittest.TestCase):
     def test_refuses_an_old_claude_and_notes_the_minimum(self):
         before = self.settings.read_bytes()
         with self.assertRaises(SystemExit) as e:
-            install_hooks.run(win=True, settings=str(self.settings), port='8123', python=self.PYTHON, claude_version=lambda: (2, 1, 138))
+            install_hooks.run(win=True, settings=str(self.settings), port='8123', python=self.PYTHON, claude_version=lambda: ((2, 1, 138), r'C:\tools\claude.exe'))
         self.assertIn('2.1.139', str(e.exception))
         self.assertEqual(self.settings.read_bytes(), before)
-        out = install_hooks.run(win=True, settings=str(self.settings), port='8123', python=self.PYTHON, claude_version=lambda: (2, 1, 139))
+        out = install_hooks.run(win=True, settings=str(self.settings), port='8123', python=self.PYTHON, claude_version=lambda: ((2, 1, 139), r'C:\tools\claude.exe'))
         self.assertIn('2.1.139', out)
         self.assertIn('installed', out)
+
+    def test_finding_claude_and_its_version_without_running_shims_or_aliases(self):
+        from unittest.mock import patch
+        base = Path(self.tmp.name)
+        npm, bare, alias, cwd = (base / n for n in ('npm', 'bare', 'WindowsApps', 'here'))
+        for d in (npm, bare, alias, cwd):
+            d.mkdir()
+        for d, name in ((npm, 'claude.cmd'), (bare, 'claude.cmd'), (alias, 'claude.exe'), (cwd, 'claude.exe')):
+            (d / name).write_bytes(b'')
+        pkg = npm.joinpath(*install_hooks.NPM_PACKAGE)
+        pkg.parent.mkdir(parents=True)
+        pkg.write_text('\ufeff{"name": "@anthropic-ai/claude-code", "version": "2.1.200"}', encoding='utf-8')
+        ext = '.EXE;.CMD'
+        old = os.getcwd()
+        os.chdir(str(cwd))
+        try:
+            with patch.object(install_hooks.subprocess, 'run', side_effect=AssertionError('must not run')):
+                self.assertEqual(install_hooks.installed_claude_version(os.pathsep.join(['', '.', 'here']), ext), (None, ''))
+                self.assertEqual(install_hooks.installed_claude_version(str(npm), ext), ((2, 1, 200), str(npm / 'claude.cmd')))
+                self.assertEqual(install_hooks.installed_claude_version(str(bare), ext), (None, str(bare / 'claude.cmd')))
+                self.assertEqual(install_hooks.installed_claude_version(os.pathsep.join([str(alias), str(npm)]), ext),
+                                 (None, str(alias / 'claude.exe')))
+        finally:
+            os.chdir(old)
+        found = lambda v, name: (lambda: (v, str(base / name)))
+        with self.assertRaises(SystemExit) as e:
+            self.install_with(found((2, 1, 100), 'claude.cmd'))
+        self.assertIn('2.1.100', str(e.exception))
+        out = self.install_with(found(None, 'claude.cmd'))
+        self.assertIn('found claude.cmd; its version could not be checked', out)
+        self.assertIn('2.1.139', out)
+        self.assertIn('run this again', out)
+        self.assertIn('no claude command found', self.install_with(lambda: (None, '')))
+        self.assertIn('found claude.cmd 2.1.200', self.install_with(found((2, 1, 200), 'claude.cmd')))
+
+    def install_with(self, version):
+        return install_hooks.run(win=True, settings=str(self.settings), port='8123', python=self.PYTHON, claude_version=version)
+
+    def test_settings_with_a_byte_order_mark(self):
+        self.settings.write_bytes(b'\xef\xbb\xbf' + self.settings.read_bytes())
+        self.install(True)
+        self.install(True, remove=True)
+        self.assertEqual(self.hooks(), self.others)
+        self.assertFalse(self.settings.read_bytes().startswith(b'\xef\xbb\xbf'))
 
     def test_command_line_uses_the_settings_override(self):
         env = {k: v for k, v in os.environ.items()}
