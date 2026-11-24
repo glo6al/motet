@@ -537,6 +537,37 @@ class SqliteCompanions(unittest.TestCase):
             os.mkdir(database + '-shm')
             self.assertFalse(ps.sqlite_companions_plain(database))
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX modes; WindowsWalk checks the Windows rule')
+    def test_private_companions_must_also_be_this_users_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = os.path.join(os.path.realpath(tmp), 'fixture.sqlite3')
+            self.assertTrue(ps.sqlite_companions_private(database))
+            fd = ps.create_private_file(database + '-journal')
+            os.close(fd)
+            self.assertTrue(ps.sqlite_companions_private(database))
+            os.chmod(database + '-journal', 0o644)
+            self.assertFalse(ps.sqlite_companions_private(database))
+            os.unlink(database + '-journal')
+            os.symlink(database, database + '-wal')
+            self.assertFalse(ps.sqlite_companions_private(database))
+
+
+class FileIdentity(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Windows reads it from the handle; see WindowsWalk')
+    def test_posix_identity_is_fstat_as_always(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(os.path.realpath(tmp), 'fixture')
+            fd = ps.create_private_file(path)
+            try:
+                info = os.fstat(fd)
+                self.assertEqual(ps.file_identity(fd), (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                                                         info.st_ctime_ns))
+            finally:
+                os.close(fd)
+            with ps.open_folder(os.path.realpath(tmp)) as folder:
+                info = os.stat(os.path.realpath(tmp))
+                self.assertEqual(folder.identity()[:2], (info.st_dev, info.st_ino))
+
 
 # ---------------------------------------------------------------------------
 # The no-link folder walk (open_folder, open_no_links).
@@ -1171,7 +1202,8 @@ class SimulatedWindowsWalk(unittest.TestCase):
                         patch.object(ps, '_win_access_mask', lambda handle: self.handles[handle][2]),
                         patch.object(ps, '_private_descriptor', fake_descriptor),
                         patch.object(ps, '_win_file_id', lambda handle: id(self.handles[handle][0])),
-                        patch.object(ps, '_win_file_system', lambda handle: self.file_systems.get(self.handles[handle][1], 'NTFS'))]
+                        patch.object(ps, '_win_file_system', lambda handle: self.file_systems.get(self.handles[handle][1], 'NTFS')),
+                        patch.object(ps, '_win_identity', lambda handle: (0x1234ABCD, id(self.handles[handle][0]), 0, 0, 0))]
         self.file_systems = {}
         for p in self.patches:
             p.start()
@@ -1697,6 +1729,13 @@ class SimulatedWindowsWalk(unittest.TestCase):
         claude.close()
         self.assert_nothing_open()
 
+    def test_identities_are_read_from_the_handle(self):
+        fd = ps.open_no_links(self.FILE_PATH)
+        self.assertEqual(ps.file_identity(fd)[:2], (0x1234ABCD, id(self.chat)))
+        with ps.open_folder(self.CLAUDE) as claude:
+            self.assertEqual(claude.identity()[:2], (0x1234ABCD, id(self.claude())))
+        self.assert_nothing_open()
+
     def test_the_file_system_is_read_through_the_held_handle(self):
         with ps.open_folder(self.CLAUDE) as claude:
             self.assertEqual(claude.file_system(), 'NTFS')
@@ -1962,6 +2001,43 @@ class WindowsWalk(unittest.TestCase):
         os.close(ps.open_no_links(private, directory=True, private=True))
         icacls(secret, '/grant', EVERYONE_READ)
         reason(self, lambda: os.close(ps.open_no_links(secret, private=True)), 'access')
+
+    def test_identities_come_from_the_handle_with_the_32_bit_volume_serial(self):
+        import ctypes
+        from ctypes import wintypes as w
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        serial = w.DWORD()
+        self.assertTrue(kernel.GetVolumeInformationW(os.path.splitdrive(self.file)[0] + '\\', None, 0,
+                                                     ctypes.byref(serial), None, None, None, 0))
+        fd = ps.open_no_links(self.file)
+        try:
+            volume, index, size, written, created = ps.file_identity(fd)
+            info = os.fstat(fd)
+        finally:
+            os.close(fd)
+        self.assertEqual(volume, serial.value, 'the 32-bit serial, whatever this Python reports as st_dev')
+        self.assertLessEqual(volume, 2 ** 32 - 1)
+        self.assertEqual((size, written), (info.st_size, info.st_mtime_ns))
+        self.assertEqual(index & 0xFFFFFFFFFFFF, info.st_ino & 0xFFFFFFFFFFFF, 'the same NTFS record')
+        with ps.open_folder(self.middle) as middle:
+            self.assertEqual(middle.identity()[0], serial.value)
+
+    def test_private_companions_follow_the_folder_rule(self):
+        private = os.path.join(self.base, 'private')
+        ps.make_private_folder(private)
+        database = os.path.join(private, 'fixture.sqlite3')
+        self.assertTrue(ps.sqlite_companions_private(database))
+        with open(database + '-journal', 'wb') as out:
+            out.write(b'')                         # inherits the private folder's list, as SQLite's journal does
+        if not owned_by(database + '-journal'):
+            subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % (database + '-journal'),
+                           shell=True, check=True, capture_output=True, timeout=30)
+        self.assertTrue(ps.sqlite_companions_private(database), 'inherited, private: allowed')
+        icacls(database + '-journal', '/grant', EVERYONE_READ)
+        self.assertFalse(ps.sqlite_companions_private(database))
+        os.remove(database + '-journal')
+        junction(database + '-wal', private)
+        self.assertFalse(ps.sqlite_companions_private(database))
 
     def test_a_hold_alone_keeps_the_folders_above_in_place_and_reports_ntfs(self):
         with ps.open_folder(self.middle, writable=True, alone=True) as middle:
@@ -2294,6 +2370,14 @@ class WindowsChanges(unittest.TestCase):
             reason(self, lambda: ps.unwritable(fd), 'owner')
         finally:
             os.close(fd)
+
+
+def owned_by(path):
+    try:
+        ps.windows_security(path)
+        return True
+    except ps.PrivateStorageError as e:
+        return e.reason != 'owner'
 
 
 def windows_handle_check(path):

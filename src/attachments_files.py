@@ -38,16 +38,23 @@ def _unavailable():
     fail('storage_unavailable', 'Private attachment storage is unavailable.', 503)
 
 
-def private(st, directory=False):
-    """The POSIX rule on a stat result. Windows' stat carries no owner or mode, so there it always refuses: use
-    ``private_fd`` on an open descriptor instead (a call that reaches here on Windows fails closed)."""
-    if ps.WIN:
-        _unavailable()
+def _posix_private(st, directory=False):
+    """The POSIX rule on a stat result: the right type, this user's uid, mode exactly 0600 (0700 for a folder) and
+    one name. Returns the identity."""
     if (not (stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode))
             or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != (0o700 if directory else 0o600)
             or not directory and st.st_nlink != 1):
         _unavailable()
     return identity(st)
+
+
+def private(st, directory=False):
+    """The POSIX rule on a stat result, for callers outside the store. Windows' stat carries no owner or mode, so
+    there it always refuses: use ``private_fd`` on an open descriptor instead (a call that reaches here on Windows
+    fails closed)."""
+    if ps.WIN:
+        _unavailable()
+    return _posix_private(st, directory)
 
 
 # Identities are stored and checked as integers of at most 2**63-1 (the validators in attachments_catalogue,
@@ -58,27 +65,35 @@ def private(st, directory=False):
 _ID_LIMIT = 2 ** 63 - 1
 
 
-def _id_ok(st):
-    if not (0 <= st.st_dev <= _ID_LIMIT and 0 < st.st_ino <= _ID_LIMIT):
+def _id_ok(values):
+    """A Windows identity (``private_storage.file_identity``: volume serial, file index, size, write time, creation
+    time) as a list, refused when the volume or index does not fit the stored range."""
+    if not (0 <= values[0] <= _ID_LIMIT and 0 < values[1] <= _ID_LIMIT):
         _unavailable()
-    return st
+    return list(values)
 
 
-def private_fd(fd, directory=False):
-    """``private`` for an open descriptor: on POSIX exactly ``private(os.fstat(fd))``; on Windows the owner, access
-    list, type and link count are read on its handle, and the identity must fit the stored range."""
-    if not ps.WIN:
-        return private(os.fstat(fd), directory)
+def _private_fd(fd, windows, directory=False):
+    """``private`` for an open descriptor. POSIX: exactly ``private(os.fstat(fd))``. Windows: the owner, access list,
+    type and link count are read on its handle, and the identity comes from the handle too (its 32-bit volume serial
+    and 64-bit file index, size and times), never from Python's fstat, whose st_dev and st_ino changed in 3.12."""
+    if not windows:
+        return _posix_private(os.fstat(fd), directory)
     try:
         ps.check_private_fd(fd, directory, single_link=not directory)
     except ps.PrivateStorageError:
         _unavailable()
-    return identity(_id_ok(os.fstat(fd)))
+    return _id_ok(ps.file_identity(fd))
+
+
+def private_fd(fd, directory=False):
+    return _private_fd(fd, ps.WIN, directory)
 
 
 def _folder_identity(folder):
-    """[st_dev, st_ino] of a held folder whose privacy was checked when it was opened (Windows)."""
-    return identity(_id_ok(folder.stat()))[:2]
+    """[volume, file index] of a held Windows folder, from its handle; its owner and access list were checked when
+    it was opened."""
+    return _id_ok(folder.identity())[:2]
 
 
 class _BufferLease:
@@ -162,7 +177,7 @@ class PrivateFiles:
             st = ancestor.lstat()
             if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
                 _unavailable()
-        private(self.parent.lstat(), True)
+        _posix_private(self.parent.lstat(), True)
         try:
             self.root.mkdir(mode=0o700)
         except FileExistsError:
@@ -204,7 +219,7 @@ class PrivateFiles:
             self.lock_fd = self._root.open_or_create('writer.lock')
         except ps.PrivateStorageError:
             _unavailable()
-        self.lock_identity = private_fd(self.lock_fd)[:2]
+        self.lock_identity = self.private_fd(self.lock_fd)[:2]
         if not ps.try_lock(self.lock_fd):
             raise BlockingIOError(errno.EWOULDBLOCK, 'Attachment storage is in use by another Motet.')
         try:
@@ -223,15 +238,15 @@ class PrivateFiles:
     def _held_identity(self, folder):
         if self._windows:
             return _folder_identity(folder)        # its owner and access list were checked when it was opened
-        return private(os.fstat(folder._fd), True)[:2]
+        return _posix_private(os.fstat(folder._fd), True)[:2]
 
     def verify(self):
         if not self._windows:
-            if private(self.root.lstat(), True)[:2] != self.root_identity:
+            if _posix_private(self.root.lstat(), True)[:2] != self.root_identity:
                 fail('storage_unavailable', 'Attachment storage changed.', 503)
-            if private(os.stat('writer.lock', dir_fd=self.root_fd, follow_symlinks=False))[:2] != self.lock_identity:
+            if _posix_private(os.stat('writer.lock', dir_fd=self.root_fd, follow_symlinks=False))[:2] != self.lock_identity:
                 fail('storage_unavailable', 'Attachment storage lock changed.', 503)
-            if private(os.stat('objects', dir_fd=self.root_fd, follow_symlinks=False), True)[:2] != self.objects_identity:
+            if _posix_private(os.stat('objects', dir_fd=self.root_fd, follow_symlinks=False), True)[:2] != self.objects_identity:
                 fail('storage_unavailable', 'Attachment storage changed.', 503)
             return
         # Windows: walk to the storage folder again by name, as POSIX looks at it by path, and compare identities.
@@ -241,7 +256,7 @@ class PrivateFiles:
                     fail('storage_unavailable', 'Attachment storage changed.', 503)
                 fd = again.open('writer.lock', single_link=True, private=True)
                 try:
-                    if private_fd(fd)[:2] != self.lock_identity:
+                    if self.private_fd(fd)[:2] != self.lock_identity:
                         fail('storage_unavailable', 'Attachment storage lock changed.', 503)
                 finally:
                     os.close(fd)
@@ -263,11 +278,11 @@ class PrivateFiles:
                 self._db_hold = self._root.open_or_create('ledger.sqlite3')
             except ps.PrivateStorageError:
                 _unavailable()
-            self.db_identity = private_fd(self._db_hold)[:2]
+            self.db_identity = self.private_fd(self._db_hold)[:2]
         else:
             fd = os.open('ledger.sqlite3', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=self.root_fd)
             try:
-                self.db_identity = private(os.fstat(fd))[:2]
+                self.db_identity = _posix_private(os.fstat(fd))[:2]
             finally:
                 os.close(fd)
         self.verify_database()  # Reject unsafe sidecars before SQLite can open them.
@@ -281,20 +296,21 @@ class PrivateFiles:
             except OSError:
                 fail('storage_unavailable', 'Attachment storage changed.', 503)
             try:
-                if private_fd(fd)[:2] != self.db_identity:
+                if self.private_fd(fd)[:2] != self.db_identity:
                     fail('storage_unavailable', 'Attachment storage changed.', 503)
             finally:
                 os.close(fd)
             # SQLite makes its journal by name, with the folder's inherited access list (private, but not protected
-            # as a file made here is), so the file rule would refuse it: it must be a plain file with one name.
-            if not ps.sqlite_companions_plain(str(self.root / 'ledger.sqlite3')):
+            # as a file made here is), so the file rule would refuse it: it must be a plain file with one name, owned
+            # by this user, whose list names only this user, SYSTEM, Administrators or OWNER RIGHTS.
+            if not ps.sqlite_companions_private(str(self.root / 'ledger.sqlite3')):
                 _unavailable()
             return
-        if private(os.stat('ledger.sqlite3', dir_fd=self.root_fd, follow_symlinks=False))[:2] != self.db_identity:
+        if _posix_private(os.stat('ledger.sqlite3', dir_fd=self.root_fd, follow_symlinks=False))[:2] != self.db_identity:
             fail('storage_unavailable', 'Attachment storage changed.', 503)
         for name in ('ledger.sqlite3-journal', 'ledger.sqlite3-wal', 'ledger.sqlite3-shm'):
             try:
-                private(os.stat(name, dir_fd=self.root_fd, follow_symlinks=False))
+                _posix_private(os.stat(name, dir_fd=self.root_fd, follow_symlinks=False))
             except FileNotFoundError:
                 pass
 
@@ -317,18 +333,19 @@ class PrivateFiles:
         """``private`` identity of the object by name, not followed: FileNotFoundError when it is missing."""
         ident(file_id)
         if not self._windows:
-            return private(os.stat(file_id, dir_fd=self.objects_fd, follow_symlinks=False))
+            return _posix_private(os.stat(file_id, dir_fd=self.objects_fd, follow_symlinks=False))
         try:
             fd = self._objects.open(file_id, single_link=True, private=True)
         except ps.PrivateStorageError:
             _unavailable()
         try:
-            return private_fd(fd)
+            return self.private_fd(fd)
         finally:
             os.close(fd)
 
-    def private_fd(self, fd):
-        return private_fd(fd)
+    def private_fd(self, fd, directory=False):
+        """``private_fd`` on this storage's own system (decided once, when it opened)."""
+        return _private_fd(fd, self._windows, directory)
 
     def create(self, file_id):
         self.verify()
@@ -338,7 +355,7 @@ class PrivateFiles:
         except ps.PrivateStorageError:
             _unavailable()
         try:
-            private_fd(fd)
+            self.private_fd(fd)
             self._objects.sync()
             return fd
         except BaseException:
@@ -449,12 +466,12 @@ class PrivateFiles:
             if pin not in self._workspace_pins or pin.lock_fd is not None or pin.uncertain or pin.finishing:
                 fail('storage_unavailable', 'Attachment workspace ownership changed.', 503)
         self.verify_database()
-        if private_fd(self.lock_fd)[:2] != self.lock_identity:
+        if self.private_fd(self.lock_fd)[:2] != self.lock_identity:
             fail('storage_unavailable', 'Attachment storage lock changed.', 503)
         # dup keeps the held flock's open file description. It is non-inheritable
         # across exec. Neither this pin nor PrivateFiles explicitly unlocks it.
         pin.lock_fd = os.dup(self.lock_fd)
-        if (private_fd(pin.lock_fd)[:2] != self.lock_identity
+        if (self.private_fd(pin.lock_fd)[:2] != self.lock_identity
                 or pin.installation != self._workspace_identity()):
             fail('storage_unavailable', 'Attachment storage lock changed.', 503)
 
@@ -607,9 +624,9 @@ class PrivateFiles:
         token, fd = self._begin_io(file_id, 'read'), None
         try:
             self.verify()
-            fd = self._open_object(file_id)
+            fd = self.open_object(file_id)
             self._opened(token)
-            before = private_fd(fd)
+            before = self.private_fd(fd)
             if before != expected or before[2] > maximum:
                 fail('source_changed', 'The saved attachment could not be verified.')
             data = bytearray()
@@ -618,14 +635,14 @@ class PrivateFiles:
                 if not chunk:
                     break
                 data.extend(chunk)
-            if (len(data) > maximum or private_fd(fd) != before
+            if (len(data) > maximum or self.private_fd(fd) != before
                     or hashlib.sha256(data).hexdigest() != expected_digest):
                 fail('source_changed', 'The saved attachment could not be verified.')
             return bytes(data)
         finally:
             self._finish_io(token, fd)
 
-    def _open_object(self, file_id):
+    def open_object(self, file_id):
         """A read-only descriptor for the object: ``O_RDONLY | O_NOFOLLOW`` by the held folder on POSIX, as before;
         on Windows through the walk, refusing a reparse point as POSIX's ELOOP does and checking the handle."""
         if not self._windows:
@@ -662,7 +679,7 @@ class PrivateFiles:
                 raise
             self._opened(token)
             try:
-                current = private(os.fstat(fd))
+                current = _posix_private(os.fstat(fd))
             except AttachmentError:
                 if durable_absence:
                     return 'changed'
@@ -676,11 +693,11 @@ class PrivateFiles:
                     if not chunk:
                         break
                     h.update(chunk)
-                if h.hexdigest() != expected_digest or private(os.fstat(fd)) != current:
+                if h.hexdigest() != expected_digest or _posix_private(os.fstat(fd)) != current:
                     return 'changed'
             # Private directory serializes WATCH operations; same-UID hostile namespace
             # mutation is outside this storage profile, not an isolation guarantee.
-            if private(os.stat(file_id, dir_fd=self.objects_fd, follow_symlinks=False)) != current:
+            if _posix_private(os.stat(file_id, dir_fd=self.objects_fd, follow_symlinks=False)) != current:
                 return 'changed'
             os.unlink(file_id, dir_fd=self.objects_fd)
             os.fsync(self.objects_fd)
@@ -697,7 +714,7 @@ class PrivateFiles:
         def recognise(fd):
             self._opened(token)
             try:
-                current = private_fd(fd)
+                current = self.private_fd(fd)
             except AttachmentError as error:
                 if not durable_absence:
                     refused.append(error)
@@ -711,12 +728,20 @@ class PrivateFiles:
                     if not chunk:
                         break
                     h.update(chunk)
-                if h.hexdigest() != expected_digest or private_fd(fd) != current:
+                if h.hexdigest() != expected_digest or self.private_fd(fd) != current:
                     return False
             return True
         outcome = self._objects.remove(file_id, recognise)
         if refused:
             raise refused[0]
+        if outcome == 'changed' and not durable_absence:
+            # As on POSIX, where O_NOFOLLOW meets a link with ELOOP: a link in place of the object is that error, not
+            # a quiet 'changed' (with durable_absence POSIX also answers 'changed').
+            try:
+                if stat.S_ISLNK(self._objects.child_stat(file_id).st_mode):
+                    raise OSError(errno.ELOOP, 'private storage: a link in place of an attachment')
+            except FileNotFoundError:
+                pass
         if outcome == 'removed' or outcome == 'absent' and durable_absence:
             self._objects.sync()
         return outcome

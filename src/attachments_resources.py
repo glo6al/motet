@@ -53,12 +53,12 @@ def _refused():
     fail('resource_unavailable', 'Attachment resource ownership is unavailable.', 503)
 
 
-def _windows_identity(st):
-    """(st_dev, st_ino) on Windows, where the owner and access list were checked on the handle; an id outside the
-    stored range is refused, as in attachments_files."""
-    if not (0 <= st.st_dev <= 2 ** 63 - 1 and 0 < st.st_ino <= 2 ** 63 - 1):
+def _windows_identity(values):
+    """(volume serial, file index) on Windows, read from the handle (``private_storage.file_identity``), where the
+    owner and access list were also checked; an id outside the stored range is refused, as in attachments_files."""
+    if not (0 <= values[0] <= 2 ** 63 - 1 and 0 < values[1] <= 2 ** 63 - 1):
         _refused()
-    return (st.st_dev, st.st_ino)
+    return (values[0], values[1])
 
 
 class ResourceLease:
@@ -91,7 +91,7 @@ class ResourceLocks:
         if self._windows:
             try:
                 self._folder = ps.open_folder(private_root, private=True, writable=True, alone=True)
-                self._identity = _windows_identity(self._folder.stat())
+                self._identity = _windows_identity(self._folder.identity())
             except BaseException as error:
                 if self._folder is not None:
                     self._folder.close()
@@ -128,7 +128,7 @@ class ResourceLocks:
             ps.check_private_fd(fd, single_link=True)
         except ps.PrivateStorageError:
             _refused()
-        return _windows_identity(os.fstat(fd))
+        return _windows_identity(ps.file_identity(fd))
 
     def _name_identity(self, name):
         """The identity of the lock file that ``name`` names now, not followed."""
@@ -139,7 +139,7 @@ class ResourceLocks:
         except ps.PrivateStorageError:
             _refused()
         try:
-            return _windows_identity(os.fstat(fd))
+            return _windows_identity(ps.file_identity(fd))
         finally:
             os.close(fd)
 
@@ -173,8 +173,8 @@ class ResourceLocks:
         if self._windows:
             try:
                 with ps.open_folder(self._path, private=True) as current:
-                    if (_windows_identity(current.stat()) != self._identity
-                            or _windows_identity(self._folder.stat()) != self._identity):
+                    if (_windows_identity(current.identity()) != self._identity
+                            or _windows_identity(self._folder.identity()) != self._identity):
                         fail('resource_changed', 'Attachment resource locking changed.', 409)
             except OSError:
                 fail('resource_changed', 'Attachment resource locking changed.', 409)

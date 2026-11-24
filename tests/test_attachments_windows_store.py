@@ -59,6 +59,7 @@ NOT_SIMULATED = {
     'test_native_excluded_nonmember_cleanup_after_actual_descriptor_closes': 'two threads',
     'test_concurrent_exact_retry_is_at_most_one_retained_message': 'two threads',
     'test_source_handles_prevent_store_close': 'a source handle for delivery to agent chats, off on Windows',
+    'test_real_http_binary_end_and_completed_retry_no_body_wait': 'the HTTP server answers on its own thread',
     'test_close_fences_new_reads_and_removals_before_descriptor_teardown': 'watches POSIX descriptor teardown',
     'test_unlinked_remove_descriptor_close_failure_stays_charged': (
         "POSIX's removal owns its descriptor; on Windows the walk deletes through its own handle"),
@@ -77,6 +78,11 @@ def _simulated(base):
             if why:
                 self.skipTest('not simulated: ' + why)
             from windows_simulation import simulated_windows
+            import attachments_service
+            # No background thread under the simulation: its switches are process-wide (see windows_simulation).
+            worker = mock.patch.object(attachments_service, 'CLEANUP_WORKER', False)
+            worker.start()
+            self.addCleanup(worker.stop)
             simulation = simulated_windows()
             self.windows_calls = simulation.__enter__()
             self.addCleanup(simulation.__exit__, None, None, None)
@@ -129,12 +135,42 @@ class SimulatedWindowsStoreRefusals(unittest.TestCase):
 
     def test_identities_outside_the_stored_range_are_refused(self):
         import attachments_files
-        big = os.stat_result((0o100600, 2 ** 63, 1, 1, 0, 0, 0, 0, 0, 0))
-        with self.assertRaises(AttachmentError):
-            attachments_files._id_ok(big)
-        attachments_files._id_ok(os.stat_result((0o100600, 2 ** 63 - 1, 2 ** 63 - 1, 1, 0, 0, 0, 0, 0, 0)))
-        with self.assertRaises(AttachmentError):
-            attachments_files._id_ok(os.stat_result((0o100600, 0, 1, 1, 0, 0, 0, 0, 0, 0)))
+        # (volume serial, file index, size, write time, creation time), as private_storage.file_identity gives them
+        for refused in ((1, 2 ** 63, 0, 0, 0), (1, 0, 0, 0, 0), (2 ** 63, 1, 0, 0, 0)):
+            with self.subTest(identity=refused), self.assertRaises(AttachmentError):
+                attachments_files._id_ok(refused)
+        self.assertEqual(attachments_files._id_ok((2 ** 32 - 1, 2 ** 63 - 1, 5, 6, 7)), [2 ** 32 - 1, 2 ** 63 - 1, 5, 6, 7])
+
+    def test_identities_come_from_the_handle_not_from_pythons_fstat(self):
+        """Since Python 3.12 Windows' fstat gives st_dev as a 64-bit serial, often above 2**63, and a value that
+        differs from earlier Pythons. The store must start anyway and store the handle's 32-bit serial."""
+        import json
+        from windows_simulation import SERIAL
+        real_fstat = os.fstat
+
+        def fstat_312(fd):
+            info = real_fstat(fd)
+            fields = list(info)
+            fields[2] = 0xF1D2C3B4A5968778                 # st_dev: 64 bits, top bit set, unlike the handle serial
+            shown = ('st_mode', 'st_ino', 'st_dev', 'st_nlink', 'st_uid', 'st_gid', 'st_size')
+            return os.stat_result(fields, {n: getattr(info, n) for n in dir(info) if n.startswith('st_') and n not in shown})
+        with self.simulated_windows() as calls, mock.patch.object(os, 'fstat', fstat_312):
+            store = self.open()
+            try:
+                d = store.create_draft(BINDING, 'fictional-key-000001')
+                u = store.reserve_upload(d['id'], d['capability'], fence(d), metadata(DATA), 'fictional-key-000002')
+                d['revision'] = u['draftRevision']
+                out = store.receive_upload(d['id'], d['capability'], fence(d), u['id'], u['fingerprint'], io.BytesIO(DATA))
+                stored = json.loads(store.db.execute('SELECT identity FROM files WHERE id=?', (out['fileId'],)).fetchone()[0])
+                self.assertEqual(stored[0], SERIAL, 'the volume part is the handle serial')
+                self.assertEqual(stored[1], real_fstat(os.open(self.root / 'attachments' / 'objects' / out['fileId'],
+                                                               os.O_RDONLY)).st_ino)
+                self.assertEqual(store.files.root_identity[0], SERIAL)
+                row = store.db.execute('SELECT identity, digest FROM files WHERE id=?', (out['fileId'],)).fetchone()
+                self.assertEqual(store.files.read(out['fileId'], json.loads(row['identity']), row['digest'], 1000), DATA)
+            finally:
+                store.close()
+        self.assertIn('file_identity', calls)
 
     def test_the_store_runs_on_its_windows_branch(self):
         with self.simulated_windows() as calls:
@@ -147,7 +183,8 @@ class SimulatedWindowsStoreRefusals(unittest.TestCase):
                 store.receive_upload(d['id'], d['capability'], fence(d), u['id'], u['fingerprint'], io.BytesIO(DATA))
             finally:
                 store.close()
-        for name in ('anchored', 'open_folder', 'check_private_fd', 'try_lock', 'sqlite_companions_plain', 'close_lock'):
+        for name in ('anchored', 'open_folder', 'check_private_fd', 'file_identity', 'try_lock', 'sqlite_companions_private',
+                     'close_lock'):
             self.assertIn(name, calls)
 
     def test_posix_stat_rule_refuses_on_windows(self):
@@ -172,6 +209,23 @@ class SimulatedWindowsStoreRefusals(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_a_link_in_place_of_an_object_is_refused_as_on_posix(self):
+        """POSIX's removal meets a link with ELOOP (or 'changed' when the absence must be durable); the Windows
+        branch answers the same, though it never follows the link either way."""
+        import errno
+        with self.simulated_windows():
+            store = self.open()
+            try:
+                objects = self.root / 'attachments' / 'objects'
+                os.symlink(objects / 'elsewhere', objects / ('a' * 32))
+                with self.assertRaises(OSError) as raised:
+                    store.files.remove('a' * 32, [1, 2, 3, 4, 5])
+                self.assertEqual(raised.exception.errno, errno.ELOOP)
+                self.assertEqual(store.files.remove('a' * 32, [1, 2, 3, 4, 5], durable_absence=True), 'changed')
+                self.assertTrue(os.path.islink(objects / ('a' * 32)))
+            finally:
+                store.close()
+
     def test_the_database_is_held_while_the_store_is_open(self):
         with self.simulated_windows():
             store = self.open()
@@ -185,6 +239,26 @@ class SimulatedWindowsStoreRefusals(unittest.TestCase):
             self.assertIsNone(files._db_hold)
             with self.assertRaises(OSError):
                 os.fstat(hold)
+
+
+def volume_serial(folder):
+    """The 32-bit volume serial number of the volume ``folder`` is on, asked of Windows separately."""
+    import ctypes
+    from ctypes import wintypes as w
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    serial = w.DWORD()
+    root = os.path.splitdrive(str(folder))[0] + '\\'
+    if not kernel.GetVolumeInformationW(root, None, 0, ctypes.byref(serial), None, None, None, 0):
+        raise OSError(ctypes.get_last_error(), 'GetVolumeInformationW failed')
+    return serial.value
+
+
+def owned_by_me(path):
+    try:
+        ps.windows_security(str(path))
+        return True
+    except ps.PrivateStorageError as e:
+        return e.reason != 'owner'
 
 
 def icacls(*args):
@@ -236,6 +310,9 @@ class WindowsStore(unittest.TestCase):
         d, file_id = self.uploaded()
         row = self.store.db.execute('SELECT identity, digest FROM files WHERE id=?', (file_id,)).fetchone()
         import json
+        stored = json.loads(row['identity'])
+        self.assertEqual(stored[0], volume_serial(self.root), 'the 32-bit volume serial, read from a handle')
+        self.assertLessEqual(stored[0], 2 ** 32 - 1)
         self.assertEqual(self.store.files.read(file_id, json.loads(row['identity']), row['digest'], 1000), DATA)
         ps.windows_security(str(self.root / 'attachments' / 'objects' / file_id))      # private and protected
         self.store.close()
@@ -316,6 +393,57 @@ class WindowsStore(unittest.TestCase):
         database = self.root / 'attachments' / 'ledger.sqlite3'
         with self.assertRaises(OSError):
             os.replace(database, str(database) + '-moved')
+
+    def reopen_refused(self, make, undo):
+        """Close the store, ``make`` something in its folder, check a new store refuses it, ``undo`` it, and check
+        the store opens again."""
+        if self.store is not None:
+            self.store.close()
+            self.store = None
+        make()
+        try:
+            self.error('storage_unavailable', self.open)
+        finally:
+            undo()
+        self.store = self.open()
+
+    def test_a_junction_in_place_of_a_journal_or_wal_is_refused(self):
+        self.store = self.open()
+        folder, elsewhere = self.root / 'attachments', self.root / 'elsewhere'
+        elsewhere.mkdir()
+        for suffix in ('-journal', '-wal'):
+            with self.subTest(suffix=suffix):
+                link = folder / ('ledger.sqlite3' + suffix)
+                self.reopen_refused(lambda: junction(link, elsewhere), lambda: os.rmdir(link))
+        self.assertEqual(os.listdir(elsewhere), [], 'nothing was written through the junction')
+
+    def test_a_leftover_journal_is_kept_unless_others_can_open_it(self):
+        self.store = self.open()
+        self.store.close()
+        self.store = None
+        journal = self.root / 'attachments' / 'ledger.sqlite3-journal'
+
+        def leftover():
+            if not journal.exists():
+                journal.write_bytes(b'')               # follows the folder's list: private, though not protected
+            if not owned_by_me(journal):               # an elevated runner's default owner can be Administrators
+                subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % journal, shell=True,
+                               check=True, capture_output=True, timeout=30)
+        leftover()
+        self.store = self.open()                       # a plain private leftover journal is fine
+
+        def opened_up():
+            leftover()
+            icacls(str(journal), '/grant', '*S-1-1-0:(R)')
+        self.reopen_refused(opened_up, lambda: journal.unlink())
+
+    def test_a_second_name_for_the_lock_or_the_database_is_refused(self):
+        self.store = self.open()
+        folder = self.root / 'attachments'
+        for name in ('writer.lock', 'ledger.sqlite3'):
+            with self.subTest(name=name):
+                second = folder / (name + '-second')
+                self.reopen_refused(lambda: os.link(folder / name, second), lambda: os.remove(second))
 
     def test_text_preview_reads_through_the_resource_locks(self):
         from attachments_catalogue import Catalogue

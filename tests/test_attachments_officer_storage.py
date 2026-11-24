@@ -24,6 +24,7 @@ import test_attachments_conversations as cf
 from test_attachments_foundation import EPOCH, BINDING, fence, metadata
 from test_attachments_requests import FakeLease
 from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
+import private_storage
 
 PDF = b'%PDF-1.7\nfictional original; no parsed content asserted'
 PNG = b'\x89PNG\r\n\x1a\nfictional original; no pixels decoded'
@@ -220,7 +221,7 @@ class DirectStoreTests(unittest.TestCase):
         row=self.store.db.execute('SELECT * FROM files WHERE id=?',(a['fileId'],)).fetchone()
         identity=json.loads(row['identity']);real=os.read;entered=[];used=self.store.storage()['usedBytes']
         def reading(fd,count):
-            if not entered and (os.fstat(fd).st_dev,os.fstat(fd).st_ino)==tuple(identity[:2]):
+            if not entered and tuple(private_storage.file_identity(fd)[:2])==tuple(identity[:2]):   # as the store records it
                 entered.append(True)
                 self.error('upload_busy',self.store.close)
                 d['revision']=self.store.remove_file(d['id'],d['capability'],fence(d),a['fileId'])['revision']

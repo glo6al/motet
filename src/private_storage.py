@@ -762,6 +762,42 @@ def sqlite_companions_plain(path):
     return True
 
 
+def sqlite_companions_private(path):
+    """``sqlite_companions_plain``, and each companion that exists must also be private to this user.
+
+    POSIX: the private rule (``posix_verdict``, one name). Windows: each is opened without following a reparse point
+    and checked on its handle: a plain file with one name, owned by this user, whose access list names only this
+    user, SYSTEM, Administrators or OWNER RIGHTS. The list need not be protected: SQLite makes its journal by name,
+    so it inherits the folder's list, which is private but inherited. A leftover journal someone opened up to others
+    is refused."""
+    for suffix in ('-journal', '-wal', '-shm'):
+        name = path + suffix
+        if not WIN:
+            try:
+                posix_verdict(os.lstat(name), False, True)
+            except FileNotFoundError:
+                continue
+            except PrivateStorageError:
+                return False
+            continue
+        try:
+            handle = _win_open(name, _READ_CONTROL | _FILE_READ_ATTRIBUTES, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE,
+                               _OPEN_EXISTING, 0)
+        except OSError as e:
+            if getattr(e, 'winerror', 0) in _NOT_FOUND:
+                continue
+            return False
+        try:
+            _win_kind(_win_facts(handle), False, 'file', True)
+            with _CurrentUser() as user:
+                _check_descriptor(user, True, handle=handle)       # the folder rule: inherited entries allowed
+        except PrivateStorageError:
+            return False
+        finally:
+            _win_close(handle)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # (g) Open a folder or file with no link followed anywhere in its path.
 #
@@ -1320,6 +1356,11 @@ class NoLinkFolder:
         self._held()
         return _win_file_system(self._handles[-1]) if self._windows else None
 
+    def identity(self):
+        """This held folder's ``file_identity`` (on Windows read from its handle)."""
+        self._held()
+        return _win_identity(self._handles[-1]) if self._windows else _posix_identity(os.fstat(self._fd))
+
     def _child(self, name):
         return self.path + name if self.path.endswith('\\') else self.path + '\\' + name
 
@@ -1594,6 +1635,40 @@ def _win_file_id(handle):
     if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
         raise _unavailable()
     return info.volume, info.index_high, info.index_low
+
+
+_FILETIME_UNIX_EPOCH = 116444736000000000      # 1601-01-01 to 1970-01-01 in 100 ns units
+
+
+def _win_identity(handle):
+    """``file_identity`` from one GetFileInformationByHandle call on the handle."""
+    kernel, w, SA, FILEINFO = _win_api()[1:5]
+    info = FILEINFO()
+    if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+        raise _unavailable()
+
+    def nanoseconds(filetime):
+        return (((filetime.high << 32) | filetime.low) - _FILETIME_UNIX_EPOCH) * 100
+    return (info.volume, (info.index_high << 32) | info.index_low, (info.size_high << 32) | info.size_low,
+            nanoseconds(info.written), nanoseconds(info.created))
+
+
+def _posix_identity(info):
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def file_identity(fd):
+    """(volume, file index, size, last write time in ns, fourth time in ns) of what the open descriptor ``fd`` has
+    open, for identities that are stored and compared later.
+
+    POSIX: ``st_dev``, ``st_ino``, ``st_size``, ``st_mtime_ns`` and ``st_ctime_ns`` of ``fstat``, as always. Windows:
+    one GetFileInformationByHandle call on the handle: the 32-bit volume serial number, the 64-bit file index, the
+    size, and the last write and creation times. Python's ``fstat`` is not used there because what it reports has
+    changed between versions: since 3.12 ``st_dev`` is a 64-bit serial (often above 2**63) and ``st_ino`` may be a
+    128-bit id, so an identity stored under one Python would not match under the next."""
+    if WIN:
+        return _win_identity(_win_handle_of(fd))
+    return _posix_identity(os.fstat(fd))
 
 
 def _win_check_or_undo(parent, name, handle, created, check):
