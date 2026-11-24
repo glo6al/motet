@@ -692,8 +692,11 @@ def sqlite_companions_plain(path):
 # Windows paths must be plain drive paths (``C:\...``). UNC shares (``\\server\share``) and device paths
 # (``\\?\``, ``\\.\``) are refused: they skip or change Win32's normal path handling, and Motet's own folders do
 # not need them. So are "." and "..", names Win32 would rewrite (a trailing dot or space), and names with ":",
-# which open an alternate data stream. Reserved device names (CON, NUL and the like) need no rule: relative NT opens
-# never treat them as devices, and a path that Win32's abspath turns into a device path is refused as one.
+# which open an alternate data stream. These shapes are checked on the path as given, before ``abspath`` (which
+# on real Windows would silently drop a trailing dot, for example), so every Windows version refuses the same
+# paths. A path whose last name is a reserved device name (CON, NUL and the like, with any extension) is refused
+# for the same reason; names below a held folder need no device rule, since relative NT opens never treat them as
+# devices.
 
 _CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
 
@@ -1014,11 +1017,46 @@ def _path_module():
     return os.path
 
 
+def _win_raw_refused(path):
+    """Refuse a Windows path by its shape as given, before ``abspath`` rewrites it, so the answer does not depend on
+    which Windows version normalises it how. Refused: UNC and device prefixes; a ":" anywhere but after a drive
+    letter (a data stream); a name ending in a dot or space (Win32 silently drops those, so another name would be
+    opened); and a last name that is a reserved device name, with or without an extension (some Windows versions
+    turn it into a device path). "." and ".." are left to ``abspath``, which resolves them as Windows does."""
+    import ntpath
+    if not isinstance(path, str) or '\0' in path:
+        return True
+    path = path.replace('/', '\\')
+    if path.startswith('\\\\'):
+        return True
+    drive, rest = ntpath.splitdrive(path)
+    if drive and (len(drive) != 2 or drive[1] != ':'):
+        return True
+    names = [name for name in rest.split('\\') if name]
+    for name in names:
+        if name not in ('.', '..') and (':' in name or name[-1] in '. '):
+            return True
+    if names and names[-1].split('.', 1)[0].rstrip(' ').upper() in _DEVICE_NAMES:
+        return True
+    return False
+
+
+_DEVICE_NAMES = frozenset(['CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'] + ['COM%d' % n for n in range(1, 10)]
+                          + ['LPT%d' % n for n in range(1, 10)])
+
+
+def _absolute(path):
+    """``path`` made absolute; on Windows its raw shape is checked first (see ``_win_raw_refused``)."""
+    if WIN and _win_raw_refused(path):
+        raise _refuse('unavailable', 'folder')
+    return _path_module().abspath(path)
+
+
 def open_folder(path, private=False, listing=False):
     """Hold the folder at ``path`` (made absolute) with no link followed anywhere on the way; the caller closes
     it. ``private`` checks the folder itself (owner, and mode or access list); ``listing`` lets ``names()`` list it on
     Windows. A missing folder raises FileNotFoundError; on POSIX a link raises the system's own OSError (ELOOP)."""
-    path = _path_module().abspath(path)
+    path = _absolute(path)
     if WIN:
         root, names = _win_parts(path)
         handles, current = [], root
@@ -1055,7 +1093,7 @@ def anchored(path):
     are resolved here, then the walk opens the resolved path by handle and holds it, so nothing in it can change
     afterwards, and a link or junction at the last name itself is still refused."""
     module = _path_module()
-    path = module.abspath(path)
+    path = _absolute(path)
     return module.join(module.realpath(module.dirname(path)), module.basename(path))
 
 
@@ -1066,7 +1104,7 @@ def open_no_links(path, directory=False, single_link=False, private=False):
     Windows that descriptor holds the folder and serves ``os.fstat``; to open its children use ``open_folder``).
     ``private`` also checks the opened file or folder's owner, and mode or access list. A missing name raises
     FileNotFoundError and refusals raise PrivateStorageError; on POSIX a link raises the system's own OSError."""
-    path = _path_module().abspath(path)
+    path = _absolute(path)
     if directory:
         folder = open_folder(path, private)
         if folder._windows:
