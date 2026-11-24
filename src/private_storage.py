@@ -975,7 +975,9 @@ class NoLinkFolder:
         if not _plain_name(name, self._windows):
             raise _refuse('unavailable', subject)
         if self._windows:
-            return _win_fd(_win_open_checked(self._handles[-1], name, directory, subject, single_link, private), os.O_RDONLY)
+            # Binary, so a read returns the bytes as they are (no CRLF change, no stop at Ctrl-Z).
+            return _win_fd(_win_open_checked(self._handles[-1], name, directory, subject, single_link, private),
+                           os.O_RDONLY | getattr(os, 'O_BINARY', 0))
         flags = os.O_RDONLY | os.O_NOFOLLOW | _CLOEXEC | (os.O_DIRECTORY if directory else os.O_NONBLOCK)
         fd = os.open(name, flags, dir_fd=self._fd)      # non-blocking: a pipe cannot hang the open
         try:
