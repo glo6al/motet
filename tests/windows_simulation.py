@@ -2,8 +2,9 @@
 
 ``private_storage.WIN`` is set, so callers take their Windows branch, but each private_storage call they make is
 answered by the POSIX implementation (links, owner and mode still refused), including the no-link folder walk
-(``open_folder``, ``open_no_links``). fcntl and os.getuid are made to fail loudly, so a Windows branch that still
-reached for them would show up as an error. This checks the wiring only; the Windows walk's own decisions are
+(``open_folder``, ``open_no_links``) and every change made through a held folder (``create``, ``open_or_create``,
+``mkdir``, ``remove``, ``child_stat``, ``sync``). fcntl and os.getuid are made to fail loudly, so a Windows branch
+that still reached for them would show up as an error. This checks the wiring only; the Windows walk's own decisions are
 tested with the Win32 calls replaced (test_private_storage.py), and the access-list rules on real Windows.
 """
 from contextlib import ExitStack, contextmanager
@@ -16,7 +17,7 @@ import private_storage as ps
 
 CALLS = ('check_private', 'make_private_folder', 'create_private_file', 'open_private_file', 'open_private_rw',
          'open_lock_file', 'try_lock', 'unlock', 'close_lock', 'sqlite_companions_plain', 'folder_walk_available',
-         'open_folder', 'open_no_links', 'anchored')
+         'open_folder', 'open_no_links', 'anchored', 'read_only', 'unwritable', 'sync_file')
 
 
 def _forbidden(name):
