@@ -12,18 +12,31 @@ const key = 'fictional-officer-browser-fixture-key';
 // On Windows the fixture is stopped through its standard input (see officer_document_fixture_process.js).
 const fixtureArgs = extra => [path.join(__dirname, 'officer_document_live_fixture.py'), ...extra, ...(WINDOWS ? ['--stop-on-stdin'] : [])];
 const fixtureOptions = {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:[WINDOWS?'pipe':'ignore','pipe','pipe']};
+// 'close' (not 'exit') follows the child's last output, so the closing counters line has arrived by then. Watched
+// from the start, so a fixture that already ended, by exit or by signal, is seen at once.
+function watchClose(proc) {
+  const state = {closed: false, code: null, signal: null};
+  state.done = new Promise(resolve => proc.once('close', (code, signal) => {
+    Object.assign(state, {closed: true, code, signal}); resolve();
+  }));
+  return state;
+}
 const child = spawn(PYTHON, fixtureArgs([]), fixtureOptions);
-child.stdin?.on('error', () => {});      // a fixture that already exited gives EPIPE: its exit is what counts
-let logs = '', errors = '', secondary = null, secondaryLog = '', failed = false;
+const childClose = watchClose(child);
+child.stdin?.on('error', () => {});      // a fixture that already exited gives EPIPE: its close is what counts
+let logs = '', errors = '', secondary = null, secondaryClose = null, secondaryLog = '', failed = false;
 // Stop a fixture and check it closed cleanly: exit code 0 and its closing counters, within 30 seconds (killed after).
-async function stopChecked(proc, output, name) {
-  if (proc.exitCode === null) stopFixture(proc);
-  const code = await new Promise(resolve => {
-    if (proc.exitCode !== null) return resolve(proc.exitCode);
-    const timer = setTimeout(() => { proc.kill('SIGKILL'); resolve('no exit within 30 s'); }, 30000);
-    proc.once('exit', exitCode => { clearTimeout(timer); resolve(exitCode); });
-  });
-  assert.equal(code, 0, name + ' fixture did not stop cleanly');
+async function stopChecked(proc, state, output, name) {
+  if (!state.closed && proc.exitCode === null && proc.signalCode === null) stopFixture(proc);
+  if (!state.closed) {
+    let timer;
+    const late = await Promise.race([state.done.then(() => false),
+                                     new Promise(resolve => { timer = setTimeout(() => resolve(true), 30000); })]);
+    clearTimeout(timer);
+    if (late) { proc.kill('SIGKILL'); assert.fail(name + ' fixture did not close within 30 s'); }
+  }
+  assert.equal(state.signal, null, name + ' fixture ended by signal');
+  assert.equal(state.code, 0, name + ' fixture did not stop cleanly');
   const stats = JSON.parse(output().trim().split('\n').pop());
   assert.equal(stats.outboundBlocked, 0, name + ' fixture made an outbound connection');
 }
@@ -267,7 +280,7 @@ const ready = new Promise((resolve,reject) => {
     const gone=s.answers.find(a=>a.id===last.id);assert.equal(gone.state,'source_unavailable');assert.equal(gone.answeredAt,last.answeredAt);assert.equal(gone.priorAnswerWindow,null);assert.equal(s.usableFileCount,1);
     const windowMeta=await metadata();assert.equal(windowMeta.fakeProviderCalls,13);assert.equal(windowMeta.outboundBlocked,0);assert.equal(windowMeta.ordinaryAskBlocked,0);
 
-    secondary=spawn(PYTHON,fixtureArgs(['--reading-off']),fixtureOptions);secondary.stdin?.on('error',()=>{});
+    secondary=spawn(PYTHON,fixtureArgs(['--reading-off']),fixtureOptions);secondaryClose=watchClose(secondary);secondary.stdin?.on('error',()=>{});
     let secondaryErrors='';secondary.stderr.on('data',b=>secondaryErrors=(secondaryErrors+b).slice(-10000));
     const coldOrigin=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Management-only fixture startup timed out')),STARTUP_MS);secondary.stdout.on('data',b=>{secondaryLog+=b;const match=secondaryLog.match(/http:\/\/127\.0\.0\.1:\d+\//);if(match){clearTimeout(timer);resolve(match[0].slice(0,-1));}});secondary.once('exit',code=>{clearTimeout(timer);reject(Error('Management-only fixture exited '+code+' '+secondaryErrors));});});
     const managementRequests=[];
@@ -289,8 +302,8 @@ const ready = new Promise((resolve,reject) => {
   } finally {
     client?.dispose();
     try {
-      if (secondary) await stopChecked(secondary, () => secondaryLog, 'Management-only');
-      await stopChecked(child, () => logs, 'Offline');
+      if (secondary) await stopChecked(secondary, secondaryClose, () => secondaryLog, 'Management-only');
+      await stopChecked(child, childClose, () => logs, 'Offline');
     } catch (error) { if (!failed) throw error; }
   }
 })().catch(e=>{console.error(e);if(errors)console.error(errors);process.exitCode=1;});

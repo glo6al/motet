@@ -46,8 +46,9 @@ const PYTHON=WINDOWS?'python':'python3';
 const stopFixture=WINDOWS?child=>{child.stdin.end('stop\n');}:child=>child.kill('SIGINT');
 // Windows runners can be slow to start Python: wait longer there; a start that succeeds returns as soon as it is ready.
 const STARTUP_MS=WINDOWS?60000:10000;
+const CLEANUP_MS=WINDOWS?60000:5000;     // likewise for a fixture's clean stop
 
-async function ownerFixture(run,args=[],{model='claude-haiku-5-5',spawnChild=spawn,now=ownerNow,setTimer=setTimeout,clearTimer=clearTimeout,cleanupMs=5000,killWaitMs=1000,stop=stopFixture,stdinStop=WINDOWS}={}) {
+async function ownerFixture(run,args=[],{model='claude-haiku-5-5',spawnChild=spawn,now=ownerNow,setTimer=setTimeout,clearTimer=clearTimeout,cleanupMs=CLEANUP_MS,killWaitMs=1000,stop=stopFixture,stdinStop=WINDOWS}={}) {
   const variant=['--model',model,'--trace-startup',...args,...(stdinStop?['--stop-on-stdin']:[])],started=now();let child;
   try{child=spawnChild(PYTHON,[path.join(__dirname,'officer_document_live_fixture.py'),...variant],{env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:[stdinStop?'pipe':'ignore','pipe','pipe']});}
   catch(error){throw ownerFixtureError(`startup spawn failed (${error.message})`,variant,started,now,()=>'');}

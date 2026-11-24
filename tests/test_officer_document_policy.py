@@ -236,7 +236,8 @@ class WindowsPolicyTests(unittest.TestCase):
         self.refused_for('access')
 
     def test_a_protected_policy_that_also_names_administrators_is_refused(self):
-        """A copied file, or one after /inheritance:d, keeps an explicit Administrators entry: still not private."""
+        """A protected policy owned by this user, with an explicit Administrators grant added to the file (as icacls
+        /grant would add it): still not private, since a file may name only this user and SYSTEM."""
         self.private_policy()
         icacls(str(self.path), '/grant', '*S-1-5-32-544:(R)')
         self.refused_for('access')

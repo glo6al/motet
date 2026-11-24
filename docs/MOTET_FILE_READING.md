@@ -33,7 +33,7 @@ Save the key first, as [Keys and settings on Windows](MOTET.md#keys-and-settings
 Set-Content -NoNewline -Encoding ascii "$env:USERPROFILE\.live-room\officer-document-policy.json" '{"version":1,"evidenceId":"haiku-pdf-png-2026-11-15","scopeId":"officer-files","scopeRevision":"v1","usdLimit":"6.00"}'
 ```
 
-Then make the file yours alone. Run this, and the `/setowner` command below if you need it, in a normal Command Prompt, not one opened with "Run as administrator": in an administrator window `%USERNAME%` can be the administrator's account, which would give the file to the wrong account.
+Then make the file yours alone. Run this, and the `/setowner` command below if you need it, in a normal Command Prompt, not one opened with "Run as administrator": files made from an administrator window usually belong to the Administrators group rather than to you, and if the window was opened with another administrator's sign-in, `%USERNAME%` names that account instead of yours.
 
 ```
 icacls "%USERPROFILE%\.live-room\officer-document-policy.json" /inheritance:r /grant:r "%USERDOMAIN%\%USERNAME%:F"
