@@ -4,6 +4,7 @@ Queue acceptance is not delivery. Only the exact outgoing user envelope followed
 by a matching completed turn can produce an answer. Uncertain sends are never retried.
 """
 import copy
+import errno
 import hmac
 import json
 import math
@@ -29,6 +30,7 @@ import peer_inbox
 import peer_lifecycle
 import peer_progress
 import codex_transcript
+import private_storage
 
 CLI = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
 ACTIVE = ('sending', 'queued', 'awaiting_reply', 'unknown', 'expired')
@@ -36,6 +38,9 @@ MAX_RECORDS, MAX_PENDING, MAX_LINE, MAX_READ = 256, 8, 1_000_000, 2_000_000
 TTL, RETENTION = 900, 86400
 CODEX_REPLY_EXPIRED = 'No matching reply yet. The question may still be queued; Motet will not resend.'
 CODEX_PREVIOUS_SOURCE_UNAVAILABLE = 'The original Codex transcript is temporarily unavailable. Motet will check it again.'
+STATE_FOLDER_REFUSED = 'Messaging state directory must be private and owned by you.'
+LOCK_REFUSED = 'Messaging lock must be a private regular file.'
+DATABASE_REFUSED = 'Messaging database must be a private regular file.'
 CLAUDE_OWNER_UNAVAILABLE = ("Exact named-chat delivery requires the official Motet plugin connected in this Claude chat. "
                            "Connect it before sending. Nothing was sent.")
 
@@ -111,6 +116,64 @@ def public(row):
     return result
 
 
+def private_state_folder(state_dir):
+    """Make the messaging state folder if it is missing, then refuse it unless it is private to this user.
+
+    POSIX: created 0700 (with any missing parents); it must be a real folder (not a link), owned by this user,
+    with nothing for group or others. Windows: created with a protected this-user/SYSTEM access list; it must not
+    be a link or junction, must be owned by this user, and its list may name only this user, SYSTEM,
+    Administrators and OWNER RIGHTS. An existing folder is checked, never loosened or repaired."""
+    if private_storage.WIN:
+        os.makedirs(os.path.dirname(os.path.abspath(state_dir)), exist_ok=True)
+        if not os.path.lexists(state_dir):
+            try:
+                private_storage.make_private_folder(state_dir)
+            except OSError:
+                if not os.path.lexists(state_dir):   # something else made it first: check that one instead
+                    raise
+    else:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    try:
+        private_storage.check_private(state_dir, directory=True)
+    except private_storage.PrivateStorageError:
+        raise OSError(STATE_FOLDER_REFUSED) from None
+
+
+def private_state_file(path, create, refused):
+    """A read-write descriptor for a private regular file with one name, opened without following a link.
+
+    A refused file raises ``OSError(refused)``; a failed open raises the system's own error, as before."""
+    try:
+        return private_storage.open_private_rw(path, create)
+    except private_storage.PrivateStorageError:
+        raise OSError(refused) from None
+
+
+def check_database_companions(path):
+    """Windows only: SQLite makes its rollback journal by name next to the database, with the folder's
+    inherited access list. Refuse a journal (or a stray -wal/-shm) that is a link, junction or not a plain file,
+    so SQLite never follows one out of the private folder. A plain leftover journal is kept: SQLite needs it to
+    roll back an interrupted write."""
+    for suffix in ('-journal', '-wal', '-shm'):
+        try:
+            info = os.lstat(path + suffix)
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & private_storage.REPARSE_POINT
+                or not stat.S_ISREG(info.st_mode)):
+            raise OSError(DATABASE_REFUSED)
+
+
+def close_owner_lock(fd):
+    """Release the lifetime lock and close it. Windows may hold a lock for a while after its file closes."""
+    if private_storage.WIN:
+        try:
+            private_storage.unlock(fd)
+        except OSError:
+            pass   # not held: closing is all that is left
+    os.close(fd)
+
+
 class MessagingStore:
     def __init__(self, state_dir, sessions_dir, cli=CLI, channel_root=None, managed=None):
         self.managed = managed  # Independent owner ledger; never fed to legacy/peer workers.
@@ -128,30 +191,26 @@ class MessagingStore:
         self._native_composition_lock = threading.Lock()
         self._native_composition = None
         self._native_composition_error = None
-        os.makedirs(state_dir, mode=0o700, exist_ok=True)
-        st = os.lstat(state_dir)
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-            raise OSError('Messaging state directory must be private and owned by you.')
+        private_state_folder(state_dir)
         # A second WATCH process must not launch the same persisted request. The
         # lifetime lock also protects recovery from marking another worker unknown.
-        import fcntl
-        self.owner_fd = os.open(os.path.join(state_dir, 'officer-messages.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        self.owner_fd = private_state_file(os.path.join(state_dir, 'officer-messages.lock'), True, LOCK_REFUSED)
         self.db = None
         try:
-            st = os.fstat(self.owner_fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or st.st_mode & 0o077:
-                raise OSError('Messaging lock must be a private regular file.')
-            fcntl.flock(self.owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not private_storage.try_lock(self.owner_fd):
+                raise BlockingIOError(errno.EWOULDBLOCK, os.strerror(errno.EWOULDBLOCK))
             path = os.path.join(state_dir, 'officer-messages.sqlite3')
             fence = self._retained_namespace_before_open(state_dir)
             with self.lock, (fence.owner_open() if fence is not None else nullcontext()) as expected:
-                flags = os.O_RDWR | os.O_NOFOLLOW | (0 if expected is not None else os.O_CREAT)
-                fd = os.open(path, flags, 0o600)
+                # The checked descriptor stays open while SQLite opens the same name. On Windows it does not
+                # share delete, so the file cannot be renamed or replaced in between.
+                fd = private_state_file(path, expected is None, DATABASE_REFUSED)
                 try:
                     st = os.fstat(fd)
-                    if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or st.st_mode & 0o077
-                            or expected is not None and [st.st_dev, st.st_ino] != expected):
-                        raise OSError('Messaging database must be a private regular file.')
+                    if expected is not None and [st.st_dev, st.st_ino] != expected:
+                        raise OSError(DATABASE_REFUSED)
+                    if private_storage.WIN:
+                        check_database_companions(path)
                     if expected is not None:
                         self.db = sqlite3.connect(Path(path).absolute().as_uri() + '?mode=rw', uri=True,
                                                   check_same_thread=False, timeout=peer_bridge.DB_TIMEOUT)
@@ -205,7 +264,7 @@ class MessagingStore:
         except BaseException:
             if self.db is not None:
                 self.db.close()
-            os.close(self.owner_fd)
+            close_owner_lock(self.owner_fd)
             self.owner_fd = None
             raise
 
@@ -490,7 +549,7 @@ class MessagingStore:
                 raise RuntimeError('Messaging worker is still stopping; ownership retained.')
             self.db.close()
             if self.owner_fd is not None:
-                os.close(self.owner_fd)
+                close_owner_lock(self.owner_fd)
                 self.owner_fd = None
 
     def _metadata(self, path, ident):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """No live sends: mocked CLI, temporary transcripts and an ephemeral HTTP server."""
 import concurrent.futures
+import errno
 import http.client
 import inspect
 import json
@@ -50,7 +51,7 @@ class PublicTimestampTests(unittest.TestCase):
         self.assertFalse(result.wasSuccessful(), 'Removing the public field must break the serializer contract test')
 
 
-@unittest.skipIf(os.name == "nt", "POSIX-private Codex messaging storage; Windows startup leaves it unavailable")
+@unittest.skipIf(os.name == "nt", "Codex flows read transcripts by handle-based folder walk; Codex messaging needs the Mac app")
 class MessagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -579,6 +580,219 @@ class MessagingTests(unittest.TestCase):
             httpd.shutdown(); httpd.server_close(); thread.join()
             server.KEY, server.MESSAGING, server.PORT = old_key, old_store, old_port
             server.AGENTS.clear(); server.AGENTS.update(old_agents)
+
+
+# The exact texts the store has always given on POSIX. Written out here, not read from the module,
+# so these tests fail if a refactor changes what the owner sees.
+STATE_REFUSED = 'Messaging state directory must be private and owned by you.'
+LOCK_REFUSED = 'Messaging lock must be a private regular file.'
+DATABASE_REFUSED = 'Messaging database must be a private regular file.'
+
+
+class StoreStorageCommon(unittest.TestCase):
+    """Behaviour every system shares: creation, the lifetime lock, and reopening after close."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self.temp.name)
+        self.state = os.path.join(self.base, 'state')
+        self.sessions = os.path.join(self.base, 'sessions')
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def open(self):
+        return m.MessagingStore(self.state, self.sessions)
+
+    def test_new_state_is_private_and_a_second_store_is_refused_until_the_first_closes(self):
+        import private_storage
+        store = self.open()
+        try:
+            private_storage.check_private(self.state, directory=True)
+            for name in ('officer-messages.lock', 'officer-messages.sqlite3'):
+                private_storage.check_private(os.path.join(self.state, name), single_link=True)
+            with self.assertRaises(BlockingIOError) as held:
+                self.open()
+            self.assertIn(held.exception.errno, (errno.EWOULDBLOCK, errno.EAGAIN))
+        finally:
+            store.close()
+        again = self.open()                                # the lock was released by close()
+        again.close()
+
+    def test_missing_parent_folders_are_made(self):
+        self.state = os.path.join(self.base, 'home', '.live-room')
+        self.open().close()
+        import private_storage
+        private_storage.check_private(self.state, directory=True)
+
+
+@unittest.skipIf(os.name == 'nt', 'POSIX owner and mode bits')
+class StoreStoragePosix(StoreStorageCommon):
+    """The refusals and their texts, unchanged from the store's own POSIX checks before the shared layer."""
+
+    def refused(self, text):
+        with self.assertRaises(OSError) as raised:
+            self.open()
+        self.assertEqual(str(raised.exception), text)
+        self.assertNotIsInstance(raised.exception, BlockingIOError)
+
+    def make_state(self):
+        os.mkdir(self.state, 0o700)
+
+    def test_created_modes(self):
+        old = os.umask(0o022)
+        try:
+            self.open().close()
+        finally:
+            os.umask(old)
+        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
+        for name in ('officer-messages.lock', 'officer-messages.sqlite3'):
+            self.assertEqual(os.stat(os.path.join(self.state, name)).st_mode & 0o777, 0o600)
+
+    def test_state_folder_open_to_others_or_linked_or_not_mine_is_refused(self):
+        self.make_state()
+        os.chmod(self.state, 0o755)
+        self.refused(STATE_REFUSED)
+        os.chmod(self.state, 0o700)
+        real = self.state
+        self.state = os.path.join(self.base, 'linked-state')
+        os.symlink(real, self.state)
+        self.refused(STATE_REFUSED)
+        self.state = real
+        with patch('os.getuid', return_value=os.getuid() + 1):
+            self.refused(STATE_REFUSED)
+        self.state = os.path.join(self.base, 'plain-file')
+        open(self.state, 'w').close()
+        with self.assertRaises(FileExistsError):       # makedirs refuses a file in the folder's place first
+            self.open()
+
+    def test_lock_file_that_is_shared_open_to_others_or_linked_is_refused(self):
+        self.make_state()
+        lock = os.path.join(self.state, 'officer-messages.lock')
+        fd = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+        os.chmod(lock, 0o644)
+        self.refused(LOCK_REFUSED)
+        os.chmod(lock, 0o600)
+        os.link(lock, lock + '.second')
+        self.refused(LOCK_REFUSED)
+        os.unlink(lock + '.second')
+        with patch('os.getuid', return_value=os.getuid() + 1):
+            self.refused(STATE_REFUSED)               # the folder is checked first
+        os.unlink(lock)
+        os.symlink(os.path.join(self.state, 'elsewhere'), lock)
+        with self.assertRaises(OSError) as raised:     # the open itself refuses a link: the system's own error
+            self.open()
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
+        self.assertFalse(os.path.lexists(os.path.join(self.state, 'elsewhere')))
+        os.unlink(lock)
+        os.mkdir(lock, 0o700)
+        with self.assertRaises(OSError) as raised:
+            self.open()
+        self.assertEqual(raised.exception.errno, errno.EISDIR)
+
+    def test_database_that_is_shared_open_to_others_or_linked_is_refused(self):
+        self.open().close()
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        os.chmod(database, 0o640)
+        self.refused(DATABASE_REFUSED)
+        os.chmod(database, 0o600)
+        os.link(database, database + '.second')
+        self.refused(DATABASE_REFUSED)
+        os.unlink(database + '.second')
+        os.rename(database, database + '.moved')
+        os.symlink(database + '.moved', database)
+        with self.assertRaises(OSError) as raised:
+            self.open()
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
+        os.unlink(database)
+        os.rename(database + '.moved', database)
+        self.open().close()                            # the original file is accepted again
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'officer-messages.lock')))
+
+    def test_refused_lock_or_database_releases_the_lock(self):
+        self.open().close()
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        os.chmod(database, 0o644)
+        self.refused(DATABASE_REFUSED)
+        os.chmod(database, 0o600)
+        self.open().close()                            # not left holding the lifetime lock
+
+
+def _icacls(*args):
+    subprocess.run(['icacls'] + list(args), check=True, capture_output=True, timeout=30)
+
+
+def _junction(link, target):
+    """A directory junction needs no special privilege, unlike a symbolic link."""
+    subprocess.run(['cmd', '/c', 'mklink', '/J', link, target], check=True, capture_output=True, timeout=30)
+
+
+@unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists and junctions')
+class StoreStorageWindows(StoreStorageCommon):
+    EVERYONE_READ = '*S-1-1-0:(R)'      # a SID, so the test does not depend on the system language
+
+    def refused(self, text):
+        with self.assertRaises(OSError) as raised:
+            self.open()
+        self.assertEqual(str(raised.exception), text)
+
+    def test_new_files_have_protected_private_access_lists(self):
+        import private_storage
+        self.open().close()
+        private_storage.windows_security(self.state, True)
+        for name in ('officer-messages.lock', 'officer-messages.sqlite3'):
+            private_storage.windows_security(os.path.join(self.state, name))
+
+    def test_state_folder_open_to_everyone_is_refused(self):
+        import private_storage
+        private_storage.make_private_folder(self.state)
+        _icacls(self.state, '/grant', self.EVERYONE_READ)
+        self.refused(STATE_REFUSED)
+        self.assertEqual(os.listdir(self.state), [], 'nothing is created in a refused folder')
+
+    def test_junction_in_place_of_the_state_folder_is_refused(self):
+        import private_storage
+        target = os.path.join(self.base, 'real-state')
+        private_storage.make_private_folder(target)
+        _junction(self.state, target)
+        self.refused(STATE_REFUSED)
+        self.assertEqual(os.listdir(target), [], 'nothing is created behind the junction')
+
+    def test_existing_private_folder_is_accepted(self):
+        import private_storage
+        private_storage.make_private_folder(self.state)
+        self.open().close()
+
+    def test_database_open_to_everyone_is_refused(self):
+        self.open().close()
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        _icacls(database, '/grant', self.EVERYONE_READ)
+        self.refused(DATABASE_REFUSED)
+
+    def test_lock_open_to_everyone_is_refused(self):
+        self.open().close()
+        _icacls(os.path.join(self.state, 'officer-messages.lock'), '/grant', self.EVERYONE_READ)
+        self.refused(LOCK_REFUSED)
+
+    def test_journal_junction_is_refused(self):
+        self.open().close()
+        elsewhere = os.path.join(self.base, 'elsewhere')
+        os.mkdir(elsewhere)
+        _junction(os.path.join(self.state, 'officer-messages.sqlite3-journal'), elsewhere)
+        self.refused(DATABASE_REFUSED)
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_open_database_cannot_be_swapped_while_sqlite_opens_it(self):
+        import private_storage
+        self.open().close()
+        database = os.path.join(self.state, 'officer-messages.sqlite3')
+        fd = private_storage.open_private_rw(database)
+        try:
+            with self.assertRaises(OSError):
+                os.replace(database, database + '.moved')   # the checked handle does not share delete
+        finally:
+            os.close(fd)
 
 
 if __name__ == '__main__':
