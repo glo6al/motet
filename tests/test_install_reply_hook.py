@@ -157,7 +157,8 @@ class NoHookFolders(unittest.TestCase):
             with context(),self.assertRaisesRegex(ValueError,'^Stop Motet before provisioning reply hooks.$'):self.run_main('--remove','--revoke')
         finally:self.storage.close_lock(lock)
         self.assertEqual(self.active(),[('fictional-id',)])
-        with context():
+        from handle_leaks import no_leaked_handles
+        with context(),no_leaked_handles(self):
             self.assertEqual(self.run_main('--remove','--revoke'),installer.NONE_ON_WINDOWS+' Saved reply-notice access was turned off.\n')
         self.assertEqual(self.active(),[])
         for name in ('.codex','.claude'):self.assertFalse((self.home/name).exists())

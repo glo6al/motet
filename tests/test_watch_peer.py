@@ -320,6 +320,19 @@ class SimulatedWindowsCredentials(unittest.TestCase):
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
 
+    def test_credential_files_are_closed_on_success_and_refusal(self):
+        from handle_leaks import no_leaked_handles
+        credential = {'version': 2, 'credential_id': str(uuid.uuid4()), 'secret': 'd' * 64}
+        with self.simulated_windows():
+            with no_leaked_handles(self):
+                path = w.write_credential(self.state, credential, 8793)
+                w.read_credential(path)
+            with no_leaked_handles(self), self.assertRaises(OSError):
+                w.write_credential(self.state, credential, 8793)
+        os.chmod(path, 0o644)
+        with self.simulated_windows(), no_leaked_handles(self), self.assertRaises(w.claude_channel.ChannelError):
+            w.read_credential(path)
+
     def test_refusals_map_to_one_plain_message(self):
         credential = {'version': 2, 'credential_id': str(uuid.uuid4()), 'secret': 'b' * 64}
         with self.simulated_windows():

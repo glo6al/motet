@@ -168,17 +168,23 @@ def open_database(state):
             db = sqlite3.connect(path, timeout=DB_TIMEOUT)
         finally:
             os.close(fd)
-        with transaction(db):
-            schema(db)
-        return db
+        return _with_schema(db)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         claude_channel._private(os.fstat(fd))
     finally:
         os.close(fd)
-    db = sqlite3.connect(path, timeout=DB_TIMEOUT)
-    with transaction(db):
-        schema(db)
+    return _with_schema(sqlite3.connect(path, timeout=DB_TIMEOUT))
+
+
+def _with_schema(db):
+    """Create the tables, closing the connection if that fails so no handle outlives the call."""
+    try:
+        with transaction(db):
+            schema(db)
+    except BaseException:
+        db.close()
+        raise
     return db
 
 

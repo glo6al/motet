@@ -34,9 +34,14 @@ def inspect(state_dir):
     identity = path.stat()
     snapshot = sqlite3.connect(':memory:')
     try:
-        with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2) as source:
+        # A connection's "with" block only ends a transaction; close it explicitly, or the database stays open
+        # until garbage collection (Windows then refuses to delete or replace the file).
+        source = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2)
+        try:
             source.execute('PRAGMA query_only=ON')
             source.backup(snapshot)
+        finally:
+            source.close()
         after = path.stat()
         if (identity.st_dev, identity.st_ino) != (after.st_dev, after.st_ino):
             raise ValueError('The state database changed identity during inspection.')
