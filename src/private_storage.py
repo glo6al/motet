@@ -585,3 +585,32 @@ def unlock(fd):
     else:
         import fcntl
         fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def close_lock(fd):
+    """Release a lock taken by ``try_lock`` and close its descriptor. Windows may hold a byte lock for a while after
+    its file closes, so it is released first there; a lock that was never taken is simply closed."""
+    if WIN:
+        try:
+            unlock(fd)
+        except OSError:
+            pass   # not held: closing is all that is left
+    os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# (f) SQLite's companion files. SQLite makes its rollback journal by name next to the database.
+
+def sqlite_companions_plain(path):
+    """False if a rollback journal, -wal or -shm file next to ``path`` is a link, junction, not a plain file, or a
+    file with a second name, so SQLite would write through it to somewhere else. A plain leftover journal is fine:
+    SQLite needs it to roll back an interrupted write."""
+    for suffix in ('-journal', '-wal', '-shm'):
+        try:
+            info = os.lstat(path + suffix)
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & REPARSE_POINT
+                or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+            return False
+    return True
