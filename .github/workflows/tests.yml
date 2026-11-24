@@ -117,6 +117,9 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_check_privacy.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_windows_probe.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python scripts/check_privacy.py --all
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_memory.py
