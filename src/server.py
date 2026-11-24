@@ -5262,8 +5262,11 @@ class H(BaseHTTPRequestHandler):
     def attachments_http(self):
         import attachments_http
         native = None
-        if ATTACHMENTS_ENABLED and NATIVE_AGENT_ATTACHMENTS_ENABLED and os.environ.get('WATCH_DEMO') != '1':
+        if (ATTACHMENTS_ENABLED and NATIVE_AGENT_ATTACHMENTS_ENABLED and NATIVE_ATTACHMENT_DELIVERY_HOST
+                and os.environ.get('WATCH_DEMO') != '1'):
             native = getattr(getattr(MESSAGING, '_native_composition', None), 'claude', None)
+        if os.environ.get('WATCH_DEMO') == '1':
+            return attachments_http.handle_http(self, ATTACHMENTS, KEY, PORT, native=native)     # as before
         off = ATTACHMENTS_OFF or 'attachments_disabled'
         return attachments_http.handle_http(self, ATTACHMENTS, KEY, PORT, native=native,
                                             unavailable=(off, ATTACHMENTS_OFF_WHY[off]))
@@ -6504,6 +6507,9 @@ def attachment_availability():
 
     Attachments are on only while the store runs; Motet's own file reading only while its host policy also loaded.
     ``reason`` is plain words for the page when attachments are off, and None while they are on."""
+    if os.environ.get('WATCH_DEMO') == '1':
+        # The demo feeds screenshots: it reports the rollout switches exactly as before, with no store behind them.
+        return ATTACHMENTS_ENABLED, ATTACHMENTS_ENABLED and OFFICER_DOCUMENTS_ENABLED, None
     if ATTACHMENTS is None or not ATTACHMENTS_ENABLED:
         return False, False, ATTACHMENTS_OFF_WHY[ATTACHMENTS_OFF or 'attachments_disabled']
     return True, bool(OFFICER_DOCUMENTS_ENABLED and getattr(ATTACHMENTS, 'documents', None) is not None), None

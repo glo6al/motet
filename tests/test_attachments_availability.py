@@ -40,8 +40,9 @@ class Request:
         return code, json.loads(body)
 
 
-def model_selection():
-    with mock.patch.object(server, 'OFFICER_MODEL', 'claude-haiku-5-5'), mock.patch.object(server, 'OFFICER_MODEL_ERROR', ''):
+def model_selection(demo='0'):
+    with mock.patch.object(server, 'OFFICER_MODEL', 'claude-haiku-5-5'), mock.patch.object(server, 'OFFICER_MODEL_ERROR', ''), \
+            mock.patch.dict(os.environ, {'WATCH_DEMO': demo}):
         code, value = server.H.officer_models_http(Request(), 'GET')
     assert code == 200
     return value
@@ -114,6 +115,20 @@ class StartupTests(unittest.TestCase):
                          (True, False, None))
         self.assertNotIn('attachments_reason', value)
 
+    def test_reading_turns_off_when_the_policy_is_refused_at_start(self):
+        # Kept on purpose: with the store running but the reading policy missing, unreadable or out of date, the page is
+        # told documents_enabled is false (2a2d902 said true), so a staged file question gets the "current setting" line.
+        (self.home / '.live-room').mkdir(mode=0o700)
+        expired = AttachmentError('policy_unavailable', 'Fictional expired policy.', 503)
+        with mock.patch('officer_document_policy.load_allowance', side_effect=expired) as load:
+            service = self.start()
+        load.assert_called_once()
+        self.assertIsNotNone(service)
+        with mock.patch.object(server, 'ATTACHMENTS', service):
+            value = model_selection()
+        self.assertEqual(value, {'schemaVersion': 1, 'selected_model': 'claude-haiku-5-5', 'selection_available': True,
+                                 'attachments_enabled': True, 'documents_enabled': False})
+
     def test_failed_store_on_a_mac_or_linux_reports_the_storage_reason(self):
         (self.home / '.live-room').mkdir(mode=0o755)        # not private, so the store refuses it
         with mock.patch.object(server, 'WIN', False):
@@ -146,6 +161,46 @@ class StartupTests(unittest.TestCase):
             self.assertEqual(server.ATTACHMENTS_OFF, 'attachments_disabled')
 
 
+class DemoTests(unittest.TestCase):
+    """The demo feeds screenshots, so it reports and refuses exactly as 2a2d902 did."""
+
+    def test_demo_reports_the_rollout_switches_as_before(self):
+        for off in ('attachments_disabled', 'attachments_windows_unavailable', 'attachments_storage_unavailable', None):
+            with mock.patch.object(server, 'ATTACHMENTS', None), mock.patch.object(server, 'ATTACHMENTS_OFF', off):
+                self.assertEqual(model_selection(demo='1'), {'schemaVersion': 1, 'selected_model': 'claude-haiku-5-5',
+                                                             'selection_available': True, 'attachments_enabled': True,
+                                                             'documents_enabled': True})
+        with mock.patch.object(server, 'ATTACHMENTS', None), mock.patch.object(server, 'OFFICER_DOCUMENTS_ENABLED', False):
+            value = model_selection(demo='1')
+        self.assertEqual((value['attachments_enabled'], value['documents_enabled']), (True, False))
+        self.assertNotIn('attachments_reason', value)
+
+    def test_demo_requests_get_the_old_refusal(self):
+        seen = []
+        def handle(handler, service, key, port, **options):
+            seen.append(options)
+        with mock.patch.object(server, 'ATTACHMENTS', None), mock.patch.object(server, 'ATTACHMENTS_OFF', 'attachments_windows_unavailable'), \
+                mock.patch.dict(os.environ, {'WATCH_DEMO': '1'}), mock.patch('attachments_http.handle_http', side_effect=handle):
+            server.H.attachments_http(Request())
+        self.assertEqual(seen, [{'native': None}], 'the default code and words: attachments_disabled, as before')
+
+
+@unittest.skipUnless(os.name == 'nt', 'The real Windows refusal; simulated on POSIX by StartupTests')
+class RealWindowsStartupTests(unittest.TestCase):
+    def test_real_start_attachments_reports_windows_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.multiple(server, HOME=temporary, KEY=KEY, ATTACHMENTS_ENABLED=True,
+                                     OFFICER_DOCUMENTS_ENABLED=True), mock.patch.dict(os.environ, {'WATCH_DEMO': '0'}):
+                try:
+                    self.assertIsNone(server.start_attachments())
+                    self.assertEqual(server.ATTACHMENTS_OFF, 'attachments_windows_unavailable')
+                    with mock.patch.object(server, 'ATTACHMENTS', None):
+                        self.assertEqual(model_selection()['attachments_reason'], WINDOWS)
+                finally:
+                    server.ATTACHMENTS_OFF = 'attachments_disabled'
+            self.assertEqual(os.listdir(temporary), [], 'refused before touching disk')
+
+
 class RefusalCodeTests(unittest.TestCase):
     def test_requests_get_the_reason_code_while_the_store_is_off(self):
         seen = []
@@ -153,10 +208,24 @@ class RefusalCodeTests(unittest.TestCase):
             seen.append((service, unavailable))
         for off in ('attachments_windows_unavailable', 'attachments_storage_unavailable', 'attachments_disabled', None):
             with mock.patch.object(server, 'ATTACHMENTS', None), mock.patch.object(server, 'ATTACHMENTS_OFF', off), \
-                    mock.patch('attachments_http.handle_http', side_effect=handle):
+                    mock.patch.dict(os.environ, {'WATCH_DEMO': '0'}), mock.patch('attachments_http.handle_http', side_effect=handle):
                 server.H.attachments_http(Request())
             code = off or 'attachments_disabled'
             self.assertEqual(seen.pop(), (None, (code, server.ATTACHMENTS_OFF_WHY[code])))
+
+    def test_native_helper_is_chosen_only_where_the_host_may_deliver(self):
+        seen = []
+        def handle(handler, service, key, port, *, native=None, unavailable):
+            seen.append(native)
+        helper = object()
+        messaging = mock.Mock(_native_composition=mock.Mock(claude=helper))
+        for host, expected in ((False, None), (True, helper)):
+            with mock.patch.multiple(server, MESSAGING=messaging, ATTACHMENTS=mock.Mock(), ATTACHMENTS_OFF=None,
+                                     ATTACHMENTS_ENABLED=True, NATIVE_AGENT_ATTACHMENTS_ENABLED=True,
+                                     NATIVE_ATTACHMENT_DELIVERY_HOST=host), \
+                    mock.patch.dict(os.environ, {'WATCH_DEMO': '0'}), mock.patch('attachments_http.handle_http', side_effect=handle):
+                server.H.attachments_http(Request())
+            self.assertIs(seen.pop(), expected)
 
     def test_http_boundary_answers_with_that_code_after_owner_checks(self):
         import attachments_http
@@ -230,11 +299,12 @@ class HostFlagTests(unittest.TestCase):
 
 class ImportWithoutFcntlTests(unittest.TestCase):
     def test_attachment_modules_import_where_fcntl_does_not_exist(self):
-        modules = sorted(p.stem for p in (ROOT / 'src').glob('*.py')
-                         if p.stem.startswith(('attachments_', 'officer_document')) or p.stem in (
-                             'claude_attachment_adapter', 'codex_attachment_adapter', 'codex_attachment_dispatch',
-                             'codex_attachment_evidence', 'officer_documents'))
-        self.assertIn('attachments_native_namespace', modules)
+        # Every module on the attachment path on disk, so a new one is covered without editing this list.
+        modules = sorted({p.stem for pattern in ('attachments_*.py', 'officer_document*.py', 'codex_attachment*.py',
+                                                 'claude_attachment*.py') for p in (ROOT / 'src').glob(pattern)})
+        for name in ('attachments_native_namespace', 'attachments_claude_service', 'attachments_native_composition',
+                     'officer_documents', 'codex_attachment_live_evidence', 'claude_attachment_adapter'):
+            self.assertIn(name, modules)
         code = ("import importlib, sys\n"
                 "sys.modules['fcntl'] = None\n"
                 "sys.path.insert(0, sys.argv[1])\n"
