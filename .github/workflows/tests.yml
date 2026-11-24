@@ -38,6 +38,8 @@ jobs:
           python -u -X faulthandler -c "import faulthandler, runpy; print('parser checks started', flush=True); faulthandler.dump_traceback_later(60, repeat=True); runpy.run_path('tests/test_parsers.py', run_name='__main__')"
       - run: python tests/test_app_icons.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_preview_walk.py
+        if: ${{ !cancelled() }}
       - run: python tests/test_dictation_assets.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5

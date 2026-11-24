@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""The owner's app icons: one read-only, owner-keyed address over a private folder. Fictional icons in a
-temporary home only; the WATCH listener binds an ephemeral loopback port, never 8793."""
+"""The owner's app icons: one read-only, owner-keyed address over a private folder, on macOS, Linux and Windows.
+Fictional icons in a temporary home only, written in binary; the WATCH listener binds an ephemeral loopback port,
+never 8793. On Windows a junction stands in for a folder link (it needs no special privilege); a symbolic link to a
+file is tried and the check skipped where Windows does not allow one."""
 import http.client
 from http.server import ThreadingHTTPServer
 import os
@@ -9,24 +11,45 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server
 
 SVG = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="#2f86c9"/></svg>'
 PNG = b'\x89PNG\r\n\x1a\n' + b'\0' * 24
 
 
-@unittest.skipIf(server.WIN, 'not offered on Windows')
+def folder_link(target, link):
+    """A link to a folder: a junction on Windows, a symbolic link elsewhere."""
+    if server.WIN:
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link)
+
+
+def remove_folder_link(link):
+    (os.rmdir if server.WIN else os.unlink)(link)      # the link itself, never what it points to
+
+
 class AppIconFolder(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.icons = self.home / '.live-room' / 'app-icons'
         self.icons.mkdir(parents=True)
+        self.links = []
 
     def tearDown(self):
+        while self.links:
+            remove_folder_link(self.links.pop())
         self.tmp.cleanup()
+
+    def link_folder(self, target, link):
+        folder_link(target, link)
+        self.links.append(link)
 
     def get(self, name):
         return server.app_icon(name, home=str(self.home))
@@ -50,11 +73,18 @@ class AppIconFolder(unittest.TestCase):
         self.assertIsNone(self.get('cursor'))
         self.assertIsNone(server.app_icon('claude', home=str(self.home / 'nowhere')))
 
-    def test_links_hard_links_size_and_shape_are_refused(self):
+    def test_a_linked_icon_is_refused(self):
         outside = self.home / 'outside.svg'
         outside.write_bytes(SVG)
-        os.symlink(outside, self.icons / 'claude.svg')
+        try:
+            os.symlink(outside, self.icons / 'claude.svg')
+        except OSError as e:
+            self.skipTest('creating a symbolic link needs Developer Mode or the symlink privilege (%s)' % type(e).__name__)
         self.assertIsNone(self.get('claude'), 'a link out of the folder is not followed')
+
+    def test_hard_links_size_and_shape_are_refused(self):
+        outside = self.home / 'outside.svg'
+        outside.write_bytes(SVG)
         os.link(outside, self.icons / 'codex.svg')
         self.assertIsNone(self.get('codex'), 'a second name for a file elsewhere is not served')
         (self.icons / 'cursor.svg').write_bytes(b'<svg>' + b' ' * server.APP_ICON_MAX)
@@ -69,11 +99,88 @@ class AppIconFolder(unittest.TestCase):
         real.mkdir()
         (real / 'claude.svg').write_bytes(SVG)
         self.icons.rmdir()
-        os.symlink(real, self.icons)
+        self.link_folder(real, self.icons)
+        self.assertIsNone(self.get('claude'))
+        remove_folder_link(self.links.pop())
+        self.icons.mkdir()
+        (self.icons / 'claude.svg').write_bytes(SVG)
+        self.assertEqual(self.get('claude'), (SVG, 'image/svg+xml'), 'served again from a real folder')
+
+    def test_a_linked_state_folder_is_refused(self):
+        (self.icons / 'claude.svg').write_bytes(SVG)
+        state = self.home / '.live-room'
+        state.rename(self.home / 'state-elsewhere')
+        self.link_folder(self.home / 'state-elsewhere', state)
         self.assertIsNone(self.get('claude'))
 
+    def test_links_above_the_state_folder_are_resolved_once(self):
+        """As before the walk: your home may be reached through a link (a moved profile, /var on macOS)."""
+        (self.icons / 'claude.svg').write_bytes(SVG)
+        self.link_folder(self.home, self.home.parent / (self.home.name + '-via-link'))
+        self.assertEqual(server.app_icon('claude', home=str(self.links[-1])), (SVG, 'image/svg+xml'))
 
-@unittest.skipIf(server.WIN, 'not offered on Windows')
+    @unittest.skipUnless(server.WIN, 'Windows opens icons through the shared walk; macOS and Linux keep the path open')
+    def test_icons_are_opened_through_the_shared_walk(self):
+        (self.icons / 'claude.svg').write_bytes(SVG)
+        calls = []
+        real_folder = server.private_storage.open_folder
+
+        def recorded(path, *args, **kwargs):
+            calls.append(path)
+            return real_folder(path, *args, **kwargs)
+        with unittest.mock.patch.object(server.private_storage, 'open_folder', recorded):
+            self.assertEqual(self.get('claude'), (SVG, 'image/svg+xml'))
+        self.assertEqual(calls, [os.path.join(os.path.realpath(str(self.home)), '.live-room')])
+
+    @unittest.skipIf(server.WIN, 'POSIX permission bits')
+    def test_a_search_only_folder_above_home_is_enough(self):
+        """As before the walk: a folder above home that others may only pass through (/home at 0711 on Linux)."""
+        if os.geteuid() == 0:
+            self.skipTest('root reads any folder, so a search-only folder proves nothing')
+        outer = self.home / 'outer'
+        home = outer / 'person'
+        icons = home / '.live-room' / 'app-icons'
+        icons.mkdir(parents=True)
+        (icons / 'claude.svg').write_bytes(SVG)
+        outer.chmod(0o111)
+        try:
+            with self.assertRaises(PermissionError):
+                os.listdir(outer)              # the premise: nothing here may read the folder
+            self.assertEqual(server.app_icon('claude', home=str(home)), (SVG, 'image/svg+xml'))
+            with unittest.mock.patch.object(server, 'HOME', str(home)):
+                self.assertEqual(server.app_icon('claude'), (SVG, 'image/svg+xml'))
+        finally:
+            outer.chmod(0o755)
+
+    def test_posix_keeps_its_own_opens(self):
+        """macOS and Linux do not go through the shared walk for icons (it needs read access on every folder)."""
+        if server.WIN:
+            self.skipTest('Windows uses the walk')
+        (self.icons / 'claude.svg').write_bytes(SVG)
+        with unittest.mock.patch.object(server.private_storage, 'open_folder', side_effect=AssertionError('walk used')):
+            self.assertEqual(self.get('claude'), (SVG, 'image/svg+xml'))
+
+
+@unittest.skipIf(os.name == 'nt', 'simulates Windows on macOS or Linux')
+class SimulatedWindowsIcons(unittest.TestCase):
+    """app_icon under the Windows simulation: every open goes through private_storage, links still refused."""
+
+    def test_served_and_links_refused(self):
+        from windows_simulation import simulated_windows
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            icons = home / '.live-room' / 'app-icons'
+            icons.mkdir(parents=True)
+            (icons / 'codex.png').write_bytes(PNG)
+            with simulated_windows() as calls, unittest.mock.patch.object(server, 'WIN', True):
+                self.assertEqual(server.app_icon('codex', home=str(home)), (PNG, 'image/png'))
+                self.assertIn('anchored', calls)
+                self.assertIn('open_folder', calls)
+                icons.rename(home / 'icons-elsewhere')
+                os.symlink(home / 'icons-elsewhere', icons)
+                self.assertIsNone(server.app_icon('codex', home=str(home)))
+
+
 class AppIconAddress(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

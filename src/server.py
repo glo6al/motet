@@ -1528,6 +1528,10 @@ PRIVATE_ROOTS = tuple(os.path.join(HOME, p) + os.sep for p in ('.live-room', '.s
 
 
 def dir_ids(paths):
+    """The identities (file id, volume) of these folders, following links, as os.stat reports them. On Windows each
+    folder's identity as read from a held handle (``held_id``, after resolving the path once) is added as well, so a
+    folder is recognised whichever way Python read it: the preview walk compares identities read from its own
+    handles with these, and a folder that could only be told apart by one reading is counted under both."""
     out = set()
     for p in paths:
         try:
@@ -1535,22 +1539,19 @@ def dir_ids(paths):
             out.add((st.st_ino, st.st_dev))
         except OSError:
             pass
+        if WIN:
+            try:
+                with private_storage.open_folder(os.path.realpath(p)) as folder:
+                    out.add(held_id(folder))
+            except OSError:
+                pass
     return out
 
 
-def no_reparse(start, path, lstat=os.lstat):
-    """Windows only: is neither `start` nor any name from it down to `path` a link or junction? lstat does not
-    follow the name it is given, so a link to a network share is noticed before anything would wait on the share.
-    Each name is its own snapshot: a folder swapped after its check is not seen here, and a later lstat resolves
-    through whatever is then above it (see preview, which rests on the file id check after the open, not on this)."""
-    import stat as _st
-    walk = start
-    for name in [None] + [x for x in path[len(start):].split(os.sep) if x]:
-        if name is not None:
-            walk = os.path.join(walk, name)
-        if lstat(walk).st_file_attributes & _st.FILE_ATTRIBUTE_REPARSE_POINT:
-            return False
-    return True
+def held_id(folder):
+    """The identity (file id, volume) of a folder held by the no-link walk, read through its own handle."""
+    st = folder.stat()
+    return (st.st_ino, st.st_dev)
 
 
 def above(path):
@@ -1568,16 +1569,124 @@ def in_private(real):
     return under(real + os.sep, PRIVATE_ROOTS) or bool(dir_ids(above(os.path.dirname(real))) & dir_ids(PRIVATE_ROOTS))
 
 
+_RESOLVED_HOME = (None, None)
+
+
+def resolved_home():
+    """HOME with its links resolved (a profile moved with a junction, a home reached through a symlink), read once
+    for each value of HOME. Grants are recorded under resolved paths, so the home rule and the private names must
+    know where home really is, not only the name it was given. It is not read again while HOME stays the same: if
+    the junction your profile is reached through is pointed somewhere else, the change takes effect after a restart."""
+    global _RESOLVED_HOME
+    home, real = _RESOLVED_HOME
+    if home != HOME:
+        home, real = HOME, os.path.realpath(HOME)
+        _RESOLVED_HOME = (home, real)
+    return real
+
+
+def home_and_above():
+    """The home folder and every folder above it, under its given name and under its resolved one."""
+    given, real = above(HOME), above(resolved_home())
+    return given + [p for p in real if p not in given]
+
+
+def private_names():
+    """The private folders by name: as given (under HOME) and also under the resolved home, where grants live."""
+    home, real = HOME, resolved_home()
+    names = list(PRIVATE_ROOTS)
+    if real != home:
+        names += [real + p[len(home):] for p in PRIVATE_ROOTS if p.startswith(home + os.sep)]
+    return tuple(names)
+
+
+def named_private(path):
+    """Windows, while serving: is this path inside a private folder by name alone (case ignored)? Nothing on disk is
+    looked at, so no link is followed before the walk; identities are compared by the walk itself."""
+    return under(path + os.sep, private_names())
+
+
+_PRIVATE_TARGETS = (None, ())
+_PRIVATE_TARGETS_LOCK = threading.Lock()       # grants arrive on several log-tail threads at once
+PRIVATE_TARGETS_KEPT = 64
+
+
+def record_private_targets():
+    """Grant time only: where each private folder really is, its links followed (realpath), as the grant's own
+    checks already follow them. A private folder that is a link or junction (~/.claude moved to another drive, say)
+    is otherwise known only by its name, and the serving walk never follows it. The places are kept for this home
+    and list of private folders, older ones too (up to PRIVATE_TARGETS_KEPT), so a folder a link pointed to when any
+    page was granted stays protected after the link is pointed elsewhere. The places are resolved first, then
+    merged under a lock, so two grants at once cannot drop each other's older places. Returns them all."""
+    global _PRIVATE_TARGETS
+    key = (HOME, PRIVATE_ROOTS)
+    found = []
+    for name in private_names():
+        try:
+            found.append(os.path.realpath(name.rstrip(os.sep)))
+        except (OSError, ValueError):
+            continue
+    with _PRIVATE_TARGETS_LOCK:
+        held_key, known = _PRIVATE_TARGETS
+        known = list(known) if held_key == key else []
+        for real in found:
+            if real in known:
+                known.remove(real)
+            known.append(real)
+        _PRIVATE_TARGETS = (key, tuple(known[-PRIVATE_TARGETS_KEPT:]))
+        return _PRIVATE_TARGETS[1]
+
+
+def private_targets():
+    """The private folders' real places recorded at the last grants (record_private_targets); nothing is resolved."""
+    key, known = _PRIVATE_TARGETS
+    return known if key == (HOME, PRIVATE_ROOTS) else ()
+
+
+PRIVATE_IDS_SECONDS = 2.0
+_PRIVATE_IDS = (None, 0.0, frozenset())
+
+
+def windows_private_ids():
+    """Windows, while serving: the identities of the private folders, each opened by the no-link walk and read
+    through its own handle: from its name (under the given and the resolved home), and from each real place recorded
+    when pages were granted (private_targets), which is how a private folder that is a link or junction is known.
+    Nothing is resolved here, so no link is followed while serving (a link to a network share would otherwise be
+    contacted on every request). The set is reused for PRIVATE_IDS_SECONDS (per home, list of private folders and
+    recorded places): it describes folders at fixed places, which a grant never covers, so a reading two seconds old
+    answers the same question; it saves opening every private folder from the drive down for each file of a page."""
+    global _PRIVATE_IDS
+    targets = private_targets()
+    key, now = (HOME, PRIVATE_ROOTS, targets), time.monotonic()
+    held_key, at, ids = _PRIVATE_IDS
+    if held_key == key and 0 <= now - at < PRIVATE_IDS_SECONDS:
+        return ids
+    out = set()
+    for name in private_names() + targets:
+        try:
+            with private_storage.open_folder(name) as folder:
+                out.add(held_id(folder))
+        except OSError:
+            pass
+    _PRIVATE_IDS = (key, now, frozenset(out))
+    return _PRIVATE_IDS[2]
+
+
 def allow_preview(aid, old, ts, cid, path):
     """Let the page render an HTML file an agent wrote. The path must be a real, regular .html file reached without
     any symlink, outside private configuration folders. Its identity is recorded, so a file swapped in later under
-    the same name is not served. On macOS the folder it sits in is granted for its styles, scripts and images, unless
-    that folder is your home folder or above it; private folders below a granted folder are never served (see
-    preview). On Windows no folder is granted (see preview), and nothing is granted before Python 3.12, which can
-    report full-width Windows file ids (the version is checked, not whether the filesystem supplied one): the "same
-    file id" check rests on them (an id a filesystem may reuse after the file is deleted, so a file deleted and
-    replaced is not always told apart; an open handle per grant would be the cure, and is not kept).
-    A Windows path with a second colon names an alternate data stream and is refused."""
+    the same name is not served. The folder it sits in is granted for its styles, scripts and images, unless that
+    folder is your home folder or above it, under its given name or its resolved one (a home reached through a link
+    or junction), or holds the real place of a private folder (one that is a link or junction, followed here at
+    grant time and recorded for the serving walk); private folders below a granted folder are never served (see
+    preview).
+    The folder is recorded by identity: on macOS and Linux as os.stat reports it, on Windows as read from the folder's
+    own handle after the no-link walk has opened it (the same reading the preview walk compares it with later). On
+    Windows nothing is granted before Python 3.12, which can report full-width Windows file ids (the version is
+    checked, not whether the filesystem supplied one): the "same file id" checks rest on them (an id a filesystem may
+    reuse after the file is deleted, so a file deleted and replaced is not always told apart; an open handle per grant
+    would be the cure, and is not kept). A Windows path with a second colon names an alternate data stream and is
+    refused."""
     if not WIN_IDS or (WIN and ':' in path[2:]):
         return
     try:
@@ -1594,13 +1703,20 @@ def allow_preview(aid, old, ts, cid, path):
     while len(ALLOWED_FILES) > 400:
         ALLOWED_FILES.pop(next(iter(ALLOWED_FILES)))
     try:
-        if WIN:
-            raise OSError('no folder grants on Windows (see preview)')
-        ds = os.stat(os.path.dirname(real))
-        if (ds.st_ino, ds.st_dev) in dir_ids(above(HOME)) or under(HOME + os.sep, [os.path.dirname(real).rstrip(os.sep) + os.sep]):
-            raise OSError('too broad')                # a page saved straight into the home folder brings no folder with it
+        if WIN:                                       # read through the walk's own handle, as preview will read it
+            with private_storage.open_folder(os.path.dirname(real)) as folder:
+                ident = held_id(folder)
+        else:
+            ds = os.stat(os.path.dirname(real))
+            ident = (ds.st_ino, ds.st_dev)
+        folder = [os.path.dirname(real).rstrip(os.sep) + os.sep]
+        if (ident in dir_ids(home_and_above()) or under(HOME + os.sep, folder)
+                or under(resolved_home() + os.sep, folder)):
+            raise OSError('too broad')                # a page saved into the home folder, or above it, brings no folder
+        if any(under(target + os.sep, folder) for target in record_private_targets()):
+            raise OSError('holds a private folder')   # where a private folder really is, behind a link or junction
         ALLOWED_DIRS.pop(os.path.dirname(real), None)
-        ALLOWED_DIRS[os.path.dirname(real)] = (ds.st_ino, ds.st_dev)     # styles, scripts and images beside it; never other pages
+        ALLOWED_DIRS[os.path.dirname(real)] = ident   # styles, scripts and images beside it; never other pages
         while len(ALLOWED_DIRS) > 100:
             ALLOWED_DIRS.pop(next(iter(ALLOWED_DIRS)))
     except OSError:
@@ -4884,8 +5000,8 @@ def accepts_page_gzip(values):
 
 
 # The owner's own app icons (never shipped with Motet): ~/.live-room/app-icons/<name>.svg or .png, for exactly these
-# four names. Read-only, owner key required, opened name by name from the state folder with links refused, one-name
-# regular files only, capped in size. An SVG is served under a policy that lets it draw and do nothing else.
+# four names. Read-only, owner key required, opened name by name with links refused, one-name regular files only,
+# capped in size. An SVG is served under a policy that lets it draw and do nothing else.
 APP_ICON_NAMES = ('claude', 'codex', 'antigravity', 'cursor')
 APP_ICON_MAX = 256 * 1024
 APP_ICON_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
@@ -4893,10 +5009,18 @@ APP_ICON_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
 
 def app_icon(name, home=None):
     """Return (bytes, content type) for one owner icon, or None. Nothing from a request becomes a path: the name must
-    be one of APP_ICON_NAMES. Not offered on Windows (no folder-relative opens there), where the page keeps its text."""
-    import stat as _st
-    if WIN or name not in APP_ICON_NAMES:
+    be one of APP_ICON_NAMES. On macOS and Linux the state folder is opened by its path with the last name not
+    followed, so the folders above it need only search permission (a 0711 /home works), then app-icons and the icon
+    are opened inside it by descriptor with links refused. On Windows the folders above the state folder (your home)
+    are resolved once (``private_storage.anchored``), and from there the shared no-link walk opens ``.live-room``,
+    then ``app-icons``, then the icon, refusing a link or junction at each. The state folder is not required to be
+    private here: an icon is not a secret, it is served only to the owner's key under a draw-only policy, and the
+    key's own checks (load_key, Motet's storage) guard the folder."""
+    if name not in APP_ICON_NAMES:
         return None
+    if WIN:
+        return _app_icon_windows(name, home)
+    import stat as _st
     nofollow = getattr(os, 'O_NOFOLLOW', 0)
     folder = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | nofollow
     cur = fd = -1
@@ -4911,12 +5035,9 @@ def app_icon(name, home=None):
             except FileNotFoundError:
                 continue
             st = os.fstat(fd)
-            if not _st.S_ISREG(st.st_mode) or st.st_nlink != 1 or not 0 < st.st_size <= APP_ICON_MAX:
+            if not _st.S_ISREG(st.st_mode) or st.st_nlink != 1:
                 return None
-            body = os.read(fd, APP_ICON_MAX + 1)
-            if len(body) != st.st_size or ctype == 'image/png' and not body.startswith(b'\x89PNG\r\n\x1a\n'):
-                return None
-            return body, ctype
+            return _app_icon_body(fd, st, ctype)
         return None
     except OSError:
         return None
@@ -4924,6 +5045,67 @@ def app_icon(name, home=None):
         for f in (fd, cur):
             if f >= 0:
                 os.close(f)
+
+
+def _app_icon_body(fd, st, ctype):
+    """The size cap, a whole read and the PNG signature, the same on every system."""
+    if not 0 < st.st_size <= APP_ICON_MAX:
+        return None
+    body = os.read(fd, APP_ICON_MAX + 1)
+    if len(body) != st.st_size or ctype == 'image/png' and not body.startswith(b'\x89PNG\r\n\x1a\n'):
+        return None
+    return body, ctype
+
+
+def _app_icon_windows(name, home):
+    try:
+        with private_storage.open_folder(private_storage.anchored(os.path.join(home or HOME, '.live-room'))) as state, \
+                state.folder('app-icons') as icons:
+            for ext, ctype in (('.svg', 'image/svg+xml'), ('.png', 'image/png')):
+                try:
+                    fd = icons.open(name + ext, single_link=True)     # a regular file with one name, never a link
+                except FileNotFoundError:
+                    continue
+                try:
+                    return _app_icon_body(fd, os.fstat(fd), ctype)
+                finally:
+                    os.close(fd)
+        return None
+    except OSError:
+        return None
+
+
+def preview_asset_windows(want):
+    """Windows: a descriptor for a style, script, image or font inside a granted folder, or -1. The same rules as
+    the macOS walk in preview, on held handles: the granted folder is opened with no link or junction from the
+    drive root down and held without delete sharing, so it cannot be renamed or replaced while it is used; its
+    identity must be the one granted and not a private folder's; then each next name is opened relative to the
+    folder handle above it (a link, junction or other reparse point there is refused, never followed), and each
+    folder walked through is compared by identity with the private ones. Which folder is which is decided by
+    those identities, not by spelling, so a differently cased name cannot reach a private folder.
+
+    Nothing before the walk looks at the disk: the grant is found by name, the private check before it is by name
+    only (named_private), and the private identities come from the no-link walk too (windows_private_ids). So no
+    link an agent placed under the grant, or in place of a private folder, is followed, and a link to a network
+    share is never contacted."""
+    import contextlib
+    root = next((d for d in list(ALLOWED_DIRS) if want.startswith(d + os.sep)), None)
+    if not root or not want.lower().endswith(ASSET_EXT) or named_private(want):
+        return -1
+    parts = [x for x in want[len(root) + 1:].split(os.sep) if x]
+    if any(x in ('.', '..') for x in parts) or not parts:
+        return -1
+    private = windows_private_ids()
+    with contextlib.ExitStack() as held:          # closes the deepest folder first, as the walk requires
+        cur = held.enter_context(private_storage.open_folder(root))
+        ident = held_id(cur)
+        if ident != ALLOWED_DIRS[root] or ident in private:
+            return -1
+        for name in parts[:-1]:
+            cur = held.enter_context(cur.folder(name))
+            if held_id(cur) in private:
+                return -1
+        return cur.open(parts[-1], single_link=True)
 
 
 # Fixed, because on Windows mimetypes reads the registry, where .js is sometimes text/plain (and nosniff then blocks it).
@@ -5213,10 +5395,11 @@ class H(BaseHTTPRequestHandler):
         else must be a style, script, image or font inside a granted folder, and is opened by walking down from that
         folder one name at a time with symlinks refused at every step, so what is served is always inside the grant.
         Nothing in or under a private folder is served that way, whatever folder was granted: the granted folder and
-        every folder walked through is compared, by identity, with the private ones. On Windows only granted pages
-        and images are served, each walked by name from its drive root first (a snapshot: nothing on the way may be
-        a link or junction) and then required to be, by file id, the very file that was granted; its folder is not
-        granted there (see the branch below)."""
+        every folder walked through is compared, by identity, with the private ones. On Windows the walk is the shared
+        held-handle one (private_storage): the granted folder is opened from its drive root with no link or junction
+        anywhere on the way and held, each next name is opened relative to the folder handle above it, and every
+        identity is read from those handles. A granted page or image is opened the same way there, then required to
+        be, by file id, the very file that was granted."""
         import stat as _st
         want = os.path.normpath(want)
         flags = os.O_RDONLY | BINARY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
@@ -5224,19 +5407,20 @@ class H(BaseHTTPRequestHandler):
         try:
             granted = ALLOWED_FILES.get(want)
             if granted:
-                if WIN:                     # no link or junction from the drive root down, name by name; C:file is refused
-                    drive, rest = os.path.splitdrive(want)
-                    if not drive or not rest.startswith(os.sep) or not no_reparse(drive + os.sep, want):
+                if WIN:     # held from the drive root down, no link or junction anywhere; C:file and streams are refused
+                    if not os.path.isabs(want):     # C:file names a folder by the drive's current one
                         return self.send(404, b'not found')
-                fd = os.open(want, flags)
+                    fd = private_storage.open_no_links(want, single_link=True)
+                else:
+                    fd = os.open(want, flags)
                 st = os.fstat(fd)
                 if (st.st_ino, st.st_dev) != granted:
                     return self.send(404, b'not found')
             elif WIN:
-                # No folder is granted on Windows (allow_preview), so nothing but a granted page or image is served
-                # there: Python's os API cannot open a folder and walk down from it on Windows, and a walk by name
-                # cannot be made atomic. A walk pinned through Windows directory handles is on the roadmap.
-                return self.send(404, b'not found')
+                fd = preview_asset_windows(want)
+                if fd < 0:
+                    return self.send(404, b'not found')
+                st = os.fstat(fd)
             else:
                 root = next((d for d in list(ALLOWED_DIRS) if want.startswith(d + os.sep)), None)
                 if not root or not want.lower().endswith(ASSET_EXT) or in_private(want):

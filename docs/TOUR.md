@@ -27,7 +27,7 @@ Choose **Motet** in the sidebar for its desk. **Recorded days · UTC** opens ret
 
 See [brand assets](../brand/README.md) for the Motet wordmark and icon. Workspace follows the same provider and permission limits described in [What works with what](PROVIDER_SUPPORT.md).
 
-The sidebar names the app each agent runs in (Claude, Codex, Antigravity or Cursor) as text after its name. To show icons instead, put your own files in `~/.live-room/app-icons/`, named `claude`, `codex`, `antigravity` or `cursor` with `.svg` or `.png` (up to 256 KB each, a plain file, not a link), then reload the page. Motet ships without provider icons and the demo always shows text; you are responsible for having the rights to any icons you add. Icons are not offered on Windows yet.
+The sidebar names the app each agent runs in (Claude, Codex, Antigravity or Cursor) as text after its name. To show icons instead, put your own files in `~/.live-room/app-icons/`, named `claude`, `codex`, `antigravity` or `cursor` with `.svg` or `.png` (up to 256 KB each, a plain file, not a link), then reload the page. Motet ships without provider icons and the demo always shows text; you are responsible for having the rights to any icons you add. On Windows the folder is `%USERPROFILE%\.live-room\app-icons`, and a junction in place of either folder is refused like a link.
 
 <a id="the-room-and-the-desk"></a>
 
