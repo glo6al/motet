@@ -328,12 +328,21 @@ def load_key():
     """On macOS the key lives in a directory and a regular file forced to private modes and checked to be owned by
     you. On Windows the server checks neither owner nor permissions: it relies on the user profile's default
     permissions, which keep other non-administrator accounts out unless they have been changed, and refuses only a
-    link or junction in the folder's place. Creation is serialised with a lock and each file is published by rename, so two servers starting together agree on one key and a hook never
+    link or junction in the folder's place. A folder this function creates on Windows gets a private access list
+    (this user and SYSTEM) from the start, so the files made in it inherit only those. Creation is serialised with a lock and each file is published by rename, so two servers starting together agree on one key and a hook never
     reads a half-written header. Unlock files old enough to be dead are removed; a younger one may belong to a
     server that is still running, and is left for it."""
     import stat as _st, tempfile
     d = os.path.join(HOME, '.live-room')
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    if WIN and not os.path.lexists(d):
+        os.makedirs(HOME, exist_ok=True)
+        try:
+            private_storage.make_private_folder(d)
+        except OSError:
+            if not os.path.lexists(d):    # another server made it first: it is checked below like any other
+                raise
+    else:
+        os.makedirs(d, mode=0o700, exist_ok=True)
     # Windows has no owner ids or modes here, and nothing is checked: the folder is as private as the user profile's
     # default permissions make it. Links are refused on both.
     if os.path.islink(d) or (WIN and os.lstat(d).st_file_attributes & _st.FILE_ATTRIBUTE_REPARSE_POINT) \
@@ -6355,7 +6364,9 @@ def start_native_attachment_maintenance(messaging, attachments):
 
 
 MESSAGING_STORAGE_WHY = ('Agent messaging needs a private readable state folder and database in '
-                         + ('%USERPROFILE%\\.live-room.' if WIN else '~/.live-room.'))
+                         + ('%USERPROFILE%\\.live-room. If Motet was first started as administrator, make the folder '
+                            'yours with: icacls "%USERPROFILE%\\.live-room" /setowner "%USERDOMAIN%\\%USERNAME%"'
+                            if WIN else '~/.live-room.'))
 
 
 def start_messaging():

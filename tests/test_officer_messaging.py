@@ -990,6 +990,23 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
         again, _ = server.start_messaging()        # the refusal released the lifetime lock
         self.assertIsNone(again)
 
+    @unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists')
+    def test_windows_key_folder_is_created_private_and_messaging_accepts_it(self):
+        import private_storage
+        server.load_key()
+        state = os.path.join(self.home, '.live-room')
+        private_storage.windows_security(state, True)            # owned by this user, private access list
+        store, reason = server.start_messaging()
+        try:
+            self.assertIsNone(reason)
+        finally:
+            store.close()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX modes')
+    def test_posix_key_folder_is_still_made_0700(self):
+        server.load_key()
+        self.assertEqual(os.stat(os.path.join(self.home, '.live-room')).st_mode & 0o777, 0o700)
+
     def test_import_failure_is_caught(self):
         with patch.object(server, 'MessagingStore', side_effect=ImportError('fictional')):
             self.assertEqual(server.start_messaging(), (None, server.MESSAGING_STORAGE_WHY))
@@ -1018,7 +1035,9 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
             import private_storage
             private_storage.make_private_folder(state)
             _icacls(state, '/grant', StoreStorageWindows.EVERYONE_READ)
-            expected = 'Agent messaging needs a private readable state folder and database in %USERPROFILE%\\.live-room.'
+            expected = ('Agent messaging needs a private readable state folder and database in %USERPROFILE%\\.live-room. '
+                        'If Motet was first started as administrator, make the folder yours with: '
+                        'icacls "%USERPROFILE%\\.live-room" /setowner "%USERDOMAIN%\\%USERNAME%"')
         else:
             os.mkdir(state, 0o755)
             expected = 'Agent messaging needs a private readable state folder and database in ~/.live-room.'
