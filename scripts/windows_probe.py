@@ -15,7 +15,6 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -36,10 +35,23 @@ def _path_regex(path):
     return re.compile(lead + body, re.IGNORECASE)
 
 
+COMMON_WORDS = {'user', 'users', 'admin', 'administrator', 'code', 'test', 'guest', 'default', 'public', 'owner',
+                'home', 'name', 'root', 'main', 'work', 'dev', 'me', 'my', 'pc', 'laptop', 'desktop'}
+EDGE = r'\\/._~@-'
+
+
 def _name_regex(name):
-    if len(name) >= 4:
-        return re.compile(re.escape(name), re.IGNORECASE)
-    return re.compile(r'(?<![A-Za-z0-9])' + re.escape(name) + r'(?![A-Za-z0-9])', re.IGNORECASE)
+    """A name of 5+ letters that is not an everyday word matches anywhere (a pipe name may embed it).
+    A very short or common name matches only when it sits next to a path or name separator, so
+    ordinary words are left alone; anything else matches as a whole word."""
+    esc = re.escape(name)
+    if len(name) >= 5 and name.lower() not in COMMON_WORDS:
+        return re.compile(esc, re.IGNORECASE)
+    if len(name) <= 3 or name.lower() in COMMON_WORDS:
+        edge = '[' + EDGE + ']'
+        return re.compile('(?:(?<=' + edge + ')' + esc + r'(?![A-Za-z0-9])|(?<![A-Za-z0-9])' + esc + '(?=' + edge + '))',
+                          re.IGNORECASE)
+    return re.compile(r'(?<![A-Za-z0-9])' + esc + r'(?![A-Za-z0-9])', re.IGNORECASE)
 
 
 EMAIL = re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+')
@@ -48,14 +60,30 @@ PREFIXED_KEY = re.compile(
     r'\b(?:sk|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abprs]|AKIA|AIza)[-_A-Za-z0-9]{8,}')
 JWT = re.compile(r'\beyJ[\w-]{5,}\.[\w-]{5,}(?:\.[\w-]*)?')
 BEARER = re.compile(r'(?i)\b(bearer|basic)\s+[\w.~+/=-]{8,}')
-ASSIGNED = re.compile(r'(?i)\b(token|secret|password|passwd|api[_-]?key|apikey|key)(\s*[=:]\s*)\S+')
+# A label followed by a value that is not one of the probe's own status words.
+ASSIGNED = re.compile(r'(?i)\b(token|secret|password|passwd|api[_-]?key)(\s*[=:]\s*)'
+                      r'(?!(?:not|found|yes|no|none|set|error|n/a|skipped)\b)[^\s<]{6,}')
 LONG_HEX = re.compile(r'\b[0-9a-fA-F]{16,}\b')
 LONG_RUN = re.compile(r'[A-Za-z0-9+/_=-]{32,}')
 
 
+def _short_path(path):
+    """The 8.3 form of a path, read-only, on Windows; '' when unavailable."""
+    if os.name != 'nt' or not path:
+        return ''
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 1024)
+        return buf.value if 0 < n < 1024 else ''
+    except Exception:
+        return ''
+
+
 def make_context(env=None):
     """The things to hide, gathered from the environment (or from a given dict)."""
-    env = os.environ if env is None else env
+    real = env is None
+    env = os.environ if real else env
     profile = env.get('USERPROFILE') or os.path.expanduser('~')
     user = env.get('USERNAME') or env.get('USER') or ''
     if not user:
@@ -65,44 +93,62 @@ def make_context(env=None):
         except Exception:
             user = ''
     pc = env.get('COMPUTERNAME') or platform.node() or ''
-    return {
+    ctx = {
         'profile': profile,
         'localappdata': env.get('LOCALAPPDATA') or '',
         'appdata': env.get('APPDATA') or '',
         'user': user,
         'pc': pc,
     }
+    if real:
+        ctx['short_paths'] = [(_short_path(ctx[k]), n) for k, n in
+                              (('localappdata', '%LOCALAPPDATA%'), ('appdata', '%APPDATA%'),
+                               ('profile', '%USERPROFILE%'))]
+    return ctx
 
 
 def redact(text, ctx=None):
-    """Return text with personal paths, names, e-mails and key-like strings replaced."""
+    """Return text with personal paths, names, e-mails and key-like strings replaced.
+
+    Placeholders are put in as sentinels and swapped in at the very end, so a later step
+    can never rewrite part of an earlier placeholder."""
     if text is None:
         return ''
     ctx = ctx or make_context()
-    text = str(text)
-    text = EMAIL.sub('<email>', text)
+    text = str(text).replace('\x00', '')
+    marks = []
+
+    def mark(value):
+        marks.append(value)
+        return '\x00%d\x00' % (len(marks) - 1)
+
+    text = EMAIL.sub(lambda m: mark('<email>'), text)
     paths = [(ctx.get('localappdata'), '%LOCALAPPDATA%'),
              (ctx.get('appdata'), '%APPDATA%'),
              (ctx.get('profile'), '%USERPROFILE%')]
+    paths += list(ctx.get('short_paths') or [])
     paths = [(p, n) for p, n in paths if p and len(p) > 3]
     paths.sort(key=lambda pn: -len(pn[0]))          # longest first: AppData lives inside the profile
     for path, name in paths:
         rx = _path_regex(path)
         if rx:
-            text = rx.sub(name, text)
+            text = rx.sub(lambda m, n=name: mark(n), text)
     user = ctx.get('user') or ''
-    aliases = [user]
     profile = ctx.get('profile') or ''
     base = [p for p in re.split(r'[\\/]+', profile) if p][-1:] if profile else []
-    aliases += base
-    if len(user) > 6:
-        aliases.append(user[:6] + '~1')               # the 8.3 short form of a long name
-    names = {a: '<user>' for a in aliases if a and len(a) >= 2}
+    names = {}
+    for a in [user] + base:
+        if a:
+            names[a] = '<user>'
     pc = ctx.get('pc') or ''
-    if len(pc) >= 2:
+    if pc:
         names[pc] = '<pc>'
     for alias in sorted(names, key=len, reverse=True):      # longest first: a PC name may contain the user name
-        text = _name_regex(alias).sub(names[alias], text)
+        text = _name_regex(alias).sub(lambda m, v=names[alias]: mark(v), text)
+    short = re.sub(r'[^A-Za-z0-9]', '', user)[:6]            # an 8.3 short form: first six letters, ~1, ~2 ...
+    if short:
+        text = re.compile(r'(?<![A-Za-z0-9])' + re.escape(short) + r'~\d+(?![A-Za-z0-9])', re.IGNORECASE).sub(
+            lambda m: mark('<user>'), text)
     text = UUID.sub('<id>', text)
     text = JWT.sub('<key>', text)
     text = PREFIXED_KEY.sub('<key>', text)
@@ -110,7 +156,7 @@ def redact(text, ctx=None):
     text = ASSIGNED.sub(lambda m: m.group(1) + m.group(2) + '<key>', text)
     text = LONG_HEX.sub('<id>', text)
     text = LONG_RUN.sub('<key>', text)
-    return text
+    return re.sub('\x00(\\d+)\x00', lambda m: marks[int(m.group(1))], text)
 
 
 # ---------------------------------------------------------------- helpers
@@ -119,20 +165,82 @@ def remaining():
     return BUDGET_SECONDS - (time.time() - _START)
 
 
+SYSTEM32 = os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', 'System32')
+POWERSHELL = os.path.join(SYSTEM32, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+
+
+def which(name):
+    """Find a command on PATH only (never the current folder). Returns a path or None."""
+    exts = ['', '.exe', '.cmd', '.bat', '.com'] if os.name == 'nt' else ['']
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        d = d.strip('"')
+        if not d or not os.path.isabs(d):
+            continue
+        for ext in exts:
+            cand = os.path.join(d, name + ext)
+            if os.path.isfile(cand) and (os.name == 'nt' or os.access(cand, os.X_OK)):
+                return cand
+    return None
+
+
+def not_run_reason(path):
+    """Why a command must not be executed, or '' if it may be."""
+    low = path.lower().replace('/', '\\')
+    if '\\windowsapps\\' in low:
+        return 'app alias, not run'
+    if low.endswith(('.cmd', '.bat')):
+        return 'script shim, not run'
+    return ''
+
+
 def run(cmd, timeout=10):
-    """Run a command without a shell. Returns (exit code, combined output) or (None, 'error: ...')."""
+    """Run a command without a shell. Returns (exit code, combined output) or (None, 'error: ...').
+
+    The wait is bounded: on a timeout the whole process tree is killed (on Windows a direct kill leaves
+    grandchildren holding the pipe open) and the output is read by a helper thread we do not wait for."""
+    import threading
     left = remaining()
     if left < 1:
         return None, 'error: skipped, time budget used up'
-    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
     try:
-        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=min(timeout, left), creationflags=flags)
-    except subprocess.TimeoutExpired:
-        return None, 'error: timed out'
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             creationflags=flags)
     except Exception as e:
         return None, 'error: %s' % type(e).__name__
-    return p.returncode, p.stdout.decode('utf-8', 'replace')
+    box = []
+
+    def reader():
+        try:
+            box.append(p.stdout.read())
+        except Exception:
+            box.append(b'')
+        finally:
+            try:
+                p.stdout.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    t.join(min(timeout, left))
+    if t.is_alive():
+        try:
+            if os.name == 'nt':
+                subprocess.run([os.path.join(SYSTEM32, 'taskkill.exe'), '/T', '/F', '/PID', str(p.pid)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=5, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            else:
+                p.kill()
+        except Exception:
+            pass
+        t.join(2)
+        return None, 'error: timed out'
+    try:
+        rc = p.wait(timeout=2)
+    except Exception:
+        return None, 'error: timed out'
+    return rc, (box[0] if box else b'').decode('utf-8', 'replace')
 
 
 def first_line(text, limit=120):
@@ -169,7 +277,7 @@ def appx_packages():
         return _APPX['v']
     script = ("Get-AppxPackage | Where-Object { $_.Name -match '%s' } | ForEach-Object "
               "{ $_.Name + '|' + $_.Version + '|' + $_.InstallLocation }" % APPX_PATTERN)
-    rc, out = run(['powershell', '-NoProfile', '-Command', script], timeout=25)
+    rc, out = run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', script], timeout=25)
     if rc != 0:
         _APPX['v'] = out.strip() if rc is None else 'error: powershell exit %s' % rc
         raise RuntimeError(_APPX['v'])
@@ -296,17 +404,30 @@ def check_windows_python():
 
 
 def probe_codex_cli(path, label):
+    why = not_run_reason(path)
+    if why:
+        return ['%s: found (%s)' % (label, why)]
     lines = []
     rc, out = run([path, '--version'])
     lines.append('%s --version: %s' % (label, first_line(out) if rc == 0 else
                                        (out if rc is None else 'error: exit %s' % rc)))
-    for args in (['queue', '--help'], ['app-server', '--help']):
-        rc, out = run([path] + args)
+    for sub in ('queue', 'app-server'):
+        rc, out = run([path, sub, '--help'])
         if rc is None:
-            lines.append('%s %s: %s' % (label, ' '.join(args), out))
+            lines.append('%s %s --help: %s' % (label, sub, out))
+            continue
+        usage = ''
+        for line in out.splitlines():
+            if re.match(r'(?i)^\s*usage:', line):
+                usage = line
+                break
+        if rc != 0:
+            verdict = 'failed'
+        elif re.search(r'(?<![\w-])' + re.escape(sub) + r'(?![\w-])', usage):
+            verdict = 'ok'
         else:
-            lines.append('%s %s: %s (exit %s); first line: %s' % (
-                label, ' '.join(args), 'ok' if rc == 0 else 'failed', rc, first_line(out) or '(none)'))
+            verdict = 'exit 0 but the help is not for this subcommand (probably not supported)'
+        lines.append('%s %s --help: %s (exit %s); first line: %s' % (label, sub, verdict, rc, first_line(out) or '(none)'))
     return lines
 
 
@@ -354,7 +475,7 @@ def check_codex_app():
     else:
         lines.append('Bundled codex file: not searched (no install folder)')
 
-    on_path = shutil.which('codex')
+    on_path = which('codex')
     lines.append('codex on PATH: %s' % ('found: %s' % on_path if on_path else 'not found'))
     probed = []
     for label, path in (('PATH codex', on_path), ('bundled codex', exes[0] if exes else None)):
@@ -447,12 +568,16 @@ def check_claude():
     except Exception as e:
         lines.append('Uninstall entry: error: %s' % type(e).__name__)
 
-    cli = shutil.which('claude')
+    cli = which('claude')
     if cli:
-        rc, out = run([cli, '--version'])
         lines.append('claude on PATH: found: %s' % cli)
-        lines.append('claude --version: %s' % (first_line(out) if rc == 0 else
-                                               (out if rc is None else 'error: exit %s' % rc)))
+        why = not_run_reason(cli)
+        if why:
+            lines.append('claude --version: not run (%s)' % why)
+        else:
+            rc, out = run([cli, '--version'])
+            lines.append('claude --version: %s' % (first_line(out) if rc == 0 else
+                                                   (out if rc is None else 'error: exit %s' % rc)))
     else:
         lines.append('claude on PATH: not found')
 
@@ -467,15 +592,15 @@ def check_claude():
             hooks = data.get('hooks') if isinstance(data, dict) else None
             if isinstance(hooks, dict):
                 events = [k if re.match(r'^[A-Za-z]{1,30}$', k) else '<other>' for k in hooks]
-                lines.append('  hooks key: found; events: %s' % (', '.join(sorted(events)) or '(none)'))
+                lines.append('  hooks section: found; events: %s' % (', '.join(sorted(events)) or '(none)'))
             elif hooks is not None:
-                lines.append('  hooks key: found (not an object)')
+                lines.append('  hooks section: found (not an object)')
             else:
-                lines.append('  hooks key: not found')
+                lines.append('  hooks section: not found')
         except Exception as e:
-            lines.append('  hooks key: error: could not read (%s)' % type(e).__name__)
+            lines.append('  hooks section: error: could not read (%s)' % type(e).__name__)
 
-    where = shutil.which('bash')
+    where = which('bash')
     lines.append('bash on PATH: %s' % ('found: %s' % where if where else 'not found'))
     gb = os.path.join(env_dir('ProgramFiles') or r'C:\Program Files', 'Git', 'bin', 'bash.exe')
     lines.append('Git Bash (Program Files\\Git\\bin\\bash.exe): %s' % ('found' if os.path.isfile(gb) else 'not found'))
@@ -500,7 +625,7 @@ def check_editor(label, pattern, folder_names, cli_names):
     except Exception as e:
         lines.append('%s uninstall entry: error: %s' % (label, type(e).__name__))
     for cli in cli_names:
-        lines.append('%s on PATH: %s' % (cli, 'found: %s' % shutil.which(cli) if shutil.which(cli) else 'not found'))
+        lines.append('%s on PATH: %s' % (cli, 'found: %s' % which(cli) if which(cli) else 'not found'))
     return lines
 
 
@@ -511,7 +636,7 @@ def check_editors():
 
 
 def check_terminal():
-    wt = shutil.which('wt')
+    wt = which('wt')
     return ['wt.exe on PATH: %s' % ('found: %s' % wt if wt else 'not found')]
 
 
@@ -521,7 +646,7 @@ def check_moonshine():
 
 def check_processes():
     lines = []
-    rc, out = run(['tasklist', '/fo', 'csv', '/nh'])
+    rc, out = run([os.path.join(SYSTEM32, 'tasklist.exe'), '/fo', 'csv', '/nh'])
     if rc != 0:
         return ['Process list: %s' % (out if rc is None else 'error: tasklist exit %s' % rc)]
     counts = {}
@@ -538,18 +663,20 @@ def check_processes():
         lines.append('codex.exe command line: not checked (codex.exe not running)')
         return lines
     cmdlines, how = None, ''
-    if shutil.which('wmic'):
-        rc, out = run(['wmic', 'process', 'where', "name='codex.exe'", 'get', 'commandline'])
-        if rc == 0:
-            cmdlines, how = [l.strip() for l in out.splitlines()[1:] if l.strip()], 'wmic'
-    if cmdlines is None:
-        rc, out = run(['powershell', '-NoProfile', '-Command',
-                       "Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | "
-                       "ForEach-Object { $_.CommandLine }"], timeout=15)
-        if rc == 0:
-            cmdlines, how = [l.strip() for l in out.splitlines() if l.strip()], 'PowerShell Get-CimInstance'
-        else:
-            lines.append('codex.exe command line: error: %s' % (out if rc is None else 'powershell exit %s' % rc))
+    rc, out = run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command',
+                   "Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | "
+                   "ForEach-Object { $_.CommandLine }"], timeout=15)
+    if rc == 0:
+        cmdlines, how = [l.strip() for l in out.splitlines() if l.strip()], 'PowerShell Get-CimInstance'
+    else:
+        err = out if rc is None else 'powershell exit %s' % rc
+        wmic = os.path.join(SYSTEM32, 'wbem', 'wmic.exe')
+        if os.path.isfile(wmic):
+            rc, out = run([wmic, 'process', 'where', "name='codex.exe'", 'get', 'commandline'])
+            if rc == 0:
+                cmdlines, how = [l.strip() for l in out.splitlines()[1:] if l.strip()], 'wmic'
+        if cmdlines is None:
+            lines.append('codex.exe command line: error: %s' % err)
             return lines
     lines.append('codex.exe command lines readable (via %s): %s' % (how, 'yes (%d)' % len(cmdlines) if cmdlines else 'no'))
     joined = '\n'.join(cmdlines).lower()
@@ -578,6 +705,10 @@ def main():
     if os.name != 'nt':
         print('This script is for Windows.')
         return 0
+    try:
+        sys.stdout.reconfigure(errors='replace')
+    except Exception:
+        pass
     ctx = make_context()
     out = ['Motet Windows probe (read-only; nothing was changed, written or sent)']
     for label, fn in SECTIONS:
