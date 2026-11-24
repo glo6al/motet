@@ -1050,15 +1050,18 @@ class SimulatedWindowsWalk(unittest.TestCase):
                 self.created.append(name)
                 if self.refuse_new:
                     self.public.add(id(node))
-            elif disposition == ps._NT_FILE_CREATE:
-                fail(ps._NT_COLLISION)
-            if node['kind'] == 'busy':
-                fail(ps._NT_SHARING_VIOLATION)
+            # As real NtCreateFile does (seen on windows-latest): the wrong type is reported before a collision, so a
+            # file created over a folder or junction gives STATUS_FILE_IS_A_DIRECTORY, a folder over a file
+            # STATUS_NOT_A_DIRECTORY, and only a name of the asked-for type STATUS_OBJECT_NAME_COLLISION.
             is_folder = node['kind'] in ('folder', 'link-folder')
             if directory and not is_folder:
                 fail(0xC0000103)
-            if directory is False and node['kind'] == 'folder':
+            if directory is False and is_folder:
                 fail(0xC00000BA)
+            if not made and disposition == ps._NT_FILE_CREATE:
+                fail(ps._NT_COLLISION)
+            if node['kind'] == 'busy':
+                fail(ps._NT_SHARING_VIOLATION)
             if conflicts(node, access, share):
                 fail(ps._NT_SHARING_VIOLATION)
             if information is not None:
@@ -1392,6 +1395,12 @@ class SimulatedWindowsWalk(unittest.TestCase):
             for name in ('chat.jsonl', 'new.json', 'link.json'):       # a link counts as an existing name
                 with self.subTest(name=name), self.assertRaises(FileExistsError):
                     folder.create(name)
+            claude['children'].update({'sub': self.node('folder'), 'junction': self.node('link-folder')})
+            for name in ('sub', 'junction'):          # reported by Windows as STATUS_FILE_IS_A_DIRECTORY
+                with self.subTest(name=name), self.assertRaises(FileExistsError) as raised:
+                    folder.create(name)
+                self.assertEqual(raised.exception.ntstatus, 0xC00000BA)
+                self.assertEqual(claude['children'][name]['kind'], 'folder' if name == 'sub' else 'link-folder')
             for name in ('', '..', 'a\\b', 'chat.jsonl:stream', 'trailing.'):
                 with self.subTest(name=name):
                     reason(self, lambda: folder.create(name), 'unavailable')
@@ -1435,9 +1444,12 @@ class SimulatedWindowsWalk(unittest.TestCase):
             node = self.claude()['children']['sub']
             self.assertEqual((node['kind'], node['descriptor'], self.checked), ('folder', 'private-descriptor', ['sub']))
             self.assertEqual(len(self.open_now), 4, 'the new folder is closed; only the walk is held')
-            for name in ('sub', 'chat.jsonl'):
-                with self.subTest(name=name), self.assertRaises(FileExistsError):
+            self.claude()['children'].update({'link.json': self.node('link-file'), 'junction': self.node('link-folder')})
+            for name, status in (('sub', ps._NT_COLLISION), ('junction', ps._NT_COLLISION),
+                                 ('chat.jsonl', 0xC0000103), ('link.json', 0xC0000103)):   # STATUS_NOT_A_DIRECTORY
+                with self.subTest(name=name), self.assertRaises(FileExistsError) as raised:
                     folder.mkdir(name)
+                self.assertEqual(raised.exception.ntstatus, status)
             with folder.folder('sub', private=True, writable=True) as sub:
                 sub.create('inner.json')
         self.assertIn('inner.json', node['children'])
@@ -1580,6 +1592,18 @@ class SimulatedWindowsWalk(unittest.TestCase):
             reason(self, lambda: folder.open_append('sub'), 'not_regular')
             self.assertEqual(checked, [('chat.jsonl', False), ('exclude', False)], 'checked as unwritable, not private')
             self.assertEqual(self.checked, [], 'the private rule is not applied')
+            lookups = []
+
+            def junction_appears(name):               # missing when opened, a junction by the time it is created
+                if name == 'raced':
+                    lookups.append(name)
+                    if len(lookups) == 2:
+                        claude['children']['raced'] = self.node('link-folder')
+            self.during_open = junction_appears
+            with self.assertRaises(FileExistsError):
+                folder.open_append('raced')
+            self.during_open = None
+            self.assertEqual(claude['children']['raced']['kind'], 'link-folder')
             self.public.add(id(self.chat))
             reason(self, lambda: folder.open_append('chat.jsonl'), 'access')
             self.assertIn('chat.jsonl', claude['children'])

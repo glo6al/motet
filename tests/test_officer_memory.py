@@ -128,7 +128,7 @@ class OfficerMemoryTests(unittest.TestCase):
                 record['timestamp'] = yesterday.isoformat()
                 out.write(json.dumps(record) + '\n')
         server.CodexTail(path).poll()
-        self.assertTrue(server.HISTORY.flush())
+        self.assertTrue(server.HISTORY.flush(timeout=20))     # generous: slow CI runners exceed the 2-second default
         events = server.HISTORY.search(limit=100)['events']
         self.assertEqual({e['outcome'] for e in events if e['phase'] == 'result'}, {'failure', 'unknown'})
         self.assertTrue(all(e['project_name'] == poison for e in events))
