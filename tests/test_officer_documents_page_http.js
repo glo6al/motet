@@ -739,25 +739,37 @@ async function run() {
   console.log('Motet page/client actual HTTP: 21 flows + 12 unmodified VM scenario controls / 14 causal mutants passed; every callback and final DTO validated, only explicit fictional calls, 0 external calls.');
 }
 if (process.platform === 'win32') {
-  // Positive HTTP cases require POSIX storage. Exercise the actual native
-  // Windows refusal and verify that it leaves no private store behind.
+  // The positive HTTP cases need Motet's file reading, which stays off on Windows until its reading policy can be
+  // read there (step 6c.3). What is true on Windows now: the private store starts in a private state folder (made
+  // owned by this user: an elevated runner's new folders belong to Administrators, which the store refuses), and the
+  // reading policy refuses, so file reading stays off.
   const result = spawnSync('python', ['-c', `
 from pathlib import Path
+import os
 from tempfile import TemporaryDirectory
+import private_storage
 from attachments_files import PrivateFiles
 from attachments_types import AttachmentError
-with TemporaryDirectory() as folder:
+from officer_document_policy import load_allowance
+with TemporaryDirectory() as temporary:
+    state = Path(os.path.realpath(temporary)) / 'state'
+    private_storage.make_private_folder(str(state))
+    files = PrivateFiles(str(state))
     try:
-        PrivateFiles(folder)
+        assert files._windows
+        assert (state / 'attachments' / 'objects').is_dir()
+    finally:
+        files.close()
+    try:
+        load_allowance(Path(files.parent), enabled=True, demo=False)
     except AttachmentError as error:
-        assert error.code == 'host_unavailable', error
-        assert not any(Path(folder).iterdir())
+        assert error.code == 'document_policy_unavailable', error
     else:
-        raise AssertionError('Native Windows accepted POSIX attachment storage.')
-`], {cwd: path.join(__dirname, '../src'), encoding: 'utf8', timeout: 15000});
+        raise AssertionError('Motet file reading started on Windows before its policy can be read there.')
+`], {cwd: path.join(__dirname, '../src'), encoding: 'utf8', timeout: 30000});
   if (result.error) throw result.error;
   assert.equal(result.status, 0, result.stderr);
-  console.log('ok native Windows refuses private attachment storage before creating files');
+  console.log('ok native Windows starts the private attachment store and keeps Motet file reading off at its policy');
 } else {
   setImmediate(() => run().catch(error => { console.error(error); process.exitCode = 1; }));
 }

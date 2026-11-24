@@ -19,6 +19,11 @@ import officer_messaging as messaging
 import peer_lifecycle
 import server
 
+# How long a test request may wait for the server. Windows CI runners are slow at times (on one Python 3.9 run a
+# whole unchanged suite took twice its usual time), and twelve concurrent polls queue there on the store's lock;
+# 3 seconds is kept elsewhere. No test here relies on a request timing out.
+CLIENT_TIMEOUT = 30 if os.name == 'nt' else 3
+
 
 def uid():
     return str(uuid.uuid4())
@@ -61,7 +66,7 @@ class ClaudeModTests(unittest.TestCase):
             headers['X-Live-Room-Key'] = server.KEY
         if token is not None:
             headers['Authorization'] = 'Bearer '+token
-        conn = http.client.HTTPConnection('127.0.0.1', server.PORT, timeout=3)
+        conn = http.client.HTTPConnection('127.0.0.1', server.PORT, timeout=CLIENT_TIMEOUT)
         conn.request('POST', path, json.dumps(data), headers)
         response = conn.getresponse()
         raw = response.read(); status = response.status
