@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import officer_messaging as m
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX store')
+@unittest.skipIf(os.name == 'nt', 'Codex live controls need the Mac app and read transcripts by handle-based folder walk')
 class ControlTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

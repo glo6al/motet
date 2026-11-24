@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 NATIVE = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222']
 
 
-@unittest.skipIf(os.name == 'nt' or not shutil.which('node'), 'Requires private POSIX outbox and Node')
+@unittest.skipIf(not shutil.which('node'), 'Requires Node')
 class GlobalModIntegration(unittest.TestCase):
     def test_two_loaded_chats_one_authorization_isolated_request_and_reply(self):
         previous = server.MESSAGING, server.KEY, server.PORT, dict(server.AGENTS)

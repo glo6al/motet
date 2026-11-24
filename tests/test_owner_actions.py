@@ -19,7 +19,7 @@ import officer_messaging as messaging
 import server
 
 
-@unittest.skipIf(os.name == 'nt', 'Messaging storage requires POSIX')
+@unittest.skipIf(os.name == 'nt', 'Codex relays read transcripts by handle-based folder walk; Codex messaging needs the Mac app')
 class OwnerActionsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -257,7 +257,7 @@ finally:
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM controls').fetchone()[0],0)
 
 
-@unittest.skipIf(os.name == 'nt', 'Messaging storage requires POSIX')
+@unittest.skipIf(os.name == 'nt', 'Codex relays read transcripts by handle-based folder walk; Codex messaging needs the Mac app')
 class GuardedRelayTests(unittest.TestCase):
     # Share the real HTTP fixture, without duplicating the unrelated test methods.
     setUp = OwnerActionsTests.setUp

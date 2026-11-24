@@ -70,6 +70,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_new_chat_service.py
         if: ${{ !cancelled() }}
+      # Off on Windows: managed Claude (chats Motet starts) needs the Mac app, macOS identity and its pinned runner.
       - run: python tests/test_managed_new_chat_service.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_claude_managed_runner.py
@@ -217,6 +218,9 @@ jobs:
         timeout-minutes: 5
       - run: python tests/test_watch_claude.py
         if: ${{ !cancelled() }}
+      # Off on Windows: the Claude MCP channel, Antigravity inbox and bridge find their files by handle-based folder walk
+      # (dir_fd), which Windows lacks; they come to Windows with the bridge step. Messaging Claude through the
+      # plugin is covered on Windows by test_claude_mod.py and test_claude_global_integration.py above.
       - run: npm --prefix integrations/claude ci --ignore-scripts --no-audit --no-fund
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_peer_refusal_compatibility.py -v
@@ -318,6 +322,7 @@ jobs:
       - run: python tests/test_attachments_integration.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # Off on Windows: attachments store files by handle-based folder walk (dir_fd), so they stay off on Windows for now.
       - run: python tests/test_attachments_native_composition.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_attachments_native_deletion.py
@@ -344,6 +349,7 @@ jobs:
         timeout-minutes: 5
       - run: python tests/test_attachments_proof_generator.py
         if: ${{ !cancelled() }}
+      # Off on Windows: attachment storage needs the handle-based folder walk.
       - run: python tests/test_attachments_proof_harness.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
@@ -353,11 +359,13 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_codex_attachment_evidence.py
         if: ${{ !cancelled() }}
+      # Off on Windows: Codex attachments need the Mac app and attachment storage needs the folder walk.
       - run: python tests/test_codex_attachment_live_evidence.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_codex_attachment_integration.py
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         timeout-minutes: 5
+      # Off on Windows: attachment storage and the managed namespace need the handle-based folder walk.
       - run: python tests/test_claude_attachment_adapter.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_claude_attachment_integration.py
@@ -365,6 +373,7 @@ jobs:
         timeout-minutes: 5
       - run: python tests/test_native_managed_namespace.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+      # Off on Windows: Python there has no IANA time-zone data unless the tzdata package is installed.
       - run: python tests/test_attachments_expiry_time.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_owner_actions.py
@@ -400,11 +409,13 @@ jobs:
         run: node --test docs/fixtures/attachments/fixture-vm-probe.test.mjs
       - run: node tests/test_attachments_client.js
         if: ${{ !cancelled() }}
+      # Off on Windows: attachment storage needs the handle-based folder walk.
       - run: node tests/test_claude_attachment_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
       - run: node tests/test_native_agent_attachments_client.js
         if: ${{ !cancelled() }}
+      # Off on Windows: attachment storage needs the handle-based folder walk.
       - run: node tests/test_native_agent_attachments_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
@@ -412,6 +423,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: node tests/test_native_agent_attachments_page.js
         if: ${{ !cancelled() }}
+      # Off on Windows: attachment storage needs the handle-based folder walk.
       - run: node tests/test_native_agent_attachments_stage23_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
@@ -422,6 +434,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: node tests/test_officer_documents_client.js
         if: ${{ !cancelled() }}
+      # Off on Windows: Motet's document files use attachment storage, which needs the handle-based folder walk.
       - run: node tests/test_officer_documents_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5

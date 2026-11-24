@@ -795,5 +795,116 @@ class StoreStorageWindows(StoreStorageCommon):
             os.close(fd)
 
 
+class CodexOffMac(unittest.TestCase):
+    """Off a Mac the store still starts: Claude through the plugin, Codex unavailable with a plain reason."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        base = os.path.realpath(self.temp.name)
+        self.store = m.MessagingStore(os.path.join(base, 'state'), os.path.join(base, 'sessions'))
+        self.codex = 'x:' + str(uuid.uuid4())
+        self.claude = 'c:' + str(uuid.uuid4())
+        self.agents = {self.codex: {'runtime': 'Codex', 'name': 'Aster'},
+                       self.claude: {'runtime': 'Claude', 'name': 'Birch', 'cwd': base}}
+
+    def tearDown(self):
+        self.store.close()
+        self.temp.cleanup()
+
+    def test_codex_is_reported_unavailable_with_a_plain_reason(self):
+        for platform in ('linux', 'win32'):
+            with self.subTest(platform=platform), patch.object(m.sys, 'platform', platform), \
+                    patch.object(m.subprocess, 'run') as run:
+                self.store.codex_available, self.store.reason = self.store.probe()
+                run.assert_not_called()
+                self.assertEqual((self.store.codex_available, self.store.reason),
+                                 (False, 'Messaging Codex needs the Codex desktop app on a Mac for now.'))
+                snapshot = self.store.snapshot()
+                self.assertFalse(snapshot['available'])
+                self.assertEqual(snapshot['reason'], 'Messaging Codex needs the Codex desktop app on a Mac for now. '
+                                                     'Claude chats can be messaged once Claude is set up in Motet.')
+                self.assertEqual(snapshot['capabilities'], {'codex': False, 'claude': False})
+                actions = self.store.owner_capabilities(self.codex, self.agents)['actions']
+                self.assertEqual(actions['queue'], {'available': False, 'mode': 'queue',
+                                 'reason': 'Messaging Codex needs the Codex desktop app on a Mac for now.'})
+                self.assertEqual(actions['steer']['reason'], 'Live controls for Codex need the Codex desktop app on a Mac for now.')
+                with self.assertRaises(m.MessagingError) as refused:
+                    self.store.submit(self.codex, 'A fictional question.', str(uuid.uuid4()), self.agents)
+                self.assertEqual((refused.exception.status, str(refused.exception)),
+                                 (503, 'Messaging Codex needs the Codex desktop app on a Mac for now.'))
+
+    def test_claude_chats_still_offer_setup(self):
+        with patch.object(m.sys, 'platform', 'win32'):
+            self.store.codex_available, self.store.reason = self.store.probe()
+        capability = self.store.owner_capabilities(self.claude, self.agents)
+        self.assertEqual(capability['claude_setup']['state'], 'setup_needed')
+        self.assertEqual(capability['actions']['queue']['reason'], 'Set up Claude once in Motet to connect eligible local chats.')
+        self.assertEqual(capability['actions']['steer']['reason'], 'Live controls support local parent Codex desktop chats only.')
+
+    def test_mac_reason_is_unchanged(self):
+        self.store.codex_available, self.store.reason = False, 'The bundled Codex executable is unavailable.'
+        self.assertEqual(self.store.snapshot()['reason'], 'The bundled Codex executable is unavailable.')
+
+
+class ServerStartsMessagingEverywhere(unittest.TestCase):
+    """server.start_messaging on each system, with a temporary home and no attachments or managed chats."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = os.path.realpath(self.temp.name)
+        self.host = patch.multiple(server, HOME=self.home, CLAUDE_MANAGED=None, ATTACHMENTS=None)
+        self.host.start()
+
+    def tearDown(self):
+        self.host.stop()
+        self.temp.cleanup()
+
+    def test_store_starts_and_reports_codex_truthfully_off_a_mac(self):
+        for platform in ('linux', 'win32'):
+            with self.subTest(platform=platform), patch.object(m.sys, 'platform', platform):
+                store, reason = server.start_messaging()
+                try:
+                    self.assertIsNotNone(store)
+                    self.assertIsNone(reason)
+                    self.assertEqual(store.reason, 'Messaging Codex needs the Codex desktop app on a Mac for now.')
+                    self.assertFalse(store.worker_failed)
+                    self.assertTrue(store.thread.is_alive())
+                    self.assertIs(store.history_observer, server.officer_history_outcome)
+                finally:
+                    store.close()
+
+    @unittest.skipIf(os.name == 'nt', 'Attachments need the handle-based folder walk, which Windows lacks')
+    def test_linux_binds_attachment_maintenance_before_the_worker_starts(self):
+        os.mkdir(os.path.join(self.home, '.live-room'), 0o700)       # made by load_key() in a real start
+        with patch.object(m.sys, 'platform', 'linux'), patch.object(server, 'KEY', 'fictional-owner-key-for-attachments'):
+            attachments = server.start_attachments()
+            self.assertIsNotNone(attachments)
+            try:
+                with patch.object(server, 'ATTACHMENTS', attachments):
+                    store, reason = server.start_messaging()
+                try:
+                    self.assertIsNone(reason)
+                    self.assertIsNotNone(store._attachment_guard)
+                    self.assertIsNotNone(store._native_owner_runtime)
+                    self.assertIsNone(store._native_owner_error)
+                    self.assertEqual(store.reason, 'Messaging Codex needs the Codex desktop app on a Mac for now.')
+                finally:
+                    store.close()
+            finally:
+                attachments.close()
+
+    def test_refused_state_folder_leaves_messaging_off_with_the_storage_reason(self):
+        state = os.path.join(self.home, '.live-room')
+        if os.name == 'nt':
+            import private_storage
+            private_storage.make_private_folder(state)
+            _icacls(state, '/grant', StoreStorageWindows.EVERYONE_READ)
+            expected = 'Agent messaging needs a private readable state folder and database in %USERPROFILE%\\.live-room.'
+        else:
+            os.mkdir(state, 0o755)
+            expected = 'Agent messaging needs a private readable state folder and database in ~/.live-room.'
+        self.assertEqual(server.start_messaging(), (None, expected))
+
+
 if __name__ == '__main__':
     unittest.main()

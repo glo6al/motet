@@ -5888,7 +5888,12 @@ def shared_directory_snapshot(store):
 
 def configure_shared_directory(store, home):
     import chat_directory
+    import claude_channel
     import claude_mod
+    if not claude_channel.folder_walk_available():
+        # The shared chat directory reads transcripts by handle-based folder walk, which Windows lacks for now.
+        # Without it the bridge has no directory; owner messaging to Claude chats on the stage is unaffected.
+        return
     def factory(policy):
         live = {'snapshot': {'__claude_transport__': {'capability': 'unavailable', 'reason': claude_mod.PEER_UNAVAILABLE}}}
         def capture():
@@ -6349,6 +6354,32 @@ def start_native_attachment_maintenance(messaging, attachments):
     return bind_owner_runtime(messaging, allow_install=allow_install)
 
 
+MESSAGING_STORAGE_WHY = ('Agent messaging needs a private readable state folder and database in '
+                         + ('%USERPROFILE%\\.live-room.' if WIN else '~/.live-room.'))
+
+
+def start_messaging():
+    """Agent messaging on every system: ``(store, None)``, or ``(None, plain reason)``.
+
+    Claude chats are messaged through the watch-owner plugin on macOS, Linux and Windows. Codex needs the Codex
+    desktop app on a Mac; elsewhere the store reports it unavailable with that reason instead of failing.
+    Attachment maintenance binds before the worker starts; a retained attachment guard that cannot be
+    enforced still keeps messaging off (fail closed). Windows has no attachments yet, so nothing binds there."""
+    store = None
+    try:
+        store = MessagingStore(os.path.join(HOME, '.live-room'), os.path.join(HOME, '.codex', 'sessions'),
+                               managed=CLAUDE_MANAGED)
+        store.history_observer = officer_history_outcome
+        configure_shared_directory(store, HOME)
+        start_native_attachment_maintenance(store, ATTACHMENTS)
+        store.start()
+        return store, None
+    except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
+        if store is not None:
+            store.stop_native_attachment_runtime()
+        return None, MESSAGING_STORAGE_WHY
+
+
 def start_new_chat():
     """No native calls on startup; rollout and installed-provider capabilities stay gated."""
     if sys.platform != 'darwin':
@@ -6386,21 +6417,8 @@ if __name__ == '__main__':
         history_arm()
     except (OSError, sqlite3.Error, ValueError):
         HISTORY_WHY = 'Deck Log needs private local storage.'
-    if sys.platform == 'darwin':
-        try:
-            MESSAGING = MessagingStore(os.path.join(HOME, '.live-room'), os.path.join(HOME, '.codex', 'sessions'),
-                                       managed=CLAUDE_MANAGED)
-            MESSAGING.history_observer = officer_history_outcome
-            configure_shared_directory(MESSAGING, HOME)
-            start_native_attachment_maintenance(MESSAGING, ATTACHMENTS)
-            MESSAGING.start()
-        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
-            if MESSAGING is not None:
-                MESSAGING.stop_native_attachment_runtime()
-            MESSAGING = None
-            MESSAGING_WHY = 'Agent messaging needs a private readable state folder and database in ~/.live-room.'
-    else:
-        MESSAGING_WHY = 'Agent messaging currently requires Codex desktop on macOS.'
+    MESSAGING, reason = start_messaging()
+    MESSAGING_WHY = reason or MESSAGING_WHY
     load_links()
     apply_watch(True)
     load_officer_key()

@@ -18,7 +18,7 @@ import test_claude_mod as owner_fixture
 uid = owner_fixture.uid
 
 
-@unittest.skipIf(os.name == 'nt', 'Requires private POSIX outbox')
+@unittest.skipIf(os.name == 'nt', 'Shared bridge discovery reads transcripts by handle-based folder walk; the bridge comes to Windows later')
 class ClaudePeerBackendTests(unittest.TestCase):
     http = owner_fixture.ClaudeModTests.http
     register_global = owner_fixture.ClaudeModTests.register_global

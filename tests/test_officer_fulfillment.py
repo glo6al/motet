@@ -20,7 +20,7 @@ def ident():
     return str(uuid.uuid4())
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX store')
+@unittest.skipIf(os.name == 'nt', 'Codex fulfillment reads transcripts by handle-based folder walk; Codex messaging needs the Mac app')
 class FulfillmentTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

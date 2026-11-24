@@ -38,6 +38,9 @@ MAX_RECORDS, MAX_PENDING, MAX_LINE, MAX_READ = 256, 8, 1_000_000, 2_000_000
 TTL, RETENTION = 900, 86400
 CODEX_REPLY_EXPIRED = 'No matching reply yet. The question may still be queued; Motet will not resend.'
 CODEX_PREVIOUS_SOURCE_UNAVAILABLE = 'The original Codex transcript is temporarily unavailable. Motet will check it again.'
+CODEX_NEEDS_MAC = 'Messaging Codex needs the Codex desktop app on a Mac for now.'
+CODEX_CONTROLS_NEED_MAC = 'Live controls for Codex need the Codex desktop app on a Mac for now.'
+CLAUDE_SETUP_HINT = 'Claude chats can be messaged once Claude is set up in Motet.'
 STATE_FOLDER_REFUSED = 'Messaging state directory must be private and owned by you.'
 LOCK_REFUSED = 'Messaging lock must be a private regular file.'
 DATABASE_REFUSED = 'Messaging database must be a private regular file.'
@@ -502,7 +505,8 @@ class MessagingStore:
 
     def probe(self):
         if sys.platform != 'darwin':
-            return False, 'Agent messaging currently requires Codex desktop on macOS.'
+            # The Codex queue command ships inside the macOS app; Claude chats are messaged through the plugin.
+            return False, CODEX_NEEDS_MAC
         try:
             version = subprocess.run([self.cli, '--version'], capture_output=True, timeout=5, text=True)
             help_result = subprocess.run([self.cli, 'queue', '--help'], capture_output=True, timeout=5, text=True)
@@ -589,10 +593,16 @@ class MessagingStore:
             return {'requests': [self._public_request(r) for r in sorted((r for r in self._rows() if r.get('origin') != 'peer'), key=lambda x: x['created'])] + managed_requests,
                     'controls': [self._public_control(r) for r in sorted(retained, key=lambda x: (x['created'], x['request_id']))],
                     'available': codex_ready or claude_ready or managed_ready,
-                    'reason': '' if codex_ready or claude_ready or managed_ready else self.reason,
+                    'reason': '' if codex_ready or claude_ready or managed_ready else self._unavailable_reason(),
                     'managed_error': managed_error,
                     'capabilities': {'codex': codex_ready, 'claude': claude_ready or managed_ready,
                                      **({'claude_managed': managed_ready} if self.managed is not None else {})}}
+
+    def _unavailable_reason(self):
+        # Off a Mac only Codex is out of reach: say how Claude chats become reachable instead.
+        if self.reason == CODEX_NEEDS_MAC:
+            return CODEX_NEEDS_MAC + ' ' + CLAUDE_SETUP_HINT
+        return self.reason
 
     def owner_capabilities(self, agent, agents):
         """Advisory eligibility only; never starts native observation or resolves a turn."""
@@ -632,7 +642,7 @@ class MessagingStore:
         if not reason and (not codex or agents[agent].get('sub') or agents[agent].get('parent')):
             control_reason = 'Live controls support local parent Codex desktop chats only.'
         elif not reason and sys.platform != 'darwin':
-            control_reason = 'Codex desktop controls require macOS.'
+            control_reason = CODEX_CONTROLS_NEED_MAC
         result = {'agent': agent, 'actions': {
             'queue': {'available': not bool(queue_reason), 'reason': queue_reason, 'mode': 'queue'},
             'steer': {'supported': not bool(control_reason), 'reason': control_reason, 'mode': 'new_instruction'},
