@@ -1483,13 +1483,17 @@ def _private_descriptor():
 
 
 def _created_error(error, subject):
-    """The refusal for a failed relative create: an existing name (or one still being removed) is FileExistsError."""
+    """The refusal for a failed relative create (FILE_CREATE): any existing name is FileExistsError, as POSIX's
+    ``O_CREAT | O_EXCL`` or ``mkdir`` gives EEXIST for any existing name, links included. Windows reports some of
+    them by their type instead of a collision: creating a file over a folder or a junction gives
+    STATUS_FILE_IS_A_DIRECTORY, and a folder over a file STATUS_NOT_A_DIRECTORY. A name still being removed, open
+    elsewhere, exists too."""
     status = getattr(error, 'ntstatus', 0)
-    if status in (_NT_COLLISION, _NT_DELETE_PENDING):
+    if status in (_NT_COLLISION, _NT_DELETE_PENDING) or status in _NT_WRONG_TYPE:
         exists = FileExistsError(errno.EEXIST, 'private storage: %s exists' % subject)
         exists.ntstatus = status
         return exists
-    return _refuse('not_regular' if status in _NT_WRONG_TYPE else 'open', subject)
+    return _refuse('open', subject)
 
 
 def _win_create(parent, name):
