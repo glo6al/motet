@@ -1575,7 +1575,8 @@ _RESOLVED_HOME = (None, None)
 def resolved_home():
     """HOME with its links resolved (a profile moved with a junction, a home reached through a symlink), read once
     for each value of HOME. Grants are recorded under resolved paths, so the home rule and the private names must
-    know where home really is, not only the name it was given."""
+    know where home really is, not only the name it was given. It is not read again while HOME stays the same: if
+    the junction your profile is reached through is pointed somewhere else, the change takes effect after a restart."""
     global _RESOLVED_HOME
     home, real = _RESOLVED_HOME
     if home != HOME:
@@ -1605,25 +1606,59 @@ def named_private(path):
     return under(path + os.sep, private_names())
 
 
+_PRIVATE_TARGETS = (None, ())
+PRIVATE_TARGETS_KEPT = 64
+
+
+def record_private_targets():
+    """Grant time only: where each private folder really is, its links followed (realpath), as the grant's own
+    checks already follow them. A private folder that is a link or junction (~/.claude moved to another drive, say)
+    is otherwise known only by its name, and the serving walk never follows it. The places are kept for this home
+    and list of private folders, older ones too (up to PRIVATE_TARGETS_KEPT), so a folder a link pointed to when any
+    page was granted stays protected after the link is pointed elsewhere. Returns them all."""
+    global _PRIVATE_TARGETS
+    key = (HOME, PRIVATE_ROOTS)
+    held_key, known = _PRIVATE_TARGETS
+    known = list(known) if held_key == key else []
+    for name in private_names():
+        try:
+            real = os.path.realpath(name.rstrip(os.sep))
+        except (OSError, ValueError):
+            continue
+        if real in known:
+            known.remove(real)
+        known.append(real)
+    known = known[-PRIVATE_TARGETS_KEPT:]
+    _PRIVATE_TARGETS = (key, tuple(known))
+    return _PRIVATE_TARGETS[1]
+
+
+def private_targets():
+    """The private folders' real places recorded at the last grants (record_private_targets); nothing is resolved."""
+    key, known = _PRIVATE_TARGETS
+    return known if key == (HOME, PRIVATE_ROOTS) else ()
+
+
 PRIVATE_IDS_SECONDS = 2.0
 _PRIVATE_IDS = (None, 0.0, frozenset())
 
 
 def windows_private_ids():
-    """Windows, while serving: the identities of the private folders, each opened by the no-link walk from its name
-    (under the resolved home) and read through its own handle, so nothing an agent links in place of a private
-    folder is followed (a link to a network share would otherwise be contacted on every request). A private folder
-    that is itself a link or junction is not opened: it is still refused by name, and when a page is granted. The set
-    is reused for PRIVATE_IDS_SECONDS (per home and list of private folders): it describes folders at fixed places
-    in your home, which a grant never covers, so a reading two seconds old answers the same question; it saves
-    opening every private folder from the drive down for each style, script and image of a page."""
+    """Windows, while serving: the identities of the private folders, each opened by the no-link walk and read
+    through its own handle: from its name (under the given and the resolved home), and from each real place recorded
+    when pages were granted (private_targets), which is how a private folder that is a link or junction is known.
+    Nothing is resolved here, so no link is followed while serving (a link to a network share would otherwise be
+    contacted on every request). The set is reused for PRIVATE_IDS_SECONDS (per home, list of private folders and
+    recorded places): it describes folders at fixed places, which a grant never covers, so a reading two seconds old
+    answers the same question; it saves opening every private folder from the drive down for each file of a page."""
     global _PRIVATE_IDS
-    key, now = (HOME, PRIVATE_ROOTS), time.monotonic()
+    targets = private_targets()
+    key, now = (HOME, PRIVATE_ROOTS, targets), time.monotonic()
     held_key, at, ids = _PRIVATE_IDS
     if held_key == key and 0 <= now - at < PRIVATE_IDS_SECONDS:
         return ids
     out = set()
-    for name in private_names():
+    for name in private_names() + targets:
         try:
             with private_storage.open_folder(name) as folder:
                 out.add(held_id(folder))
@@ -1638,7 +1673,9 @@ def allow_preview(aid, old, ts, cid, path):
     any symlink, outside private configuration folders. Its identity is recorded, so a file swapped in later under
     the same name is not served. The folder it sits in is granted for its styles, scripts and images, unless that
     folder is your home folder or above it, under its given name or its resolved one (a home reached through a link
-    or junction); private folders below a granted folder are never served (see preview).
+    or junction), or holds the real place of a private folder (one that is a link or junction, followed here at
+    grant time and recorded for the serving walk); private folders below a granted folder are never served (see
+    preview).
     The folder is recorded by identity: on macOS and Linux as os.stat reports it, on Windows as read from the folder's
     own handle after the no-link walk has opened it (the same reading the preview walk compares it with later). On
     Windows nothing is granted before Python 3.12, which can report full-width Windows file ids (the version is
@@ -1672,6 +1709,8 @@ def allow_preview(aid, old, ts, cid, path):
         if (ident in dir_ids(home_and_above()) or under(HOME + os.sep, folder)
                 or under(resolved_home() + os.sep, folder)):
             raise OSError('too broad')                # a page saved into the home folder, or above it, brings no folder
+        if any(under(target + os.sep, folder) for target in record_private_targets()):
+            raise OSError('holds a private folder')   # where a private folder really is, behind a link or junction
         ALLOWED_DIRS.pop(os.path.dirname(real), None)
         ALLOWED_DIRS[os.path.dirname(real)] = ident   # styles, scripts and images beside it; never other pages
         while len(ALLOWED_DIRS) > 100:

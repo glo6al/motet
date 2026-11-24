@@ -172,7 +172,7 @@ class PreviewCase:
         given = os.path.join(self.home, 'person-link')
         self.link(real_home, given)
         server.HOME = given
-        server.PRIVATE_ROOTS = tuple(os.path.join(given, p) + os.sep for p in ('.live-room', 'AppData'))
+        server.PRIVATE_ROOTS = ()      # no private folder, so only the home rule can refuse (their real places would too)
         self.assertEqual(server.resolved_home(), real_home)
         for page in (os.path.join(self.home, 'disk', 'page.html'), os.path.join(real_home, 'page.html')):
             write(page, b'<p>page')
@@ -188,6 +188,49 @@ class PreviewCase:
         self.grant(os.path.join(project, 'index.html'))
         self.assertIn(project, server.ALLOWED_DIRS)
         self.assertEqual(self.get(os.path.join(project, 'a.css')), (200, b'site style'))
+
+    def check_linked_private_folder(self):
+        """A private folder that is a link or junction (~/.claude moved to another drive): a page above its real place
+        grants no folder, a page beside it reaches nothing in it, and a folder granted before the link pointed into it
+        is refused at that place once any later grant has recorded where the link leads."""
+        drive = os.path.join(self.home, 'drive')
+        target = os.path.join(drive, 'claude-config')
+        os.makedirs(target)
+        write(os.path.join(target, 'x.js'), b'private settings')
+        private_link = os.path.join(self.home, '.claude')
+        self.link(target, private_link)
+        server.PRIVATE_ROOTS = server.PRIVATE_ROOTS + (private_link + os.sep,)
+        secret = os.path.join(target, 'x.js')
+        # above it: the page is shown, its folder is not granted
+        above_page = os.path.join(drive, 'page.html')
+        write(above_page, b'<p>above')
+        self.grant(above_page)
+        self.assertIn(above_page, server.ALLOWED_FILES)
+        self.assertNotIn(drive, server.ALLOWED_DIRS, 'a folder holding a private folder\'s real place is not granted')
+        self.assertEqual(self.get(secret)[0], 404)
+        # beside it: granted as usual, and nothing in the private folder is reached from it
+        site = os.path.join(drive, 'site')
+        os.makedirs(site)
+        write(os.path.join(site, 'index.html'), b'<p>beside')
+        write(os.path.join(site, 'a.css'), b'site style')
+        self.grant(os.path.join(site, 'index.html'))
+        self.assertIn(site, server.ALLOWED_DIRS)
+        self.assertEqual(self.get(os.path.join(site, 'a.css')), (200, b'site style'))
+        self.assertEqual(self.get(os.path.join(site, '..', 'claude-config', 'x.js'))[0], 404)
+        self.assertEqual(self.get(secret)[0], 404)
+        # pointed into a folder granted earlier: refused there once a later grant has recorded the link's target
+        self.unlink(private_link)
+        os.makedirs(private_link)                    # a plain folder for now
+        server.ALLOWED_FILES.clear(); server.ALLOWED_DIRS.clear()
+        server._PRIVATE_TARGETS = (None, ())       # nothing recorded yet for this home
+        self.grant(above_page)
+        self.assertIn(drive, server.ALLOWED_DIRS, 'granted while the private folder was elsewhere')
+        self.assertEqual(self.get(secret), (200, b'private settings'), 'control: not private yet')
+        os.rmdir(private_link)
+        self.link(target, private_link)
+        self.grant(os.path.join(site, 'index.html'))  # any later grant records where the private folder really is
+        with patch.object(server, 'PRIVATE_IDS_SECONDS', 0):
+            self.assertEqual(self.get(secret)[0], 404)
 
     def check_what_is_not_granted(self):
         write(os.path.join(self.home, 'top.html'), b'<p>home')
@@ -232,6 +275,9 @@ class Posix(PreviewCase, unittest.TestCase):
 
     def test_home_reached_through_a_link(self):
         self.check_home_reached_through_a_link()
+
+    def test_a_private_folder_that_is_a_link(self):
+        self.check_linked_private_folder()
 
     def test_a_link_to_a_file_is_refused(self):
         self.grant()
@@ -376,6 +422,9 @@ class RealWindows(PreviewCase, unittest.TestCase):
 
     def test_home_reached_through_a_junction(self):
         self.check_home_reached_through_a_link()
+
+    def test_a_private_folder_that_is_a_link(self):
+        self.check_linked_private_folder()
 
     def test_a_symbolic_link_at_the_file_or_a_folder_is_refused(self):
         self.grant()
