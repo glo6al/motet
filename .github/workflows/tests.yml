@@ -188,6 +188,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_install_reply_hook.py
         if: ${{ !cancelled() }}
+      - name: Check the portable Claude Code hook and both installer forms
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python tests/test_hooks_portable.py
       - run: python tests/test_codex_desktop_control.py
         if: ${{ !cancelled() }}
       - run: python tests/test_codex_native_input.py
