@@ -18,6 +18,19 @@ from unittest.mock import patch, Mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import officer_messaging as m
 import server
+from attachments_owner_marker import sqlite_marker_available
+
+
+def native_attachments_sqlite():
+    """The product's own check (attachments_owner_marker.sqlite_marker_available), asked of this Python's SQLite.
+
+    Native agent attachments bind only where it passes; stock Python 3.9 builds with an older SQLite fail it."""
+    import sqlite3
+    db = sqlite3.connect(':memory:')
+    try:
+        return sqlite_marker_available(db)
+    finally:
+        db.close()
 
 
 class PublicTimestampTests(unittest.TestCase):
@@ -966,16 +979,22 @@ class ServerStartsMessagingEverywhere(unittest.TestCase):
                     store, reason = server.start_messaging()
                 try:
                     self.assertIsNone(reason)
-                    self.assertIsNotNone(store._attachment_guard)
-                    self.assertIsNotNone(store._native_owner_runtime)
-                    self.assertIsNone(store._native_owner_error)
                     self.assertEqual(store.reason, 'Messaging Codex needs the Codex desktop app on a Mac for now.')
+                    if native_attachments_sqlite():
+                        self.assertIsNotNone(store._attachment_guard)
+                        self.assertIsNotNone(store._native_owner_runtime)
+                        self.assertIsNone(store._native_owner_error)
+                    else:      # an older SQLite: attachments decline to bind, and messaging still starts
+                        self.assertIsNone(store._attachment_guard)
+                        self.assertIsNone(store._native_owner_runtime)
+                        self.assertEqual(store._native_owner_error, 'sqlite_unavailable')
                 finally:
                     store.close()
             finally:
                 attachments.close()
 
     @unittest.skipIf(os.name == 'nt', 'Attachments need the handle-based folder walk, which Windows lacks')
+    @unittest.skipUnless(native_attachments_sqlite(), "This Python's SQLite cannot run native attachments, so binding never reaches the failure")
     def test_failed_attachment_binding_leaves_no_closure_over_the_closed_store(self):
         import attachments_native_composition
         os.mkdir(os.path.join(self.home, '.live-room'), 0o700)
