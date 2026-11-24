@@ -11,12 +11,13 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from attachments_store import AttachmentStore
 from attachments_types import AttachmentError
 from test_attachments_foundation import BINDING,EPOCH,fence,metadata
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires qualified POSIX primitives.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class StoreBoundaryTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory();self.root=Path(os.path.realpath(self.temp.name))
+        self.temp=tempfile.TemporaryDirectory();self.root=state_root(self.temp.name)
         self.store=AttachmentStore(self.root,enabled=True,owner_epoch=EPOCH,clock=lambda:1800000000)
         self.serial=0
     def tearDown(self):

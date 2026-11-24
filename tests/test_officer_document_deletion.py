@@ -26,9 +26,10 @@ from test_attachments_foundation import EPOCH
 from test_attachments_foundation import fence, metadata
 import test_officer_document_ledger as ledger_fixtures
 import test_officer_document_intents as intent_fixtures
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private files require POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)        # on Windows too: the cleanup worker runs there
 class DeletionTests(unittest.TestCase):
     def setUp(self):
         self.f = storage_fixtures.DirectStoreTests(); self.f.setUp()
@@ -37,7 +38,7 @@ class DeletionTests(unittest.TestCase):
         self.workers = []
 
     def tearDown(self):
-        for worker in self.workers: worker.close(2)
+        for worker in self.workers: worker.close(30)
         self.f.tearDown()
 
     def add(self, raw=PDF):
@@ -213,6 +214,7 @@ class DeletionTests(unittest.TestCase):
         self.assertEqual(self.confirm(current, command)['state'], 'deleting')
         self.l.execute(p['id']); self.assertEqual(self.status(current)['state'], 'deleted')
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_changed_identity_and_symlink_left_untouched_and_charged(self):
         for symlink in (False, True):
             with self.subTest(symlink=symlink):
@@ -226,6 +228,7 @@ class DeletionTests(unittest.TestCase):
                 self.assertEqual(self.status(p)['state'], 'partial_failure'); self.assertEqual(self.status(p)['reason'], 'identity_changed')
                 self.assertEqual(self.store.storage()['usedBytes'], used); self.assertTrue(path.exists())
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)        # fails POSIX's folder fsync; Windows flushes through its handle
     def test_durable_absence_fsync_failure_no_refund_then_restart_recovery(self):
         source = self.add(); p = self.prepare(source); self.confirm(p); used = self.store.storage()['usedBytes']
         actual = os.fsync
@@ -260,8 +263,8 @@ class DeletionTests(unittest.TestCase):
         lease.close()
         with self.store.files._io_condition:
             # Event-based observation of removal completion; no production polling.
-            self.store.files._io_condition.wait_for(lambda: not (self.store.files.root / 'objects' / source).exists(), timeout=2)
-        worker.close(2)
+            self.store.files._io_condition.wait_for(lambda: not (self.store.files.root / 'objects' / source).exists(), timeout=30)   # generous: slow Windows runners
+        worker.close(30)
         self.assertEqual(self.status(p)['state'], 'deleted'); self.assertEqual(self.store.storage()['usedBytes'], used - len(PDF))
 
     def test_startup_recovery_visits_unknown_before_nonboundary_cursor(self):
@@ -281,8 +284,8 @@ class DeletionTests(unittest.TestCase):
             return result
         with mock.patch.object(self.store.files, 'remove', side_effect=remove):
             worker = DeletionWorker(self.l); self.workers.append(worker)
-            self.assertTrue(visited.wait(3), 'startup recovery skipped slot61 before cursor75')
-            worker.close(3)
+            self.assertTrue(visited.wait(30), 'startup recovery skipped slot61 before cursor75')   # returns once visited
+            worker.close(30)
         self.assertEqual(self.status(p)['state'], 'deleted')
 
     def test_deletion_uses_reserved_fence_space_at_actual_sqlite_full(self):

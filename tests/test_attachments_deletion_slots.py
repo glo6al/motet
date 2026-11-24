@@ -18,6 +18,7 @@ from attachments_types import AttachmentError
 from attachment_schema_fixtures import drop_deletion_schema
 from test_attachments_foundation import BINDING, EPOCH, fence
 import test_attachments_requests as request_fixtures
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 
 class CodecTests(unittest.TestCase):
@@ -99,7 +100,7 @@ class CodecTests(unittest.TestCase):
         self.error(lambda: slots.COPY_PREVIEW.decode(bytes(changed)))
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class SlotStoreTests(unittest.TestCase):
     for _name in ('setUp', 'tearDown', 'open', 'key', 'error', 'draft', 'prepare', 'send', 'status'):
         locals()[_name] = getattr(request_fixtures.RequestTests, _name)

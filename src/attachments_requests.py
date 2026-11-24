@@ -15,7 +15,6 @@ import os
 import secrets
 import uuid
 
-from attachments_files import private
 from attachments_types import TOKEN, OPAQUE, AttachmentError, canonical, digest, fail, ident, integer, now, text
 
 EXTENSIONS = {'text/plain': 'txt', 'text/markdown': 'md', 'application/pdf': 'pdf', 'image/png': 'png', 'image/jpeg': 'jpg'}
@@ -747,8 +746,9 @@ class RequestLedger:
             self.store.request_handles.add(handle_id)
         try:
             self.store.files.verify()
-            fd = os.open(member['source_id'], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.store.files.objects_fd)
-            if private(os.fstat(fd)) != json.loads(member['identity']):
+            # By the held objects folder: O_RDONLY | O_NOFOLLOW on POSIX, the walk and the handle check on Windows.
+            fd = self.store.files.open_object(member['source_id'])
+            if self.store.files.private_fd(fd) != json.loads(member['identity']):
                 fail('source_changed', 'The attachment source changed.')
             yield fd
         finally:

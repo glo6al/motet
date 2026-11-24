@@ -20,12 +20,13 @@ from attachments_types import AttachmentError
 from attachment_schema_fixtures import drop_officer_schema
 from test_attachments_foundation import EPOCH, BINDING, fence, metadata
 from test_attachments_requests import FakeLease
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 
-@unittest.skipUnless(os.name=='posix','Private attachment storage requires POSIX primitives.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class ConversationTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory();self.root=Path(os.path.realpath(self.temp.name));self.clock=[1800000000.0];self.serial=0
+        self.temp=tempfile.TemporaryDirectory();self.root=state_root(self.temp.name);self.clock=[1800000000.0];self.serial=0
         self.store=self.open();self.cid=self.store.create_conversation('fictional-room',self.key())['id']
         self.binding=dict(kind='officer',id='officer',scopeId='fictional-room',conversationId=self.cid,modelId='fictional-fast',capabilityRevision='fictional-v1')
         self.profile=OfficerRetentionProfile('fictional-retention','v1','local_retention','fictional-v1')

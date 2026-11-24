@@ -16,6 +16,7 @@ from attachments_requests import (RequestLedger, TransportProfile, PhaseVerifica
                                   CopyCleanup, PartialCopy, OwnerReceipt, OwnerAbsenceEvidence, serialize_envelope)
 from attachments_types import AttachmentError
 from test_attachments_foundation import EPOCH, BINDING, fence, metadata
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 
 class FakeLease:
@@ -26,10 +27,10 @@ class FakeLease:
             raise AttachmentError('resource_unavailable','Fictional resource lease is not held.',503)
 
 
-@unittest.skipUnless(os.name=='posix','Private attachment storage requires qualified POSIX primitives.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class RequestTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory();self.root=Path(os.path.realpath(self.temp.name));self.serial=0;self.clock=[1800000000.0]
+        self.temp=tempfile.TemporaryDirectory();self.root=state_root(self.temp.name);self.serial=0;self.clock=[1800000000.0]
         self.store=self.open();self.ledger=RequestLedger(self.store)
         self.profile=TransportProfile('fictional-profile','v1','codex',BINDING['capabilityRevision'],'b'*64,'e'*64,'fictional-proof',('text/plain',))
     def open(self, **kwargs):return AttachmentStore(self.root,enabled=True,owner_epoch=EPOCH,clock=lambda:self.clock[0],**kwargs)
@@ -150,6 +151,7 @@ class RequestTests(unittest.TestCase):
         self.error('proof_unavailable',lambda:self.ledger.record_copy_result(result,lease))
         self.assertGreater(self.store.storage()['usedBytes'],intent.bytes)
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_source_handles_prevent_store_close(self):
         d,r,lease=self.send();self.directories(r,lease);copy=self.status(r)['copies'][0]
         self.ledger.claim_copy(r['id'],self.status(r)['revision'],copy['id'],lease)

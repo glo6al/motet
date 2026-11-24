@@ -194,6 +194,9 @@ def _win_api():
     kernel.DuplicateHandle.restype = w.BOOL
     kernel.FlushFileBuffers.argtypes = [w.HANDLE]
     kernel.FlushFileBuffers.restype = w.BOOL
+    kernel.GetVolumeInformationByHandleW.argtypes = [w.HANDLE, w.LPWSTR, w.DWORD, ctypes.POINTER(w.DWORD),
+                                                     ctypes.POINTER(w.DWORD), ctypes.POINTER(w.DWORD), w.LPWSTR, w.DWORD]
+    kernel.GetVolumeInformationByHandleW.restype = w.BOOL
 
     # NtCreateFile opens a name relative to an open folder handle: Windows' equivalent of openat(2) with dir_fd.
     nt = ctypes.WinDLL('ntdll')
@@ -759,6 +762,95 @@ def sqlite_companions_plain(path):
     return True
 
 
+def companion_verdict(owner_sid, owner_is_user, has_dacl, aces):
+    """Raise unless a SQLite companion file's collected descriptor is acceptable on Windows.
+
+    SQLite creates its journal by name with no security attributes of its own, so the file takes the creating
+    token's default owner (Administrators when Motet runs elevated) and inherits the folder's access list (private,
+    but not protected). So the owner may be this user, Administrators or SYSTEM, and the folder rule applies to the
+    list: plain allow entries for this user, SYSTEM, Administrators or OWNER RIGHTS only, protected or not. ``aces``
+    is as for ``acl_verdict``: (ace_type, sid_string, is_current_user)."""
+    if not (owner_is_user or owner_sid in (SYSTEM_SID, ADMINISTRATORS_SID)):
+        raise PrivateStorageError('nonprivate storage owner', 'owner')
+    acl_verdict(True, has_dacl, False, aces, True)
+
+
+def _win_companion_check(handle):
+    adv, kernel, w = _win_api()[:3]
+    with _CurrentUser() as user:
+        owner, dacl, sd = w.LPVOID(), w.LPVOID(), w.LPVOID()
+        if adv.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(sd)):
+            raise _unavailable()
+        try:
+            aces = [(t, sid, is_user) for t, flags, mask, sid, is_user in (_read_aces(dacl, user) if dacl else [])]
+            companion_verdict(_sid_text(owner), bool(adv.EqualSid(owner, user.sid)), bool(dacl), aces)
+        finally:
+            kernel.LocalFree(sd)
+
+
+def sqlite_companions_private(path, folder=None):
+    """``sqlite_companions_plain``, and each companion that exists must also be private.
+
+    POSIX: the attachment store's own rule: a regular file with one name, owned by this user, mode exactly 0600
+    (SQLite gives its journal the database's mode). Windows: each is opened relative to its folder without following
+    a reparse point and checked on its handle: a plain file with one name, and ``companion_verdict`` (owner this
+    user, Administrators or SYSTEM; the folder rule for the list, which need not be protected). A leftover journal
+    someone opened up to others is refused. A companion that is being removed (delete pending, still open in a
+    scanner, say) counts as absent; any other failure to open one refuses. On Windows ``folder`` may be the held
+    NoLinkFolder for ``path``'s folder (the walk refused any reparse point and checked it is a folder when it opened
+    it); the companions are then opened through that handle instead of opening the folder again by path."""
+    if not WIN:
+        for suffix in ('-journal', '-wal', '-shm'):
+            try:
+                info = os.lstat(path + suffix)
+            except FileNotFoundError:
+                continue
+            try:
+                posix_verdict(info, False, True)
+            except PrivateStorageError:
+                return False
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                return False
+        return True
+    folder_path, base = os.path.split(path)
+    if folder is not None:
+        folder._held()
+        parent, owned = folder._handles[-1], False
+    else:
+        try:
+            parent = _win_open(folder_path or '.', _HOLD_ACCESS, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE,
+                               _OPEN_EXISTING, 0)
+        except OSError:
+            return False
+        try:
+            _win_kind(_win_facts(parent), True, 'folder')      # a plain folder, not a junction to one
+        except PrivateStorageError:
+            _win_close(parent)
+            return False
+        owned = True
+    try:
+        for suffix in ('-journal', '-wal', '-shm'):
+            try:
+                handle = _win_child(parent, base + suffix, _READ_CONTROL | _FILE_READ_ATTRIBUTES,
+                                    _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE, None)
+            except OSError as e:
+                status = getattr(e, 'ntstatus', 0)
+                if status in _NT_NOT_FOUND or status == _NT_DELETE_PENDING:
+                    continue
+                return False
+            try:
+                _win_kind(_win_facts(handle), False, 'file', True)
+                _win_companion_check(handle)
+            except PrivateStorageError:
+                return False
+            finally:
+                _win_close(handle)
+        return True
+    finally:
+        if owned:
+            _win_close(parent)
+
+
 # ---------------------------------------------------------------------------
 # (g) Open a folder or file with no link followed anywhere in its path.
 #
@@ -1100,16 +1192,18 @@ class NoLinkFolder:
             raise
         return fd
 
-    def folder(self, name, private=False, listing=False, writable=False):
+    def folder(self, name, private=False, listing=False, writable=False, alone=False):
         """The child folder ``name``, held like this one; close it before this one. ``listing`` lets ``names()`` list
-        it on Windows; ``writable`` lets it be changed through (section h)."""
+        it on Windows; ``writable`` lets it be changed through (section h). ``alone`` makes a hold that may outlive
+        this folder (see ``open_folder``)."""
         self._held()
         if not _plain_name(name, self._windows):
             raise _refuse('unavailable', 'folder')
         if self._windows:
             handle = _win_open_checked(self._handles[-1], name, True, 'folder', private=private, listing=listing,
                                        writable=writable)
-            return NoLinkFolder(self._child(name), True, handles=[handle], parent=self, listing=listing, writable=writable)
+            return NoLinkFolder(self._child(name), True, handles=[handle], parent=None if alone else self,
+                                listing=listing, writable=writable)
         return NoLinkFolder(os.path.join(self.path, name), False, fd=self.open(name, True, private=private),
                             writable=writable)
 
@@ -1309,6 +1403,17 @@ class NoLinkFolder:
             return
         _win_flush(self._handles[-1])
 
+    def file_system(self):
+        """Windows: the name of the file system this folder is on ('NTFS', 'ReFS', 'FAT32' and so on), read through
+        its handle. POSIX: None (nothing here depends on it)."""
+        self._held()
+        return _win_file_system(self._handles[-1]) if self._windows else None
+
+    def identity(self):
+        """This held folder's ``file_identity`` (on Windows read from its handle)."""
+        self._held()
+        return _win_identity(self._handles[-1]) if self._windows else _posix_identity(os.fstat(self._fd))
+
     def _child(self, name):
         return self.path + name if self.path.endswith('\\') else self.path + '\\' + name
 
@@ -1379,11 +1484,17 @@ def _absolute(path):
     return _path_module().abspath(path)
 
 
-def open_folder(path, private=False, listing=False, writable=False):
+def open_folder(path, private=False, listing=False, writable=False, alone=False):
     """Hold the folder at ``path`` (made absolute) with no link followed anywhere on the way; the caller closes
     it. ``private`` checks the folder itself (owner, and mode or access list); ``listing`` lets ``names()`` list it on
     Windows; ``writable`` lets it be changed through (section h), and on Windows asks for that access on its hold
-    only. A missing folder raises FileNotFoundError; on POSIX a link raises the system's own OSError (ELOOP)."""
+    only. A missing folder raises FileNotFoundError; on POSIX a link raises the system's own OSError (ELOOP).
+
+    ``alone`` is for a hold kept for a long time (attachment storage keeps its folders for its lifetime): on Windows
+    the folders above are let go once this one is open, so only this folder's own handle is kept. NTFS refuses to
+    rename or remove a folder while anything below it is open (the WindowsWalk tests check this on real Windows),
+    so that one handle still keeps every folder above it in place, without blocking them all for as long. On POSIX a
+    held folder is one descriptor either way."""
     path = _absolute(path)
     if WIN:
         root, names = _win_parts(path)
@@ -1400,6 +1511,10 @@ def open_folder(path, private=False, listing=False, writable=False):
             for handle in reversed(handles):
                 _win_close(handle)
             raise
+        if alone:
+            for handle in reversed(handles[:-1]):
+                _win_close(handle)
+            handles = handles[-1:]
         return NoLinkFolder(current, True, handles=handles, listing=listing, writable=writable)
     fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
     try:
@@ -1575,6 +1690,40 @@ def _win_file_id(handle):
     return info.volume, info.index_high, info.index_low
 
 
+_FILETIME_UNIX_EPOCH = 116444736000000000      # 1601-01-01 to 1970-01-01 in 100 ns units
+
+
+def _win_identity(handle):
+    """``file_identity`` from one GetFileInformationByHandle call on the handle."""
+    kernel, w, SA, FILEINFO = _win_api()[1:5]
+    info = FILEINFO()
+    if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+        raise _unavailable()
+
+    def nanoseconds(filetime):
+        return (((filetime.high << 32) | filetime.low) - _FILETIME_UNIX_EPOCH) * 100
+    return (info.volume, (info.index_high << 32) | info.index_low, (info.size_high << 32) | info.size_low,
+            nanoseconds(info.written), nanoseconds(info.created))
+
+
+def _posix_identity(info):
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def file_identity(fd):
+    """(volume, file index, size, last write time in ns, fourth time in ns) of what the open descriptor ``fd`` has
+    open, for identities that are stored and compared later.
+
+    POSIX: ``st_dev``, ``st_ino``, ``st_size``, ``st_mtime_ns`` and ``st_ctime_ns`` of ``fstat``, as always. Windows:
+    one GetFileInformationByHandle call on the handle: the 32-bit volume serial number, the 64-bit file index, the
+    size, and the last write and creation times. Python's ``fstat`` is not used there because what it reports has
+    changed between versions: since 3.12 ``st_dev`` is a 64-bit serial (often above 2**63) and ``st_ino`` may be a
+    128-bit id, so an identity stored under one Python would not match under the next."""
+    if WIN:
+        return _win_identity(_win_handle_of(fd))
+    return _posix_identity(os.fstat(fd))
+
+
 def _win_check_or_undo(parent, name, handle, created, check):
     """Run ``check(handle)``. On a refusal close the handle and, if this call created the file, remove it again by
     name, but only while the name still has that file's ID (the handle has no DELETE access to do it itself)."""
@@ -1681,6 +1830,29 @@ def _win_remove(parent, name, expect):
 def _win_flush(handle):
     if not _win_api()[1].FlushFileBuffers(handle):
         raise _unavailable('folder')
+
+
+def _win_file_system(handle):
+    kernel = _win_api()[1]
+    name = ctypes.create_unicode_buffer(64)
+    if not kernel.GetVolumeInformationByHandleW(handle, None, 0, None, None, None, name, len(name)):
+        raise _unavailable('folder')
+    return name.value
+
+
+def check_private_fd(fd, directory=False, single_link=False):
+    """Raise PrivateStorageError unless the open descriptor ``fd`` is a private folder or regular file (one name only,
+    with ``single_link``): on POSIX ``posix_verdict`` on its ``fstat``; on Windows the type, reparse attribute, link
+    count, owner and access list read on its handle (the descriptor needs READ_CONTROL and attribute access, which
+    every descriptor from the walk and section (h) has). Windows' ``fstat`` has no owner or access bits, so this is
+    how a caller checks a descriptor it already holds."""
+    subject = 'folder' if directory else 'file'
+    if not WIN:
+        posix_verdict(os.fstat(fd), directory, single_link, subject)
+        return
+    handle = _win_handle_of(fd)
+    _win_kind(_win_facts(handle), directory, subject, single_link)
+    _win_private(handle, directory, subject)
 
 
 def sync_file(fd):

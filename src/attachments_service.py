@@ -34,6 +34,12 @@ class UnqualifiedResolver:
         return {'available': False}
 
 
+# The background thread that finishes Motet's own file deletions. Always on in Motet; tests that switch the whole
+# process between Windows and POSIX (tests/windows_simulation.py) turn it off, since a second thread would see
+# those switches midway.
+CLEANUP_WORKER = True
+
+
 class AttachmentService:
     def __init__(self, store, *, resolver, clock=time.time, officer_deletions=True):
         self.store, self.resolver, self.clock = store, resolver, clock
@@ -46,7 +52,7 @@ class AttachmentService:
         if officer_deletions and getattr(store, 'enabled', False) is True and not store.closed:
             from officer_document_deletion import OfficerDeletion, DeletionWorker
             self.deletions = OfficerDeletion(store)
-            if getattr(store, '_deletion_worker', None) is None:
+            if getattr(store, '_deletion_worker', None) is None and CLEANUP_WORKER:
                 store._deletion_worker = DeletionWorker(self.deletions)
 
     @contextmanager

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from attachments_store import AttachmentStore
 from attachments_types import AttachmentError, DEFAULT_LIMITS
 from attachments_prepare import prepare
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, state_root
 
 EPOCH = 'a' * 64
 BINDING = {'kind': 'agent', 'id': 'fictional-ada', 'scopeId': 'fictional-orchard',
@@ -30,11 +31,11 @@ def metadata(data, media='text/plain', name='sample.txt'):
     return {'name': name, 'mediaType': media, 'bytes': len(data), 'digest': hashlib.sha256(data).hexdigest()}
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires the qualified POSIX primitives.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(os.path.realpath(self.temp.name))
+        self.root = state_root(self.temp.name)
         self.clock = [1_800_000_000.0]
         self.store = self.open()
         self.serial = 0
@@ -79,6 +80,7 @@ class StoreTests(unittest.TestCase):
             self.error('attachments_disabled', store.storage)
             store.close()
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_permissions_lock_and_restart(self):
         root = self.root / 'attachments'
         self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
@@ -103,6 +105,7 @@ class StoreTests(unittest.TestCase):
         con.close()
         self.store = None
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_private_root_symlink_hardlink_permissions_refused(self):
         self.store.close()
         root = self.root / 'attachments'
@@ -398,6 +401,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(cursor, ug['fileId'])
         self.assertNotEqual(cursor, ud['fileId'])
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_lock_replacement_and_unsafe_sidecar_fail_before_sqlite(self):
         lock = self.root / 'attachments' / 'writer.lock'
         lock.rename(lock.with_name('old-lock'))

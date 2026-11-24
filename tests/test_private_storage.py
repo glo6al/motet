@@ -104,6 +104,29 @@ class WriteRule(unittest.TestCase):
                                                   program + [self.ace(self.USER, 0x2)], system_owned=True), 'access')
 
 
+class CompanionRule(unittest.TestCase):
+    """companion_verdict: SQLite's journal takes the creating token's default owner and the folder's list."""
+    USER = 'S-1-5-21-1-2-3-1001'
+
+    def test_owner_may_be_this_user_administrators_or_system(self):
+        aces = [(0, ps.SYSTEM_SID, False), (0, self.USER, True)]
+        ps.companion_verdict(self.USER, True, True, aces)
+        for owner in (ps.ADMINISTRATORS_SID, ps.SYSTEM_SID):
+            ps.companion_verdict(owner, False, True, aces)
+        for owner in ('S-1-5-21-1-2-3-1002', ps.TRUSTED_INSTALLER_SID, 'S-1-1-0'):
+            with self.subTest(owner=owner):
+                reason(self, lambda: ps.companion_verdict(owner, False, True, aces), 'owner')
+
+    def test_the_folder_rule_applies_to_the_list(self):
+        inherited = [(0, ps.SYSTEM_SID, False), (0, ps.ADMINISTRATORS_SID, False), (0, self.USER, True),
+                     (0, ps.OWNER_RIGHTS_SID, False)]
+        ps.companion_verdict(ps.ADMINISTRATORS_SID, False, True, inherited)        # need not be protected
+        for extra in ((0, 'S-1-1-0', False), (0, 'S-1-5-32-545', False), (1, 'S-1-1-0', False)):
+            with self.subTest(entry=extra):
+                reason(self, lambda: ps.companion_verdict(self.USER, True, True, inherited + [extra]), 'access')
+        reason(self, lambda: ps.companion_verdict(self.USER, True, False, []), 'access')
+
+
 class Errors(unittest.TestCase):
     def test_refusals_are_oserrors_with_fixed_words(self):
         error = ps.PrivateStorageError('private storage unavailable', 'nonsense', 'folder')
@@ -537,6 +560,37 @@ class SqliteCompanions(unittest.TestCase):
             os.mkdir(database + '-shm')
             self.assertFalse(ps.sqlite_companions_plain(database))
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX modes; WindowsWalk checks the Windows rule')
+    def test_private_companions_must_also_be_this_users_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = os.path.join(os.path.realpath(tmp), 'fixture.sqlite3')
+            self.assertTrue(ps.sqlite_companions_private(database))
+            fd = ps.create_private_file(database + '-journal')
+            os.close(fd)
+            self.assertTrue(ps.sqlite_companions_private(database))
+            os.chmod(database + '-journal', 0o644)
+            self.assertFalse(ps.sqlite_companions_private(database))
+            os.unlink(database + '-journal')
+            os.symlink(database, database + '-wal')
+            self.assertFalse(ps.sqlite_companions_private(database))
+
+
+class FileIdentity(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Windows reads it from the handle; see WindowsWalk')
+    def test_posix_identity_is_fstat_as_always(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(os.path.realpath(tmp), 'fixture')
+            fd = ps.create_private_file(path)
+            try:
+                info = os.fstat(fd)
+                self.assertEqual(ps.file_identity(fd), (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                                                         info.st_ctime_ns))
+            finally:
+                os.close(fd)
+            with ps.open_folder(os.path.realpath(tmp)) as folder:
+                info = os.stat(os.path.realpath(tmp))
+                self.assertEqual(folder.identity()[:2], (info.st_dev, info.st_ino))
+
 
 # ---------------------------------------------------------------------------
 # The no-link folder walk (open_folder, open_no_links).
@@ -856,6 +910,24 @@ class PosixChanges(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 state.child_stat('absent')
 
+    def test_check_private_fd_alone_and_file_system(self):
+        with self.no_leaks():
+            fd = ps.open_no_links(self.secret)
+            try:
+                ps.check_private_fd(fd, single_link=True)
+                os.chmod(self.secret, 0o640)
+                reason(self, lambda: ps.check_private_fd(fd), 'access')
+                reason(self, lambda: ps.check_private_fd(fd, directory=True), 'not_regular', 'folder')
+            finally:
+                os.close(fd)
+            with ps.open_folder(self.base) as base:
+                state = base.folder('state', writable=True, alone=True)
+            try:
+                os.close(state.create('after-the-parent-closed'))     # POSIX holds are one descriptor either way
+                self.assertIsNone(state.file_system())
+            finally:
+                state.close()
+
     def test_read_only_and_unwritable(self):
         with self.no_leaks():
             fd = ps.open_no_links(self.secret)
@@ -1152,7 +1224,10 @@ class SimulatedWindowsWalk(unittest.TestCase):
                         patch.object(ps, '_win_handle_of', lambda fd: fd - 9000),
                         patch.object(ps, '_win_access_mask', lambda handle: self.handles[handle][2]),
                         patch.object(ps, '_private_descriptor', fake_descriptor),
-                        patch.object(ps, '_win_file_id', lambda handle: id(self.handles[handle][0]))]
+                        patch.object(ps, '_win_file_id', lambda handle: id(self.handles[handle][0])),
+                        patch.object(ps, '_win_file_system', lambda handle: self.file_systems.get(self.handles[handle][1], 'NTFS')),
+                        patch.object(ps, '_win_identity', lambda handle: (0x1234ABCD, id(self.handles[handle][0]), 0, 0, 0))]
+        self.file_systems = {}
         for p in self.patches:
             p.start()
 
@@ -1658,6 +1733,54 @@ class SimulatedWindowsWalk(unittest.TestCase):
                 ps._win_close(handle)
         self.assert_nothing_open()
 
+    def test_a_hold_alone_keeps_only_its_own_handle(self):
+        with ps.open_folder(self.CLAUDE, writable=True, alone=True) as claude:
+            self.assertEqual([self.handles[h][1] for h in self.open_now], ['.claude'],
+                             'the folders above are let go once this one is open')
+            self.assertEqual(self.log[-1][:2], ('.claude', ps._HOLD_ACCESS | ps._WRITE_HOLD))
+            claude.create('new.json')
+        with ps.open_folder('C:\\Users\\example') as home:
+            claude = home.folder('.claude', writable=True, alone=True)
+        try:
+            self.assertEqual([self.handles[h][1] for h in self.open_now], ['.claude'])
+            claude.create('later.json')               # still usable after the folder it came from was closed
+        finally:
+            claude.close()
+        with ps.open_folder('C:\\Users\\example') as home:
+            claude = home.folder('.claude')
+        reason(self, lambda: claude.create('x'), 'changed', 'folder')    # without alone it depends on that hold
+        claude.close()
+        self.assert_nothing_open()
+
+    def test_identities_are_read_from_the_handle(self):
+        fd = ps.open_no_links(self.FILE_PATH)
+        self.assertEqual(ps.file_identity(fd)[:2], (0x1234ABCD, id(self.chat)))
+        with ps.open_folder(self.CLAUDE) as claude:
+            self.assertEqual(claude.identity()[:2], (0x1234ABCD, id(self.claude())))
+        self.assert_nothing_open()
+
+    def test_the_file_system_is_read_through_the_held_handle(self):
+        with ps.open_folder(self.CLAUDE) as claude:
+            self.assertEqual(claude.file_system(), 'NTFS')
+        self.file_systems['.claude'] = 'ReFS'
+        with ps.open_folder(self.CLAUDE) as claude:
+            self.assertEqual(claude.file_system(), 'ReFS')
+        self.assert_nothing_open()
+
+    def test_check_private_fd_reads_the_handle(self):
+        fd = ps.open_no_links(self.FILE_PATH)
+        ps.check_private_fd(fd, single_link=True)
+        self.assertEqual(self.checked, ['chat.jsonl'])
+        self.public.add(id(self.chat))
+        reason(self, lambda: ps.check_private_fd(fd), 'access')
+        self.claude()['children']['two'] = self.node('two-names')
+        two = ps.open_no_links(self.CLAUDE + '\\two')
+        reason(self, lambda: ps.check_private_fd(two, single_link=True), 'links')
+        folder = ps.open_no_links(self.CLAUDE, directory=True)
+        reason(self, lambda: ps.check_private_fd(folder), 'not_regular')
+        ps.check_private_fd(folder, directory=True)
+        self.assert_nothing_open()
+
     def test_unwritable_checks_the_opened_handle_and_names_what_was_refused(self):
         calls = []
 
@@ -1901,6 +2024,61 @@ class WindowsWalk(unittest.TestCase):
         os.close(ps.open_no_links(private, directory=True, private=True))
         icacls(secret, '/grant', EVERYONE_READ)
         reason(self, lambda: os.close(ps.open_no_links(secret, private=True)), 'access')
+
+    def test_identities_come_from_the_handle_with_the_32_bit_volume_serial(self):
+        import ctypes
+        from ctypes import wintypes as w
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        serial = w.DWORD()
+        self.assertTrue(kernel.GetVolumeInformationW(os.path.splitdrive(self.file)[0] + '\\', None, 0,
+                                                     ctypes.byref(serial), None, None, None, 0))
+        fd = ps.open_no_links(self.file)
+        try:
+            volume, index, size, written, created = ps.file_identity(fd)
+            info = os.fstat(fd)
+        finally:
+            os.close(fd)
+        self.assertEqual(volume, serial.value, 'the 32-bit serial, whatever this Python reports as st_dev')
+        self.assertLessEqual(volume, 2 ** 32 - 1)
+        self.assertEqual((size, written), (info.st_size, info.st_mtime_ns))
+        self.assertEqual(index & 0xFFFFFFFFFFFF, info.st_ino & 0xFFFFFFFFFFFF, 'the same NTFS record')
+        with ps.open_folder(self.middle) as middle:
+            self.assertEqual(middle.identity()[0], serial.value)
+
+    def test_private_companions_follow_the_folder_rule(self):
+        private = os.path.join(self.base, 'private')
+        ps.make_private_folder(private)
+        database = os.path.join(private, 'fixture.sqlite3')
+        self.assertTrue(ps.sqlite_companions_private(database))
+        with open(database + '-journal', 'wb') as out:
+            out.write(b'')                         # inherits the private folder's list, as SQLite's journal does
+        # No owner fix-up: an elevated runner's new files belong to Administrators, as SQLite's own journal does.
+        self.assertTrue(ps.sqlite_companions_private(database), 'inherited, private: allowed, whoever made it')
+        icacls(database + '-journal', '/grant', EVERYONE_READ)
+        self.assertFalse(ps.sqlite_companions_private(database))
+        os.remove(database + '-journal')
+        junction(database + '-wal', private)
+        self.assertFalse(ps.sqlite_companions_private(database))
+
+    def test_a_hold_alone_keeps_the_folders_above_in_place_and_reports_ntfs(self):
+        with ps.open_folder(self.middle, writable=True, alone=True) as middle:
+            self.assertEqual(len(middle._handles), 1, 'only its own handle is kept')
+            self.assertEqual(middle.file_system(), 'NTFS')
+            with self.assertRaises(OSError, msg='the one handle still keeps the folder above in place'):
+                os.rename(self.top, self.top + '-moved')
+            fd = middle.create('made-alone')
+            try:
+                ps.check_private_fd(fd, single_link=True)
+            finally:
+                os.close(fd)
+        plain = os.path.join(self.middle, 'notes.jsonl')       # made by Python: the folder's inherited list
+        fd = ps.open_no_links(plain)
+        try:
+            with self.assertRaises(ps.PrivateStorageError):
+                ps.check_private_fd(fd)
+        finally:
+            os.close(fd)
+        os.rename(self.top, self.top + '-moved')
 
     def test_a_held_folder_or_an_open_file_inside_blocks_renaming_the_folders_above(self):
         """NTFS refuses to rename a folder while anything below it is open, whatever that open shares. Attachment
@@ -2213,6 +2391,14 @@ class WindowsChanges(unittest.TestCase):
             reason(self, lambda: ps.unwritable(fd), 'owner')
         finally:
             os.close(fd)
+
+
+def owned_by(path):
+    try:
+        ps.windows_security(path)
+        return True
+    except ps.PrivateStorageError as e:
+        return e.reason != 'owner'
 
 
 def windows_handle_check(path):
