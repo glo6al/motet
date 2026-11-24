@@ -209,7 +209,7 @@ dir "$env:USERPROFILE\.cursor\projects"
 
 ## What does not work on Windows yet
 
-Motet **watches** on Windows: the live stage, risk flags, previews (page only, Python 3.12 or later) and Unlock all work. **Motet's own answers** and its model menu work too, once the key file is private (step 6); so far only the automated tests have checked them on Windows. Everything that **acts** on your agents is switched off for now. The goal is parity with the Mac, and these are still to come:
+Motet **watches** on Windows: the live stage, risk flags, previews (page only, Python 3.12 or later) and Unlock all work. **Motet's own answers** and its model menu work too, once the key file is private (step 6); so far only the automated tests have checked them on Windows. Everything that **acts** on your agents is switched off for now, apart from Allow / Deny, which is new and not yet checked on a real PC (see below). The goal is parity with the Mac, and these are still to come:
 
 - **Messaging between agents, and the bridge.**
 - **New chat.**
@@ -222,7 +222,7 @@ Motet **watches** on Windows: the live stage, risk flags, previews (page only, P
 
 Details on the rest:
 
-- **Answering permission prompts from the stage (Allow / Deny), and the hooks behind it.** The hooks are shell scripts, and how Claude Code runs hook commands on Windows has not been checked. `py scripts\install_hooks.py` says so and changes nothing. Motet still watches, and Claude asks in its own app as usual.
+- **Answering permission prompts from the stage (Allow / Deny), and the hooks behind it, are not yet checked on a real PC.** `py scripts\install_hooks.py` now installs them: Claude Code starts Python directly on `scripts\motet_hook.py`, with no shell in between. They need Claude Code 2.1.139 or later, and Python from winget or python.org, not the Microsoft Store. The installer refuses the Store's Python, and an older `claude` command it can find. Automated tests check them on Windows, but nobody has yet answered a real Claude Code prompt this way on a real PC. If you try it, please tell us what happened. `py scripts\install_hooks.py --remove` takes them out. Without them Motet still watches, and Claude asks in its own app as usual.
 - **Rendered previews show the page alone.** The styles, scripts and images it links to from files beside it are not served on Windows yet (inline ones still apply), so a previewed page can look unstyled; previews need Python 3.12 or later. A page reached through a link or junction, with more than one name (such as files pnpm hard-links into `node_modules`), or in `AppData` is refused. OneDrive-synced, network and ReFS/Dev Drive folders have not been tried: they may be refused by those checks, or may work. Please tell us which happen to you.
 - **Desktop app details** (session titles, permission mode, when you last looked at a session) come from the Claude desktop app's own records. On one Windows 11 PC they were under `%LOCALAPPDATA%\Claude-Data\<profile>\claude-code-sessions`, and `%APPDATA%\Claude` was empty, so Motet looks in both. Only the folder layout was checked there, not that the records read correctly.
 
