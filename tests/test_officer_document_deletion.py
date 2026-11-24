@@ -26,9 +26,10 @@ from test_attachments_foundation import EPOCH
 from test_attachments_foundation import fence, metadata
 import test_officer_document_ledger as ledger_fixtures
 import test_officer_document_intents as intent_fixtures
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private files require POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)        # on Windows too: the cleanup worker runs there
 class DeletionTests(unittest.TestCase):
     def setUp(self):
         self.f = storage_fixtures.DirectStoreTests(); self.f.setUp()
@@ -213,6 +214,7 @@ class DeletionTests(unittest.TestCase):
         self.assertEqual(self.confirm(current, command)['state'], 'deleting')
         self.l.execute(p['id']); self.assertEqual(self.status(current)['state'], 'deleted')
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_changed_identity_and_symlink_left_untouched_and_charged(self):
         for symlink in (False, True):
             with self.subTest(symlink=symlink):
@@ -226,6 +228,7 @@ class DeletionTests(unittest.TestCase):
                 self.assertEqual(self.status(p)['state'], 'partial_failure'); self.assertEqual(self.status(p)['reason'], 'identity_changed')
                 self.assertEqual(self.store.storage()['usedBytes'], used); self.assertTrue(path.exists())
 
+    @unittest.skipUnless(POSIX, POSIX_WHY)        # fails POSIX's folder fsync; Windows flushes through its handle
     def test_durable_absence_fsync_failure_no_refund_then_restart_recovery(self):
         source = self.add(); p = self.prepare(source); self.confirm(p); used = self.store.storage()['usedBytes']
         actual = os.fsync

@@ -762,40 +762,79 @@ def sqlite_companions_plain(path):
     return True
 
 
-def sqlite_companions_private(path):
-    """``sqlite_companions_plain``, and each companion that exists must also be private to this user.
+def companion_verdict(owner_sid, owner_is_user, has_dacl, aces):
+    """Raise unless a SQLite companion file's collected descriptor is acceptable on Windows.
 
-    POSIX: the private rule (``posix_verdict``, one name). Windows: each is opened without following a reparse point
-    and checked on its handle: a plain file with one name, owned by this user, whose access list names only this
-    user, SYSTEM, Administrators or OWNER RIGHTS. The list need not be protected: SQLite makes its journal by name,
-    so it inherits the folder's list, which is private but inherited. A leftover journal someone opened up to others
-    is refused."""
-    for suffix in ('-journal', '-wal', '-shm'):
-        name = path + suffix
-        if not WIN:
+    SQLite creates its journal by name with no security attributes of its own, so the file takes the creating
+    token's default owner (Administrators when Motet runs elevated) and inherits the folder's access list (private,
+    but not protected). So the owner may be this user, Administrators or SYSTEM, and the folder rule applies to the
+    list: plain allow entries for this user, SYSTEM, Administrators or OWNER RIGHTS only, protected or not. ``aces``
+    is as for ``acl_verdict``: (ace_type, sid_string, is_current_user)."""
+    if not (owner_is_user or owner_sid in (SYSTEM_SID, ADMINISTRATORS_SID)):
+        raise PrivateStorageError('nonprivate storage owner', 'owner')
+    acl_verdict(True, has_dacl, False, aces, True)
+
+
+def _win_companion_check(handle):
+    adv, kernel, w = _win_api()[:3]
+    with _CurrentUser() as user:
+        owner, dacl, sd = w.LPVOID(), w.LPVOID(), w.LPVOID()
+        if adv.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(sd)):
+            raise _unavailable()
+        try:
+            aces = [(t, sid, is_user) for t, flags, mask, sid, is_user in (_read_aces(dacl, user) if dacl else [])]
+            companion_verdict(_sid_text(owner), bool(adv.EqualSid(owner, user.sid)), bool(dacl), aces)
+        finally:
+            kernel.LocalFree(sd)
+
+
+def sqlite_companions_private(path):
+    """``sqlite_companions_plain``, and each companion that exists must also be private.
+
+    POSIX: the attachment store's own rule: a regular file with one name, owned by this user, mode exactly 0600
+    (SQLite gives its journal the database's mode). Windows: each is opened relative to its folder without following
+    a reparse point and checked on its handle: a plain file with one name, and ``companion_verdict`` (owner this
+    user, Administrators or SYSTEM; the folder rule for the list, which need not be protected). A leftover journal
+    someone opened up to others is refused. A companion that is being removed (delete pending, still open in a
+    scanner, say) counts as absent; any other failure to open one refuses."""
+    if not WIN:
+        for suffix in ('-journal', '-wal', '-shm'):
             try:
-                posix_verdict(os.lstat(name), False, True)
+                info = os.lstat(path + suffix)
             except FileNotFoundError:
                 continue
+            try:
+                posix_verdict(info, False, True)
             except PrivateStorageError:
                 return False
-            continue
-        try:
-            handle = _win_open(name, _READ_CONTROL | _FILE_READ_ATTRIBUTES, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE,
-                               _OPEN_EXISTING, 0)
-        except OSError as e:
-            if getattr(e, 'winerror', 0) in _NOT_FOUND:
-                continue
-            return False
-        try:
-            _win_kind(_win_facts(handle), False, 'file', True)
-            with _CurrentUser() as user:
-                _check_descriptor(user, True, handle=handle)       # the folder rule: inherited entries allowed
-        except PrivateStorageError:
-            return False
-        finally:
-            _win_close(handle)
-    return True
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                return False
+        return True
+    folder_path, base = os.path.split(path)
+    try:
+        folder = _win_open(folder_path or '.', _HOLD_ACCESS, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE, _OPEN_EXISTING, 0)
+    except OSError:
+        return False
+    try:
+        for suffix in ('-journal', '-wal', '-shm'):
+            try:
+                handle = _win_child(folder, base + suffix, _READ_CONTROL | _FILE_READ_ATTRIBUTES,
+                                    _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE, None)
+            except OSError as e:
+                status = getattr(e, 'ntstatus', 0)
+                if status in _NT_NOT_FOUND or status == _NT_DELETE_PENDING:
+                    continue
+                return False
+            try:
+                _win_kind(_win_facts(handle), False, 'file', True)
+                _win_companion_check(handle)
+            except PrivateStorageError:
+                return False
+            finally:
+                _win_close(handle)
+        return True
+    finally:
+        _win_close(folder)
 
 
 # ---------------------------------------------------------------------------

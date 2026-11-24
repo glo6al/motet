@@ -253,6 +253,23 @@ def volume_serial(folder):
     return serial.value
 
 
+def owner_of(path):
+    """The owner of ``path`` as a SID string (test helper)."""
+    import ctypes
+    handle = ps._win_open(str(path), ps._READ_CONTROL | ps._FILE_READ_ATTRIBUTES, 7, ps._OPEN_EXISTING, 0)
+    try:
+        adv, kernel, w = ps._win_api()[:3]
+        owner, sd = w.LPVOID(), w.LPVOID()
+        if adv.GetSecurityInfo(handle, 1, 1, ctypes.byref(owner), None, None, None, ctypes.byref(sd)):
+            return 'unreadable'
+        try:
+            return ps._sid_text(owner)
+        finally:
+            kernel.LocalFree(sd)
+    finally:
+        ps._win_close(handle)
+
+
 def owned_by_me(path):
     try:
         ps.windows_security(str(path))
@@ -267,6 +284,49 @@ def icacls(*args):
 
 def junction(link, target):
     subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)], check=True, capture_output=True, timeout=30)
+
+
+class CleanupWorkerTests(unittest.TestCase):
+    """The officer cleanup thread, for real (never under the simulation): on every system where the store runs, a
+    confirmed deletion is finished by DeletionWorker's sweep, which removes the file with durable_absence."""
+
+    def setUp(self):
+        import test_attachments_officer_storage as storage_fixtures
+        if not storage_fixtures.STORE:
+            self.skipTest(storage_fixtures.STORE_WHY)
+        self.f = storage_fixtures.DirectStoreTests()
+        self.f.setUp()
+        self.addCleanup(self.f.tearDown)
+
+    def test_the_worker_sweep_removes_a_confirmed_deletion(self):
+        import threading
+        from officer_document_deletion import OfficerDeletion, DeletionWorker
+        f, store = self.f, self.f.store
+        draft = f.draft()
+        upload, _ = f.upload(draft)
+        f.admit(draft)
+        source = upload['fileId']
+        deletions = OfficerDeletion(store)
+        prepared = deletions.prepare(source, 'officer', f.binding['scopeId'], f.cid, 0, f.key())
+        deletions.confirm(prepared['id'], prepared['capability'], prepared['fingerprint'], f.key())
+        removed, real_remove = threading.Event(), store.files.remove
+        calls = []
+
+        def remove(file_id, *args, **kwargs):
+            outcome = real_remove(file_id, *args, **kwargs)
+            if file_id == source:
+                calls.append((kwargs.get('durable_absence'), outcome))
+                removed.set()
+            return outcome
+        with mock.patch.object(store.files, 'remove', side_effect=remove):
+            worker = DeletionWorker(deletions)
+            try:
+                self.assertTrue(removed.wait(5), 'the worker never reached the file')
+            finally:
+                worker.close(5)
+        self.assertIn((True, 'removed'), calls)
+        self.assertFalse((store.files.root / 'objects' / source).exists())
+        self.assertEqual(deletions.status(prepared['id'], prepared['capability'])['state'], 'deleted')
 
 
 @unittest.skipUnless(os.name == 'nt', 'requires real Windows handles, access lists and junctions')
@@ -424,11 +484,10 @@ class WindowsStore(unittest.TestCase):
         journal = self.root / 'attachments' / 'ledger.sqlite3-journal'
 
         def leftover():
+            # Made the way SQLite makes it: by name, the folder's list, and the token's default owner (Administrators
+            # on an elevated runner). No owner fix-up.
             if not journal.exists():
-                journal.write_bytes(b'')               # follows the folder's list: private, though not protected
-            if not owned_by_me(journal):               # an elevated runner's default owner can be Administrators
-                subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % journal, shell=True,
-                               check=True, capture_output=True, timeout=30)
+                journal.write_bytes(b'')
         leftover()
         self.store = self.open()                       # a plain private leftover journal is fine
 
@@ -444,6 +503,26 @@ class WindowsStore(unittest.TestCase):
             with self.subTest(name=name):
                 second = folder / (name + '-second')
                 self.reopen_refused(lambda: os.link(folder / name, second), lambda: os.remove(second))
+
+    def test_writes_succeed_while_sqlites_own_journal_exists(self):
+        """SQLite makes its journal itself, with no security attributes, inside each write transaction, and the store
+        checks the companions inside those transactions. On an elevated runner (windows-latest) that journal belongs
+        to Administrators. Real writes must still succeed, with no icacls fix-up anywhere."""
+        self.store = self.open()
+        journal = self.root / 'attachments' / 'ledger.sqlite3-journal'
+        seen, check = [], self.store.files.verify_database
+
+        def watched():
+            if journal.exists():
+                seen.append(owner_of(journal))
+            return check()
+        with mock.patch.object(self.store.files, 'verify_database', watched):
+            d, file_id = self.uploaded()
+            self.store.remove_file(d['id'], d['capability'], fence(d), file_id)
+            self.store.reconcile()
+        self.assertTrue(seen, 'some check ran while SQLite had its journal')
+        print('\nWindows answer: SQLite\'s own journal was owned by %s during the store\'s checks.' % sorted(set(seen)))
+        self.assertEqual(self.store.storage()['usedBytes'], 0)
 
     def test_text_preview_reads_through_the_resource_locks(self):
         from attachments_catalogue import Catalogue

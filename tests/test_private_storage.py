@@ -104,6 +104,29 @@ class WriteRule(unittest.TestCase):
                                                   program + [self.ace(self.USER, 0x2)], system_owned=True), 'access')
 
 
+class CompanionRule(unittest.TestCase):
+    """companion_verdict: SQLite's journal takes the creating token's default owner and the folder's list."""
+    USER = 'S-1-5-21-1-2-3-1001'
+
+    def test_owner_may_be_this_user_administrators_or_system(self):
+        aces = [(0, ps.SYSTEM_SID, False), (0, self.USER, True)]
+        ps.companion_verdict(self.USER, True, True, aces)
+        for owner in (ps.ADMINISTRATORS_SID, ps.SYSTEM_SID):
+            ps.companion_verdict(owner, False, True, aces)
+        for owner in ('S-1-5-21-1-2-3-1002', ps.TRUSTED_INSTALLER_SID, 'S-1-1-0'):
+            with self.subTest(owner=owner):
+                reason(self, lambda: ps.companion_verdict(owner, False, True, aces), 'owner')
+
+    def test_the_folder_rule_applies_to_the_list(self):
+        inherited = [(0, ps.SYSTEM_SID, False), (0, ps.ADMINISTRATORS_SID, False), (0, self.USER, True),
+                     (0, ps.OWNER_RIGHTS_SID, False)]
+        ps.companion_verdict(ps.ADMINISTRATORS_SID, False, True, inherited)        # need not be protected
+        for extra in ((0, 'S-1-1-0', False), (0, 'S-1-5-32-545', False), (1, 'S-1-1-0', False)):
+            with self.subTest(entry=extra):
+                reason(self, lambda: ps.companion_verdict(self.USER, True, True, inherited + [extra]), 'access')
+        reason(self, lambda: ps.companion_verdict(self.USER, True, False, []), 'access')
+
+
 class Errors(unittest.TestCase):
     def test_refusals_are_oserrors_with_fixed_words(self):
         error = ps.PrivateStorageError('private storage unavailable', 'nonsense', 'folder')
@@ -2029,10 +2052,8 @@ class WindowsWalk(unittest.TestCase):
         self.assertTrue(ps.sqlite_companions_private(database))
         with open(database + '-journal', 'wb') as out:
             out.write(b'')                         # inherits the private folder's list, as SQLite's journal does
-        if not owned_by(database + '-journal'):
-            subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % (database + '-journal'),
-                           shell=True, check=True, capture_output=True, timeout=30)
-        self.assertTrue(ps.sqlite_companions_private(database), 'inherited, private: allowed')
+        # No owner fix-up: an elevated runner's new files belong to Administrators, as SQLite's own journal does.
+        self.assertTrue(ps.sqlite_companions_private(database), 'inherited, private: allowed, whoever made it')
         icacls(database + '-journal', '/grant', EVERYONE_READ)
         self.assertFalse(ps.sqlite_companions_private(database))
         os.remove(database + '-journal')
