@@ -10,7 +10,7 @@ Reading a session does not mean Motet can send to it or control it. Eligible loc
 
 ## Current provider capabilities
 
-Codex messaging, controls and native reads require macOS and an eligible local connection. Steering, interruption and native reads require Codex Desktop `26.1016.62342`, build `21477`. New chat and sending files to Codex require `26.1029.61003`, build `24614`. With one desktop build installed, only its group is available. Motet verifies the installed app files as well as the version and build. Claude permissions have separate paths for optional hooks and chats started by Motet.
+Codex messaging, controls and native reads require macOS and an eligible local connection. Messaging an existing Claude Code chat through the plugin starts on macOS, Linux and Windows; on Windows it is checked by automated tests but not yet on a real PC, a chat must be on the stage before it can connect, and sending it files is not available yet. Steering, interruption and native reads require Codex Desktop `26.1016.62342`, build `21477`. New chat and sending files to Codex require `26.1029.61003`, build `24614`. With one desktop build installed, only its group is available. Motet verifies the installed app files as well as the version and build. Claude permissions have separate paths for optional hooks and chats started by Motet.
 
 | Capability | Local Codex | Claude Code | Cursor | Codex cloud on this computer | Antigravity |
 | --- | --- | --- | --- | --- | --- |
