@@ -4884,8 +4884,8 @@ def accepts_page_gzip(values):
 
 
 # The owner's own app icons (never shipped with Motet): ~/.live-room/app-icons/<name>.svg or .png, for exactly these
-# four names. Read-only, owner key required, opened name by name from the state folder with links refused, one-name
-# regular files only, capped in size. An SVG is served under a policy that lets it draw and do nothing else.
+# four names. Read-only, owner key required, opened name by name with links refused, one-name regular files only,
+# capped in size. An SVG is served under a policy that lets it draw and do nothing else.
 APP_ICON_NAMES = ('claude', 'codex', 'antigravity', 'cursor')
 APP_ICON_MAX = 256 * 1024
 APP_ICON_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
@@ -4893,37 +4893,34 @@ APP_ICON_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
 
 def app_icon(name, home=None):
     """Return (bytes, content type) for one owner icon, or None. Nothing from a request becomes a path: the name must
-    be one of APP_ICON_NAMES. Not offered on Windows (no folder-relative opens there), where the page keeps its text."""
-    import stat as _st
-    if WIN or name not in APP_ICON_NAMES:
+    be one of APP_ICON_NAMES. The folders above the state folder (your home) are resolved once, as they always were
+    (``private_storage.anchored``); from there the shared no-link walk opens ``.live-room``, then ``app-icons`` inside
+    the folder it holds, then the icon inside that, refusing a link or junction at each of the three, on macOS, Linux
+    and Windows alike. The state folder is not required to be private here: an icon is not a secret, it is served only
+    to the owner's key under a draw-only policy, and the key's own checks (load_key, Motet's storage) guard the folder."""
+    if name not in APP_ICON_NAMES:
         return None
-    nofollow = getattr(os, 'O_NOFOLLOW', 0)
-    folder = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | nofollow
-    cur = fd = -1
     try:
-        cur = os.open(os.path.join(home or HOME, '.live-room'), folder)
-        nxt = os.open('app-icons', folder, dir_fd=cur)
-        os.close(cur)
-        cur = nxt
-        for ext, ctype in (('.svg', 'image/svg+xml'), ('.png', 'image/png')):
-            try:
-                fd = os.open(name + ext, os.O_RDONLY | nofollow | getattr(os, 'O_NONBLOCK', 0), dir_fd=cur)
-            except FileNotFoundError:
-                continue
-            st = os.fstat(fd)
-            if not _st.S_ISREG(st.st_mode) or st.st_nlink != 1 or not 0 < st.st_size <= APP_ICON_MAX:
-                return None
-            body = os.read(fd, APP_ICON_MAX + 1)
-            if len(body) != st.st_size or ctype == 'image/png' and not body.startswith(b'\x89PNG\r\n\x1a\n'):
-                return None
-            return body, ctype
+        with private_storage.open_folder(private_storage.anchored(os.path.join(home or HOME, '.live-room'))) as state, \
+                state.folder('app-icons') as icons:
+            for ext, ctype in (('.svg', 'image/svg+xml'), ('.png', 'image/png')):
+                try:
+                    fd = icons.open(name + ext, single_link=True)     # a regular file with one name, never a link
+                except FileNotFoundError:
+                    continue
+                try:
+                    st = os.fstat(fd)
+                    if not 0 < st.st_size <= APP_ICON_MAX:
+                        return None
+                    body = os.read(fd, APP_ICON_MAX + 1)
+                finally:
+                    os.close(fd)
+                if len(body) != st.st_size or ctype == 'image/png' and not body.startswith(b'\x89PNG\r\n\x1a\n'):
+                    return None
+                return body, ctype
         return None
     except OSError:
         return None
-    finally:
-        for f in (fd, cur):
-            if f >= 0:
-                os.close(f)
 
 
 # Fixed, because on Windows mimetypes reads the registry, where .js is sometimes text/plain (and nosniff then blocks it).
