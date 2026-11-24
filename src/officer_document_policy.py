@@ -9,6 +9,7 @@ import math
 import os
 import time
 
+import private_storage as ps
 from attachments_files import identity, private
 from attachments_types import OPAQUE, fail
 import officer_documents as documents
@@ -96,9 +97,21 @@ class HostAllowance:
 
 
 def load_allowance(parent, *, enabled=False, demo=False, clock=time.time):
-    """Read one fixed private file only after both explicit gates allow it."""
+    """Read one fixed private file only after both explicit gates allow it.
+
+    POSIX: exactly as before: the parent must be a private folder (0700, by lstat and on its opened descriptor), and
+    the policy a private regular file (0600, one name) opened without following a link by the parent's descriptor,
+    read once, unchanged meanwhile, still named by its name, with the parent unchanged. Windows: the same checks
+    through the no-link walk: the parent is opened by handle with every folder above it (any reparse point refused)
+    and its owner and access list checked; the policy is opened relative to it, with its owner, protected access
+    list and single name checked on its handle, and identities read from handles (``file_identity``)."""
     if enabled is not True or demo is not False:
         return None
+    if ps.WIN:
+        if not ps.folder_walk_available():
+            unavailable()
+        current(clock)
+        return _load_windows(parent, clock)
     if os.name != 'posix' or not hasattr(os,'O_NOFOLLOW'):
         unavailable()
     current(clock)
@@ -121,19 +134,7 @@ def load_allowance(parent, *, enabled=False, demo=False, clock=time.time):
             unavailable()
         if private(os.lstat(parent),True)[:2] != parent_identity:
             unavailable()
-        def unique(items):
-            out = {}
-            for k, v in items:
-                if k in out:
-                    unavailable()
-                out[k] = v
-            return out
-        obj = json.loads(raw.decode('utf-8'), object_pairs_hook=unique,
-                         parse_constant=lambda _: unavailable())
-        if (type(obj) is not dict or set(obj) != {'version','evidenceId','scopeId','scopeRevision','usdLimit'}
-                or type(obj['version']) is not int or obj['version'] != 1):
-            unavailable()
-        return HostAllowance(obj['evidenceId'], obj['scopeId'], obj['scopeRevision'], obj['usdLimit']).validate(clock)
+        return _parse(raw, clock)
     except (OSError, ValueError, TypeError, RecursionError):
         unavailable()
     finally:
@@ -143,6 +144,53 @@ def load_allowance(parent, *, enabled=False, demo=False, clock=time.time):
         finally:
             if parent_fd is not None:
                 os.close(parent_fd)
+
+
+def _parse(raw, clock):
+    """The policy's closed JSON content, the same on every system."""
+    def unique(items):
+        out = {}
+        for k, v in items:
+            if k in out:
+                unavailable()
+            out[k] = v
+        return out
+    obj = json.loads(raw.decode('utf-8'), object_pairs_hook=unique,
+                     parse_constant=lambda _: unavailable())
+    if (type(obj) is not dict or set(obj) != {'version','evidenceId','scopeId','scopeRevision','usdLimit'}
+            or type(obj['version']) is not int or obj['version'] != 1):
+        unavailable()
+    return HostAllowance(obj['evidenceId'], obj['scopeId'], obj['scopeRevision'], obj['usdLimit']).validate(clock)
+
+
+def _load_windows(parent, clock):
+    """The POSIX checks, made through the walk and on handles (Windows' stat has no owner or mode, and its st_dev
+    changed in Python 3.12, so identities come from ``private_storage.file_identity``)."""
+    try:
+        with ps.open_folder(str(parent), private=True) as folder:
+            parent_identity = folder.identity()[:2]
+            fd = folder.open(POLICY_FILENAME, single_link=True, private=True)
+            try:
+                before = tuple(ps.file_identity(fd))
+                if not 1 <= before[2] <= 4096:
+                    unavailable()
+                raw = os.read(fd, 4097)
+                if len(raw) != before[2] or tuple(ps.file_identity(fd)) != before:
+                    unavailable()
+            finally:
+                os.close(fd)
+            again = folder.open(POLICY_FILENAME, single_link=True, private=True)   # still the file that was read
+            try:
+                if tuple(ps.file_identity(again)) != before:
+                    unavailable()
+            finally:
+                os.close(again)
+        with ps.open_folder(str(parent), private=True) as folder:                   # and still the same folder
+            if folder.identity()[:2] != parent_identity:
+                unavailable()
+        return _parse(raw, clock)
+    except (OSError, ValueError, TypeError, RecursionError):
+        unavailable()
 
 
 def document_pricing():

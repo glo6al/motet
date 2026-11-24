@@ -16,6 +16,16 @@ POSIX = os.name == 'posix'
 POSIX_WHY = 'Checks POSIX modes, links or descriptors.'
 
 
+def private_folder(path):
+    """Make a new private folder: mode 0700 on POSIX; on Windows a protected access list owned by this user (an
+    elevated test runner's new folders would otherwise belong to Administrators, which Motet's checks refuse)."""
+    if os.name == 'nt':
+        private_storage.make_private_folder(str(path))
+    else:
+        os.mkdir(path, 0o700)
+    return Path(path)
+
+
 def state_root(temporary):
     """The folder a test keeps the store's state in, inside its own temporary folder. On POSIX the temporary folder
     itself (private, mode 0700), as before. On Windows a new private folder in it: an elevated test runner can own

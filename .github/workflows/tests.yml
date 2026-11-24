@@ -461,7 +461,6 @@ jobs:
         if: ${{ !cancelled() }}
       - run: node tests/test_officer_documents_client.js
         if: ${{ !cancelled() }}
-      # Off on Windows: Motet's file reading stays off there until its reading policy can be read (step 6c.3).
       - run: node tests/test_officer_documents_http.js
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
         timeout-minutes: 5

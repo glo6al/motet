@@ -27,6 +27,7 @@ import test_attachments_officer_storage as storage_fixtures
 PDF,PNG=storage_fixtures.PDF,storage_fixtures.PNG
 from test_officer_document_transport import FakeConnection,FakeResponse
 from test_officer_documents import wire,response
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, private_folder
 
 
 class Provider:
@@ -38,7 +39,7 @@ class Provider:
     def calls(self):return sum(len(c.requests) for c in self.connections)
 
 
-@unittest.skipUnless(os.name=='posix','Private storage requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class CoordinatorTests(unittest.TestCase):
     def setUp(self):
         self.f=storage_fixtures.DirectStoreTests();self.f.setUp();self.store=self.f.store
@@ -690,15 +691,13 @@ class HostGateTests(unittest.TestCase):
                 self.assertIsNone(server.start_attachments())
         for documents_enabled in (False,True):
             with tempfile.TemporaryDirectory() as tmp:
-                root=Path(os.path.realpath(tmp));(root/'.live-room').mkdir(mode=0o700)
+                root=Path(os.path.realpath(tmp));private_folder(root/'.live-room')
                 with mock.patch.object(server,'ATTACHMENTS_ENABLED',True),mock.patch.object(server,'OFFICER_DOCUMENTS_ENABLED',documents_enabled),mock.patch.object(server,'HOME',str(root)),mock.patch.object(server,'KEY',KEY),mock.patch.dict(os.environ,{'WATCH_DEMO':'0'}),mock.patch('officer_document_transport.DirectDocumentTransport',side_effect=AssertionError('network constructed')):
                     service = server.start_attachments()
                     try:
-                        if os.name == 'posix':
-                            self.assertIsNotNone(service)
-                            self.assertFalse(service.capabilities('officer', 'room', documents.MODEL)['available'])
-                        else:
-                            self.assertIsNone(service)
+                        # The store starts on every system now, Windows included; without a policy, reading is off.
+                        self.assertIsNotNone(service)
+                        self.assertFalse(service.capabilities('officer', 'room', documents.MODEL)['available'])
                     finally:
                         if service is not None:
                             service.close()

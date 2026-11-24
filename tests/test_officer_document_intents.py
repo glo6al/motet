@@ -16,9 +16,10 @@ from attachments_store import SCHEMA_VERSION
 from officer_document_intents import OfficerIntents,migrate
 import test_officer_document_ledger as fixture
 from test_attachments_foundation import fence
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 
-@unittest.skipUnless(os.name=='posix','Private store requires POSIX.')
+@unittest.skipUnless(STORE, STORE_WHY)
 class IntentTests(unittest.TestCase):
     def setUp(self):
         self.f=fixture.ExecutionTests();self.f.setUp();self.store=self.f.store

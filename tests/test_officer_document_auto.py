@@ -10,9 +10,10 @@ import test_officer_document_coordinator as fixtures
 from attachments_types import AttachmentError
 import officer_documents as documents
 from officer_policy import AUTOMATIC
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private storage requires POSIX.')  # borrows the coordinator's storage setUp
+@unittest.skipUnless(STORE, STORE_WHY)  # borrows the coordinator's storage setUp
 class AutoDocumentTests(unittest.TestCase):
     setUp = fixtures.CoordinatorTests.setUp
     tearDown = fixtures.CoordinatorTests.tearDown

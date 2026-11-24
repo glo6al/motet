@@ -739,18 +739,16 @@ async function run() {
   console.log('Motet page/client actual HTTP: 21 flows + 12 unmodified VM scenario controls / 14 causal mutants passed; every callback and final DTO validated, only explicit fictional calls, 0 external calls.');
 }
 if (process.platform === 'win32') {
-  // The positive HTTP cases need Motet's file reading, which stays off on Windows until its reading policy can be
-  // read there (step 6c.3). What is true on Windows now: the private store starts in a private state folder (made
-  // owned by this user: an elevated runner's new folders belong to Administrators, which the store refuses), and the
-  // reading policy refuses, so file reading stays off.
+  // On Windows the store starts in a private state folder (made owned by this user: an elevated runner's new folders
+  // belong to Administrators, which the store refuses), and a private reading policy loads, checked on its handle.
+  // The positive HTTP cases below then run as elsewhere, against the offline fixture (fake provider only).
   const result = spawnSync('python', ['-c', `
 from pathlib import Path
-import os
+import json, os
 from tempfile import TemporaryDirectory
 import private_storage
 from attachments_files import PrivateFiles
-from attachments_types import AttachmentError
-from officer_document_policy import load_allowance
+import officer_document_policy as policy
 with TemporaryDirectory() as temporary:
     state = Path(os.path.realpath(temporary)) / 'state'
     private_storage.make_private_folder(str(state))
@@ -760,16 +758,17 @@ with TemporaryDirectory() as temporary:
         assert (state / 'attachments' / 'objects').is_dir()
     finally:
         files.close()
+    fd = private_storage.create_private_file(str(state / policy.POLICY_FILENAME))
     try:
-        load_allowance(Path(files.parent), enabled=True, demo=False)
-    except AttachmentError as error:
-        assert error.code == 'document_policy_unavailable', error
-    else:
-        raise AssertionError('Motet file reading started on Windows before its policy can be read there.')
+        os.write(fd, json.dumps({'version': 1, 'evidenceId': policy.EVIDENCE_ID, 'scopeId': 'fictional-scope',
+                                 'scopeRevision': 'v1', 'usdLimit': '2.22'}).encode('utf-8'))
+    finally:
+        os.close(fd)
+    allowance = policy.load_allowance(Path(files.parent), enabled=True, clock=lambda: policy.VALID_FROM + 1)
+    assert allowance.usd_limit == '2.22', allowance
 `], {cwd: path.join(__dirname, '../src'), encoding: 'utf8', timeout: 30000});
   if (result.error) throw result.error;
   assert.equal(result.status, 0, result.stderr);
-  console.log('ok native Windows starts the private attachment store and keeps Motet file reading off at its policy');
-} else {
-  setImmediate(() => run().catch(error => { console.error(error); process.exitCode = 1; }));
+  console.log('ok native Windows starts the private attachment store and loads a private reading policy');
 }
+setImmediate(() => run().catch(error => { console.error(error); process.exitCode = 1; }));

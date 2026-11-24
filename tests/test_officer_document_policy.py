@@ -14,6 +14,7 @@ import officer_document_ledger as ledger
 import officer_documents as documents
 from attachments_types import AttachmentError
 import test_attachments_officer_storage as fixtures
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 
 def usage(n=100,geo='global',**kw):
@@ -60,7 +61,7 @@ class PolicyTests(unittest.TestCase):
             for enabled,demo in ((False,False),(True,True),(1,False),(True,0)):
                 self.assertIsNone(p.load_allowance('fictional-not-opened',enabled=enabled,demo=demo))
 
-    @unittest.skipUnless(os.name=='posix','Private allowance requires POSIX.')
+    @unittest.skipUnless(POSIX, POSIX_WHY)       # Windows: WindowsPolicyTests and the simulated tests below
     def test_closed_private_allowance_file_and_no_evidence_override(self):
         with tempfile.TemporaryDirectory() as raw:
             parent=Path(os.path.realpath(raw)); path=parent/p.POLICY_FILENAME
@@ -87,7 +88,199 @@ class PolicyTests(unittest.TestCase):
             with mock.patch.object(os,'read',side_effect=change),self.assertRaises(AttachmentError):load()
 
 
-@unittest.skipUnless(os.name=='posix','Private store requires POSIX.')
+DATA = {'version': 1, 'evidenceId': p.EVIDENCE_ID, 'scopeId': 'fictional-scope', 'scopeRevision': 'v1', 'usdLimit': '2.22'}
+NOW = p.VALID_FROM + 1
+
+
+@unittest.skipIf(os.name == 'nt', 'the simulation answers Windows calls with the POSIX walk')
+class SimulatedWindowsPolicyTests(unittest.TestCase):
+    """load_allowance's Windows branch under tests/windows_simulation.py: the walk and handle checks are answered by
+    POSIX, and os.getuid and fcntl fail loudly, so a POSIX-only call left in the Windows branch shows up."""
+
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from windows_simulation import simulated_windows
+        self.simulated_windows = simulated_windows
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.parent = Path(os.path.realpath(temporary.name)) / 'state'
+        os.mkdir(self.parent, 0o700)
+        self.path = self.parent / p.POLICY_FILENAME
+
+    def write(self, value, mode=0o600):
+        if self.path.exists() or self.path.is_symlink():
+            self.path.unlink()
+        self.path.write_bytes((value if type(value) is str else json.dumps(value)).encode('utf-8'))
+        self.path.chmod(mode)
+
+    def load(self):
+        with self.simulated_windows() as calls:
+            result = p.load_allowance(self.parent, enabled=True, clock=lambda: NOW)
+        return result, calls
+
+    def refused(self):
+        with self.assertRaises(AttachmentError) as raised:
+            self.load()
+        self.assertEqual(raised.exception.code, 'document_policy_unavailable')
+
+    def test_a_private_policy_loads_through_the_walk_and_handles(self):
+        self.write(DATA)
+        allowance, calls = self.load()
+        self.assertEqual((allowance.scope_id, allowance.usd_limit), ('fictional-scope', '2.22'))
+        for name in ('open_folder', 'file_identity'):
+            self.assertIn(name, calls)
+
+    def test_every_content_check_still_applies(self):
+        for invalid in (dict(DATA, rate=1), dict(DATA, evidenceId='invented'), dict(DATA, usdLimit='0.01'),
+                        dict(DATA, usdLimit='NaN'), dict(DATA, version=True), '{"version":1,"version":1}', '',
+                        'x' * 4097):
+            with self.subTest(invalid=str(invalid)[:40]):
+                self.write(invalid)
+                with self.assertRaises(AttachmentError):     # as on POSIX: an unreadable limit has its own code
+                    self.load()
+
+    def test_what_is_not_a_private_file_with_one_name_is_refused(self):
+        self.write(DATA, 0o644)
+        self.refused()
+        self.write(DATA)
+        os.link(self.path, self.parent / 'second-name')
+        self.refused()
+        os.unlink(self.parent / 'second-name')
+        self.path.rename(self.parent / 'elsewhere.json')
+        os.symlink('elsewhere.json', self.path)
+        self.refused()
+        self.path.unlink()
+        self.refused()                                     # missing
+        os.chmod(self.parent, 0o755)
+        (self.parent / 'elsewhere.json').rename(self.path)
+        self.refused()                                     # the folder is not private
+        os.chmod(self.parent, 0o700)
+        self.assertEqual(self.load()[0].usd_limit, '2.22')
+
+    def test_a_policy_changed_while_it_is_read_is_refused(self):
+        self.write(DATA)
+        old_read = os.read
+
+        def change(fd, size):
+            result = old_read(fd, size)
+            self.path.write_bytes(json.dumps(dict(DATA, usdLimit='3.33')).encode('utf-8'))
+            return result
+        with mock.patch.object(os, 'read', side_effect=change):
+            self.refused()
+
+    def test_the_dates_and_gates_still_come_first(self):
+        self.write(DATA)
+        with self.simulated_windows() as calls, self.assertRaises(AttachmentError):
+            p.load_allowance(self.parent, enabled=True, clock=lambda: p.VALID_UNTIL)
+        self.assertNotIn('open_folder', calls, 'an expired qualification reads nothing')
+        with self.simulated_windows() as calls:
+            self.assertIsNone(p.load_allowance(self.parent, enabled=False))
+        self.assertEqual(calls, [])
+
+
+def icacls(*args):
+    import subprocess
+    subprocess.run(['icacls'] + list(args), check=True, capture_output=True, timeout=30)
+
+
+@unittest.skipUnless(os.name == 'nt', 'requires real Windows access lists and junctions')
+class WindowsPolicyTests(unittest.TestCase):
+    """The policy file on a real NTFS volume, in a state folder made private and owned by this user (the runner is
+    elevated, so a plain new folder would belong to Administrators)."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(os.path.realpath(temporary.name))
+        self.parent = self.base / 'state'
+        import private_storage
+        private_storage.make_private_folder(str(self.parent))
+        self.path = self.parent / p.POLICY_FILENAME
+
+    def load(self):
+        return p.load_allowance(self.parent, enabled=True, clock=lambda: NOW)
+
+    def refused(self):
+        with self.assertRaises(AttachmentError) as raised:
+            self.load()
+        self.assertEqual(raised.exception.code, 'document_policy_unavailable')
+
+    def private_policy(self, value=DATA):
+        import private_storage
+        fd = private_storage.create_private_file(str(self.path))       # protected: this user and SYSTEM only
+        try:
+            os.write(fd, json.dumps(value).encode('utf-8'))
+        finally:
+            os.close(fd)
+
+    def test_a_private_policy_loads(self):
+        self.private_policy()
+        self.assertEqual(self.load().usd_limit, '2.22')
+
+    def refused_for(self, reason):
+        """Refused, and for ``reason`` (checked separately on the file, since the policy's refusal is one code)."""
+        import private_storage
+        self.refused()
+        with self.assertRaises(private_storage.PrivateStorageError) as raised:
+            private_storage.windows_security(str(self.path))
+        self.assertEqual(raised.exception.reason, reason)
+
+    def make_mine(self):
+        import subprocess
+        subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % self.path, shell=True, check=True,
+                       capture_output=True, timeout=30)
+
+    def test_a_policy_that_follows_the_folder_access_list_is_refused(self):
+        self.path.write_bytes(json.dumps(DATA).encode('utf-8'))       # inherited, not protected
+        self.make_mine()             # the elevated runner made it Administrators'; the owner is not what is tested
+        self.refused_for('access')
+
+    def test_a_protected_policy_that_also_names_administrators_is_refused(self):
+        """A protected policy owned by this user, with an explicit Administrators grant added to the file (as icacls
+        /grant would add it): still not private, since a file may name only this user and SYSTEM."""
+        self.private_policy()
+        icacls(str(self.path), '/grant', '*S-1-5-32-544:(R)')
+        self.refused_for('access')
+
+    def test_the_documented_icacls_command_makes_it_load(self):
+        self.path.write_bytes(json.dumps(DATA).encode('utf-8'))
+        import subprocess
+        subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % self.path, shell=True, check=True,
+                       capture_output=True, timeout=30)
+        subprocess.run('icacls "%s" /inheritance:r /grant:r "%%USERDOMAIN%%\\%%USERNAME%%:F"' % self.path, shell=True,
+                       check=True, capture_output=True, timeout=30)
+        self.assertEqual(self.load().usd_limit, '2.22')
+
+    def test_a_policy_readable_by_others_is_refused(self):
+        self.private_policy()
+        icacls(str(self.path), '/grant', '*S-1-1-0:(R)')
+        self.refused()
+
+    def test_a_junction_in_place_of_the_policy_or_its_folder_is_refused(self):
+        import subprocess
+        elsewhere = self.base / 'elsewhere'
+        elsewhere.mkdir()
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(self.path), str(elsewhere)], check=True, capture_output=True,
+                       timeout=30)
+        self.refused()
+        os.rmdir(self.path)
+        self.private_policy()
+        moved = self.base / 'state-moved'
+        os.rename(self.parent, moved)
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(self.parent), str(moved)], check=True, capture_output=True,
+                       timeout=30)
+        self.refused()
+        os.rmdir(self.parent)
+        os.rename(moved, self.parent)
+        self.assertEqual(self.load().usd_limit, '2.22')
+
+    def test_a_second_name_is_refused(self):
+        self.private_policy()
+        os.link(self.path, self.parent / 'second-name')
+        self.refused()
+
+
+@unittest.skipUnless(STORE, STORE_WHY)
 class QualifiedLedgerTests(unittest.TestCase):
     def setUp(self):
         self.f=fixtures.DirectStoreTests();self.f.setUp();self.store=self.f.store
