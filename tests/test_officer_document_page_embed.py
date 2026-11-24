@@ -79,8 +79,8 @@ class EmbedTests(unittest.TestCase):
         method = next(n for n in handler.body if isinstance(n, ast.FunctionDef) and n.name == 'officer_models_http')
         def forbidden_call(*args): raise AssertionError('No catalogue or selection mutation permitted')
         scope = {'json': json, 'OFFICER_LOCK': threading.RLock(), 'OFFICER_MODEL': 'claude-haiku-5-5',
-                 'OFFICER_MODEL_ERROR': '', 'ATTACHMENTS_ENABLED': False, 'OFFICER_DOCUMENTS_ENABLED': False,
-                 'officer_catalog': forbidden_call, 'select_officer_model': forbidden_call}
+                 'OFFICER_MODEL_ERROR': '', 'officer_catalog': forbidden_call, 'select_officer_model': forbidden_call,
+                 'attachment_availability': lambda: (False, False, 'Sending files is turned off in this Motet.')}
         exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), scope)
         class Request:
             path = '/officer/model-selection'
@@ -93,7 +93,8 @@ class EmbedTests(unittest.TestCase):
         code, body, extra = scope['officer_models_http'](req, 'GET')
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body), {'schemaVersion': 1, 'selected_model': 'claude-haiku-5-5',
-                                          'selection_available': True, 'attachments_enabled': False, 'documents_enabled': False})
+                                          'selection_available': True, 'attachments_enabled': False, 'documents_enabled': False,
+                                          'attachments_reason': 'Sending files is turned off in this Motet.'})
         self.assertIn(('Cache-Control', 'no-store'), extra)
         req.allowed = False
         self.assertEqual(scope['officer_models_http'](req, 'GET')[0], 403)

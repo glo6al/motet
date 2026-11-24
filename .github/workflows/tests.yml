@@ -337,6 +337,11 @@ jobs:
       - run: python tests/test_attachments_integration.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # On every system: what the page is told when the store is off (Windows, or a failed store) and that the
+      # attachment modules import without fcntl.
+      - run: python tests/test_attachments_availability.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       # Off on Windows: attachments store files by handle-based folder walk (dir_fd), so they stay off on Windows for now.
       - run: python tests/test_attachments_native_composition.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}

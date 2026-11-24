@@ -148,6 +148,8 @@ test('opening the picker from saved drafts does not create an empty draft', asyn
 for (const [code, expected] of [
   ['sqlite_unavailable', 'Sending files to agents is unavailable because this Python uses an older database library. Install a newer Python and use it to restart Motet.'],
   ['legacy_managed_storage', "Sending files to agents is unavailable because Motet's Claude chats were first set up with an older Python. Ordinary messages still work."],
+  ['attachments_windows_unavailable', 'Sending files is not available on Windows yet. Ordinary messages still work.'],
+  ['attachments_storage_unavailable', 'Sending files is unavailable because Motet could not open its private file storage. Restart Motet to try again. Ordinary messages still work.'],
 ]) test(code+' notice leaves ordinary words and Send usable only without retained work', async () => {
   const {createNativeAgentAttachmentsClient} = require('../src/web/native-agent-attachments-client.js');
   const calls=[];

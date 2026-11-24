@@ -1,7 +1,6 @@
 """Private owner/managed namespace witnesses and reciprocal reservation fence."""
 from contextlib import closing, contextmanager
 import errno
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -205,6 +204,10 @@ class NativeNamespaceFence:
     @contextmanager
     def host_fence(self):
         with _qualified(), _open(self.host) as (fd, _):
+            try:
+                import fcntl            # POSIX only; imported here so this module still imports on Windows
+            except ImportError:
+                raise NamespaceError() from None
             deadline = time.monotonic() + .35
             while True:
                 try:

@@ -125,7 +125,8 @@ function createNativeAgentAttachmentsPage(o) {
   const current = b => !!b && binding === b && sameSelection(b, o.selection());
   const sameSelection = (b, selected) => !!selected && b.key === selected.key && b.target === selected.target && b.identity === selected.identity;
   const safeUUID = () => typeof o.crypto?.randomUUID === 'function' && !!o.crypto?.subtle;
-  const passiveFileRefusal = s => !!s && ['sqlite_unavailable','legacy_managed_storage'].includes(s.error?.code) &&
+  const passiveFileRefusal = s => !!s && ['sqlite_unavailable','legacy_managed_storage','attachments_windows_unavailable',
+    'attachments_storage_unavailable'].includes(s.error?.code) &&
     Object.values(s.features).every(value => value === false) && !s.context && !s.draft && !s.unsavedEdit &&
     !s.uploads.length && !s.attempts.length && !s.requests.length && !s.uncertain && !s.busy;
   const stateOwns = b => {

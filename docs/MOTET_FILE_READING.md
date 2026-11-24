@@ -1,6 +1,6 @@
 # Motet file reading
 
-Open the [workspace](http://127.0.0.1:8793/) on the computer running Motet. File reading requires macOS or Linux with private POSIX file permissions and a filesystem that supports the local storage checks. It is unavailable on Windows. Motet accepts original PDFs and PNGs. File questions use Haiku 5.5 when the picker is set to **Auto** or explicitly to **Haiku 5.5**. The answer shows the model it used.
+Open the [workspace](http://127.0.0.1:8793/) on the computer running Motet. File reading requires macOS or Linux with private POSIX file permissions and a filesystem that supports the local storage checks. It is unavailable on Windows. If Motet's private file storage cannot start (on Windows, or on a Mac or Linux computer where the storage checks fail), the workspace offers no file button for Motet and says why in a chat's message box; restarting Motet tries the storage again. Motet accepts original PDFs and PNGs. File questions use Haiku 5.5 when the picker is set to **Auto** or explicitly to **Haiku 5.5**. The answer shows the model it used.
 
 1. Save your Anthropic API key in `~/.live-room/anthropic-key` as a private regular file with mode `0600`. Create `~/.live-room/officer-document-policy.json` as a private regular file with mode `0600`.
 2. Restart Motet so it loads the policy. Open Motet’s conversation and choose **Attach files**, or drag a file onto the message box. A tray holds up to five files and 300,000 bytes total, counting both new and kept files.

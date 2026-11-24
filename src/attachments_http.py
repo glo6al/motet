@@ -72,7 +72,9 @@ class LimitedReader:
         return chunk
 
 
-def handle_http(handler, service, owner_key, port, *, native=None):
+def handle_http(handler, service, owner_key, port, *, native=None,
+                unavailable=('attachments_disabled', 'Attachments are unavailable.')):
+    """``unavailable`` is the (code, words) every request gets while ``service`` is None: why the store is not running."""
     handler.close_connection = True
     def headers(name):
         return handler.headers.get_all(name, [])
@@ -152,7 +154,7 @@ def handle_http(handler, service, owner_key, port, *, native=None):
         for name in SENSITIVE:
             one(name, required=False)
         if service is None:
-            return error(503, 'attachments_disabled', 'Attachments are unavailable.')
+            return error(503, *unavailable)
         parsed = urllib.parse.urlsplit(handler.path)
         if (parsed.scheme or parsed.netloc or parsed.fragment or '#' in handler.path or '%' in parsed.path
                 or not parsed.path.startswith(PREFIX + '/') or re.search(r'%(?![0-9a-fA-F]{2})', parsed.query)):

@@ -214,7 +214,7 @@ Motet **watches** on Windows: the live stage, risk flags, previews (with their s
 - **Messaging Codex chats.** It needs the Codex desktop app on a Mac for now; Send stays off and says so.
 - **Parts of the bridge between agents:** Codex chats as recipients, the Antigravity plugin and inbox, and the offline recovery and clear commands (see below); and the older Claude channel launcher (`scripts/watch_claude.py`).
 - **New chat.**
-- **Files and attachments.**
+- **Sending files, and Motet's own files.** You cannot attach files to a Claude or Codex chat, or give Motet files to read, on Windows yet. The page says so instead of offering it: a chat's message box shows "Sending files is not available on Windows yet. Ordinary messages still work.", and Motet's own conversation has no file button. Ordinary messages and questions still send.
 - **Dictation.** The whole feature is off on Windows, not only the speech engine.
 - **Codex cloud agents** on the stage, which are found through the process list.
 - **Open in Antigravity.**

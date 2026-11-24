@@ -70,6 +70,7 @@ MESSAGING = None
 NATIVE_OBSERVATIONS = None
 ATTACHMENTS = None
 ATTACHMENTS_ENABLED = True
+ATTACHMENTS_OFF = 'attachments_disabled'   # why ATTACHMENTS is None, as a code from ATTACHMENTS_OFF_WHY; set by start_attachments
 OFFICER_DOCUMENTS_ENABLED = True
 NATIVE_AGENT_ATTACHMENTS_ENABLED = True
 NEW_CHAT = None                 # owner-only; never a Bridge capability
@@ -106,6 +107,18 @@ ID_RX = re.compile(r'[0-9a-fA-F-]{8,64}\Z')
 WIN = os.name == 'nt'
 WIN_IDS = not WIN or sys.version_info >= (3, 12)      # before 3.12 Windows file ids are cut to 64 bits, which ReFS does not keep unique
 BINARY = getattr(os, 'O_BINARY', 0)       # Windows opens files as text unless told otherwise
+# Host capability: may files sent to an agent chat be handed to that agent here? Claude's workspace delivery (and
+# Codex's, which also needs the Mac app) is built on POSIX folder handles and has not been ported to Windows, so this
+# stays False there even once the attachment store itself starts on Windows. Turn it on only with that port.
+NATIVE_ATTACHMENT_DELIVERY_HOST = not WIN
+# What the page is told when the attachment store is not running, by the code in ATTACHMENTS_OFF. The same codes
+# answer attachment requests, and the page words them the same way (src/web/native-agent-attachments-client.js).
+ATTACHMENTS_OFF_WHY = {
+    'attachments_disabled': 'Sending files is turned off in this Motet. Ordinary messages still work.',
+    'attachments_windows_unavailable': 'Sending files is not available on Windows yet. Ordinary messages still work.',
+    'attachments_storage_unavailable': ('Sending files is unavailable because Motet could not open its private file '
+                                        'storage. Restart Motet to try again. Ordinary messages still work.'),
+}
 
 
 def same_path(a, b):
@@ -5226,11 +5239,13 @@ class H(BaseHTTPRequestHandler):
         if method == 'GET':
             if self.path == '/officer/model-selection':
                 # Local saved selection only: never refresh the provider catalogue.
+                attachments_on, documents_on, reason = attachment_availability()
                 with OFFICER_LOCK:
                     value = {'schemaVersion': 1, 'selected_model': OFFICER_MODEL,
                              'selection_available': not bool(OFFICER_MODEL_ERROR),
-                             'attachments_enabled': ATTACHMENTS_ENABLED,
-                             'documents_enabled': ATTACHMENTS_ENABLED and OFFICER_DOCUMENTS_ENABLED}
+                             'attachments_enabled': attachments_on, 'documents_enabled': documents_on}
+                if reason is not None:
+                    value['attachments_reason'] = reason    # only while off, so a running store answers as before
                 return answer(200, value)
             if self.path != '/officer/models':
                 return answer(400, officer_models_view(error='Invalid Motet model request.'))
@@ -5249,7 +5264,9 @@ class H(BaseHTTPRequestHandler):
         native = None
         if ATTACHMENTS_ENABLED and NATIVE_AGENT_ATTACHMENTS_ENABLED and os.environ.get('WATCH_DEMO') != '1':
             native = getattr(getattr(MESSAGING, '_native_composition', None), 'claude', None)
-        return attachments_http.handle_http(self, ATTACHMENTS, KEY, PORT, native=native)
+        off = ATTACHMENTS_OFF or 'attachments_disabled'
+        return attachments_http.handle_http(self, ATTACHMENTS, KEY, PORT, native=native,
+                                            unavailable=(off, ATTACHMENTS_OFF_WHY[off]))
 
     def do_PUT(self):
         if self.path.startswith('/api/dictation/'):
@@ -6482,8 +6499,23 @@ def admit_managed_claude(identity, folder, tails, permit):
         return None
 
 
+def attachment_availability():
+    """What the page is told: ``(attachments_on, documents_on, reason)``, from what actually started.
+
+    Attachments are on only while the store runs; Motet's own file reading only while its host policy also loaded.
+    ``reason`` is plain words for the page when attachments are off, and None while they are on."""
+    if ATTACHMENTS is None or not ATTACHMENTS_ENABLED:
+        return False, False, ATTACHMENTS_OFF_WHY[ATTACHMENTS_OFF or 'attachments_disabled']
+    return True, bool(OFFICER_DOCUMENTS_ENABLED and getattr(ATTACHMENTS, 'documents', None) is not None), None
+
+
 def start_attachments():
-    """Return before constructing dependencies while rollout is disabled/demo."""
+    """Return before constructing dependencies while rollout is disabled/demo.
+
+    Records in ATTACHMENTS_OFF why no store is running: None once it starts, the Windows code where this host
+    cannot store files yet, and the storage code for any other failure."""
+    global ATTACHMENTS_OFF
+    ATTACHMENTS_OFF = 'attachments_disabled'
     if not ATTACHMENTS_ENABLED or os.environ.get('WATCH_DEMO') == '1':
         return None
     from attachments_store import AttachmentStore
@@ -6512,14 +6544,20 @@ def start_attachments():
                 transport = DirectDocumentTransport(enabled=True, demo=False)
                 coordinator = DocumentCoordinator(store, allowance, selected_model=selected_model,
                     credential=lambda: OFFICER_KEY, transport=transport, enabled=True, demo=False)
-                return OfficerAttachmentService(store, coordinator=coordinator, known_scopes=known_scopes)
+                service = OfficerAttachmentService(store, coordinator=coordinator, known_scopes=known_scopes)
+                ATTACHMENTS_OFF = None
+                return service
             except (AttachmentError, OSError, ValueError, TypeError):
                 # Missing/expired policy never falls back to ordinary Officer calls.
                 pass
-        return AttachmentService(store, resolver=UnqualifiedResolver())
-    except (AttachmentError, OSError, ValueError, TypeError):
+        service = AttachmentService(store, resolver=UnqualifiedResolver())
+        ATTACHMENTS_OFF = None
+        return service
+    except (AttachmentError, OSError, ValueError, TypeError) as error:
         if store is not None:
             store.close()
+        ATTACHMENTS_OFF = ('attachments_windows_unavailable' if WIN and getattr(error, 'code', None) == 'host_unavailable'
+                           else 'attachments_storage_unavailable')
         return None
 
 
@@ -6536,7 +6574,8 @@ def codex_attachment_room():
 def start_native_attachment_maintenance(messaging, attachments):
     if messaging is None or os.environ.get('WATCH_DEMO') == '1':
         return None
-    allow_install = ATTACHMENTS_ENABLED and NATIVE_AGENT_ATTACHMENTS_ENABLED and attachments is not None
+    allow_install = (ATTACHMENTS_ENABLED and NATIVE_AGENT_ATTACHMENTS_ENABLED and NATIVE_ATTACHMENT_DELIVERY_HOST
+                     and attachments is not None)
     if messaging._attachment_guard is None and not allow_install:
         return None
     if allow_install and getattr(attachments, 'store', None) is not None:
@@ -6559,7 +6598,8 @@ def start_messaging():
     Claude chats are messaged through the watch-owner plugin on macOS, Linux and Windows. Codex needs the Codex
     desktop app on a Mac; elsewhere the store reports it unavailable with that reason instead of failing.
     Attachment maintenance binds before the worker starts; a retained attachment guard that cannot be
-    enforced still keeps messaging off (fail closed). Windows has no attachments yet, so nothing binds there."""
+    enforced still keeps messaging off (fail closed). Windows has no attachment store yet, and even once it has one,
+    NATIVE_ATTACHMENT_DELIVERY_HOST keeps files sent to agent chats from being installed there."""
     store = None
     try:
         store = MessagingStore(os.path.join(HOME, '.live-room'), os.path.join(HOME, '.codex', 'sessions'),
