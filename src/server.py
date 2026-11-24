@@ -1569,11 +1569,76 @@ def in_private(real):
     return under(real + os.sep, PRIVATE_ROOTS) or bool(dir_ids(above(os.path.dirname(real))) & dir_ids(PRIVATE_ROOTS))
 
 
+_RESOLVED_HOME = (None, None)
+
+
+def resolved_home():
+    """HOME with its links resolved (a profile moved with a junction, a home reached through a symlink), read once
+    for each value of HOME. Grants are recorded under resolved paths, so the home rule and the private names must
+    know where home really is, not only the name it was given."""
+    global _RESOLVED_HOME
+    home, real = _RESOLVED_HOME
+    if home != HOME:
+        home, real = HOME, os.path.realpath(HOME)
+        _RESOLVED_HOME = (home, real)
+    return real
+
+
+def home_and_above():
+    """The home folder and every folder above it, under its given name and under its resolved one."""
+    given, real = above(HOME), above(resolved_home())
+    return given + [p for p in real if p not in given]
+
+
+def private_names():
+    """The private folders by name: as given (under HOME) and also under the resolved home, where grants live."""
+    home, real = HOME, resolved_home()
+    names = list(PRIVATE_ROOTS)
+    if real != home:
+        names += [real + p[len(home):] for p in PRIVATE_ROOTS if p.startswith(home + os.sep)]
+    return tuple(names)
+
+
+def named_private(path):
+    """Windows, while serving: is this path inside a private folder by name alone (case ignored)? Nothing on disk is
+    looked at, so no link is followed before the walk; identities are compared by the walk itself."""
+    return under(path + os.sep, private_names())
+
+
+PRIVATE_IDS_SECONDS = 2.0
+_PRIVATE_IDS = (None, 0.0, frozenset())
+
+
+def windows_private_ids():
+    """Windows, while serving: the identities of the private folders, each opened by the no-link walk from its name
+    (under the resolved home) and read through its own handle, so nothing an agent links in place of a private
+    folder is followed (a link to a network share would otherwise be contacted on every request). A private folder
+    that is itself a link or junction is not opened: it is still refused by name, and when a page is granted. The set
+    is reused for PRIVATE_IDS_SECONDS (per home and list of private folders): it describes folders at fixed places
+    in your home, which a grant never covers, so a reading two seconds old answers the same question; it saves
+    opening every private folder from the drive down for each style, script and image of a page."""
+    global _PRIVATE_IDS
+    key, now = (HOME, PRIVATE_ROOTS), time.monotonic()
+    held_key, at, ids = _PRIVATE_IDS
+    if held_key == key and 0 <= now - at < PRIVATE_IDS_SECONDS:
+        return ids
+    out = set()
+    for name in private_names():
+        try:
+            with private_storage.open_folder(name) as folder:
+                out.add(held_id(folder))
+        except OSError:
+            pass
+    _PRIVATE_IDS = (key, now, frozenset(out))
+    return _PRIVATE_IDS[2]
+
+
 def allow_preview(aid, old, ts, cid, path):
     """Let the page render an HTML file an agent wrote. The path must be a real, regular .html file reached without
     any symlink, outside private configuration folders. Its identity is recorded, so a file swapped in later under
     the same name is not served. The folder it sits in is granted for its styles, scripts and images, unless that
-    folder is your home folder or above it; private folders below a granted folder are never served (see preview).
+    folder is your home folder or above it, under its given name or its resolved one (a home reached through a link
+    or junction); private folders below a granted folder are never served (see preview).
     The folder is recorded by identity: on macOS and Linux as os.stat reports it, on Windows as read from the folder's
     own handle after the no-link walk has opened it (the same reading the preview walk compares it with later). On
     Windows nothing is granted before Python 3.12, which can report full-width Windows file ids (the version is
@@ -1603,8 +1668,10 @@ def allow_preview(aid, old, ts, cid, path):
         else:
             ds = os.stat(os.path.dirname(real))
             ident = (ds.st_ino, ds.st_dev)
-        if ident in dir_ids(above(HOME)) or under(HOME + os.sep, [os.path.dirname(real).rstrip(os.sep) + os.sep]):
-            raise OSError('too broad')                # a page saved straight into the home folder brings no folder with it
+        folder = [os.path.dirname(real).rstrip(os.sep) + os.sep]
+        if (ident in dir_ids(home_and_above()) or under(HOME + os.sep, folder)
+                or under(resolved_home() + os.sep, folder)):
+            raise OSError('too broad')                # a page saved into the home folder, or above it, brings no folder
         ALLOWED_DIRS.pop(os.path.dirname(real), None)
         ALLOWED_DIRS[os.path.dirname(real)] = ident   # styles, scripts and images beside it; never other pages
         while len(ALLOWED_DIRS) > 100:
@@ -4972,15 +5039,20 @@ def preview_asset_windows(want):
     identity must be the one granted and not a private folder's; then each next name is opened relative to the
     folder handle above it (a link, junction or other reparse point there is refused, never followed), and each
     folder walked through is compared by identity with the private ones. Which folder is which is decided by
-    those identities, not by spelling, so a differently cased name cannot reach a private folder."""
+    those identities, not by spelling, so a differently cased name cannot reach a private folder.
+
+    Nothing before the walk looks at the disk: the grant is found by name, the private check before it is by name
+    only (named_private), and the private identities come from the no-link walk too (windows_private_ids). So no
+    link an agent placed under the grant, or in place of a private folder, is followed, and a link to a network
+    share is never contacted."""
     import contextlib
     root = next((d for d in list(ALLOWED_DIRS) if want.startswith(d + os.sep)), None)
-    if not root or not want.lower().endswith(ASSET_EXT) or in_private(want):
+    if not root or not want.lower().endswith(ASSET_EXT) or named_private(want):
         return -1
     parts = [x for x in want[len(root) + 1:].split(os.sep) if x]
     if any(x in ('.', '..') for x in parts) or not parts:
         return -1
-    private = dir_ids(PRIVATE_ROOTS)
+    private = windows_private_ids()
     with contextlib.ExitStack() as held:          # closes the deepest folder first, as the walk requires
         cur = held.enter_context(private_storage.open_folder(root))
         ident = held_id(cur)

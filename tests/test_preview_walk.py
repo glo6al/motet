@@ -33,6 +33,13 @@ def ident(path):
     return (st.st_ino, st.st_dev)
 
 
+@contextlib.contextmanager
+def names_not_private():
+    """Take the by-name private checks out of the way, so only the walk's identity checks can refuse."""
+    with patch.object(server, 'in_private', lambda path: False), patch.object(server, 'named_private', lambda path: False):
+        yield
+
+
 class Fake:
     def send(self, code, body, *a):
         self.got = (code, body)
@@ -139,7 +146,7 @@ class PreviewCase:
         server.PRIVATE_ROOTS = server.PRIVATE_ROOTS + (vault + os.sep,)
         self.assertEqual(self.get(os.path.join(vault, 'x.css'))[0], 404)
         # The walk's own identity check, with the name check out of the way: still refused.
-        with patch.object(server, 'in_private', lambda path: False):
+        with names_not_private():
             self.assertEqual(self.get(os.path.join(vault, 'x.css'))[0], 404)
             server.PRIVATE_ROOTS = server.PRIVATE_ROOTS + (self.proj + os.sep,)
             self.assertEqual(self.get(self.asset)[0], 404, 'the granted folder itself is now private')
@@ -155,6 +162,32 @@ class PreviewCase:
         os.makedirs(os.path.join(self.proj, 'css'))
         write(self.asset, b'replacement')
         self.assertEqual(self.get(self.asset)[0], 404)
+
+    def check_home_reached_through_a_link(self):
+        """The home folder given by a link (a profile moved with a junction): a page in the real home or above it
+        brings no folder, so files under the real home are not served."""
+        real_home = os.path.join(self.home, 'disk', 'person')
+        os.makedirs(os.path.join(real_home, 'notes'))
+        write(os.path.join(real_home, 'notes', 'a.css'), b'home file')
+        given = os.path.join(self.home, 'person-link')
+        self.link(real_home, given)
+        server.HOME = given
+        server.PRIVATE_ROOTS = tuple(os.path.join(given, p) + os.sep for p in ('.live-room', 'AppData'))
+        self.assertEqual(server.resolved_home(), real_home)
+        for page in (os.path.join(self.home, 'disk', 'page.html'), os.path.join(real_home, 'page.html')):
+            write(page, b'<p>page')
+            self.grant(page)
+            self.assertIn(page, server.ALLOWED_FILES, 'the page itself is still shown')
+            self.assertNotIn(os.path.dirname(page), server.ALLOWED_DIRS, 'the real home or above it brings no folder')
+            self.assertEqual(self.get(os.path.join(real_home, 'notes', 'a.css'))[0], 404)
+        # a project inside the real home is still granted as usual
+        project = os.path.join(real_home, 'site')
+        os.makedirs(project)
+        write(os.path.join(project, 'index.html'), b'<p>site')
+        write(os.path.join(project, 'a.css'), b'site style')
+        self.grant(os.path.join(project, 'index.html'))
+        self.assertIn(project, server.ALLOWED_DIRS)
+        self.assertEqual(self.get(os.path.join(project, 'a.css')), (200, b'site style'))
 
     def check_what_is_not_granted(self):
         write(os.path.join(self.home, 'top.html'), b'<p>home')
@@ -196,6 +229,9 @@ class Posix(PreviewCase, unittest.TestCase):
 
     def test_what_is_not_granted(self):
         self.check_what_is_not_granted()
+
+    def test_home_reached_through_a_link(self):
+        self.check_home_reached_through_a_link()
 
     def test_a_link_to_a_file_is_refused(self):
         self.grant()
@@ -253,6 +289,54 @@ class SimulatedWindows(Posix):
             self.assertEqual(self.get(self.asset)[0], 404)
             self.assertEqual(self.get(self.page)[0], 404)
 
+    def test_nothing_on_the_request_path_follows_a_link_before_the_walk(self):
+        """A link under the grant (say to a network share) must not be followed by anything before the no-link walk:
+        while a style or page is served, every call that resolves or stats a path by name fails the test."""
+        self.grant()
+        server.resolved_home()                       # read once per home, before any request
+        self.link(self.outside, os.path.join(self.css, 'share'))
+        self.link(self.outside, os.path.join(self.home, '.ssh'))        # a link in place of a private folder
+        server.PRIVATE_ROOTS = server.PRIVATE_ROOTS + (os.path.join(self.home, '.ssh') + os.sep,)
+
+        def never(*args, **kwargs):
+            raise AssertionError('a path was resolved or stat-ed by name while serving')
+        with patch.object(os, 'stat', never), patch.object(os, 'lstat', never), \
+                patch.object(os.path, 'realpath', never), patch.object(os.path, 'exists', never):
+            self.assertEqual(self.get(self.asset), (200, ASSET))
+            self.assertEqual(self.get(os.path.join(self.css, 'share', 'a.css'))[0], 404)
+            self.assertEqual(self.get(self.page)[0], 200)
+        # The private identities are reused for a moment, not re-read for each file of a page.
+        opened, real_open_folder = [], server.private_storage.open_folder
+
+        def recorded(path, *args, **kwargs):
+            opened.append(path)
+            return real_open_folder(path, *args, **kwargs)
+        with patch.object(server.private_storage, 'open_folder', recorded):
+            for _ in range(3):
+                self.assertEqual(self.get(self.asset), (200, ASSET))
+        self.assertEqual(opened, [self.proj] * 3, 'only the granted folder is opened for each file')
+
+    def test_private_identities_come_from_the_walk_handles(self):
+        """Identity is the reading of the held handle, not os.stat: here the handle reading is replaced by the folder's
+        own name, so a folder named like a private one elsewhere is refused only if handles are what is compared."""
+        self.grant()
+        vault, other_vault = os.path.join(self.proj, 'vault'), os.path.join(self.outside, 'vault')
+        for folder in (vault, other_vault):
+            os.makedirs(folder)
+        write(os.path.join(vault, 'x.css'), b'secret')
+        server.PRIVATE_ROOTS = server.PRIVATE_ROOTS + (other_vault + os.sep,)
+        real_held_id = server.held_id
+
+        def by_name(folder):
+            name = os.path.basename(folder.path.rstrip(os.sep))
+            return ('name', name) if name == 'vault' else real_held_id(folder)
+        with names_not_private():
+            self.assertEqual(self.get(os.path.join(vault, 'x.css')), (200, b'secret'), 'control: two different folders')
+            with patch.object(server, 'held_id', by_name), patch.object(server, 'PRIVATE_IDS_SECONDS', 0):
+                self.assertEqual(self.get(os.path.join(vault, 'x.css'))[0], 404)
+                self.assertIn(('name', 'vault'), server.dir_ids([other_vault]), 'dir_ids adds the handle reading on Windows')
+                self.assertIn(ident(other_vault), server.dir_ids([other_vault]), 'and keeps the os.stat one')
+
     def test_dot_names_are_refused(self):
         self.grant()
         write(os.path.join(self.proj, 'up.css'), b'up')
@@ -290,6 +374,9 @@ class RealWindows(PreviewCase, unittest.TestCase):
     def test_what_is_not_granted(self):
         self.check_what_is_not_granted()
 
+    def test_home_reached_through_a_junction(self):
+        self.check_home_reached_through_a_link()
+
     def test_a_symbolic_link_at_the_file_or_a_folder_is_refused(self):
         self.grant()
         file_link, folder_link = os.path.join(self.css, 'link.css'), os.path.join(self.css, 'linked')
@@ -312,18 +399,34 @@ class RealWindows(PreviewCase, unittest.TestCase):
         write(os.path.join(vault, 'x.css'), b'secret')
         server.PRIVATE_ROOTS = server.PRIVATE_ROOTS + (vault + os.sep,)
         self.assertEqual(self.get(os.path.join(self.proj, 'CSS', 'A.CSS')), (200, ASSET), 'names below the grant ignore case, as Windows does')
-        with patch.object(server, 'in_private', lambda path: False):     # the identity walk alone
+        with names_not_private():     # the identity walk alone
             self.assertEqual(self.get(os.path.join(self.proj, 'VAULT', 'x.css'))[0], 404)
         self.assertEqual(self.get(os.path.join(self.proj, 'VAULT', 'x.css'))[0], 404)
         self.assertEqual(self.get(self.proj.upper() + os.sep + 'CSS' + os.sep + 'A.CSS')[0], 404,
                          'a differently cased grant matches no granted folder')
 
-    def test_device_names_and_streams_are_refused(self):
+    def test_names_windows_would_rewrite_or_streams_are_refused_by_the_walk(self):
+        """Each path keeps a .css ending and a granted prefix, so it reaches the walk's own name rule (_plain_name):
+        a trailing dot or space, which Win32 would drop to open another name, and a colon, which names a stream."""
         self.grant()
         write(self.asset + ':s.css', b'stream')
-        for path in (os.path.join(self.css, 'CON.css'), os.path.join(self.css, 'NUL'), self.asset + ':s.css',
-                     self.asset + '.', self.asset + ' '):
-            self.assertEqual(self.get(path)[0], 404, path)
+        refused = ((os.path.join(self.proj, 'css.', 'a.css'), 'folder'), (os.path.join(self.proj, 'css ', 'a.css'), 'folder'),
+                   (os.path.join(self.proj, 'css:x', 'a.css'), 'folder'), (self.asset + ':s.css', 'file'))
+        for path, subject in refused:
+            with self.subTest(path=path):
+                with self.assertRaises(server.private_storage.PrivateStorageError) as raised:
+                    server.preview_asset_windows(path)
+                self.assertEqual((raised.exception.reason, raised.exception.subject), ('unavailable', subject))
+                self.assertEqual(self.get(path)[0], 404)
+
+    def test_device_names_below_the_grant_are_only_names(self):
+        """CON.css and the like are opened relative to the held folder, where they are plain names, never devices."""
+        self.grant()
+        for name in ('CON.css', 'nul.css', 'COM1.css'):
+            with self.subTest(name=name):
+                with self.assertRaises(FileNotFoundError):
+                    server.preview_asset_windows(os.path.join(self.css, name))
+                self.assertEqual(self.get(os.path.join(self.css, name))[0], 404)
 
     def test_the_granted_folder_is_held_while_an_asset_is_read(self):
         self.grant()
