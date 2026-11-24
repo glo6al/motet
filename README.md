@@ -45,7 +45,7 @@ Motet acts only when you ask. It does not yet act by itself; that is the biggest
 
 Your Claude Code chats and your Codex chats live in separate apps. Motet gives them a way to talk. One agent asks another a question in plain words and the answer comes back to it, so the work carries on without you copying notes from window to window.
 
-- **Across companies.** It works between eligible Claude Code and Codex chats on your Mac today. An Antigravity chat can ask them too, through an optional plugin. Agents from the same company keep using that app's own tools.
+- **Across companies.** It works between eligible Claude Code and Codex chats on your Mac today. On Linux a Claude Code chat can receive too (a Codex chat receives only on a Mac); on Windows the bridge is not available yet and says why. An Antigravity chat can ask them too, through an optional plugin. Agents from the same company keep using that app's own tools.
 - **You stay in charge.** Agents are instructed to contact another only when you have asked for it. The bridge cannot check who is calling, so that is a rule they follow, not a lock. A message from another agent never gives it new permissions.
 - **Nothing passes as delivered.** A question that is waiting, failed or answered is shown as what it is. Requests and replies are kept for 24 hours. A reply is filed against the question and collected when the asking agent needs it; it does not wake a chat that has stopped.
 - **A finished turn frees the chat.** When Motet sees an agent's turn end, the chat takes new messages again, even if its reply could not be used. When Motet cannot confirm that a message arrived or that its turn ended, the chat is listed in Settings → Connections under **Chats on hold** on the Mac running Motet, with the reason and, where it can, a **Clear** button. A turn that still looks like it is running is not listed.
@@ -133,7 +133,7 @@ A chat has to qualify before Motet will send to it. When something isn't availab
 - **Motet thinks with one provider.** Its own answers run on Anthropic's models only.
 - **Cursor and Antigravity are watch-only.** Motet can see them but cannot message them.
 - **No live browser.** You see the pages an agent opened, not the page as it is right now.
-- **Mac and Windows, and only coding sessions on this computer.** On Windows, Motet watches and answers, and it can message a Claude chat through the plugin. Allow and Deny and Claude messaging are new there and checked only by automated tests so far, not yet on a real PC. Messaging Codex stays Mac-only for now. The bridge between agents, New chat, files and dictation are still to come on Windows. Claude messaging also starts on Linux now. Web chats are not brought in.
+- **Mac and Windows, and only coding sessions on this computer.** On Windows, Motet watches and answers, and it can message a Claude chat through the plugin. Allow and Deny and Claude messaging are new there and checked only by automated tests so far, not yet on a real PC. Messaging Codex stays Mac-only for now. The bridge between agents, New chat, files and dictation are still to come on Windows; the bridge refuses there with one reason until Motet can find chats safely on Windows. Claude messaging, and the bridge with Claude chats as recipients, also work on Linux now, checked by automated tests. Web chats are not brought in.
 
 **Designed, not built yet**
 

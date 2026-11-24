@@ -218,9 +218,12 @@ jobs:
         timeout-minutes: 5
       - run: python tests/test_watch_claude.py
         if: ${{ !cancelled() }}
-      # Off on Windows: the Claude MCP channel, Antigravity inbox and bridge find their files by handle-based folder walk
-      # (dir_fd), which Windows lacks; they come to Windows with the bridge step. Messaging Claude through the
-      # plugin is covered on Windows by test_claude_mod.py and test_claude_global_integration.py above.
+      # Off on Windows: these drive the bridge's MCP adapter, the Claude MCP channel or the Antigravity inbox end to
+      # end. All three find chats or files by handle-based folder walk (dir_fd), which Windows lacks, so on Windows
+      # the adapter and server refuse with one reason instead (the refusal itself, the credential files and the
+      # offline locks are checked on Windows by test_watch_peer.py, test_peer_bridge.py, test_install_reply_hook.py,
+      # test_peer_recovery.py, test_watch_bridge_clear.py and test_bridge_preflight.py above). Messaging Claude
+      # through the plugin is covered on Windows by test_claude_mod.py and test_claude_global_integration.py above.
       - run: npm --prefix integrations/claude ci --ignore-scripts --no-audit --no-fund
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_peer_refusal_compatibility.py -v

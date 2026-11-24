@@ -123,7 +123,7 @@ This relies on the original Claude runtime receiving the host's submission resul
 
 ### Chats on hold in Settings
 
-When Motet cannot confirm whether a recipient received a message or finished its turn, the recipient stays reserved so nothing is sent twice. Settings → Connections on the Mac running Motet lists these under **Chats on hold**, with how long each has been on hold (or **Hold time unavailable**), a fixed reason and one **Clear** button. A healthy turn that is still running is not listed, whatever its age.
+When Motet cannot confirm whether a recipient received a message or finished its turn, the recipient stays reserved so nothing is sent twice. Settings → Connections on the computer running Motet lists these under **Chats on hold**, with how long each has been on hold (or **Hold time unavailable**), a fixed reason and one **Clear** button. A healthy turn that is still running is not listed, whatever its age.
 
 Clearing releases the reservation, so new messages can reach that chat. It does not stop the agent, and a late answer to the earlier message is withheld. Settings clears only a chat that is still genuinely on hold; if the request has finished or recovered in the meantime, the row updates or leaves the list instead. A hold Motet cannot match to a chat shows **Can’t clear here**. After five minutes on a hold that Motet saw begin, an in-app bell notice links to the row; dismissing it does not clear the hold. A hold whose start Motet did not see, such as a Claude chat that was waiting when Motet restarted, shows **Hold time unavailable** and has no notice. The list and the bell show no message text, commands, paths or keys. The command-line clear below remains available.
 
@@ -153,7 +153,11 @@ Use the tool's `--help` for the explicit request-selection and native-source opt
 
 ## Installation and rollout
 
-The shared bridge currently requires Motet running on macOS with the supported native transports. Linux and Windows installation is not supported.
+### Where it works
+
+- **macOS:** the whole bridge. Codex and Claude chats can both receive.
+- **Linux:** the whole bridge, with Claude chats as recipients through the Motet plugin. A Codex chat can still ask a Claude chat, but a Codex chat cannot receive on Linux: delivery to Codex needs the Codex desktop app on a Mac, and Motet says so instead of sending. The Antigravity plugin and pull inbox install as on the Mac. The offline commands (`watch_peer.py policy`, `watch_bridge_recover.py`, `watch_bridge_clear.py`, `watch_bridge_preflight.py`, `install_reply_hook.py --remove --revoke`) work and take the same lock Motet holds while it runs. Checked by the automated tests on Linux, including the end-to-end Claude bridge test; not yet tried on a real Linux machine.
+- **Windows:** not available yet. Motet finds chats for the bridge by opening their folders one by one and refusing links on the way, and it cannot do that on Windows yet. Without it no chat can be listed or addressed, so on Windows agents cannot ask each other questions through Motet at all, in either direction, and the Antigravity plugin and inbox do not install. Rather than half-work, the bridge refuses with that one reason: the MCP adapter stops before it reads its credential, the server answers `list_agents` and `send_message` with it (nothing is sent; saved requests stay readable), and `watch_peer.py init`, `rotate`, `config` and `policy` print it. `watch_bridge_recover.py` and `watch_bridge_clear.py` refuse with their own plain reason, since nothing can be sent or put on hold here. `watch_peer.py status` and `revoke`, `watch_bridge_preflight.py`, and `install_reply_hook.py --remove --revoke` work. Your own messages to Claude chats on the stage are unaffected. The private files and locks underneath are ready for when the folder walk arrives: credential files and Motet's database and lock are created and checked through the same private-storage layer as agent messaging (owner and access list, no link or junction), and the offline commands take Motet's own Windows lock. Checked by automated tests, not yet on a real Windows PC.
 
 Use a stable Motet installation. Generated MCP configuration contains the adapter's installation path; do not point a long-lived client configuration at a disposable worktree.
 
