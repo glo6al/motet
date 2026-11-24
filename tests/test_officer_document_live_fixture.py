@@ -45,19 +45,23 @@ class FixtureProcess(unittest.TestCase):
             stderr=subprocess.PIPE, text=True)
         self.stopped = False
         self.addCleanup(self.stop)
+        startup = 60 if windows else 15         # Windows runners can be slow to start Python
+        reader = None
         if windows:
             first = []
             reader = threading.Thread(target=lambda: first.append(self.child.stdout.readline()), daemon=True)
             reader.start()
-            reader.join(15)
+            reader.join(startup)
             line = first[0] if first else ''
         else:
-            ready, _, _ = select.select([self.child.stdout], [], [], 15)
+            ready, _, _ = select.select([self.child.stdout], [], [], startup)
             line = self.child.stdout.readline() if ready else ''
         match = re.search(r'http://127\.0\.0\.1:\d+', line)
         if match is None:
             self.stopped = True
             self.child.kill()
+            if reader is not None:
+                reader.join(5)                    # its pipe closed with the child: it returns before communicate reads
             _, err = self.child.communicate(timeout=5)
             self.fail('Fixture did not print its ready URL: ' + err[-4000:])
         self.origin = match[0]
@@ -604,7 +608,8 @@ class FixtureBoundaryTests(unittest.TestCase):
                       ['--seed-file', '--seed-answers', '9', '--reading-off'],
                       ['--seed-file', '--seed-answers', '9', '--outcome', 'unknown'],
                       ['--seed-file', '--seed-answers', '9', '--seed-count', '51'], ['--seed-answer-scope', 'room']):
-            result = subprocess.run([sys.executable, fixture.__file__, '--metadata', *flags], capture_output=True, text=True, timeout=5)
+            result = subprocess.run([sys.executable, fixture.__file__, '--metadata', *flags], capture_output=True, text=True,
+                                    timeout=60 if os.name == 'nt' else 5)
             self.assertEqual(result.returncode, 2)
             self.assertNotIn('OFFLINE fixture URL', result.stdout)
 

@@ -217,9 +217,29 @@ class WindowsPolicyTests(unittest.TestCase):
         self.private_policy()
         self.assertEqual(self.load().usd_limit, '2.22')
 
+    def refused_for(self, reason):
+        """Refused, and for ``reason`` (checked separately on the file, since the policy's refusal is one code)."""
+        import private_storage
+        self.refused()
+        with self.assertRaises(private_storage.PrivateStorageError) as raised:
+            private_storage.windows_security(str(self.path))
+        self.assertEqual(raised.exception.reason, reason)
+
+    def make_mine(self):
+        import subprocess
+        subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%"' % self.path, shell=True, check=True,
+                       capture_output=True, timeout=30)
+
     def test_a_policy_that_follows_the_folder_access_list_is_refused(self):
         self.path.write_bytes(json.dumps(DATA).encode('utf-8'))       # inherited, not protected
-        self.refused()
+        self.make_mine()             # the elevated runner made it Administrators'; the owner is not what is tested
+        self.refused_for('access')
+
+    def test_a_protected_policy_that_also_names_administrators_is_refused(self):
+        """A copied file, or one after /inheritance:d, keeps an explicit Administrators entry: still not private."""
+        self.private_policy()
+        icacls(str(self.path), '/grant', '*S-1-5-32-544:(R)')
+        self.refused_for('access')
 
     def test_the_documented_icacls_command_makes_it_load(self):
         self.path.write_bytes(json.dumps(DATA).encode('utf-8'))

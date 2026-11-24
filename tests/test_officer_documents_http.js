@@ -7,16 +7,29 @@ const {webcrypto,createHash} = require('node:crypto');
 const path = require('node:path');
 const {createOfficerDocumentsClient} = require('../src/web/officer-documents-client.js');
 const {createOfficerDocumentPending} = require('../src/web/officer-document-pending.js');
-const {PYTHON,stopFixture,WINDOWS} = require('./officer_document_fixture_process.js');
+const {PYTHON,stopFixture,WINDOWS,STARTUP_MS} = require('./officer_document_fixture_process.js');
 const key = 'fictional-officer-browser-fixture-key';
 // On Windows the fixture is stopped through its standard input (see officer_document_fixture_process.js).
 const fixtureArgs = extra => [path.join(__dirname, 'officer_document_live_fixture.py'), ...extra, ...(WINDOWS ? ['--stop-on-stdin'] : [])];
 const fixtureOptions = {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:[WINDOWS?'pipe':'ignore','pipe','pipe']};
 const child = spawn(PYTHON, fixtureArgs([]), fixtureOptions);
-let logs = '', errors = '', secondary = null;
+child.stdin?.on('error', () => {});      // a fixture that already exited gives EPIPE: its exit is what counts
+let logs = '', errors = '', secondary = null, secondaryLog = '', failed = false;
+// Stop a fixture and check it closed cleanly: exit code 0 and its closing counters, within 30 seconds (killed after).
+async function stopChecked(proc, output, name) {
+  if (proc.exitCode === null) stopFixture(proc);
+  const code = await new Promise(resolve => {
+    if (proc.exitCode !== null) return resolve(proc.exitCode);
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); resolve('no exit within 30 s'); }, 30000);
+    proc.once('exit', exitCode => { clearTimeout(timer); resolve(exitCode); });
+  });
+  assert.equal(code, 0, name + ' fixture did not stop cleanly');
+  const stats = JSON.parse(output().trim().split('\n').pop());
+  assert.equal(stats.outboundBlocked, 0, name + ' fixture made an outbound connection');
+}
 child.stderr.on('data', b => { errors = (errors + b).slice(-10000); });
 const ready = new Promise((resolve,reject) => {
-  const timer = setTimeout(() => reject(Error('Offline fixture startup timed out')),10000);
+  const timer = setTimeout(() => reject(Error('Offline fixture startup timed out')),STARTUP_MS);
   child.stdout.on('data', b => { logs += b; const match = logs.match(/http:\/\/127\.0\.0\.1:\d+\//); if(match){clearTimeout(timer);resolve(match[0].slice(0,-1));} });
   child.once('exit', code => {clearTimeout(timer);reject(Error('Offline fixture exited: '+code+' '+errors));});
 });
@@ -254,9 +267,9 @@ const ready = new Promise((resolve,reject) => {
     const gone=s.answers.find(a=>a.id===last.id);assert.equal(gone.state,'source_unavailable');assert.equal(gone.answeredAt,last.answeredAt);assert.equal(gone.priorAnswerWindow,null);assert.equal(s.usableFileCount,1);
     const windowMeta=await metadata();assert.equal(windowMeta.fakeProviderCalls,13);assert.equal(windowMeta.outboundBlocked,0);assert.equal(windowMeta.ordinaryAskBlocked,0);
 
-    secondary=spawn(PYTHON,fixtureArgs(['--reading-off']),fixtureOptions);
-    let secondaryLog='',secondaryErrors='';secondary.stderr.on('data',b=>secondaryErrors=(secondaryErrors+b).slice(-10000));
-    const coldOrigin=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Management-only fixture startup timed out')),10000);secondary.stdout.on('data',b=>{secondaryLog+=b;const match=secondaryLog.match(/http:\/\/127\.0\.0\.1:\d+\//);if(match){clearTimeout(timer);resolve(match[0].slice(0,-1));}});secondary.once('exit',code=>{clearTimeout(timer);reject(Error('Management-only fixture exited '+code+' '+secondaryErrors));});});
+    secondary=spawn(PYTHON,fixtureArgs(['--reading-off']),fixtureOptions);secondary.stdin?.on('error',()=>{});
+    let secondaryErrors='';secondary.stderr.on('data',b=>secondaryErrors=(secondaryErrors+b).slice(-10000));
+    const coldOrigin=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Management-only fixture startup timed out')),STARTUP_MS);secondary.stdout.on('data',b=>{secondaryLog+=b;const match=secondaryLog.match(/http:\/\/127\.0\.0\.1:\d+\//);if(match){clearTimeout(timer);resolve(match[0].slice(0,-1));}});secondary.once('exit',code=>{clearTimeout(timer);reject(Error('Management-only fixture exited '+code+' '+secondaryErrors));});});
     const managementRequests=[];
     const managementTransport=(url,init)=>{managementRequests.push({url,method:init.method});return fetch(coldOrigin+url,init);};
     client.dispose();
@@ -270,10 +283,14 @@ const ready = new Promise((resolve,reject) => {
     const restoreStart=managementRequests.length;s=await client.connect({scopeId:'room',modelId:null});assert.equal(s.error,null,JSON.stringify(s.error));assert.equal(s.deletions[0].id,coldOperation);assert.equal(s.deletions[0].sourceUnavailable,true);assert(managementRequests.slice(restoreStart).every(r=>r.method==='GET'));
     const coldMetadata=await(await fetch(coldOrigin+'/fixture/metadata',{headers:{'X-Live-Room-Key':key}})).json();assert.equal(coldMetadata.readingEnabled,false);assert.equal(coldMetadata.fakeProviderCalls,0);assert.equal(coldMetadata.ordinaryAskBlocked,0);assert.equal(coldMetadata.outboundBlocked,0);
     console.log('Motet document client: actual HTTP reading/Auto/history, recent-answer window, deletion withdrawal/reopen and reading-off cleanup/reload passed. 13 fictional calls, 0 external calls.');
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
     client?.dispose();
-    if(secondary){stopFixture(secondary);await new Promise(resolve=>secondary.exitCode!==null?resolve():secondary.once('exit',resolve));}
-    stopFixture(child);
-    await new Promise(resolve=>child.exitCode!==null?resolve():child.once('exit',resolve));
+    try {
+      if (secondary) await stopChecked(secondary, () => secondaryLog, 'Management-only');
+      await stopChecked(child, () => logs, 'Offline');
+    } catch (error) { if (!failed) throw error; }
   }
 })().catch(e=>{console.error(e);if(errors)console.error(errors);process.exitCode=1;});

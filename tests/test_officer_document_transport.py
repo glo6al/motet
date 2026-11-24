@@ -609,7 +609,7 @@ class TransportTests(unittest.TestCase):
             env=dict(os.environ,TMPDIR=root,PYTHONPATH=os.pathsep.join((str(Path(__file__).parent),str(Path(__file__).parent.parent/'src'))))
             for mode in ('connection','source'):
                 code='import test_officer_document_transport as t;t.uncertain_close_child('+repr(mode)+')'
-                run=subprocess.run([sys.executable,'-c',code],env=env,capture_output=True,timeout=5)
+                run=subprocess.run([sys.executable,'-c',code],env=env,capture_output=True,timeout=60 if os.name=='nt' else 5)
                 self.assertEqual(run.returncode,0,run.stderr.decode())
                 self.assertEqual(run.stdout,b'')
 

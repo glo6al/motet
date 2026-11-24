@@ -541,16 +541,17 @@ def main():
         print('Fictional owner key: ' + KEY + '\nStop with Ctrl-C; temporary state is removed.', flush=True)
         if args.browser_fault != 'none':
             print('EXTRA TEST INSTRUMENTATION: ' + args.browser_fault, flush=True)
-        if args.stop_on_stdin:
-            import _thread
-
-            def stop_on_stdin():
-                for line in sys.stdin:
-                    if line.strip() == 'stop':
-                        break
-                _thread.interrupt_main()          # the same KeyboardInterrupt as Ctrl-C, in the serving thread
-            threading.Thread(target=stop_on_stdin, name='fixture-stdin-stop', daemon=True).start()
         try:
+            if args.stop_on_stdin:
+                import _thread
+
+                def stop_on_stdin():
+                    for line in sys.stdin:
+                        if line.strip() == 'stop':
+                            break
+                    _thread.interrupt_main()      # the same KeyboardInterrupt as Ctrl-C, in the serving thread
+                # A daemon thread, so a reader still waiting on standard input never holds up the exit.
+                threading.Thread(target=stop_on_stdin, name='fixture-stdin-stop', daemon=True).start()
             httpd.serve_forever(poll_interval=0.2)
         except KeyboardInterrupt:
             pass

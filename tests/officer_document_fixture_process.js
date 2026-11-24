@@ -44,17 +44,20 @@ function waitForOwnerReady(child,args,{now=ownerNow,started=now(),readStderr=()=
 const WINDOWS=process.platform==='win32';
 const PYTHON=WINDOWS?'python':'python3';
 const stopFixture=WINDOWS?child=>{child.stdin.end('stop\n');}:child=>child.kill('SIGINT');
+// Windows runners can be slow to start Python: wait longer there; a start that succeeds returns as soon as it is ready.
+const STARTUP_MS=WINDOWS?60000:10000;
 
 async function ownerFixture(run,args=[],{model='claude-haiku-5-5',spawnChild=spawn,now=ownerNow,setTimer=setTimeout,clearTimer=clearTimeout,cleanupMs=5000,killWaitMs=1000,stop=stopFixture,stdinStop=WINDOWS}={}) {
   const variant=['--model',model,'--trace-startup',...args,...(stdinStop?['--stop-on-stdin']:[])],started=now();let child;
   try{child=spawnChild(PYTHON,[path.join(__dirname,'officer_document_live_fixture.py'),...variant],{env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:[stdinStop?'pipe':'ignore','pipe','pipe']});}
   catch(error){throw ownerFixtureError(`startup spawn failed (${error.message})`,variant,started,now,()=>'');}
+  if(child?.stdin)child.stdin.on('error',()=>{});     // a fixture that already exited gives EPIPE: its close is what counts
   let stderr='',primaryFailed=false,childClosed=false;const readStderr=()=>stderr;
   const appendStderr=bytes=>{stderr=(stderr+bytes).slice(-OWNER_STDERR_LIMIT);};child.stderr.on('data',appendStderr);
   const onChildError=()=>{};child.on('error',onChildError);
   let finish;const closed=new Promise(resolve=>{finish=resolve});const onClose=()=>{childClosed=true;finish();};child.once('close',onClose);
   const within=async ms=>{let timer;try{return await Promise.race([closed.then(()=>true),new Promise(resolve=>{timer=setTimer(()=>resolve(false),ms)})]);}finally{clearTimer(timer);}};
-  try{const origin=await waitForOwnerReady(child,variant,{started,now,readStderr,setTimer,clearTimer});assert.equal(new URL(origin).hostname,'127.0.0.1');return await run(origin);}
+  try{const origin=await waitForOwnerReady(child,variant,{started,now,readStderr,setTimer,clearTimer,startupMs:STARTUP_MS});assert.equal(new URL(origin).hostname,'127.0.0.1');return await run(origin);}
   catch(error){primaryFailed=true;throw error;}
   finally{try{
     let signalError;
@@ -126,4 +129,4 @@ async function ownerStartupChecks({causals=true}={}) {
   console.log('ok fixture startup diagnostics and listener cleanup');
 }
 
-module.exports={ownerFixture,waitForOwnerReady,ownerStartupChecks,PYTHON,stopFixture,WINDOWS};
+module.exports={ownerFixture,waitForOwnerReady,ownerStartupChecks,PYTHON,stopFixture,WINDOWS,STARTUP_MS};

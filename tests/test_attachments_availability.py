@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 import server
 import private_storage
 from attachments_types import AttachmentError
+from officer_document_transport import DirectDocumentTransport as REAL_TRANSPORT   # before any test patches it
 
 sys.path.insert(0, str(ROOT / 'tests'))
 from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
@@ -144,6 +145,37 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(value, {'schemaVersion': 1, 'selected_model': 'claude-haiku-5-5', 'selection_available': True,
                                  'attachments_enabled': True, 'documents_enabled': False})
 
+    def test_a_valid_private_policy_turns_reading_on(self):
+        """On every system where the store runs, Windows included: a private reading policy within its dates makes
+        documents_enabled true. The transport is built but can only reach a refusing connection."""
+        import json
+        import attachments_store
+        import officer_document_policy as policy
+        state = private_live_room(self.home)
+        fd = private_storage.create_private_file(str(state / policy.POLICY_FILENAME))
+        try:
+            os.write(fd, json.dumps({'version': 1, 'evidenceId': policy.EVIDENCE_ID, 'scopeId': 'fictional-scope',
+                                     'scopeRevision': 'v1', 'usdLimit': '2.22'}).encode('utf-8'))
+        finally:
+            os.close(fd)
+        real_store, real_transport = attachments_store.AttachmentStore, REAL_TRANSPORT
+
+        def store(*args, **kwargs):
+            kwargs['clock'] = lambda: policy.VALID_FROM + 1
+            return real_store(*args, **kwargs)
+
+        def no_network(*args, **kwargs):
+            raise AssertionError('no connection may be made in this test')
+        with mock.patch('attachments_store.AttachmentStore', side_effect=store), \
+                mock.patch('officer_document_transport.DirectDocumentTransport',
+                           side_effect=lambda **kwargs: real_transport(connect=no_network, **kwargs)):
+            service = self.start()
+        self.assertIsNotNone(service)
+        with mock.patch.object(server, 'ATTACHMENTS', service):
+            value = model_selection()
+        self.assertEqual((value['attachments_enabled'], value['documents_enabled']), (True, True))
+        self.assertNotIn('attachments_reason', value)
+
     @unittest.skipUnless(POSIX, POSIX_WHY)
     def test_failed_store_on_a_mac_or_linux_reports_the_storage_reason(self):
         (self.home / '.live-room').mkdir(mode=0o755)        # not private, so the store refuses it
@@ -217,7 +249,7 @@ class RealWindowsStartupTests(unittest.TestCase):
                     self.assertIsNone(server.ATTACHMENTS_OFF)
                     with mock.patch.object(server, 'ATTACHMENTS', service):
                         value = model_selection()
-                    # Motet's own file reading still refuses at its policy on Windows (step 6c.3).
+                    # No reading policy is saved in this test, so Motet's own file reading stays off.
                     self.assertEqual((value['attachments_enabled'], value['documents_enabled']), (True, False))
                     self.assertNotIn('attachments_reason', value)
                     self.assertIs(server.NATIVE_ATTACHMENT_DELIVERY_HOST, False)
