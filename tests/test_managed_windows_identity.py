@@ -245,6 +245,13 @@ class SimulatedExecutableTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(windows, 'change_time', lambda fd: os.fstat(fd).st_ctime_ns))
         self.addCleanup(stack.close)
 
+    @staticmethod
+    def past_the_mac_gate():
+        """The gates that keep managed Claude to macOS until 8b.5 read sys.platform (the supervisor's start, and
+        preflight for a real manager): answer 'darwin' while the Windows path behind them is exercised, so these
+        tests run the same on Linux as on a Mac."""
+        return mock.patch.object(sys, 'platform', 'darwin')
+
     def manager(self):
         return claude_managed.ManagedClaude(self.home / '.live-room', home=self.home, enabled=True,
                                             configuration_ready=True)
@@ -296,7 +303,7 @@ class SimulatedExecutableTests(unittest.TestCase):
         return hashed
 
     def available(self, manager):
-        with mock.patch.object(windows, 'breakaway_refusal', return_value=None):
+        with mock.patch.object(windows, 'breakaway_refusal', return_value=None), self.past_the_mac_gate():
             capability = manager.preflight()
         return capability.available, capability.code
 
@@ -390,7 +397,7 @@ class SimulatedExecutableTests(unittest.TestCase):
             return FakeProcess(), mock.Mock()
         with mock.patch.object(windows, 'open_pinned', open_pinned), \
                 mock.patch.object(windows, 'start_in_job', start_in_job), \
-                mock.patch.object(windows, 'ThreadedPipes', mock.Mock()):
+                mock.patch.object(windows, 'ThreadedPipes', mock.Mock()), self.past_the_mac_gate():
             transport.start()
         self.assertEqual(events, ['hashed', ('started', exe, str(project))])
         with self.assertRaises(OSError):
@@ -411,7 +418,8 @@ class SimulatedExecutableTests(unittest.TestCase):
             opened.append(real_open(path, pin))
             return opened[-1]
         with mock.patch.object(windows, 'open_pinned', open_pinned), \
-                mock.patch.object(windows, 'start_in_job', side_effect=windows.JobError('fictional refusal')):
+                mock.patch.object(windows, 'start_in_job', side_effect=windows.JobError('fictional refusal')), \
+                self.past_the_mac_gate():
             with self.assertRaises(runner_module.RunnerError) as raised:
                 transport.start()
         self.assertEqual(raised.exception.code, 'unsupported_build')
