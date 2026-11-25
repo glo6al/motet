@@ -3,9 +3,10 @@
 
 Run:  py scripts\\windows_probe.py
 
-It reads the registry, folder listings, a few small settings files and `--version` / `--help`
-output from command-line tools. It writes no files, opens no network connection, starts no
-app window, sends no message and changes nothing. The output is redacted (your profile path,
+It reads the registry, folder listings, a few small settings files, app package manifests, file and
+pipe permissions, and `--version` / `--help` output from command-line tools. It opens the Codex app's
+control pipe (if there is one) only to ask who serves it, reading and sending nothing. It writes no
+files, opens no network connection, starts no app window, sends no message and changes nothing. The output is redacted (your profile path,
 user name, computer name, e-mail addresses and key-like strings) but READ IT before posting.
 """
 
@@ -216,11 +217,22 @@ def which(name, windows=None):
     return None
 
 
-def not_run_reason(path):
-    """Why a command must not be executed, or '' if it may be."""
+IO_REPARSE_TAG_APPEXECLINK = 0x8000001B
+
+
+def not_run_reason(path, lstat=os.lstat):
+    """Why a command must not be executed, or '' if it may be. An app execution alias (a link in
+    %LOCALAPPDATA%\\Microsoft\\WindowsApps, or any file Windows marks as one) is told apart from a real
+    file inside a Store app package (C:\\Program Files\\WindowsApps\\...); neither is run."""
     low = path.lower().replace('/', '\\')
+    try:
+        tag = getattr(lstat(path), 'st_reparse_tag', 0)
+    except (OSError, ValueError):
+        tag = 0
+    if tag == IO_REPARSE_TAG_APPEXECLINK or '\\microsoft\\windowsapps\\' in low:
+        return 'app execution alias, not run'
     if '\\windowsapps\\' in low:
-        return 'app alias, not run'
+        return 'file inside a Store app package, not run'
     if low.endswith(('.cmd', '.bat')):
         return 'script shim, not run'
     return ''
@@ -302,25 +314,39 @@ def list_dir(path):
 _APPX = {}
 
 
-def appx_packages():
-    """Matching Appx packages as (name, version, install location); cached. Raises on failure."""
+def parse_appx(out):
+    """Rows of the Get-AppxPackage query: name|version|install location|family name|publisher id.
+    ('|' cannot appear in a Windows path, a package name or a version.)"""
+    rows = []
+    for line in out.splitlines():
+        parts = line.strip().split('|')
+        if len(parts) >= 3 and parts[0]:
+            parts += [''] * (5 - len(parts))
+            rows.append({'name': parts[0], 'version': parts[1], 'location': parts[2], 'family': parts[3],
+                         'publisher': parts[4]})
+    return rows
+
+
+def appx_rows():
+    """Matching Appx packages as dicts; cached. Raises on failure."""
     if 'v' in _APPX:
         if isinstance(_APPX['v'], str):
             raise RuntimeError(_APPX['v'])
         return _APPX['v']
     script = ("Get-AppxPackage | Where-Object { $_.Name -match '%s' } | ForEach-Object "
-              "{ $_.Name + '|' + $_.Version + '|' + $_.InstallLocation }" % APPX_PATTERN)
+              "{ $_.Name + '|' + $_.Version + '|' + $_.InstallLocation + '|' + $_.PackageFamilyName + '|' + $_.PublisherId }"
+              % APPX_PATTERN)
     rc, out = run([POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', script], timeout=25)
     if rc != 0:
         _APPX['v'] = out.strip() if rc is None else 'error: powershell exit %s' % rc
         raise RuntimeError(_APPX['v'])
-    rows = []
-    for line in out.splitlines():
-        parts = line.strip().split('|', 2)
-        if len(parts) == 3 and parts[0]:
-            rows.append(tuple(parts))
-    _APPX['v'] = rows
-    return rows
+    _APPX['v'] = parse_appx(out)
+    return _APPX['v']
+
+
+def appx_packages():
+    """Matching Appx packages as (name, version, install location)."""
+    return [(r['name'], r['version'], r['location']) for r in appx_rows()]
 
 
 def appx_matching(pattern):
@@ -547,6 +573,10 @@ def check_pipes():
     lines.extend('  pipe: found: %s' % n for n in hits[:60])
     if not hits:
         lines.append('  matching pipes: not found')
+    try:
+        lines.extend(check_codex_pipe(names))
+    except Exception as e:
+        lines.append('codex-ipc: error: %s' % type(e).__name__)
     return lines
 
 
@@ -718,6 +748,486 @@ def check_processes():
     return lines
 
 
+# ---------------------------------------------------------------- Windows security, read-only (ctypes)
+
+WELL_KNOWN_SIDS = {
+    'S-1-1-0': 'Everyone', 'S-1-3-0': 'CREATOR OWNER', 'S-1-5-7': 'Anonymous', 'S-1-5-4': 'INTERACTIVE',
+    'S-1-5-11': 'Authenticated Users', 'S-1-5-18': 'SYSTEM', 'S-1-5-19': 'LOCAL SERVICE', 'S-1-5-20': 'NETWORK SERVICE',
+    'S-1-5-32-544': 'Administrators', 'S-1-5-32-545': 'Users', 'S-1-15-2-1': 'ALL APPLICATION PACKAGES',
+    'S-1-15-2-2': 'ALL RESTRICTED APPLICATION PACKAGES',
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464': 'TrustedInstaller',
+}
+ACE_KINDS = {0: 'allow', 1: 'deny', 9: 'allow, with a condition', 10: 'deny, with a condition'}
+
+
+def sid_text(raw):
+    """A SID's S-1-... form from its bytes, without asking Windows (and so never a domain controller)."""
+    if len(raw) < 8 or raw[0] != 1 or len(raw) < 8 + 4 * raw[1]:
+        raise ValueError('not a SID')
+    authority = int.from_bytes(raw[2:8], 'big')
+    subs = [int.from_bytes(raw[8 + 4 * i:12 + 4 * i], 'little') for i in range(raw[1])]
+    return 'S-1-%d' % authority + ''.join('-%d' % s for s in subs)
+
+
+def sid_label(sid, mine=''):
+    """Who a SID is, in words. This user is 'you'. Another account keeps only its last number, and an app package or
+    capability only its kind, so no machine or domain number is shown; nothing is looked up."""
+    if mine and sid == mine:
+        return 'you'
+    if sid in WELL_KNOWN_SIDS:
+        # a long SID would read as a key to redact(), and its kind is already said by its name
+        return '%s (%s)' % (WELL_KNOWN_SIDS[sid], sid if len(sid) < 24 else '-'.join(sid.split('-')[:4]) + '-...')
+    parts = sid.split('-')
+    if sid.startswith('S-1-5-21-') and len(parts) >= 5:
+        return 'another account (S-1-5-21-...-%s)' % parts[-1]
+    if sid.startswith('S-1-5-5-'):
+        return 'this logon session (S-1-5-5-...)'
+    if sid.startswith('S-1-5-80-'):
+        return 'a Windows service (S-1-5-80-...)'
+    if sid.startswith('S-1-15-2-'):
+        return 'an app package (S-1-15-2-...)'
+    if sid.startswith('S-1-15-3-'):
+        return 'an app capability (S-1-15-3-...)'
+    if sid.startswith('S-1-16-'):
+        return 'integrity level (%s)' % sid
+    return 'other (%s)' % ('-'.join(parts[:4]) + ('-...' if len(parts) > 4 else ''))
+
+
+def rights(mask):
+    """An access mask in words, with the number."""
+    if mask & 0x10000000 or mask & 0x1F01FF == 0x1F01FF:
+        words = ['full control']
+    else:
+        words = [w for w, bits, generic in (('read', 0x120089, 0x80000000), ('write', 0x120116, 0x40000000),
+                                             ('execute', 0x1200A0, 0x20000000))
+                 if mask & bits == bits or mask & generic]
+        if mask & 0x10000 and 'write' not in words:
+            words.append('delete')
+        if not words:
+            words = ['some rights']
+    return '%s (0x%x)' % (', '.join(words), mask)
+
+
+def parse_acl(raw):
+    """(kind, flags, mask, SID) for each entry of an ACL given as bytes."""
+    if len(raw) < 8:
+        raise ValueError('not an ACL')
+    count, pos, out = int.from_bytes(raw[4:6], 'little'), 8, []
+    for _ in range(count):
+        kind, flags, size = raw[pos], raw[pos + 1], int.from_bytes(raw[pos + 2:pos + 4], 'little')
+        if size < 8 or pos + size > len(raw):
+            raise ValueError('bad ACL entry')
+        sid = ''
+        if kind in ACE_KINDS:
+            mask = int.from_bytes(raw[pos + 4:pos + 8], 'little')
+            sid = sid_text(raw[pos + 8:pos + size])
+        else:
+            mask = 0
+        out.append((kind, flags, mask, sid))
+        pos += size
+    return out
+
+
+def acl_lines(owner, aces, mine, indent='  '):
+    """An owner and access list as lines. `aces` None means no access list at all (anyone may open it)."""
+    lines = ['%sowner: %s' % (indent, sid_label(owner, mine) if owner else 'unknown')]
+    if aces is None:
+        return lines + ['%saccess list: none (anyone may open it)' % indent]
+    if not aces:
+        return lines + ['%saccess list: empty (no one may open it)' % indent]
+    for kind, flags, mask, sid in aces[:24]:
+        if kind not in ACE_KINDS:
+            lines.append('%sentry of type %d (not shown)' % (indent, kind))
+            continue
+        lines.append('%s%s %s: %s%s' % (indent, ACE_KINDS[kind], sid_label(sid, mine), rights(mask),
+                                        ' (inherited by contents only)' if flags & 0x8 else ''))
+    if len(aces) > 24:
+        lines.append('%s... %d more entries' % (indent, len(aces) - 24))
+    return lines
+
+
+_WIN = {}
+
+
+def win():
+    """kernel32, advapi32 and friends with their argument types, loaded once (Windows only)."""
+    if 'api' in _WIN:
+        return _WIN['api']
+    import ctypes
+    from ctypes import wintypes as w
+    k, a = ctypes.WinDLL('kernel32', use_last_error=True), ctypes.WinDLL('advapi32', use_last_error=True)
+    H, D, P = w.HANDLE, w.DWORD, ctypes.c_void_p
+    k.CreateFileW.argtypes, k.CreateFileW.restype = [w.LPCWSTR, D, D, P, D, D, H], H
+    k.CloseHandle.argtypes, k.CloseHandle.restype = [H], w.BOOL
+    k.GetNamedPipeServerProcessId.argtypes, k.GetNamedPipeServerProcessId.restype = [H, ctypes.POINTER(w.ULONG)], w.BOOL
+    k.OpenProcess.argtypes, k.OpenProcess.restype = [D, w.BOOL, D], H
+    k.QueryFullProcessImageNameW.argtypes = [H, D, w.LPWSTR, ctypes.POINTER(D)]
+    k.QueryFullProcessImageNameW.restype = w.BOOL
+    k.LocalFree.argtypes, k.LocalFree.restype = [P], P
+    k.GetCurrentProcess.argtypes, k.GetCurrentProcess.restype = [], H
+    k.CreateToolhelp32Snapshot.argtypes, k.CreateToolhelp32Snapshot.restype = [D, D], H
+    a.OpenProcessToken.argtypes, a.OpenProcessToken.restype = [H, D, ctypes.POINTER(H)], w.BOOL
+    a.GetTokenInformation.argtypes = [H, ctypes.c_int, P, D, ctypes.POINTER(D)]
+    a.GetTokenInformation.restype = w.BOOL
+    a.GetLengthSid.argtypes, a.GetLengthSid.restype = [P], D
+    a.GetSecurityInfo.argtypes = [H, ctypes.c_int, D, ctypes.POINTER(P), ctypes.POINTER(P), ctypes.POINTER(P),
+                                  ctypes.POINTER(P), ctypes.POINTER(P)]
+    a.GetSecurityInfo.restype = D
+    a.GetNamedSecurityInfoW.argtypes = [w.LPCWSTR, ctypes.c_int, D, ctypes.POINTER(P), ctypes.POINTER(P),
+                                        ctypes.POINTER(P), ctypes.POINTER(P), ctypes.POINTER(P)]
+    a.GetNamedSecurityInfoW.restype = D
+    try:
+        k.GetPackageFamilyName.argtypes = [H, ctypes.POINTER(ctypes.c_uint32), w.LPWSTR]
+        k.GetPackageFamilyName.restype = ctypes.c_long
+    except AttributeError:
+        pass                                        # before Windows 8
+    _WIN['api'] = (ctypes, w, k, a)
+    return _WIN['api']
+
+
+def _sid_at(ptr):
+    ctypes, _, _, a = win()
+    return sid_text(ctypes.string_at(ptr, a.GetLengthSid(ptr)))
+
+
+def _security(get):
+    """(owner SID, ACEs or None) through GetSecurityInfo or GetNamedSecurityInfoW (`get` fills the pointers)."""
+    ctypes, _, k, _ = win()
+    owner, dacl, sd = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    err = get(ctypes.byref(owner), ctypes.byref(dacl), ctypes.byref(sd))
+    if err:
+        raise OSError('error %d' % err)
+    try:
+        sid = _sid_at(owner) if owner.value else ''
+        if not dacl.value:
+            return sid, None
+        size = int.from_bytes(ctypes.string_at(dacl.value + 2, 2), 'little')
+        return sid, parse_acl(ctypes.string_at(dacl.value, size))
+    finally:
+        k.LocalFree(sd)
+
+
+OWNER_AND_DACL = 0x1 | 0x4                          # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+
+
+def handle_security(handle):
+    _, _, _, a = win()
+    return _security(lambda o, d, s: a.GetSecurityInfo(handle, 6, OWNER_AND_DACL, o, None, d, None, s))  # SE_KERNEL_OBJECT
+
+
+def path_security(path):
+    _, _, _, a = win()
+    return _security(lambda o, d, s: a.GetNamedSecurityInfoW(path, 1, OWNER_AND_DACL, o, None, d, None, s))  # SE_FILE_OBJECT
+
+
+def token_sid(process):
+    """The account a process runs as, from its token. '' when it cannot be read."""
+    ctypes, w, k, a = win()
+    token = w.HANDLE()
+    if not a.OpenProcessToken(process, 0x8, ctypes.byref(token)):          # TOKEN_QUERY
+        return ''
+    try:
+        buf, need = ctypes.create_string_buffer(256), w.DWORD()
+        if not a.GetTokenInformation(token, 1, buf, 256, ctypes.byref(need)):   # TokenUser
+            return ''
+        return _sid_at(ctypes.c_void_p.from_buffer(buf).value)
+    finally:
+        k.CloseHandle(token)
+
+
+def my_sid():
+    try:
+        return token_sid(win()[2].GetCurrentProcess())
+    except Exception:
+        return ''
+
+
+def process_facts(pid):
+    """{'image', 'family', 'owner'} for a process, each '' when Windows does not say."""
+    ctypes, w, k, _ = win()
+    facts = {'image': '', 'family': '', 'owner': ''}
+    handle = k.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        facts['error'] = 'cannot be opened (error %d)' % ctypes.get_last_error()
+        return facts
+    try:
+        buf, size = ctypes.create_unicode_buffer(1024), w.DWORD(1024)
+        if k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            facts['image'] = buf.value
+        if hasattr(k, 'GetPackageFamilyName'):
+            name, length = ctypes.create_unicode_buffer(256), ctypes.c_uint32(256)
+            rc = k.GetPackageFamilyName(handle, ctypes.byref(length), name)
+            facts['family'] = name.value if rc == 0 else ('none' if rc == 15700 else 'unknown (error %d)' % rc)
+        facts['owner'] = token_sid(handle)
+    finally:
+        k.CloseHandle(handle)
+    return facts
+
+
+def processes_named(names):
+    """(pid, name) of running processes whose image name is one of `names`, from a Toolhelp snapshot."""
+    ctypes, w, k, _ = win()
+
+    class Entry(ctypes.Structure):
+        _fields_ = [('dwSize', w.DWORD), ('cntUsage', w.DWORD), ('th32ProcessID', w.DWORD),
+                    ('th32DefaultHeapID', ctypes.c_size_t), ('th32ModuleID', w.DWORD), ('cntThreads', w.DWORD),
+                    ('th32ParentProcessID', w.DWORD), ('pcPriClassBase', ctypes.c_long), ('dwFlags', w.DWORD),
+                    ('szExeFile', ctypes.c_wchar * 260)]
+    first, following = k.Process32FirstW, k.Process32NextW
+    first.argtypes = following.argtypes = [w.HANDLE, ctypes.POINTER(Entry)]
+    first.restype = following.restype = w.BOOL
+    snap = k.CreateToolhelp32Snapshot(0x2, 0)                 # TH32CS_SNAPPROCESS
+    if not snap or snap == w.HANDLE(-1).value:
+        raise OSError('no process snapshot')
+    wanted, found = {n.lower() for n in names}, []
+    try:
+        entry = Entry()
+        entry.dwSize = ctypes.sizeof(Entry)
+        ok = first(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() in wanted:
+                found.append((entry.th32ProcessID, entry.szExeFile))
+            ok = following(snap, ctypes.byref(entry))
+    finally:
+        k.CloseHandle(snap)
+    return found
+
+
+def pipe_facts(name):
+    """Open a named pipe for its attributes and permissions only (no reading or writing, nothing sent), with the
+    server not allowed to act as us (SECURITY_SQOS_PRESENT, anonymous level), and say who serves it."""
+    ctypes, w, k, _ = win()
+    handle = k.CreateFileW(name, 0x80 | 0x20000, 0x3, None, 3, 0x00100000, None)  # FILE_READ_ATTRIBUTES|READ_CONTROL, OPEN_EXISTING
+    if handle in (None, w.HANDLE(-1).value):
+        err = ctypes.get_last_error()
+        return {'error': {231: 'all instances busy', 5: 'access denied', 2: 'gone'}.get(err, 'error %d' % err)}
+    try:
+        facts = {}
+        pid = w.ULONG()
+        if k.GetNamedPipeServerProcessId(handle, ctypes.byref(pid)):
+            facts['pid'] = pid.value
+        try:
+            facts['owner'], facts['aces'] = handle_security(handle)
+        except OSError as e:
+            facts['security_error'] = str(e)
+        return facts
+    finally:
+        k.CloseHandle(handle)
+
+
+def signature(path):
+    """(status, signer) of a file's own Authenticode signature, through WinVerifyTrust with no UI, no revocation check
+    and cached URLs only (so no network). The file is read, never run."""
+    import ctypes
+    from ctypes import wintypes as w
+    t = ctypes.WinDLL('wintrust')
+    c = ctypes.WinDLL('crypt32')
+
+    class FileInfo(ctypes.Structure):
+        _fields_ = [('cbStruct', w.DWORD), ('pcwszFilePath', w.LPCWSTR), ('hFile', w.HANDLE), ('pgKnownSubject', ctypes.c_void_p)]
+
+    class Data(ctypes.Structure):
+        _fields_ = [('cbStruct', w.DWORD), ('pPolicyCallbackData', ctypes.c_void_p), ('pSIPClientData', ctypes.c_void_p),
+                    ('dwUIChoice', w.DWORD), ('fdwRevocationChecks', w.DWORD), ('dwUnionChoice', w.DWORD),
+                    ('pFile', ctypes.POINTER(FileInfo)), ('dwStateAction', w.DWORD), ('hWVTStateData', w.HANDLE),
+                    ('pwszURLReference', w.LPCWSTR), ('dwProvFlags', w.DWORD), ('dwUIContext', w.DWORD),
+                    ('pSignatureSettings', ctypes.c_void_p)]
+
+    class Guid(ctypes.Structure):
+        _fields_ = [('a', w.DWORD), ('b', w.WORD), ('c', w.WORD), ('d', ctypes.c_ubyte * 8)]
+
+    class Signer(ctypes.Structure):
+        _fields_ = [('cbStruct', w.DWORD), ('sftVerifyAsOf', w.FILETIME), ('csCertChain', w.DWORD), ('pasCertChain', ctypes.c_void_p)]
+
+    class Cert(ctypes.Structure):
+        _fields_ = [('cbStruct', w.DWORD), ('pCert', ctypes.c_void_p)]
+    import uuid
+    action = Guid.from_buffer_copy(uuid.UUID('00aac56b-cd44-11d0-8cc2-00c04fc295ee').bytes_le)    # WINTRUST_ACTION_GENERIC_VERIFY_V2
+    info = FileInfo(ctypes.sizeof(FileInfo), path, None, None)
+    data = Data(cbStruct=ctypes.sizeof(Data), dwUIChoice=2, fdwRevocationChecks=0, dwUnionChoice=1,
+                pFile=ctypes.pointer(info), dwStateAction=1, dwProvFlags=0x10 | 0x1000)
+    t.WinVerifyTrust.argtypes, t.WinVerifyTrust.restype = [w.HWND, ctypes.POINTER(Guid), ctypes.POINTER(Data)], ctypes.c_long
+    t.WTHelperProvDataFromStateData.argtypes, t.WTHelperProvDataFromStateData.restype = [w.HANDLE], ctypes.c_void_p
+    t.WTHelperGetProvSignerFromChain.argtypes = [ctypes.c_void_p, w.DWORD, w.BOOL, w.DWORD]
+    t.WTHelperGetProvSignerFromChain.restype = ctypes.POINTER(Signer)
+    c.CertGetNameStringW.argtypes = [ctypes.c_void_p, w.DWORD, w.DWORD, ctypes.c_void_p, w.LPWSTR, w.DWORD]
+    c.CertGetNameStringW.restype = w.DWORD
+    rc = t.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(data))
+    status = {0: 'valid', -2146762496: 'not signed (no signature of its own)',
+              -2146869232: 'signed, but the signature does not match the file',
+              -2146762487: 'signed, by a certificate that is not trusted here'}.get(rc, 'not valid (0x%08x)' % (rc & 0xFFFFFFFF))
+    signer = ''
+    try:
+        if rc == 0 or rc == -2146762487:
+            prov = t.WTHelperProvDataFromStateData(data.hWVTStateData)
+            sgnr = t.WTHelperGetProvSignerFromChain(prov, 0, False, 0) if prov else None
+            if sgnr and sgnr.contents.csCertChain and sgnr.contents.pasCertChain:
+                cert = Cert.from_address(sgnr.contents.pasCertChain).pCert
+                buf = ctypes.create_unicode_buffer(256)
+                if cert and c.CertGetNameStringW(cert, 4, 0, None, buf, 256) > 1:          # CERT_NAME_SIMPLE_DISPLAY_TYPE
+                    signer = buf.value
+    finally:
+        data.dwStateAction = 2                                                              # WTD_STATEACTION_CLOSE
+        t.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(data))
+    return status, signer
+
+
+def parse_manifest(raw):
+    """From an AppxManifest.xml (bytes): each application's id, executable and entry point, and the protocols
+    (codex://) and execution aliases it declares. Elements are matched by local name, whatever their namespace."""
+    import xml.etree.ElementTree as ET
+    if len(raw) > 4000000:
+        raise ValueError('manifest too large')
+    root = ET.fromstring(raw)
+    local = lambda el: el.tag.rsplit('}', 1)[-1]
+    apps = []
+    for app in root.iter():
+        if local(app) != 'Application':
+            continue
+        row = {'id': app.get('Id') or '', 'exe': app.get('Executable') or '', 'entry': app.get('EntryPoint') or '',
+               'protocols': [], 'aliases': []}
+        for el in app.iter():
+            if local(el) == 'Protocol' and el.get('Name'):
+                row['protocols'].append(el.get('Name'))
+            elif local(el) == 'ExecutionAlias' and el.get('Alias'):
+                row['aliases'].append(el.get('Alias'))
+        apps.append(row)
+    return apps
+
+
+def manifest_lines(apps):
+    if not apps:
+        return ['    applications: none declared']
+    lines = []
+    for a in apps[:12]:
+        lines.append('    application %s: executable %s%s' % (a['id'] or '?', a['exe'] or '(none)',
+                                                            '; entry point %s' % a['entry'] if a['entry'] else ''))
+        lines.append('      protocols: %s' % (', '.join(p + '://' for p in a['protocols']) or 'none'))
+        lines.append('      execution aliases: %s' % (', '.join(a['aliases']) or 'none'))
+    return lines
+
+
+def check_openai_packages():
+    try:
+        rows = [r for r in appx_rows() if r['name'].lower().startswith('openai.')]
+    except Exception as e:
+        return ['OpenAI packages: %s' % (str(e) if str(e).startswith('error') else 'error: %s' % e)]
+    if not rows:
+        return ['OpenAI packages: not found']
+    lines = []
+    for r in rows:
+        lines.append('Package %s %s' % (r['name'], r['version']))
+        lines.append('  family: %s; publisher id: %s' % (r['family'] or '?', r['publisher'] or '?'))
+        manifest = os.path.join(r['location'], 'AppxManifest.xml') if r['location'] else ''
+        if not manifest:
+            lines.append('  manifest: no install location')
+            continue
+        try:
+            with open(manifest, 'rb') as f:
+                raw = f.read(4000001)
+            lines.extend(manifest_lines(parse_manifest(raw)))
+        except FileNotFoundError:
+            lines.append('  manifest: not found')
+        except PermissionError:
+            lines.append('  manifest: error: access denied')
+        except Exception as e:
+            lines.append('  manifest: error: %s' % type(e).__name__)
+    return lines
+
+
+APP_PROCESSES = ('ChatGPT.exe', 'Codex.exe', 'codex.exe')
+
+
+def process_lines(rows, mine):
+    """Rows of (name, facts) grouped by name, image and package, with counts. Owners are 'you' or a label."""
+    groups = {}
+    for name, f in rows:
+        key = (name, f.get('image') or '', f.get('family') or '', f.get('owner') or '', f.get('error') or '')
+        groups[key] = groups.get(key, 0) + 1
+    lines = []
+    for (name, image, family, owner, error), n in sorted(groups.items()):
+        if error:
+            lines.append('%s x%d: %s' % (name, n, error))
+            continue
+        lines.append('%s x%d: %s' % (name, n, image or '(image path not readable)'))
+        lines.append('  package: %s; runs as: %s' % (family or 'unknown', sid_label(owner, mine) if owner else 'unknown'))
+    return lines
+
+
+def check_app_processes():
+    found = processes_named(APP_PROCESSES)
+    if not found:
+        return ['ChatGPT.exe, Codex.exe, codex.exe: not running']
+    mine = my_sid()
+    return process_lines([(name, process_facts(pid)) for pid, name in found[:80]], mine)
+
+
+def pipe_lines(facts, mine, image_facts=None):
+    if 'error' in facts:
+        return ['  could not open it to look: %s' % facts['error']]
+    lines = ['  opened for its attributes only; nothing was read or sent']
+    if 'pid' in facts:
+        lines.append('  served by process %d' % facts['pid'])
+        f = image_facts or {}
+        if f.get('error'):
+            lines.append('  that process: %s' % f['error'])
+        else:
+            lines.append('  that process: %s' % (f.get('image') or '(image path not readable)'))
+            lines.append('  its package: %s; it runs as: %s' % (f.get('family') or 'unknown',
+                                                                 sid_label(f['owner'], mine) if f.get('owner') else 'unknown'))
+    else:
+        lines.append('  server process: not reported')
+    if 'security_error' in facts:
+        lines.append('  permissions: %s' % facts['security_error'])
+    elif 'aces' in facts:
+        lines.extend(acl_lines(facts.get('owner'), facts['aces'], mine))
+    return lines
+
+
+def check_codex_pipe(names=None):
+    if names is None:
+        names, why = list_dir('\\\\.\\pipe\\\\')
+        if names is None:
+            return ['codex-ipc: %s' % why]
+    if 'codex-ipc' not in [n.lower() for n in names]:
+        return ['codex-ipc (the Codex app\'s control pipe): not found']
+    lines = ['codex-ipc (the Codex app\'s control pipe): found']
+    facts = pipe_facts('\\\\.\\pipe\\codex-ipc')
+    mine = my_sid()
+    return lines + pipe_lines(facts, mine, process_facts(facts['pid']) if 'pid' in facts else None)
+
+
+def check_codex_cli_file():
+    lines = []
+    try:
+        rows = [r for r in appx_rows() if r['name'].lower().startswith('openai.') and r['location']]
+    except Exception as e:
+        rows = []
+        lines.append('OpenAI packages: %s' % (str(e) if str(e).startswith('error') else 'error: %s' % e))
+    mine, any_cli = my_sid(), False
+    for r in rows:
+        path = os.path.join(r['location'], 'app', 'resources', 'codex.exe')
+        if not os.path.isfile(path):
+            continue
+        any_cli = True
+        lines.append('%s: found (not run)' % path)
+        try:
+            owner, aces = path_security(path)
+            lines.extend(acl_lines(owner, aces, mine))
+        except Exception as e:
+            lines.append('  permissions: error: %s' % (str(e) or type(e).__name__))
+        try:
+            status, signer = signature(path)
+            lines.append('  signature: %s; signer: %s' % (status, signer or 'unknown'))
+        except Exception as e:
+            lines.append('  signature: unknown (%s)' % type(e).__name__)
+    if not any_cli:
+        lines.append('app\\resources\\codex.exe in an OpenAI package: not found')
+    control = os.path.join(os.path.expanduser('~'), '.codex', 'app-server-control')
+    lines.append('%%USERPROFILE%%\\.codex\\app-server-control: %s' % ('found' if os.path.lexists(control) else 'not found'))
+    return lines
+
+
 SECTIONS = [
     ('1. Windows and Python', check_windows_python),
     ('2. Codex desktop app', check_codex_app),
@@ -729,8 +1239,16 @@ SECTIONS = [
     ('8. Windows Terminal', check_terminal),
     ('9. Moonshine', check_moonshine),
     ('10. Process list', check_processes),
+    ('11. OpenAI app packages', check_openai_packages),
+    ('12. ChatGPT and Codex processes', check_app_processes),
+    ('13. Codex bundled command-line tool', check_codex_cli_file),
 ]
 
+NEW_SECTIONS_NOTE = ('New in this version: section 4 also says whether the Codex app\'s control pipe (codex-ipc) exists, '
+                     'which program answers it and who may open it (the probe opens it without reading or sending '
+                     'anything). Section 11 lists the OpenAI app packages and what their manifests declare, section 12 '
+                     'which file and package each ChatGPT or Codex process runs from, and section 13 who may open '
+                     'Codex\'s bundled codex.exe and who signed it (it is not run). "you" means your own account.')
 FINAL_LINE = 'Please read this output before posting it, and remove anything you would rather not share.'
 
 
@@ -743,7 +1261,7 @@ def main():
     except Exception:
         pass
     ctx = make_context()
-    out = ['Motet Windows probe (read-only; nothing was changed, written or sent)']
+    out = ['Motet Windows probe (read-only; nothing was changed, written or sent)', NEW_SECTIONS_NOTE]
     for label, fn in SECTIONS:
         out.append('')
         out.append('== %s ==' % label)
