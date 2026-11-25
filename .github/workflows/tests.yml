@@ -347,11 +347,12 @@ jobs:
       - run: python tests/test_attachments_availability.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-      # On Windows the composition's tests import and skip with their reason: delivery to agent chats is not ported
-      # (NATIVE_ATTACHMENT_DELIVERY_HOST keeps it off there) and they race managed Claude, which is Mac-only.
+      # On Windows the composition's tests import and skip with their reason: they race managed Claude, which is
+      # Mac-only, through POSIX fixtures. The Claude route on Windows is test_claude_attachment_integration.py.
       - run: python tests/test_attachments_native_composition.py
         if: ${{ !cancelled() }}
-      # Off on Windows: the fixture-only deletion is built on delivery to agent chats, which is not ported there.
+      # Off on Windows: this fixture-only deletion's tests build their workspaces with POSIX modes
+      # (attachments_native_fixture). Removing a copy on Windows is tested in test_attachments_windows_materialize.py.
       - run: python tests/test_attachments_native_deletion.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_attachments_native_handoff.py
@@ -402,11 +403,16 @@ jobs:
       - run: python tests/test_codex_attachment_integration.py
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         timeout-minutes: 5
-      # Off on Windows: delivery to Claude chats (workspace copies, Git exclusion) is not ported yet (step 6c.5).
+      # Off on Windows: the adapter's tests race managed Claude, which is Mac-only, through POSIX fixtures.
       - run: python tests/test_claude_attachment_adapter.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
+      # The whole route to a Claude chat, on every system (on Windows with Git for Windows under Program Files).
       - run: python tests/test_claude_attachment_integration.py
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+      # Git for Windows, the workspace check and a whole copy with Git's proof: simulated on macOS and Linux.
+      - run: python tests/test_attachments_windows_delivery.py
+        if: ${{ !cancelled() }}
         timeout-minutes: 5
       # On Windows these import and skip with their reason: they race managed Claude, which is Mac-only by design.
       - run: python tests/test_native_managed_namespace.py
@@ -447,13 +453,14 @@ jobs:
         run: node --test docs/fixtures/attachments/fixture-vm-probe.test.mjs
       - run: node tests/test_attachments_client.js
         if: ${{ !cancelled() }}
-      # Off on Windows: delivery to agent chats stays off there (NATIVE_ATTACHMENT_DELIVERY_HOST).
+      # Off on Windows: these start POSIX-only Python fixtures (private folder modes, stopped by SIGINT). The Claude
+      # route on Windows is tests/test_claude_attachment_integration.py.
       - run: node tests/test_claude_attachment_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
       - run: node tests/test_native_agent_attachments_client.js
         if: ${{ !cancelled() }}
-      # Off on Windows: delivery to agent chats stays off there (NATIVE_ATTACHMENT_DELIVERY_HOST).
+      # Off on Windows: a POSIX-only Python fixture, as above.
       - run: node tests/test_native_agent_attachments_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
@@ -461,7 +468,7 @@ jobs:
         if: ${{ !cancelled() }}
       - run: node tests/test_native_agent_attachments_page.js
         if: ${{ !cancelled() }}
-      # Off on Windows: delivery to agent chats stays off there (NATIVE_ATTACHMENT_DELIVERY_HOST).
+      # Off on Windows: a POSIX-only Python fixture, as above.
       - run: node tests/test_native_agent_attachments_stage23_http.js
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5

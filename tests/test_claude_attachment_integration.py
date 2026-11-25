@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 import server
 import peer_lifecycle
+import private_storage as ps
 from attachments_native_namespace import NativeNamespaceFence
 from attachments_owner_transport import CLAUDE_CLAIMS
 from attachments_types import AttachmentError
@@ -45,7 +46,30 @@ def uid():
     return str(uuid.uuid4())
 
 
-@unittest.skipUnless(os.name == 'posix' and os.path.exists('/usr/bin/git'), 'Requires local Git and private POSIX storage.')
+def _git_program():
+    """The Git the product uses: /usr/bin/git on POSIX; on Windows Git for Windows installed for all users."""
+    if os.name != 'nt':
+        return '/usr/bin/git' if os.path.exists('/usr/bin/git') else None
+    import attachments_windows_git
+    try:
+        return attachments_windows_git.find()
+    except attachments_windows_git.GitUnavailable:
+        return None
+
+
+GIT = _git_program()
+
+
+def _git_environment(home):
+    if os.name != 'nt':
+        return {'PATH': '/usr/bin:/bin', 'HOME': str(home), 'GIT_CONFIG_NOSYSTEM': '1',
+                'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
+    import attachments_windows_git
+    return attachments_windows_git.environment(GIT)
+
+
+@unittest.skipUnless(GIT and (os.name == 'posix' or ps.folder_walk_available()),
+                     'Requires the Git Motet uses (/usr/bin/git, or Git for Windows installed for all users) and private storage.')
 class ClaudeAttachmentIntegration(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -53,14 +77,20 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         temp = self.stack.enter_context(tempfile.TemporaryDirectory(prefix='claude-native-integration-'))
         self.home = Path(temp).resolve()
         self.project = self.home / 'orchard'
-        self.project.mkdir(mode=0o700)
+        if os.name == 'nt':
+            ps.make_private_folder(str(self.project))
+        else:
+            self.project.mkdir(mode=0o700)
         self.stack.enter_context(patch.dict(os.environ, WATCH_DEMO='0'))
-        env = {'PATH': '/usr/bin:/bin', 'HOME': str(self.home), 'GIT_CONFIG_NOSYSTEM': '1',
-               'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
-        subprocess.run(['/usr/bin/git', '-c', 'init.templateDir=', 'init', '-q', str(self.project)],
-                       env=env, check=True, capture_output=True, timeout=8)
+        subprocess.run([GIT, '-c', 'init.templateDir=', 'init', '-q', str(self.project)],
+                       env=_git_environment(self.home), check=True, capture_output=True, timeout=30)
         (self.project / '.git/info').mkdir(exist_ok=True)
         (self.project / '.git/info/exclude').touch(mode=0o600)
+        if os.name == 'nt':
+            # The runner is elevated, so what Git and Python just made belongs to Administrators; a checkout made from
+            # an ordinary window belongs to its user, which is what Motet asks for.
+            subprocess.run('icacls "%s" /setowner "%%USERDOMAIN%%\\%%USERNAME%%" /T /C /Q' % self.project, shell=True,
+                           check=True, capture_output=True, timeout=60)
         self.destination = 'c:' + uid()
         self.room = {self.destination: {'runtime': 'Claude', 'cwd': str(self.project), 'name': 'Fictional orchard'}}
         state = self.home / '.live-room'
@@ -325,7 +355,9 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         self.assertFalse((state / 'managed-claude.lock').exists())
 
     def test_initialized_namespace_excludes_the_exact_managed_uuid(self):
-        from native_managed_namespace_fixture import ManagedFixture, fixture_files
+        from native_managed_namespace_fixture import MANAGED_WHY, ManagedFixture, fixture_files
+        if MANAGED_WHY:
+            self.skipTest(MANAGED_WHY)
         self.start()
         state = self.home / '.live-room'
         fixture_files(state)

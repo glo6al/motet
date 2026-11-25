@@ -14,7 +14,9 @@ const PHASE = {draft_create: 'creating', upload_reserve: 'reserving', upload_put
   deletion_prepare: 'preparing_deletion', deletion_confirm: 'confirming_deletion', deletion_execute: 'executing_deletion'};
 const EARLIER_DELIVERY_UNRESOLVED = 'earlier_delivery_unresolved';
 const COPY_STATES = ['not_saved', 'saving', 'available', 'unavailable', 'removed', 'unknown'];
-const DELETION_REASONS = [null, 'source_in_use', 'identity_changed', 'removal_unconfirmed', 'workspace_unavailable', 'workspace_unverified'];
+// The same list, in order, as REASONS in src/attachments_native_deletion.py ('copy_in_use': another program has the
+// workspace copy open on Windows, so it is left and retried).
+const DELETION_REASONS = [null, 'source_in_use', 'identity_changed', 'removal_unconfirmed', 'workspace_unavailable', 'workspace_unverified', 'copy_in_use'];
 const DELETION_PIECES = ['watch_original', 'workspace'];
 const REQUEST_KEYS = ['id', 'draftId', 'revision', 'createdAt', 'text', 'preparation', 'files', 'delivery',
   'accepted', 'execution', 'reply', 'reason'];
@@ -36,6 +38,11 @@ const MESSAGES = {
   // Why the attachment store is not running; worded as in ATTACHMENTS_OFF_WHY (src/server.py).
   attachments_windows_unavailable: 'Sending files is not available on Windows yet. Ordinary messages still work.',
   attachments_storage_unavailable: 'Sending files is unavailable because Motet could not open its private file storage. Restart Motet to try again. Ordinary messages still work.',
+  // Windows: why one agent chat cannot be sent files here; worded as in src/attachments_windows_git.py and ATTACHMENTS_OFF_WHY.
+  attachments_git_missing: 'Sending files to Claude chats needs Git for Windows installed for all users (in Program Files). Ordinary messages still work.',
+  attachments_git_per_user: 'Sending files to Claude chats needs Git for Windows installed for all users (in Program Files). Git installed only for your account can be changed by any program you run, so Motet does not use it. Ordinary messages still work.',
+  attachments_git_unsafe: 'Sending files is unavailable because the Git in Program Files can be changed by programs you run. Reinstall Git for Windows for all users. Ordinary messages still work.',
+  attachments_codex_mac_only: 'Sending files to Codex chats needs the Codex desktop app on a Mac.',
   invalid_response: 'The attachment response could not be verified.', invalid_request: 'Choose an exact attachment item.',
   unavailable: 'This attachment operation is unavailable.', unauthorized: 'Owner access changed.',
   forbidden: 'The attachment could not be authorized.', destination_unavailable: 'Attachments are unavailable for this agent.',

@@ -73,10 +73,13 @@ class LimitedReader:
 
 
 def handle_http(handler, service, owner_key, port, *, native=None,
-                unavailable=('attachments_disabled', 'Attachments are unavailable.'), native_unavailable=None):
+                unavailable=('attachments_disabled', 'Attachments are unavailable.'), native_unavailable=None,
+                native_refusal=None):
     """``unavailable`` is the (code, words) every request gets while ``service`` is None: why the store is not running.
     ``native_unavailable`` is the (code, words) requests for files sent to agent chats get while the store runs but
-    this host cannot deliver them (``native`` is None there)."""
+    this host cannot deliver them (``native`` is None there). ``native_refusal(destination_id)`` gives (code, words)
+    when this host cannot deliver to that one chat (on Windows a Codex chat, or Git for Windows missing), else None;
+    it answers the selection, receipt and request reads that name a destination."""
     handler.close_connection = True
     def headers(name):
         return handler.headers.get_all(name, [])
@@ -226,6 +229,10 @@ def handle_http(handler, service, owner_key, port, *, native=None,
         if (native is None and native_unavailable is not None
                 and (route == '/native/selection' or native_receipt or native_request or native_send or native_prepare)):
             return error(503, *native_unavailable)
+        if native_refusal is not None and (route == '/native/selection' or native_receipt or native_request):
+            refused = native_refusal(query.get('destinationId'))
+            if refused is not None:
+                return error(503, *refused)
         if native_request or native_send or native_prepare or native_receipt and native_receipt[1] == 'send_prepare':
             if native is None:
                 fail('attachments_disabled', 'Native agent attachments are unavailable.', 503)

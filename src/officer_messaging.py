@@ -145,11 +145,12 @@ def codex_records_checkable():
 @contextmanager
 def foreign_records_refused():
     """Windows: the attachment namespace fence's refusals that have their own words, shown as they are. Records
-    whose identities or nonce do not match this folder's files (made by Motet on another computer or in another
-    folder) give RETAINED_STATE_FOREIGN; another holder keeping the fence's lock past its short wait gives
-    RETAINED_STATE_BUSY, which a later start can clear. Any other refusal (a record the walk refused for its access
-    list or a sharing violation, or a malformed one) passes on and gets the storage reason. POSIX keeps its own
-    refusal (the storage reason for all of them)."""
+    whose identities or nonce do not match this folder's files give RETAINED_STATE_FOREIGN: a Windows-made witness
+    records the identities of the files it was made with, which a start on the same files matches, so only records
+    copied from another computer or folder (or files replaced since) get it. Another holder keeping the fence's lock
+    past its short wait gives RETAINED_STATE_BUSY, which a later start can clear. Any other refusal (a record the
+    walk refused for its access list or a sharing violation, a malformed one, or a lost witness) passes on and gets
+    the storage reason. POSIX keeps its own refusal (the storage reason for all of them)."""
     if not private_storage.WIN:
         yield
         return
@@ -267,8 +268,7 @@ class MessagingStore:
                     os.close(fd)
             self.db.execute('PRAGMA secure_delete = ON')
             if fence is None and self.db.execute("SELECT 1 FROM main.sqlite_schema WHERE name='owner_attachment_namespace_identity'").fetchone():
-                if private_storage.WIN:          # copied without its witness: see foreign_records_refused
-                    raise MessagingStorageUnavailable(RETAINED_STATE_FOREIGN)
+                # A witness lost here, now that Windows makes these records too: the storage refusal on every system.
                 raise OwnerGuardError('The retained owner namespace witness is unavailable.')
             self._attachment_guard = OwnerAttachmentGuard.probe(self.db, lock=self.lock)
             if self._attachment_guard is None:

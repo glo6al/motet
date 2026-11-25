@@ -107,10 +107,11 @@ ID_RX = re.compile(r'[0-9a-fA-F-]{8,64}\Z')
 WIN = os.name == 'nt'
 WIN_IDS = not WIN or sys.version_info >= (3, 12)      # before 3.12 Windows file ids are cut to 64 bits, which ReFS does not keep unique
 BINARY = getattr(os, 'O_BINARY', 0)       # Windows opens files as text unless told otherwise
-# Host capability: may files sent to an agent chat be handed to that agent here? Claude's workspace delivery (and
-# Codex's, which also needs the Mac app) is built on POSIX folder handles and has not been ported to Windows, so this
-# stays False there even once the attachment store itself starts on Windows. Turn it on only with that port.
-NATIVE_ATTACHMENT_DELIVERY_HOST = not WIN
+# Host capability: may files sent to an agent chat be handed to that agent here? On every system since step 6c.5b:
+# Claude's workspace delivery runs on Windows through the no-link folder walk and Git for Windows installed for all
+# users (attachments_windows_git). Codex's needs the Codex desktop app on a Mac, so on Windows it is not built and a
+# Codex chat is told so (ATTACHMENTS_OFF_WHY['attachments_codex_mac_only']).
+NATIVE_ATTACHMENT_DELIVERY_HOST = True
 # What the page is told when the attachment store is not running, by the code in ATTACHMENTS_OFF. The same codes
 # answer attachment requests, and the page words them the same way (src/web/native-agent-attachments-client.js).
 ATTACHMENTS_OFF_WHY = {
@@ -118,6 +119,7 @@ ATTACHMENTS_OFF_WHY = {
     'attachments_windows_unavailable': 'Sending files is not available on Windows yet. Ordinary messages still work.',
     'attachments_storage_unavailable': ('Sending files is unavailable because Motet could not open its private file '
                                         'storage. Restart Motet to try again. Ordinary messages still work.'),
+    'attachments_codex_mac_only': 'Sending files to Codex chats needs the Codex desktop app on a Mac.',
 }
 
 
@@ -5291,10 +5293,12 @@ class H(BaseHTTPRequestHandler):
         off = ATTACHMENTS_OFF or 'attachments_disabled'
         options = {}
         if not NATIVE_ATTACHMENT_DELIVERY_HOST:
-            # The store runs here (Windows), but files sent to agent chats cannot be delivered: those requests get the
-            # Windows reason, as they did while the store was off, not a generic refusal the page reads as a fault.
+            # A host where files sent to agent chats cannot be delivered: those requests get the Windows reason, not a
+            # generic refusal the page reads as a fault.
             options['native_unavailable'] = ('attachments_windows_unavailable',
                                              ATTACHMENTS_OFF_WHY['attachments_windows_unavailable'])
+        elif WIN:
+            options['native_refusal'] = windows_native_refusal
         return attachments_http.handle_http(self, ATTACHMENTS, KEY, PORT, native=native,
                                             unavailable=(off, ATTACHMENTS_OFF_WHY[off]), **options)
 
@@ -6604,6 +6608,16 @@ def codex_attachment_room():
         return {agent: dict(row) for agent, row in AGENTS.items() if agent.startswith('x:')}
 
 
+def windows_native_refusal(destination_id):
+    """Windows: why files cannot be sent to this agent chat here, as (code, words) the page shows, or None. A Codex
+    chat needs the Codex desktop app on a Mac. A Claude chat needs Git for Windows installed for all users and
+    changeable only by the system (checked each time, so installing it later needs no restart)."""
+    if isinstance(destination_id, str) and destination_id.startswith('x:'):
+        return 'attachments_codex_mac_only', ATTACHMENTS_OFF_WHY['attachments_codex_mac_only']
+    import attachments_windows_git
+    return attachments_windows_git.refusal()
+
+
 def start_native_attachment_maintenance(messaging, attachments):
     if messaging is None or os.environ.get('WATCH_DEMO') == '1':
         return None
@@ -6613,8 +6627,9 @@ def start_native_attachment_maintenance(messaging, attachments):
         return None
     if allow_install and getattr(attachments, 'store', None) is not None:
         from attachments_native_composition import bind_native_composition
+        # Codex delivery needs the Codex desktop app on a Mac: not built on Windows.
         return bind_native_composition(messaging, attachments, claude_room=claude_attachment_room,
-                                       codex_room=codex_attachment_room)
+                                       codex_room=None if WIN else codex_attachment_room)
     from attachments_owner_runtime import bind_owner_runtime
     return bind_owner_runtime(messaging, allow_install=allow_install)
 

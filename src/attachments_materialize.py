@@ -254,13 +254,18 @@ def _pread(fd, size, offset):
 
 # How a Windows refusal names the folder it is about (the roles of WorkspaceContext's three folders).
 FOLDER_NAMES = {'workspace': 'The selected workspace folder', 'git': "The selected workspace's .git folder",
-                'git_info': "The selected workspace's .git\\info folder"}
+                'git_info': "The selected workspace's .git\\info folder",
+                'exclude': "The selected workspace's Git exclude file (.git\\info\\exclude)"}
 
 
-def _windows_refusal(error, role):
-    """Plain words for a Windows refusal of a workspace or Git folder, naming which one; None for any other."""
-    name = FOLDER_NAMES.get(role, FOLDER_NAMES['workspace'])
+def _windows_refusal(error, role, label=None):
+    """Plain words for a Windows refusal of a workspace or Git folder or file, naming which one (``label`` names
+    another file Git reads); None for any other."""
+    name = label or FOLDER_NAMES.get(role, FOLDER_NAMES['workspace'])
     reason = getattr(error, 'reason', None)
+    if reason == 'access' and role in ('exclude', 'git_file'):
+        fail('workspace_unsafe', name + ' can be changed by other people using this computer, so files are not '
+             'copied into the workspace. Make it changeable by you alone, or choose another workspace.', 409)
     if reason == 'access':
         fail('workspace_unsafe', name + ' can be changed by other people using this computer, so files are not '
              'copied into the workspace. A folder made directly under a drive (such as C:\\src) lets every '
@@ -585,6 +590,8 @@ class Materializer:
                 or FileIdentity.of(os.stat(exe, follow_symlinks=False)) != context.git_executable_identity
                 or not stat.S_ISREG(context.git_executable_identity.mode)):
             fail('exclusion_unavailable', 'The qualified Git executable changed.', 503)
+        if ps.WIN:
+            return self._windows_git(context, args, deadline, stdout_limit)
         argv = [exe, '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
                 '-c', 'core.excludesFile=/dev/null', '--git-dir=' + context.git_dir,
                 '--work-tree=' + context.root] + args
@@ -631,6 +638,71 @@ class Materializer:
                     closers.extend((lambda: self._reap_git(proc), proc.stdout.close, proc.stderr.close))
                 _close_owned(closers)
 
+    def _windows_git(self, context, args, deadline, stdout_limit):
+        """Windows ``_git``: the same fixed arguments and limits, run with Git for Windows' own environment (no
+        inherited variables), its program re-checked first (owned by the system, changeable by nobody else, no link
+        on the way). Windows' select works on sockets only, so two bounded reader threads drain stdout and stderr;
+        output over a limit, any stderr, or the deadline ends the run, and the process is killed and reaped. Git for
+        Windows reads /dev/null as NUL, so the null configuration and hooks paths are the same as on POSIX."""
+        import threading
+        import attachments_windows_git
+        exe = context.git_executable
+        try:
+            attachments_windows_git.checked(exe)
+        except attachments_windows_git.GitUnavailable:
+            fail('exclusion_unavailable', 'The qualified Git executable changed.', 503)
+        argv = [exe, '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+                '-c', 'core.excludesFile=/dev/null', '--git-dir=' + context.git_dir,
+                '--work-tree=' + context.root] + args
+        limits = (stdout_limit, 1024)
+        output, over, proc, readers = (bytearray(), bytearray()), threading.Event(), None, []
+
+        def drain(stream, index):
+            while True:
+                chunk = os.read(stream.fileno(), 4096)
+                if not chunk:
+                    return
+                output[index].extend(chunk)
+                if len(output[index]) > limits[index]:
+                    over.set()
+                    return
+        try:
+            if time.monotonic() >= deadline:
+                raise TimeoutError()
+            proc = subprocess.Popen(argv, cwd=context.root, env=attachments_windows_git.environment(exe),
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    close_fds=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            for index, stream in enumerate((proc.stdout, proc.stderr)):
+                reader = threading.Thread(target=drain, args=(stream, index), daemon=True,
+                                          name='attachment-git-reader')
+                readers.append(reader)
+                reader.start()
+            for reader in readers:
+                while reader.is_alive():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or over.is_set():
+                        raise TimeoutError() if remaining <= 0 else ValueError()
+                    reader.join(min(remaining, .05))
+            if over.is_set():
+                raise ValueError()
+            code = proc.wait(timeout=max(.001, deadline - time.monotonic()))
+            if output[1]:
+                raise ValueError()
+            return code, bytes(output[0])
+        except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
+            fail('exclusion_unavailable', 'Effective Git exclusion could not be verified.', 503)
+        finally:
+            closers = []
+            if proc is not None:
+                closers.extend((lambda: self._reap_git(proc), proc.stdout.close, proc.stderr.close))
+            if self._workspace_files is None:
+                for close in closers:
+                    close()
+            else:
+                _close_owned(closers)
+            for reader in readers:
+                reader.join(1)       # the pipes are closed, so a reader still running returns at once
+
     @staticmethod
     def _reap_git(proc):
         if proc.poll() is None:
@@ -657,6 +729,16 @@ class Materializer:
             try:
                 parent = self._workspace_directory(os.path.dirname(path))
                 fd = _open_file(parent, os.path.basename(path))
+                if ps.WIN:
+                    # Plain words for a file Git reads that another account owns or others can change.
+                    try:
+                        ps.unwritable(fd)
+                    except ps.PrivateStorageError as error:
+                        base = os.path.basename(path)
+                        _windows_refusal(error, 'exclude' if base == 'exclude' else 'git_file',
+                                         None if base == 'exclude' else
+                                         'A file Git reads in the selected workspace (%s)' % os.path.relpath(path, context.root))
+                        raise
                 value = _regular_fd(fd, private=False)
                 _same_entry(parent, os.path.basename(path), fd)
                 if os.path.basename(path).startswith('config'):
@@ -716,7 +798,11 @@ class Materializer:
                     # Git reading it, so writers are serialised by this workspace's private resource lock instead,
                     # held by the lease through this whole update.
                     lease.require(['workspace:' + context.workspace_fingerprint[:32]])
-                    fd, created = parent.open_append('exclude', create=True)
+                    try:
+                        fd, created = parent.open_append('exclude', create=True)
+                    except ps.PrivateStorageError as error:
+                        _windows_refusal(error, 'exclude')     # owned by another account, or others can change it
+                        raise
                     _regular_fd(fd, private=False)
                 else:
                     try:
@@ -1024,6 +1110,14 @@ class Materializer:
                         self._authorize(context, authority, lease, 'cleanup', (spec,))
                         outcome = _windows_remove(parent, name, saved)
                         _sync_folder(parent)
+                        if outcome == 'absent':
+                            # As POSIX does: no name now means none appeared meanwhile, or it is not proof of absence.
+                            try:
+                                _child_stat(parent, name)
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                fail('copy_changed', 'The attachment copy appeared during verification.', 409)
                         return CopyCleanup(spec.id, spec.copy_generation, spec.lease_id, outcome, True)
                     try:
                         fd = _open_file(parent, name)

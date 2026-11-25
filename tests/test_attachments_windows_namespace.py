@@ -173,7 +173,8 @@ class FenceChecks(FenceBase):
     def test_records_without_a_witness_open_without_the_fence(self):
         """An old managed registry that never had an identity, with no anchor or authority, is no witness: nothing
         was installed here to fence, so messaging opens as it always has. An owner database that carries the owner
-        identity without its witness is refused, with the copied-records reason on Windows."""
+        identity without its witness is refused with the storage refusal, as on POSIX: Windows makes these records
+        itself now, so a lost witness need not mean records from elsewhere."""
         managed = self.state / namespace.MANAGED
         self.private_folder(managed)
         self.make_private(managed / namespace.REGISTRY, b'')
@@ -190,9 +191,8 @@ class FenceChecks(FenceBase):
             os.remove(self.state / name)
         with self.windows():
             self.assertIsNone(messaging.MessagingStore._retained_namespace_before_open(str(self.state)))
-            with self.assertRaises(messaging.MessagingStorageUnavailable) as raised:
+            with self.assertRaises(messaging.OwnerGuardError):
                 messaging.MessagingStore(str(self.state), str(self.sessions)).close()
-        self.assertEqual(str(raised.exception), messaging.RETAINED_STATE_FOREIGN)
 
     def test_witness_is_made_and_messaging_starts_with_it_after_each_restart(self):
         fence = self.witnessed()

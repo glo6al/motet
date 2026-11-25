@@ -8,8 +8,9 @@ import stat
 
 import claude_mod
 import peer_lifecycle
+import private_storage as ps
 from attachments_materialize import (DirectoryIdentity, FileIdentity, Materializer, WorkspaceContext,
-                                     WorkspaceDirectories, copy_identity)
+                                     WorkspaceDirectories, _windows_folder, _windows_refusal, copy_identity)
 from attachments_native_namespace import NamespaceError
 from attachments_native_reads import NativeAgentReadService
 from attachments_native_receipts import command_digest, draft_binding
@@ -89,7 +90,9 @@ class ClaudePrepareIndex:
         return row['request_id'] if row['epoch'] == self.store.owner_epoch else None
 
 
-def _folder(path):
+def _folder(path, role='workspace'):
+    if ps.WIN:
+        return _windows_folder_at(path, role)
     fd = directory(path)
     try:
         info = os.fstat(fd)
@@ -100,17 +103,48 @@ def _folder(path):
         os.close(fd)
 
 
-def _workspace(project):
-    """Limit this integration to an owned, ordinary Git checkout at the project root."""
-    git, info = os.path.join(project, '.git'), os.path.join(project, '.git', 'info')
-    root_identity, git_identity, info_identity = map(_folder, (project, git, info))
-    if os.path.lexists(os.path.join(git, 'commondir')):
+def _windows_folder_at(path, role):
+    """Windows ``_folder``: the folder held through the no-link walk, changeable by nobody but its owner, who must be
+    this user (``unwritable``, the Windows form of POSIX's owner and 0o022 rule). Plain words for a folder owned by
+    another account, one others can change, or one reached through a link or junction; ``unavailable`` otherwise."""
+    if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
         unavailable()
+    try:
+        with ps.open_folder(path) as held:
+            return _windows_folder(held, role=role)
+    except OSError as error:
+        _windows_refusal(error, role)
+        unavailable()
+
+
+def _git_program():
+    """The Git program and its identity. POSIX: /usr/bin/git resolved, a regular executable file owned by root that
+    group and others cannot write, as before. Windows: Git for Windows installed for all users, with every folder
+    from Program Files down to it owned by the system and changeable by nobody else (attachments_windows_git)."""
+    if ps.WIN:
+        import attachments_windows_git
+        try:
+            executable = attachments_windows_git.find()
+        except attachments_windows_git.GitUnavailable:
+            unavailable()
+        st = os.stat(executable, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode):
+            unavailable()
+        return executable, FileIdentity.of(st)
     executable = os.path.realpath(GIT)
     st = os.stat(executable, follow_symlinks=False)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 or not st.st_mode & 0o111:
         unavailable()
-    executable_identity = FileIdentity.of(st)
+    return executable, FileIdentity.of(st)
+
+
+def _workspace(project):
+    """Limit this integration to an owned, ordinary Git checkout at the project root."""
+    git, info = os.path.join(project, '.git'), os.path.join(project, '.git', 'info')
+    root_identity, git_identity, info_identity = (_folder(project), _folder(git, 'git'), _folder(info, 'git_info'))
+    if os.path.lexists(os.path.join(git, 'commondir')):
+        unavailable()
+    executable, executable_identity = _git_program()
     workspace_id = digest({'project': project, 'root': asdict(root_identity)})
     identity = digest({'workspace': workspace_id, 'git': asdict(git_identity), 'info': asdict(info_identity),
                        'executable': executable, 'executableIdentity': asdict(executable_identity)})
