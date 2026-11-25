@@ -66,15 +66,26 @@ class SimulatedWindowsModelSetupTests(asset_tests.AssetsTests):
     def test_a_rename_a_scanner_briefly_blocks_is_tried_again(self):
         attempts = []
 
+        def windows_error(code):
+            error = PermissionError(13, 'fictional Windows error')
+            error.winerror = code
+            return error
+
         def replace(source, target):
             attempts.append(source)
             if len(attempts) < 3:
-                raise PermissionError(13, 'fictional sharing violation')
+                raise windows_error(32 if len(attempts) == 1 else 33)      # sharing, then lock violation
         with mock.patch.object(asset_tests.assets.time, 'sleep'):
             asset_tests.assets._windows_retry(replace, 'a', 'b')
         self.assertEqual(len(attempts), 3)
-        with self.assertRaises(OSError):
-            asset_tests.assets._windows_retry(mock.Mock(side_effect=OSError('not a sharing violation')))
+        for error in (windows_error(5), windows_error(183), PermissionError(13, 'no Windows code'),
+                      OSError('not a permission error')):
+            with self.subTest(error=error):
+                action = mock.Mock(side_effect=error)
+                with mock.patch.object(asset_tests.assets.time, 'sleep') as sleep:
+                    with self.assertRaises(OSError):
+                        asset_tests.assets._windows_retry(action)
+                self.assertEqual((action.call_count, sleep.call_count), (1, 0))
 
 
 class StateChecks:
@@ -164,6 +175,13 @@ class WindowsStateTests(StateChecks, unittest.TestCase):
     def windows(self):
         from contextlib import nullcontext
         return nullcontext()
+
+    def test_a_credential_that_cannot_be_written_is_deleted_through_its_handle(self):
+        with mock.patch('integrations.dictation.state.os.write', side_effect=OSError('fictional full disk')):
+            with self.assertRaises(StateError):
+                PrivateState(self.home).key(create=True)
+        self.assertEqual(list((self.home / '.live-room' / 'dictation').iterdir()), [])
+        self.assertEqual(len(PrivateState(self.home).key(create=True)), 64)
 
     def test_a_credential_others_can_read_is_refused_by_both(self):
         PrivateState(self.home).key(create=True)

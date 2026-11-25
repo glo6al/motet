@@ -1878,6 +1878,21 @@ def sync_file(fd):
 _CHANGE_ACCESS = 0x2 | 0x4 | 0x10 | 0x100 | _DELETE | 0x40000 | 0x80000
 
 
+def discard_fd(fd):
+    """Windows: delete the file the descriptor ``fd`` has open through that descriptor's own handle, then close it;
+    best effort. For a descriptor from ``NoLinkFolder.create`` or ``create_private_file``, whose handle holds DELETE:
+    by handle, so it removes only the file that was created, whatever its name points to by then. POSIX deletes by
+    name, so it has no such call."""
+    if not WIN:
+        raise ValueError('discard_fd is for Windows descriptors')
+    try:
+        _win_set_delete(_win_handle_of(fd))
+    except PrivateStorageError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _win_handle_of(fd):
     import msvcrt
     return msvcrt.get_osfhandle(fd)

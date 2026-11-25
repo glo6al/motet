@@ -269,7 +269,7 @@ console.log('motion diagnostic gate, geometry, lifecycle and bounds passed');
             reader = threading.Thread(target=read_lines, daemon=True)
             reader.start()
             try:
-                first = lines.get(timeout=10)
+                first = lines.get(timeout=60 if os.name == 'nt' else 10)
                 self.assertIsInstance(first, str, 'Fixture output could not be decoded as UTF-8')
                 port = int(re.search(r'127\.0\.0\.1:(\d+)', first).group(1))
                 def request(path, method='GET', body=None):

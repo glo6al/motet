@@ -55,17 +55,28 @@ def _create(destination):
     return os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
 
 
+# ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION: another program (a scanner) has the file open for now.
+_SCANNER_BUSY = (32, 33)
+
+
 def _windows_retry(action, *args):
-    """Windows: a rename or removal that a scanner briefly blocks (a sharing violation) is tried again for up to
-    ten seconds; anything else, or a block that lasts, raises."""
+    """Windows: a rename or removal that a scanner briefly blocks (a sharing or lock violation) is tried again for
+    up to ten seconds. Any other error, access denied or an existing target included, raises at once."""
     deadline = time.monotonic() + 10
     while True:
         try:
             return action(*args)
-        except PermissionError:
-            if time.monotonic() > deadline:
+        except PermissionError as error:
+            if getattr(error, 'winerror', None) not in _SCANNER_BUSY or time.monotonic() > deadline:
                 raise
             time.sleep(.25)
+
+
+def _unlink(path):
+    """POSIX: Path.unlink, as before. Windows: retried while a scanner holds the file."""
+    if _windows():
+        return _windows_retry(path.unlink)
+    return path.unlink()
 
 
 class AssetsError(Exception):
@@ -470,7 +481,7 @@ def download_model(model_dir, accept_bytes, progress=None, opener=None):
                         if exc.code not in ('model_missing', 'model_integrity'):
                             raise
                         if target.exists():
-                            target.unlink()
+                            _unlink(target)
                 if not reused:
                     report(0)
                     _fetch(item, target, opener or _opener(), report)

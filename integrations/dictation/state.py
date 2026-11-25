@@ -143,11 +143,8 @@ class PrivateState:
                 view = view[os.write(fd, view):]
             os.fsync(fd)
         except Exception:
-            os.close(fd)
-            try:
-                held.remove('header', lambda _: True)
-            except OSError:
-                pass
+            # Deleted through the handle that created it (it holds DELETE), never by name.
+            storage().discard_fd(fd)
             raise StateError('Could not create the helper credential.') from None
         os.close(fd)
         return key
