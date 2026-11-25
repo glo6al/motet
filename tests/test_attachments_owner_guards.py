@@ -26,6 +26,23 @@ import peer_lifecycle
 import server
 from test_attachments_owner_transport import FaultConnection, owner_schema
 
+CODEX_TICK_WHY = ('The tick sends to and tracks Codex chats only on macOS and Linux (Codex needs its Mac app); on '
+                  'Windows it leaves a Codex row as it is, which test_officer_messaging checks.')
+
+
+def codex_tick(test):
+    """Skip a test that needs the tick to send to or track a Codex chat where the tick leaves Codex rows alone."""
+    if not messaging.codex_records_checkable():
+        test.skipTest(CODEX_TICK_WHY)
+
+
+def one_thread(test):
+    """Skip a test whose second thread uses private_storage under the Windows simulation, which serves one thread
+    only (tests/windows_simulation.py). On real Windows and on POSIX it runs."""
+    import private_storage
+    if private_storage.WIN and os.name != 'nt':
+        test.skipTest('The Windows simulation serves one thread; this test uses a second.')
+
 
 def uid():
     return str(uuid.uuid4())
@@ -342,7 +359,6 @@ class SQLGuardTests(unittest.TestCase):
                     self.db.execute('PRAGMA max_page_count=1073741823')
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX-private owner messaging storage')
 class MessagingGuardTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -423,6 +439,7 @@ class MessagingGuardTests(unittest.TestCase):
         return send, poll
 
     def test_fresh_owner_has_no_native_objects_or_constructor(self):
+        codex_tick(self)
         self.assertIsNone(self.store._attachment_guard)
         original = self.store.db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'owner_attachment_%'").fetchall()
         opener = self.new_message()
@@ -471,6 +488,7 @@ class MessagingGuardTests(unittest.TestCase):
         self.assert_no_native_schema(version)
 
     def test_f2_uninstalled_control_alias_holds_only_peer_capture(self):
+        codex_tick(self)
         self.in_both_uninstalled_modes(self.check_control_alias_holds_only_peer_capture)
 
     def check_control_alias_holds_only_peer_capture(self):
@@ -611,6 +629,7 @@ class MessagingGuardTests(unittest.TestCase):
         return self.store.peers.result(sender, client) if version == 1 else self.store.shared.result(client)
 
     def test_uncertain_peer_restart_preserves_both_namespaces_and_capacity(self):
+        codex_tick(self)
         def seed(db):
             facts = []
             started = time.time() - 10
@@ -752,6 +771,7 @@ class MessagingGuardTests(unittest.TestCase):
         self.in_peer_recovery_modes(seed, exercise)
 
     def test_f3_uncertain_rows_are_held_without_killing_unrelated_work(self):
+        codex_tick(self)
         def exercise():
             db = self.store.db
             version = db.execute('PRAGMA schema_version').fetchone()
@@ -919,6 +939,7 @@ class MessagingGuardTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM asks').fetchone(), (0,))
 
     def test_stale_worker_selection_does_not_redispatch_or_overwrite(self):
+        codex_tick(self)
         ledger = self.installed()
         value = admission(self.agent)
         identity = value.owner_request_id
@@ -965,6 +986,7 @@ class MessagingGuardTests(unittest.TestCase):
         self.assertEqual(ledger.status(identity)['state'], 'owner_recorded')
 
     def test_post_launch_owner_check_rejects_displaced_worker_row(self):
+        codex_tick(self)
         self.installed()
         ordinary = self.new_message()
         identity = ordinary['request_id']
@@ -1002,6 +1024,7 @@ class MessagingGuardTests(unittest.TestCase):
         self.assertEqual(ledger.status(identity)['state'], 'owner_recorded')
 
     def test_control_alias_only_holds_peer_capture_until_rechecked(self):
+        codex_tick(self)
         self.installed()
         unrelated = self.new_message()
         peer = self.peer()
@@ -1040,6 +1063,7 @@ class MessagingGuardTests(unittest.TestCase):
         self.assertIsNone(self.store.claim_ask(uid(), 'Fictional independent ask.'))
 
     def test_same_writer_last_slot_race_between_ordinary_and_native(self):
+        one_thread(self)
         ledger = self.installed()
         for _ in range(messaging.MAX_PENDING - 1):
             identity = uid()
@@ -1130,7 +1154,7 @@ class MessagingGuardTests(unittest.TestCase):
             ledger.admit(admission(self.agent), now_ms=int(time.time() * 1000))
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX-private owner messaging storage')
+@unittest.skipIf(os.name == 'nt', 'Uses the shared-bridge fixture (test_shared_bridge.SharedTests), which is POSIX-only.')
 class LargeLegacyPeerTests(unittest.TestCase):
     def test_f3_real_shared_send_and_poll_preserve_large_rows_and_unicode(self):
         # The shared fixture patches native launch. No provider or HTTP access.

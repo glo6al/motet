@@ -2,7 +2,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
 from dataclasses import replace
-import fcntl
 import multiprocessing
 import os
 from pathlib import Path
@@ -23,8 +22,7 @@ from attachments_owner_guards import LINKS, OUTCOMES, OwnerAttachmentGuard
 from attachments_owner_transport import LedgerError, OwnerAttachmentLedger
 from attachments_service import AttachmentService, UnqualifiedResolver
 from attachments_types import AttachmentError
-from claude_managed import Adapter, ManagedError
-from native_managed_namespace_fixture import ManagedFixture, fixture_files
+from native_managed_namespace_fixture import MANAGED_WHY, Adapter, ManagedError, ManagedFixture, fixture_files
 from officer_messaging import MessagingStore
 import server
 from test_attachments_owner_startup import ManualWorker
@@ -147,6 +145,7 @@ def _managed_contender(root, kind, run, request_id, permission, active, go, atte
     fixture = ManagedFixture(Path(root), None)
     trace = ProductConnectionProbe(role='managed', active=active, entered=entered, release=release)
     lock_identity = namespace._id((Path(root) / namespace.HOST).stat())
+    import fcntl
     real_flock = fcntl.flock
 
     def observed(fd, flags):
@@ -167,6 +166,7 @@ def _managed_contender(root, kind, run, request_id, permission, active, go, atte
 
 
 def _flock_contender(host, pipe):
+    import fcntl
     with pipe, namespace._open(Path(host)) as (fd, _):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -176,7 +176,14 @@ def _flock_contender(host, pipe):
             pipe.send('acquired')
 
 
-@unittest.skipUnless(os.name == 'posix' and GIT, 'Requires private POSIX SQLite fixtures and Git.')
+# The composition is the delivery of files to agent chats. On Windows it is not built (NATIVE_ATTACHMENT_DELIVERY_HOST
+# keeps it off until that delivery is ported) and these tests also race managed Claude, which is Mac-only by design.
+# The fence and owner runtime it rests on are tested on Windows in test_attachments_windows_namespace.py.
+WHY = (MANAGED_WHY and 'Delivery to agent chats is off on Windows (not ported yet), and these tests race managed '
+       'Claude, which is Mac-only by design.') or (not GIT and 'Requires Git.') or None
+
+
+@unittest.skipIf(WHY, WHY)
 class CompositionTests(unittest.TestCase):
     def error(self, codes, fn):
         with self.assertRaises((AttachmentError, LedgerError, ManagedError, namespace.NamespaceError)) as caught:
@@ -664,6 +671,7 @@ class CompositionTests(unittest.TestCase):
                     native_attempted = threading.Event()
                     owner_return = threading.Event()
                     root_identity = namespace._id(f.fence.host.stat())
+                    import fcntl
                     real_flock = fcntl.flock
 
                     def observed(fd, flags):

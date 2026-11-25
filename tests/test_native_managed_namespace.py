@@ -1,6 +1,5 @@
 """Cross-process exclusion proof with stock SQLite and fictional runner calls."""
 from contextlib import ExitStack, closing, nullcontext
-import fcntl
 import multiprocessing
 import os
 from pathlib import Path
@@ -15,10 +14,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from attachments_owner_guards import LINKS, OUTCOMES
 from attachments_owner_transport import RETENTION_MS
-from claude_managed import Adapter, ManagedError
 from native_managed_namespace_fixture import (
-    AUTHORITY, HOST_LOCK, MANAGED_EXPECTED, MANAGED_IDENTITY, MANAGED_ROOT,
-    OWNER_DB, OWNER_EXPECTED, OWNER_IDENTITY, REGISTRY, ManagedFixture, Namespace,
+    AUTHORITY, HOST_LOCK, MANAGED_EXPECTED, MANAGED_IDENTITY, MANAGED_ROOT, MANAGED_WHY,
+    OWNER_DB, OWNER_EXPECTED, OWNER_IDENTITY, REGISTRY, Adapter, ManagedError, ManagedFixture, Namespace,
     bootstrap, checked_fd, native_action, native_store,
 )
 from test_attachments_owner_guards import admission, uid
@@ -128,6 +126,7 @@ def participant(root, role, kind, operation, run_id, permission, active, ready, 
     namespace = Namespace(root)
     trace = ConnectionProbe(role=role, active=active, entered=entered, release=release, fault=fault)
     fixture = None
+    import fcntl
     real_flock = fcntl.flock
 
     def watched_lock(fd, flags):
@@ -157,6 +156,10 @@ def participant(root, role, kind, operation, run_id, permission, active, ready, 
                    fixture.turns if fixture else [], trace.fired))
 
 
+# These race managed Claude (a real ManagedClaude with a fictional runner) against the owner through the fixture's own
+# POSIX lock proof. Managed Claude is Mac-only by design, so on Windows they skip; the product fence's Windows
+# branches are tested in test_attachments_windows_namespace.py.
+@unittest.skipIf(MANAGED_WHY, MANAGED_WHY)
 class NamespaceTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -214,6 +217,7 @@ class NamespaceTests(unittest.TestCase):
             return db.execute(f'SELECT 1 FROM {table} WHERE {key}=?', (request_id,)).fetchone() is not None
 
     def assert_parent_lock_held(self, root):
+        import fcntl
         with checked_fd(root / HOST_LOCK) as (fd, _):
             with self.assertRaises(BlockingIOError):
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

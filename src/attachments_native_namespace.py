@@ -1,7 +1,19 @@
-"""Private owner/managed namespace witnesses and reciprocal reservation fence."""
+"""Private owner/managed namespace witnesses and reciprocal reservation fence.
+
+POSIX: every record is opened by path without following a link and checked on its descriptor (owner, mode, one
+name, and the path still naming that same file), flushed with ``fsync``, and the host lock is ``flock``. Windows:
+the same records are opened through ``private_storage``'s no-link walk (each folder held by handle from the drive
+down, any reparse point refused) and checked on their handles (owner and access list, one name); identities are the
+volume serial and file index read from the handle (``file_identity``); new records are made private from the start
+through the held folder (``create``) and appended through an append-only handle (``open_append``); flushes go
+through a handle that can write (``FlushFileBuffers`` refuses a read-only one); and the host lock is the byte lock
+``private_storage.try_lock`` takes. The folders above the state folder are resolved once (``anchored``), as the
+attachment store resolves them, and the owner database's name is compared ignoring case and slashes, then by
+identity.
+"""
 from contextlib import closing, contextmanager
-import errno
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -12,6 +24,7 @@ import time
 
 from attachments_owner_guards import LINKS, OUTCOMES, OwnerAttachmentGuard, OwnerGuardError, _table
 from attachments_owner_marker import CLEAR, UNCERTAIN, sqlite_marker_available
+import private_storage as ps
 
 OWNER_DB = 'officer-messages.sqlite3'
 ANCHOR = 'native-attachment-namespace.expected'
@@ -69,7 +82,17 @@ def _id(st):
     return [st.st_dev, st.st_ino]
 
 
+def descriptor_identity(fd):
+    """The identity this module records for an open file: ``[st_dev, st_ino]`` of ``fstat`` on POSIX; on Windows the
+    volume serial and file index read from its handle (``private_storage.file_identity``)."""
+    if ps.WIN:
+        return list(ps.file_identity(fd)[:2])
+    return _id(os.fstat(fd))
+
+
 def _validate_fd(path, fd, *, directory=False):
+    if ps.WIN:
+        return _win_validate(path, fd)
     st = os.fstat(fd)
     _require(st.st_uid == os.getuid() and not st.st_mode & 0o077)
     _require(stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
@@ -79,6 +102,10 @@ def _validate_fd(path, fd, *, directory=False):
 
 @contextmanager
 def _open(path, *, flags=os.O_RDONLY, directory=False):
+    if ps.WIN:
+        with _win_open(path, flags=flags, directory=directory) as opened:
+            yield opened
+        return
     fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | (os.O_DIRECTORY if directory else 0), 0o600)
     try:
         yield fd, _validate_fd(path, fd, directory=directory)
@@ -86,9 +113,97 @@ def _open(path, *, flags=os.O_RDONLY, directory=False):
         os.close(fd)
 
 
+def _try_lock(fd):
+    """``private_storage.try_lock``; a POSIX without fcntl fails closed (NamespaceError), as the fence always has."""
+    try:
+        return ps.try_lock(fd)
+    except ImportError:
+        raise NamespaceError() from None
+
+
 def _sync_directory(path):
+    if ps.WIN:
+        with ps.open_folder(str(path), private=True, writable=True) as folder:
+            folder.sync()
+        return
     with _open(path, directory=True) as (fd, _):
         os.fsync(fd)
+
+
+def _flush(path, fd):
+    """Flush the file ``fd`` has open, read-only or not. POSIX: ``fsync`` on it. Windows: ``FlushFileBuffers`` needs a
+    handle that can write, so the same name is opened again to append through its held folder, checked to be the
+    same file, and flushed through that handle (Windows flushes a file's data whichever handle asks)."""
+    if not ps.WIN:
+        os.fsync(fd)
+        return
+    with ps.open_folder(str(path.parent), private=True, writable=True) as folder:
+        writer, _ = folder.open_append(path.name, create=False)
+        try:
+            _require(descriptor_identity(writer) == descriptor_identity(fd))
+            ps.sync_file(writer)
+        finally:
+            os.close(writer)
+
+
+@contextmanager
+def _win_open(path, *, flags, directory):
+    """Windows ``_open``: ``(fd, identity)`` through the no-link walk; a folder yields ``(None, identity)``. Without
+    ``O_CREAT`` or ``O_APPEND`` the file is opened read-only and must be private with one name; ``O_CREAT`` (always
+    with ``O_EXCL`` here) makes a new private file, and an existing name raises FileExistsError; ``O_APPEND`` opens
+    an existing file to append only, and it must be private with one name too."""
+    if directory:
+        with ps.open_folder(str(path), private=True) as folder:
+            yield None, list(folder.identity()[:2])
+        return
+    create, append = bool(flags & os.O_CREAT), bool(flags & os.O_APPEND)
+    _require(not create or flags & os.O_EXCL)
+    with ps.open_folder(str(path.parent), private=True, writable=create or append) as folder:
+        if create:
+            fd = folder.create(path.name)
+        elif append:
+            fd, _ = folder.open_append(path.name, create=False)
+        else:
+            fd = folder.open(path.name, single_link=True, private=True)
+        try:
+            if append:
+                ps.check_private_fd(fd, single_link=True)    # open_append itself asks only that nobody else can write
+            yield fd, descriptor_identity(fd)
+        finally:
+            os.close(fd)
+
+
+def _win_validate(path, fd):
+    """Windows ``_validate_fd`` for a file: private with one name on its handle, and its name, opened again through
+    the walk, still that same file."""
+    ps.check_private_fd(fd, single_link=True)
+    identity = descriptor_identity(fd)
+    with ps.open_folder(str(path.parent), private=True) as folder:
+        again = folder.open(path.name, single_link=True, private=True)
+        try:
+            _require(descriptor_identity(again) == identity)
+        finally:
+            os.close(again)
+    return identity
+
+
+def same_database_path(name, path):
+    """Whether SQLite's ``name`` for an open database is ``path``. POSIX: the same string. Windows: the same after
+    resolving the folders above the last name (``anchored``) and ignoring case and slashes; callers also compare the
+    file's identity, which is what decides."""
+    if not ps.WIN:
+        return name == str(path)
+    if type(name) is not str or not name:
+        return False
+
+    def canonical(value):
+        return ntpath.normcase(ntpath.normpath(ps.anchored(value)))
+    try:
+        return canonical(name) == canonical(str(path))
+    except (OSError, ValueError):
+        # A name the walk refuses by its shape is not taken as this file, so the check fails closed: one starting
+        # with two backslashes (a \\?\ long-path or device prefix, or a UNC share), a data stream, or a device name.
+        return False
 
 
 def _line(record):
@@ -120,7 +235,11 @@ def _identity(value):
 
 def _db_path(db, path, expected):
     names = [tuple(row) for row in db.execute('PRAGMA database_list')]
-    _require(names in ([(0, 'main', str(path))], [(0, 'main', str(path)), (1, 'temp', '')]))
+    if ps.WIN:
+        _require(len(names) in (1, 2) and names[0][:2] == (0, 'main') and same_database_path(names[0][2], path)
+                 and names[1:] in ([], [(1, 'temp', '')]))
+    else:
+        _require(names in ([(0, 'main', str(path))], [(0, 'main', str(path)), (1, 'temp', '')]))
     with _open(path) as (_, opened):
         _require(opened == expected)
 
@@ -135,6 +254,10 @@ def _reader(path, expected=None, *, strict=True):
         _require(expected is None or observed == expected)
         if strict:
             _sidecars_absent(path)
+        elif ps.WIN:
+            # SQLite makes its journal by name, with the folder's inherited access list and, when Motet runs
+            # elevated, Administrators as owner: the companion rule applies, as for the attachment store.
+            _require(ps.sqlite_companions_private(str(path)))
         else:
             for suffix in ('-journal', '-wal', '-shm'):
                 sidecar = Path(str(path) + suffix)
@@ -168,7 +291,9 @@ class NativeNamespaceFence:
     """The same permanent host flock fences both directions of reservation."""
 
     def __init__(self, root):
-        self.root = Path(os.path.abspath(root))
+        # Windows: the folders above the state folder (the user's profile, often moved with a junction) are resolved
+        # once; the walk then refuses a junction or link at the state folder or anything below it.
+        self.root = Path(ps.anchored(os.path.abspath(root)) if ps.WIN else os.path.abspath(root))
         self.host = self.root / HOST
         self.owner = self.root / OWNER_DB
         self.registry = self.root / MANAGED / REGISTRY
@@ -203,23 +328,24 @@ class NativeNamespaceFence:
 
     @contextmanager
     def host_fence(self):
+        """Hold the host lock for the body. POSIX: ``flock(LOCK_EX | LOCK_NB)``, retried for up to .35 s while another
+        holder has it (``private_storage.try_lock`` makes that call and reports EAGAIN, EWOULDBLOCK or EACCES as
+        held elsewhere). Windows: the same through ``try_lock``'s byte lock, released before its file closes
+        (Windows may keep a byte lock for a while after a close)."""
         with _qualified(), _open(self.host) as (fd, _):
-            try:
-                import fcntl            # POSIX only; imported here so this module still imports on Windows
-            except ImportError:
-                raise NamespaceError() from None
             deadline = time.monotonic() + .35
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError as error:
-                    if error.errno not in (errno.EACCES, errno.EAGAIN):
-                        raise
-                    _require(time.monotonic() < deadline)
-                    time.sleep(.005)
-            _validate_fd(self.host, fd)
-            yield fd
+            while not _try_lock(fd):
+                _require(time.monotonic() < deadline)
+                time.sleep(.005)
+            try:
+                _validate_fd(self.host, fd)
+                yield fd
+            finally:
+                if ps.WIN:
+                    try:
+                        ps.unlock(fd)
+                    except OSError:
+                        pass            # not held: closing is all that is left
 
     def _anchor(self, hostfd):
         _require(hostfd is not None)
@@ -231,7 +357,7 @@ class NativeNamespaceFence:
                      and type(value['v']) is int and value['v'] == 1 and _nonce(value['owner'])
                      and all(_identity(value[key]) for key in ('db', 'authority', 'host', 'root'))
                      and value['root'] == root and value['host'] == _validate_fd(self.host, hostfd))
-            os.fsync(fd)
+            _flush(self.anchor, fd)
         _sync_directory(self.root)
         return value
 
@@ -263,7 +389,7 @@ class NativeNamespaceFence:
                          and ready['nonce'] == intent['nonce'] and type(ready['files']) is dict
                          and set(ready['files']) == {MANAGED, REGISTRY, REGISTRY_LOCK, REGISTRY_EXPECTED, MANAGED_EXPECTED}
                          and all(_identity(value) for value in ready['files'].values()))
-            os.fsync(fd)
+            _flush(self.authority, fd)
         return values[-1]
 
     def _append(self, record, transition):
@@ -283,7 +409,7 @@ class NativeNamespaceFence:
                 files[name] = identity
                 if name in (REGISTRY_EXPECTED, MANAGED_EXPECTED):
                     _require(os.read(fd, 3) == b'1\n' and not os.read(fd, 1))
-                    os.fsync(fd)
+                    _flush(path, fd)
         _sync_directory(managed)
         _sync_directory(self.root)
         return files

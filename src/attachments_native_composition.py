@@ -10,7 +10,7 @@ import threading
 from attachments_materialize import Materializer
 from attachments_native_handoff import FictionalAdapterBinding, OfflineNativeHandoff
 from attachments_native_mirror import NativeOutcomeMirror
-from attachments_native_namespace import OWNER_DB, NamespaceError, NativeNamespaceFence
+from attachments_native_namespace import OWNER_DB, NamespaceError, NativeNamespaceFence, same_database_path
 from attachments_native_reads import NativeAgentReadService
 from attachments_native_receipts import NativeReadReceipts
 from attachments_owner_runtime import bind_owner_runtime
@@ -59,7 +59,10 @@ def _same_root(messaging, store):
     with store._gate():
         expected = str(Path(store.files.parent) / OWNER_DB)
     with messaging.lock:
-        if messaging.db.execute('PRAGMA database_list').fetchone() != (0, 'main', expected):
+        row = messaging.db.execute('PRAGMA database_list').fetchone()
+        # POSIX: the same string. Windows: the store resolves the folders above its own (``anchored``) and Windows
+        # names ignore case, so the names are compared that way (``same_database_path``).
+        if row is None or tuple(row[:2]) != (0, 'main') or not same_database_path(row[2], expected):
             _unavailable()
 
 

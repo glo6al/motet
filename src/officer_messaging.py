@@ -8,7 +8,7 @@ import errno
 import hmac
 import json
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 import os
 from pathlib import Path
@@ -44,6 +44,8 @@ CLAUDE_SETUP_HINT = 'Claude chats can be messaged once Claude is set up in Motet
 CLAUDE_CONNECT_HINT = 'Claude chats can be messaged once one connects through the Motet plugin.'
 RETAINED_STATE_UNAVAILABLE = ('Agent messaging cannot start here: its state folder holds attachment or managed-chat '
                               'records that this system cannot check safely yet.')
+RETAINED_STATE_FOREIGN = ('Agent messaging cannot start here: its state folder holds attachment records made by Motet '
+                          'on another computer or in another folder, and they cannot be used here.')
 STATE_FOLDER_REFUSED = 'Messaging state directory must be private and owned by you.'
 LOCK_REFUSED = 'Messaging lock must be a private regular file.'
 DATABASE_REFUSED = 'Messaging database must be a private regular file.'
@@ -126,10 +128,32 @@ def public(row):
     return result
 
 
-def posix_records_checkable():
-    """Attachment and managed-chat records, and Codex reply tracking, are checked with the POSIX folder walk, owner
-    and mode bits (and fcntl): macOS and Linux only."""
+def attachment_records_checkable():
+    """The attachment namespace and managed-registry records are checked through private_storage's no-link folder
+    walk (POSIX descriptors, owner and mode; Windows handles, owner and access list) and its lock: wherever that walk
+    is available, Windows included."""
+    return private_storage.folder_walk_available()
+
+
+def codex_records_checkable():
+    """Codex reply tracking checks transcripts with POSIX owner and mode rules: macOS and Linux only."""
     return not private_storage.WIN and private_storage.folder_walk_available()
+
+
+@contextmanager
+def foreign_records_refused():
+    """Windows: a refusal from the attachment namespace fence becomes RETAINED_STATE_FOREIGN, a reason shown as it
+    is. Nothing on Windows makes these records yet (only delivery to agent chats installs them, and it is off there),
+    so any that exist were made by Motet on another computer or in another folder, and the identities they record
+    belong there. Revisit once that delivery is ported. POSIX keeps its own refusal (the generic storage reason)."""
+    if not private_storage.WIN:
+        yield
+        return
+    from attachments_native_namespace import NamespaceError
+    try:
+        yield
+    except NamespaceError:
+        raise MessagingStorageUnavailable(RETAINED_STATE_FOREIGN) from None
 
 
 def private_state_folder(state_dir):
@@ -212,14 +236,17 @@ class MessagingStore:
                 raise BlockingIOError(errno.EWOULDBLOCK, os.strerror(errno.EWOULDBLOCK))
             path = os.path.join(state_dir, 'officer-messages.sqlite3')
             fence = self._retained_namespace_before_open(state_dir)
-            with self.lock, (fence.owner_open() if fence is not None else nullcontext()) as expected:
+            with foreign_records_refused(), self.lock, \
+                    (fence.owner_open() if fence is not None else nullcontext()) as expected:
                 # The checked descriptor stays open while SQLite opens the same name. On Windows it does not
                 # share delete, so the file cannot be renamed or replaced in between.
                 fd = private_state_file(path, expected is None, DATABASE_REFUSED)
                 try:
-                    st = os.fstat(fd)
-                    if expected is not None and [st.st_dev, st.st_ino] != expected:
-                        raise OSError(DATABASE_REFUSED)
+                    if expected is not None:
+                        # [st_dev, st_ino] on POSIX; the handle's volume serial and file index on Windows.
+                        from attachments_native_namespace import descriptor_identity
+                        if descriptor_identity(fd) != expected:
+                            raise OSError(DATABASE_REFUSED)
                     if private_storage.WIN:
                         check_database_companions(path)
                     if expected is not None:
@@ -232,6 +259,8 @@ class MessagingStore:
                     os.close(fd)
             self.db.execute('PRAGMA secure_delete = ON')
             if fence is None and self.db.execute("SELECT 1 FROM main.sqlite_schema WHERE name='owner_attachment_namespace_identity'").fetchone():
+                if private_storage.WIN:          # copied without its witness: see foreign_records_refused
+                    raise MessagingStorageUnavailable(RETAINED_STATE_FOREIGN)
                 raise OwnerGuardError('The retained owner namespace witness is unavailable.')
             self._attachment_guard = OwnerAttachmentGuard.probe(self.db, lock=self.lock)
             if self._attachment_guard is None:
@@ -296,14 +325,18 @@ class MessagingStore:
                       root / 'managed-claude' / 'registry.sqlite3')
         if not any(present(path) for path in candidates):
             return None
-        if not posix_records_checkable():
-            # The fence opens these records by the POSIX folder walk and fcntl, so it runs on macOS and Linux only.
-            # Elsewhere they can only have come from a Mac or Linux copy of this folder; refuse rather than open the
+        if not attachment_records_checkable():
+            # The fence opens these records through the no-link folder walk; without it, refuse rather than open the
             # database unfenced.
             raise MessagingStorageUnavailable(RETAINED_STATE_UNAVAILABLE)
         from attachments_native_namespace import NativeNamespaceFence
-        fence = NativeNamespaceFence(state_dir)
-        return fence if fence.detected() else None
+        # No witness (detected() False: say an old managed registry that never had an identity, and no anchor or
+        # authority) means the owner side was never installed here, so there is nothing to fence and the database
+        # opens as it always has, on every system. An owner database that does carry the owner identity without its
+        # witness is refused below.
+        with foreign_records_refused():
+            fence = NativeNamespaceFence(state_dir)
+            return fence if fence.detected() else None
 
     def claim_ask(self, request_id, user_text):
         """Claim interpretation once. A crash while planning never reruns a model."""
@@ -1722,7 +1755,7 @@ class MessagingStore:
         for row in rows:
             if row.get('transport') == claude_mod.TRANSPORT:
                 continue  # HTTP claims/events exclusively own these rows; no stale tick writeback.
-            if row.get('runtime') == 'codex' and not posix_records_checkable():
+            if row.get('runtime') == 'codex' and not codex_records_checkable():
                 # Windows: a Codex row can only have come from a copy of a Mac's folder, since sending to Codex needs
                 # the Mac app. Its sending and reply tracking check transcripts with POSIX owner and mode rules;
                 # leave the row exactly as it is.
