@@ -105,6 +105,12 @@ jobs:
       - run: python tests/test_managed_windows_control.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # Managed Claude's identity and executable (step 8b.4): the SMBIOS parser, pins and architecture on every
+      # system, locating and refusing the binary under the Windows simulation, and the firmware call, deny-writers
+      # handle and junction refusal on real Windows.
+      - run: python tests/test_managed_windows_identity.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: node docs/fixtures/new-chat/managed-fixture.test.mjs
         if: ${{ !cancelled() }}
         timeout-minutes: 5

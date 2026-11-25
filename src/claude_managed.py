@@ -58,7 +58,10 @@ PUBLIC_STATES = {'queued': 'sending', 'dispatching': 'sending', 'delivered': 'aw
 
 
 def local_configuration_identity():
-    """Identify the local Mac, user and pinned executable without starting Claude."""
+    """Identify the local Mac, user and pinned executable without starting Claude. Windows: the SMBIOS system UUID
+    and the process token's SID, and the pinned build for this machine's architecture (claude_managed_windows)."""
+    if ps.WIN:
+        return _windows_configuration_identity()
     if sys.platform != 'darwin':
         raise ValueError('Managed Claude requires macOS.')
     output = subprocess.run(['/usr/sbin/ioreg', '-a', '-r', '-d', '1', '-c', 'IOPlatformExpertDevice'],
@@ -78,6 +81,15 @@ def local_configuration_identity():
     host = hashlib.sha256(f'watch-managed-claude/v1/{machine}/{os.getuid()}'.encode('ascii')).hexdigest()
     return dict(schemaVersion=1, hostFingerprint=host, profile='normal',
                 executableVersion=VERSION, executableSha256=PINNED_SHA256)
+
+
+def _windows_configuration_identity():
+    import claude_managed_windows as windows
+    pin = windows.windows_pin()
+    if pin is None:
+        raise ValueError('No Claude Code build is pinned for this machine.')
+    return dict(schemaVersion=1, hostFingerprint=windows.host_fingerprint(windows.system_uuid(), windows.user_sid()),
+                profile='normal', executableVersion=VERSION, executableSha256=pin[0])
 
 
 def _readiness_json_object(pairs):
@@ -515,7 +527,33 @@ class ManagedClaude:
         if not self.enabled or self.demo or self.closed:
             _fail('managed_disabled', 503)
 
+    def _windows_executable(self):
+        """Windows: Claude Code 2.1.323 for this machine's architecture, found only where the native installer is
+        expected to keep it (claude_managed_windows.locate_claude), refused if it is a shim, an alias, the desktop
+        app's copy or reached through a link or junction, and hashed through a handle that shares reading only."""
+        import claude_managed_windows as windows
+        try:
+            if self._test:
+                configured = self._test.executable
+                if not isinstance(configured, dict) or set(configured) != {'path', 'version', 'sha256'}:
+                    raise ValueError()
+                checked = (configured['sha256'], os.stat(configured['path']).st_size)
+            else:
+                pin = windows.windows_pin()
+                if pin is None:
+                    raise ValueError()
+                configured = {'path': windows.locate_claude(self.home), 'version': VERSION, 'sha256': pin[0]}
+                checked = pin
+            if type(configured['path']) is not str or configured['version'] != VERSION:
+                raise ValueError()
+            os.close(windows.open_pinned(configured['path'], checked))
+            return dict(configured)
+        except (OSError, ValueError, TypeError, KeyError):
+            _fail('app_version_unsupported', 503)
+
     def _executable(self):
+        if ps.WIN:
+            return self._windows_executable()
         configured = (self._test.executable if self._test else {
             'path': str(self.home / '.local/share/claude/versions' / VERSION),
             'version': VERSION, 'sha256': PINNED_SHA256})

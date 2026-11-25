@@ -69,7 +69,7 @@ class RunFolder:
             'folder': {'id': 'fictional', 'revision': 'one', 'label': 'Fictional orchard',
                        'path': str(self.project), 'device': device, 'inode': inode},
             'executable': {'path': os.path.abspath(os.sep + os.path.join('fictional', 'claude')),
-                           'version': runner_module.PINNED_VERSION, 'sha256': runner_module.PINNED_SHA256},
+                           'version': runner_module.PINNED_VERSION, 'sha256': runner_module._pinned_sha256()},
             'profile': 'restricted_test', 'createdAt': 1000}
         for name, data in (('manifest.json', json.dumps(self.manifest).encode()), ('token', self.token.encode()),
                            ('run.lock', b'')):
@@ -181,11 +181,13 @@ class SimulatedControlRecordTests(unittest.TestCase):
         from windows_simulation import simulated_windows
         stack = ExitStack()
         self.calls = stack.enter_context(simulated_windows())
+        stack.enter_context(mock.patch.object(windows, 'native_architecture', return_value='x64'))
         self.addCleanup(stack.close)
         self.base = fixture(self)
         with ps.open_folder(str(self.base.project)) as held:
             device, inode = held.identity()[:2]
         self.base.manifest['folder'].update(device=device, inode=inode)
+        self.base.manifest['executable']['sha256'] = runner_module._pinned_sha256()     # the Windows x64 pin
         self.base.write('manifest.json', json.dumps(self.base.manifest))
 
     def test_the_supervisor_records_its_pipe_privately_then_removes_the_record(self):

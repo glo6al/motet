@@ -826,3 +826,185 @@ def open_pipe(name, server_pid, seconds=CONTROL_SECONDS):
         k.CloseHandle(handle)
         raise
     return PipeConnection(handle, lambda: k.CloseHandle(handle))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Identity and the executable (step 8b.4).
+#
+# Machine and user: the readiness record names this machine by its SMBIOS system UUID (structure type 1, read with
+# GetSystemFirmwareTable('RSMB'), the hardware UUID macOS's ioreg reports there) and this user by the SID of the
+# process token, in place of the Mac's IOPlatformUUID and uid. An all-zero or all-FF UUID (not set, or not present)
+# is refused, as the Mac refuses zero; MachineGuid (copied with disk images) is never used.
+#
+# The executable: Claude Code 2.1.323's own Windows build for this machine's real architecture (an ARM64 PC
+# running x64 Python still gets the ARM64 build), at %USERPROFILE%\.local\share\claude\versions\2.1.323, with or
+# without ".exe". That location is what the native installer is expected to write; it has not been checked on a
+# real PC yet (docs/WINDOWS.md's checklist). An npm claude.cmd or .bat shim, an app execution alias in a
+# WindowsApps folder and the Claude desktop app's own copy are refused, as is anything reached through a link or
+# junction (the no-link walk). The binary is opened with a handle that shares reading only, hashed through it, and
+# the handle is kept open until Claude has been started from that same file, so it cannot be replaced in between.
+
+CLAUDE_VERSION = '2.1.323'
+# Claude Code 2.1.323's release manifest: the Windows builds' SHA-256 and size, by native machine architecture.
+WINDOWS_PINS = {
+    'x64': ('5064e6e0572dca86257363ca04d48653eef20ef27f1bd04b504ed7199ed3fd13', 367634080),
+    'arm64': ('3071c54f466e40e668c273b53ed8942efce35bf069d66a69668f74299b0cb888', 349943968),
+}
+IMAGE_FILE_MACHINES = {0x8664: 'x64', 0xAA64: 'arm64'}      # IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64
+WINDOWS_HASH_SECONDS = 60      # hashing ~367 MB while Microsoft Defender scans it (POSIX keeps 10 s)
+RSMB = 0x52534D42              # 'RSMB': the raw SMBIOS firmware table provider
+
+
+def parse_smbios_uuid(raw):
+    """The system UUID from a raw SMBIOS table as GetSystemFirmwareTable('RSMB') returns it (the RawSMBIOSData
+    header: calling method, major and minor version, DMI revision, a 32-bit length, then the table). Structure type 1
+    holds the UUID at offset 8; from SMBIOS 2.6 its first three fields are little-endian. ValueError for a short or
+    malformed table, a missing type 1, or an all-zero or all-FF UUID."""
+    import struct
+    import uuid
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) < 8:
+        raise ValueError('SMBIOS table unavailable')
+    major, minor, length = raw[1], raw[2], struct.unpack_from('<I', raw, 4)[0]
+    table = bytes(raw[8:8 + length])
+    if len(table) != length:
+        raise ValueError('SMBIOS table truncated')
+    offset = 0
+    while offset + 4 <= len(table):
+        kind, size = table[offset], table[offset + 1]
+        if size < 4 or offset + size > len(table):
+            raise ValueError('SMBIOS structure truncated')
+        if kind == 1:
+            if size < 0x19:
+                raise ValueError('SMBIOS system information has no UUID')
+            value = table[offset + 8:offset + 24]
+            if value in (b'\x00' * 16, b'\xff' * 16):
+                raise ValueError('SMBIOS system UUID is not set')
+            return uuid.UUID(bytes_le=value) if (major, minor) >= (2, 6) else uuid.UUID(bytes=value)
+        end = table.find(b'\x00\x00', offset + size)     # the structure's strings end with two NULs
+        if end < 0:
+            raise ValueError('SMBIOS strings truncated')
+        if kind == 127:                                  # end of table
+            break
+        offset = end + 2
+    raise ValueError('SMBIOS system information missing')
+
+
+def system_uuid():
+    """This machine's SMBIOS system UUID (Windows: GetSystemFirmwareTable('RSMB'), no administrator rights needed)."""
+    ctypes, w = _api()[:2]
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.GetSystemFirmwareTable.argtypes = [w.DWORD, w.DWORD, w.LPVOID, w.DWORD]
+    k.GetSystemFirmwareTable.restype = w.UINT
+    size = k.GetSystemFirmwareTable(RSMB, 0, None, 0)
+    if not size or size > 16 * 1024 * 1024:
+        raise _failed('SMBIOS table unavailable')
+    buffer = ctypes.create_string_buffer(size)
+    if k.GetSystemFirmwareTable(RSMB, 0, buffer, size) != size:
+        raise _failed('SMBIOS table unavailable')
+    return parse_smbios_uuid(buffer.raw)
+
+
+def user_sid():
+    """The process token's user SID, as text (private_storage reads it the same way for its access lists)."""
+    import private_storage as ps
+    with ps._CurrentUser() as user:
+        return user.text
+
+
+def host_fingerprint(machine, sid):
+    """The readiness record's host fingerprint on Windows. The Mac's is built from IOPlatformUUID and the uid, under
+    the same version label; the "windows" part keeps the two apart."""
+    import hashlib
+    return hashlib.sha256(('watch-managed-claude/v1/windows/%s/%s' % (machine, sid)).encode('ascii')).hexdigest()
+
+
+def native_architecture(query=None):
+    """'x64' or 'arm64' for this machine's own architecture, else None. IsWow64Process2 gives the native machine
+    even when this Python is emulated (x64 Python on an ARM64 PC); ``query`` stands in for it in tests and returns
+    the native IMAGE_FILE_MACHINE value."""
+    if query is None:
+        ctypes, w, k = _api()[:3]
+        query_function = getattr(k, 'IsWow64Process2', None)
+        if query_function is None:
+            return None                                  # before Windows 10 1709: not qualified
+        query_function.argtypes = [w.HANDLE, ctypes.POINTER(w.USHORT), ctypes.POINTER(w.USHORT)]
+        query_function.restype = w.BOOL
+
+        def query():
+            process, native = w.USHORT(), w.USHORT()
+            if not query_function(k.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(native)):
+                raise _failed('machine architecture unavailable')
+            return native.value
+    return IMAGE_FILE_MACHINES.get(query())
+
+
+def windows_pin(architecture=None):
+    """The (SHA-256, size) of Claude Code 2.1.323's build for ``architecture`` (default: this machine's), or None
+    where there is no build Motet pins (32-bit Windows, or an unknown machine)."""
+    return WINDOWS_PINS.get(architecture if architecture is not None else native_architecture())
+
+
+def claude_candidates(home):
+    """Where the native installer keeps Claude Code 2.1.323 on Windows (unverified on a real PC): under the
+    resolved home, ``.local\\share\\claude\\versions\\2.1.323``, with or without ``.exe``."""
+    base = os.path.join(os.path.realpath(os.fspath(home)), '.local', 'share', 'claude', 'versions')
+    return [os.path.join(base, CLAUDE_VERSION), os.path.join(base, CLAUDE_VERSION + '.exe')]
+
+
+def refused_location(path):
+    """A plain reason Motet does not run the program at ``path``, or None: npm's claude.cmd or .bat shims need a
+    shell, an app execution alias in a WindowsApps folder may start an app instead, and the Claude desktop app's
+    own copy is not the pinned build."""
+    import ntpath
+    lowered = ntpath.normcase(os.fspath(path))
+    parts = lowered.replace('/', '\\').split('\\')
+    if lowered.endswith(('.cmd', '.bat')):
+        return 'a .cmd or .bat file needs a shell'
+    if 'windowsapps' in parts:
+        return 'an app execution alias is not the program itself'   # and the desktop app's packaged copy
+    if 'anthropicclaude' in parts:
+        return "the Claude desktop app's own copy is not the pinned build"
+    return None
+
+
+def locate_claude(home):
+    """The first existing candidate (``claude_candidates``), or FileNotFoundError."""
+    for candidate in claude_candidates(home):
+        if os.path.lexists(candidate):
+            return candidate
+    raise FileNotFoundError(2, 'Claude Code %s is not installed' % CLAUDE_VERSION)
+
+
+def hash_open_file(fd, seconds, read=os.read, clock=None):
+    """SHA-256 of what ``fd`` has open, read through it in 1 MiB pieces within ``seconds`` (ValueError when the
+    bound passes). ``read`` and ``clock`` stand in for os.read and time.monotonic in tests."""
+    import hashlib
+    import time
+    clock = clock or time.monotonic
+    digest, deadline = hashlib.sha256(), clock() + seconds
+    while True:
+        chunk = read(fd, 1024 * 1024)
+        if not chunk:
+            return digest.hexdigest()
+        if clock() > deadline:
+            raise ValueError('hashing took too long')
+        digest.update(chunk)
+
+
+def open_pinned(path, pin):
+    """Open the program at ``path`` through the no-link walk, sharing reading only (nobody can write, rename or
+    delete it while the descriptor is open), and check it against ``pin`` (SHA-256, size) by hashing through that
+    same descriptor within WINDOWS_HASH_SECONDS. Returns the open descriptor, which the caller keeps until the
+    program has been started from it, and closes in every path; ValueError or OSError if it is refused."""
+    import private_storage as ps
+    if pin is None or refused_location(path) is not None or os.path.realpath(path) != path:
+        raise ValueError('not the pinned Claude Code')
+    fd = ps.open_no_links(path, single_link=True, deny_writers=True)
+    try:
+        sha256, size = pin
+        if os.fstat(fd).st_size != size or hash_open_file(fd, WINDOWS_HASH_SECONDS) != sha256:
+            raise ValueError('not the pinned Claude Code')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise

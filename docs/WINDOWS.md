@@ -276,6 +276,14 @@ Read the output, then paste it into a new [issue](https://github.com/glo6al/mote
 
 **What it does not do:** it changes nothing of yours, writes no files, makes no network connection, opens no app window and sends no message. It reads no file contents beyond what each check needs, and prints none. It only checks whether `%USERPROFILE%\.claude\settings.json` has a hooks section, and prints just the hook event names. Your profile path, user name, computer name, e-mail addresses and anything that looks like a key are replaced before printing, but redaction is not perfect: **please read the output before you post it** and remove anything you would rather not share.
 
+### Still to check on a real PC: Claude chats Motet starts
+
+These are not on yet; they need a real Windows PC before they are switched on:
+
+- **Where Claude Code is installed.** Motet looks for Claude Code 2.1.323 only at `%USERPROFILE%\.local\share\claude\versions\2.1.323` (with or without `.exe`), where the native installer is expected to keep it, and checks it against that build's published SHA-256 for your PC's architecture (64-bit Intel or AMD, or ARM). That path has not been seen on a real PC yet. An npm `claude.cmd`, an app alias in `WindowsApps` and the Claude desktop app's own copy are never used.
+- **How long the check takes.** Motet reads the whole program (about 350 MB) to check it, allowing up to 60 seconds while Microsoft Defender scans it.
+- **Git Bash.** Claude Code on Windows prefers Git Bash for its shell commands (`CLAUDE_CODE_GIT_BASH_PATH`); whether Motet should point it at the Git for Windows it already checks is still open.
+
 ## Your feedback
 
 Please tell us what happened, even if it was "everything worked". [Open an issue](https://github.com/glo6al/motet/issues/new) titled `Windows: …`.
