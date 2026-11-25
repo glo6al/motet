@@ -25,11 +25,9 @@ import test_officer_document_ledger as execution_fixtures
 from test_officer_documents import response, wire
 from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
-# A call that must time out while the worker is held at a gated step (its connect, request or response) needs a
-# deadline the worker can reach that step within. On POSIX 50 ms is plenty; on Windows the durable store commits on
-# the way flush to disk and take longer, so the deadline is 5 s there (margin for a loaded runner). The step stays
-# held either way.
-GATED = 5 if os.name == 'nt' else .05
+# How long a fake's gated step (connect, request or response read) stays held before it gives up. Tests release
+# their gates themselves or in tearDown; this only bounds a test that fails, so it is generous for slow runners.
+HOLD = 30
 
 KEY = 'fictional-host-key'
 REAL_TLS_CONTEXT = transport._tls_context
@@ -55,7 +53,7 @@ class FakeResponse:
     def read(self, size):
         self.entered.set()
         if self.gate is not None:
-            if not self.gate.wait(3): raise RuntimeError('fictional read test gate timed out')
+            if not self.gate.wait(HOLD): raise RuntimeError('fictional read test gate timed out')
         out = self.raw[self.offset:self.offset + size]
         self.offset += len(out)
         self.length -= len(out)
@@ -78,12 +76,12 @@ class FakeConnection:
     def connect(self):
         self.connects += 1
         self.connect_entered.set()
-        if self.connect_gate is not None and not self.connect_gate.wait(3):
+        if self.connect_gate is not None and not self.connect_gate.wait(HOLD):
             raise RuntimeError('fictional connect test gate timed out')
         self.sock = FakeSocket()
     def request(self, method, path, *, body, headers):
         self.request_entered.set()
-        if self.request_gate is not None and not self.request_gate.wait(3):
+        if self.request_gate is not None and not self.request_gate.wait(HOLD):
             raise RuntimeError('fictional send test gate timed out')
         # Model HTTPConnection's actual no-reconnect contract, not just counters.
         if self.sock is None:
@@ -154,6 +152,26 @@ class TransportTests(unittest.TestCase):
         result = item.call(prepared, self.f.l, permit, lease, credential, time.monotonic() + seconds)
         if type(result) is transport.OwnedDocumentResult: self.results.append(result)
         return result
+    def held_call(self, connection, ticket, entered):
+        """Call with a controlled clock whose deadline passes only after the worker is held at its gated step.
+
+        It waits on the step's event rather than guessing a deadline, so a slow machine (each durable store commit on
+        the way flushes to disk on Windows) cannot make the call return before the step is reached, and a deadline
+        longer than the fake's hold cannot let the step give up first."""
+        stamp = [time.monotonic()]
+        item, factory = self.make(connection, clock=lambda: stamp[0])
+        _, _, permit, prepared, lease = ticket
+        results, errors = [], []
+        def run():
+            try: results.append(item.call(prepared, self.f.l, permit, lease, lambda: KEY, stamp[0] + .1))
+            except BaseException as error: errors.append(error)
+        caller = threading.Thread(target=run, daemon=True); caller.start()
+        self.assertTrue(entered.wait(HOLD), 'The worker did not reach its held step.')
+        stamp[0] += 1                           # now past the deadline: the waiting call abandons the held worker
+        caller.join(HOLD)
+        self.assertFalse(caller.is_alive(), 'The call did not return after its controlled deadline.')
+        self.assertEqual(errors, [])
+        return item, factory, results[0]
     def rejected(self, code, fn):
         with self.assertRaises(transport.TransportRejected) as caught: fn()
         self.assertEqual(caught.exception.code, code)
@@ -250,8 +268,7 @@ class TransportTests(unittest.TestCase):
         ticket = self.ticket()
         gate = threading.Event(); self.release_events.append(gate)
         reply = FakeResponse(wire(response('Fictional answer.',citations=False)),gate=gate)
-        item, factory = self.make(FakeConnection(reply))
-        result = self.call(item,ticket,seconds=GATED)
+        item, factory, result = self.held_call(FakeConnection(reply), ticket, reply.entered)
         self.assertEqual(result.state,'unknown')
         self.assertTrue(reply.entered.is_set())
         source = self.f.sources[0]
@@ -394,8 +411,8 @@ class TransportTests(unittest.TestCase):
 
     def test_delayed_connect_after_abandon_never_posts(self):
         ticket=self.ticket();gate=threading.Event();self.release_events.append(gate)
-        connection=FakeConnection(connect_gate=gate);item,factory=self.make(connection)
-        result=self.call(item,ticket,seconds=GATED)
+        connection=FakeConnection(connect_gate=gate)
+        item,factory,result=self.held_call(connection,ticket,connection.connect_entered)
         self.assertTrue(connection.connect_entered.is_set());self.assertFalse(result.dispatch_started)
         self.assertTrue(self.store.files.io_active());self.busy()
         gate.set();item.close(timeout=2)
@@ -404,8 +421,8 @@ class TransportTests(unittest.TestCase):
 
     def test_close_between_connect_and_send_does_not_reconnect(self):
         ticket=self.ticket();gate=threading.Event();self.release_events.append(gate)
-        connection=FakeConnection(request_gate=gate);item,factory=self.make(connection)
-        result=self.call(item,ticket,seconds=GATED)
+        connection=FakeConnection(request_gate=gate)
+        item,factory,result=self.held_call(connection,ticket,connection.request_entered)
         self.assertTrue(connection.request_entered.is_set());self.assertTrue(result.dispatch_started)
         # Simulate the real HTTPConnection.close race: sock=None would trigger
         # reconnect on request/send unless auto_open has been disabled.

@@ -21,7 +21,7 @@ from attachments_types import AttachmentError, canonical
 from codex_attachment_adapter import FictionalCodexSource, FictionalQueueCommand, OfflineCodexAttachmentAdapter
 from codex_attachment_evidence import EvidenceUnavailable
 from test_attachments_foundation import fence, metadata
-from test_codex_attachment_evidence import event, line, pin, sha, user
+from test_codex_attachment_evidence import event, line, pin, sha, unsupported, user
 
 
 REPLY = 'The fictional orchard label is blue. 🧪'
@@ -145,8 +145,7 @@ class CodexFixture(fixture.NativeFixture):
             return self.materialize(self.prepare(draft=d))
 
 
-@unittest.skipUnless(os.name == 'posix' and fixture.GIT and hasattr(sqlite3.Connection, 'deserialize'),
-                     'Disposable Git and SQLite descriptor snapshots are required.')
+@unittest.skipIf(unsupported() or not fixture.GIT, unsupported() or 'The native delivery fixture needs Git.')
 class CodexAdapterTests(unittest.TestCase):
     def build(self, *, pdf=False):
         f = CodexFixture(self)
@@ -579,9 +578,13 @@ class OfflineBoundaryTests(unittest.TestCase):
         restricted = {'officer_messaging', 'codex_new_chat', 'codex_desktop_control', 'subprocess', 'socket',
                       'peer_bridge', 'native_observation', 'claude_mod'}
         for name in ('attachments_native_handoff.py', 'codex_attachment_adapter.py', 'codex_attachment_evidence.py'):
-            tree = ast.parse((root / name).read_text(), filename=name)
+            tree = ast.parse((root / name).read_text(encoding='utf-8'), filename=name)
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     self.assertTrue(restricted.isdisjoint(alias.name.split('.')[-1] for alias in node.names), name)
                 elif isinstance(node, ast.ImportFrom):
                     self.assertNotIn((node.module or '').split('.')[-1], restricted, name)
+
+
+if __name__ == '__main__':
+    unittest.main()

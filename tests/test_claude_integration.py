@@ -106,7 +106,13 @@ class IntegrationTests(unittest.TestCase):
                 record = claude_channel.exchange(descriptor, owner_id)
                 self.assertTrue(record['peer_input_seen'])
                 self.assertEqual(record['origin'], 'owner')
-                self.assertEqual(claude_channel.exchange(descriptor, peer_id, origin='peer')['reply'], 'Peer received')
+                # The simulated peer replies to the owner request first, so its own reply can still be on the way.
+                deadline = time.monotonic() + 10
+                while not (peer_reply := claude_channel.exchange(descriptor, peer_id, origin='peer')['reply']):
+                    if peer.poll() is not None: self.fail('Simulated peer exited')
+                    if time.monotonic() > deadline: self.fail('Peer reply timed out')
+                    time.sleep(.02)
+                self.assertEqual(peer_reply, 'Peer received')
                 store.close(); store = None
                 store = MessagingStore(str(base / 'state'), str(base / 'codex'), channel_root=str(channel_root))
                 self.assertEqual(store.snapshot()['requests'][0]['delivery_warning'], result['delivery_warning'])

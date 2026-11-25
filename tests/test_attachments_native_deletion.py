@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from attachments_native_fixture import EPOCH, FaultConnection, NativeFixture, fence, metadata
+from attachments_native_fixture import EPOCH, GIT, FaultConnection, NativeFixture, fence, metadata
 from attachments_catalogue import Catalogue, HistorySelection
 from attachments_deletion_slots import COPY_PREVIEW, COPY_RECEIPT, SOURCE_RECEIPT, ZERO_ID
 from attachments_materialize import Materializer, RetainedCopyCleanup, WorkspaceDirectories
@@ -116,6 +116,10 @@ def exit_after_workspace_close_error(binding, context, operation, revision, path
     os._exit(31)
 
 
+# Delivery to agent chats is not ported to Windows (NATIVE_ATTACHMENT_DELIVERY_HOST keeps it off there), and this
+# deletion of delivered copies is built on it. Elsewhere its fixture needs Git.
+@unittest.skipUnless(os.name == 'posix' and GIT, 'Delivery to agent chats is off on Windows (not ported)'
+                     if os.name != 'posix' else 'The native delivery fixture needs Git.')
 class NativeDeletionTest(unittest.TestCase):
     def setUp(self):
         self.native = NativeFixture(self)
@@ -293,7 +297,11 @@ class NativeDeletionTest(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError) as caught:
             for _ in range(pages + 7):
                 self.db.execute('INSERT INTO fictional_filler VALUES (zeroblob(3900))')
-        self.assertEqual(caught.exception.sqlite_errorcode, sqlite3.SQLITE_FULL)
+        if hasattr(caught.exception, 'sqlite_errorcode'):
+            self.assertEqual(caught.exception.sqlite_errorcode, sqlite3.SQLITE_FULL)
+        else:
+            # Python 3.9 and 3.10 expose only SQLite's text, which for SQLITE_FULL is this fixed message.
+            self.assertEqual(caught.exception.args, ('database or disk is full',))
         self.assertEqual(self.db.execute('PRAGMA freelist_count').fetchone()[0], 0)
         schema = self.db.execute('PRAGMA schema_version').fetchone()[0]
         preview = self.prepare(r)
@@ -1159,3 +1167,7 @@ class NativeDeletionTest(unittest.TestCase):
         with self.assertRaises(AttachmentError):
             self.d.history(self.scope)
         self.assertEqual(self.d.file_details(self.scope, r['id'], self.source(r))['id'], self.source(r))
+
+
+if __name__ == '__main__':
+    unittest.main()

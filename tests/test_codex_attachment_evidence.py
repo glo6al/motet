@@ -44,7 +44,18 @@ def user(text, **metadata):
         'content': [{'type': 'input_text', 'text': text}], **metadata})
 
 
-@unittest.skipUnless(os.name == 'posix' and hasattr(sqlite3.Connection, 'deserialize'), 'Offline descriptor and SQLite snapshot support required.')
+def unsupported():
+    """Why Motet's Codex evidence reader is unavailable here, or None. It refuses without these by design."""
+    if os.name != 'posix':
+        return ('Delivery to agent chats, Codex included, is off on Windows (not ported); this reader also opens '
+                'Codex files with POSIX descriptors.')
+    if not hasattr(sqlite3.Connection, 'deserialize'):
+        return ('Codex attachment evidence reads a snapshot of the Codex index with sqlite3 deserialize '
+                '(Python 3.11 or later); Motet refuses it on older Pythons.')
+    return None
+
+
+@unittest.skipIf(unsupported(), unsupported())
 class CodexEvidenceTests(unittest.TestCase):
     def setUp(self):
         shared = tempfile.TemporaryDirectory()
@@ -538,7 +549,7 @@ class UnmountedEvidenceTests(unittest.TestCase):
         for file in source.rglob('*.py'):
             if file == source / 'codex_attachment_evidence.py':
                 continue
-            tree = ast.parse(file.read_text(), filename=file.name)
+            tree = ast.parse(file.read_text(encoding='utf-8'), filename=file.name)
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     self.assertFalse(any(part.name.split('.')[-1] == 'codex_attachment_evidence' for part in node.names), file.name)
@@ -548,3 +559,7 @@ class UnmountedEvidenceTests(unittest.TestCase):
                     self.assertNotEqual((node.module or '').split('.')[-1], 'codex_attachment_evidence', file.name)
                 if isinstance(node, ast.Constant) and isinstance(node.value, str):
                     self.assertNotEqual(node.value, 'codex_attachment_evidence', file.name)
+
+
+if __name__ == '__main__':
+    unittest.main()
