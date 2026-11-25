@@ -560,13 +560,18 @@ class _Operation:
 
     def __init__(self, handle, buffer=None):
         ctypes, w, k, Overlapped, _ = _pipe_api()
-        self.handle, self.buffer, self.pending = handle, buffer, False
+        self.handle, self.buffer, self.pending, self.unconfirmed = handle, buffer, False, False
         self.event = k.CreateEventW(None, True, False, None)
         if not self.event:
             raise _pipe_error('event unavailable')
-        self.overlapped = Overlapped()
-        self.overlapped.hEvent = self.event
-        self.count = w.DWORD()
+        try:
+            self.overlapped = Overlapped()
+            self.overlapped.hEvent = self.event
+            self.count = w.DWORD()
+        except BaseException:
+            k.CloseHandle(self.event)          # nothing was started with it
+            self.event = None
+            raise
 
     def started(self, result, code):
         """Record what the call that should have started the operation returned (its BOOL and the error it set). A
@@ -582,9 +587,12 @@ class _Operation:
         ctypes, w, k = _pipe_api()[:3]
         if not self.pending:
             return True
+        if self.unconfirmed:
+            return False                        # a cancel already went unconfirmed: never wait for it again
         if k.CancelIoEx(self.handle, ctypes.byref(self.overlapped)) or ctypes.get_last_error() != ERROR_NOT_FOUND:
             # Running, or unknown: wait for its end, bounded, through its own event.
             if k.WaitForSingleObject(self.event, 5000) != WAIT_OBJECT_0:
+                self.unconfirmed = True
                 return False
         self.pending = False
         return True
@@ -614,10 +622,12 @@ class _Operation:
 
     def close(self):
         """Free the event (and with it the OVERLAPPED and buffer) only once the operation is confirmed over; one
-        Windows never confirms is kept for the life of the process instead."""
+        Windows never confirms is kept for the life of the process instead. It is kept first and let go only after
+        the confirmation, so an interrupt during the cancel cannot free a pending operation."""
+        _KEPT.append(self)
         if not self.cancel():
-            _KEPT.append(self)
             return
+        _KEPT.remove(self)
         event, self.event = self.event, None
         if event:
             _pipe_api()[2].CloseHandle(event)
@@ -712,21 +722,26 @@ class PipeServer:
         ctypes, w, k = _pipe_api()[:3]
         if self.connect is None:
             operation = _Operation(self.handle)
-            operation.pending = True
-            result = k.ConnectNamedPipe(self.handle, ctypes.byref(operation.overlapped))
-            code = ctypes.get_last_error()
-            if result or code in (ERROR_PIPE_CONNECTED, ERROR_NO_DATA):
-                operation.pending = False                   # nothing outstanding: connected already
-                operation.close()
-                if code == ERROR_NO_DATA and not result:    # a client connected and left already
-                    k.DisconnectNamedPipe(self.handle)
-                    return None
-                return PipeConnection(self.handle, self._done)
-            failed = operation.started(result, code)
-            if failed is not None:
-                operation.close()
-                raise _pipe_error('pipe connect failed', failed)
-            self.connect = operation
+            try:
+                operation.pending = True
+                result = k.ConnectNamedPipe(self.handle, ctypes.byref(operation.overlapped))
+                code = ctypes.get_last_error()
+                if result or code in (ERROR_PIPE_CONNECTED, ERROR_NO_DATA):
+                    operation.pending = False                   # nothing outstanding: connected already
+                    operation.close()
+                    if code == ERROR_NO_DATA and not result:    # a client connected and left already
+                        k.DisconnectNamedPipe(self.handle)
+                        return None
+                    return PipeConnection(self.handle, self._done)
+                failed = operation.started(result, code)
+                if failed is not None:
+                    operation.close()
+                    raise _pipe_error('pipe connect failed', failed)
+                self.connect = operation
+            except BaseException:
+                if self.connect is not operation:
+                    operation.close()                           # cancels and confirms anything it started
+                raise
         waited = k.WaitForSingleObject(self.connect.event, _milliseconds(seconds))
         if waited == WAIT_TIMEOUT:
             return None

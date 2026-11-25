@@ -376,23 +376,47 @@ class WindowsPipeTests(unittest.TestCase):
             server.close()
             runner.root_fd.remove(runner_module.CONTROL_FILE, lambda fd: ps.file_identity(fd)[:2] == recorded[:2])
         self.addCleanup(stop)
+        # The end-to-end claim: the web server's own client_request against the supervisor's own loop.
         self.assertEqual(claude_managed.client_request(folder.run, 'status', {})['runId'], folder.manifest['runId'])
+        # The busy path: while one client holds the one instance, the next waits in WaitNamedPipeW, within its
+        # own (here generous) deadline, and is served once the first is done.
+        kernel = windows._pipe_api()[2]
+        real_wait, waits = kernel.WaitNamedPipeW, []
+
+        def counted(name, milliseconds):
+            waits.append(name)
+            return real_wait(name, milliseconds)
         first = windows.open_pipe(server.name, os.getpid())         # connected: the one instance is taken
         waiting = []
-        second = threading.Thread(target=lambda: waiting.append(
-            claude_managed.client_request(folder.run, 'status', {})), daemon=True)
-        second.start()
-        time.sleep(.3)
-        with first:
-            first.sendall((json.dumps({'token': folder.token, 'command': 'status', 'params': {}}) + '\n').encode())
+        with mock.patch.object(kernel, 'WaitNamedPipeW', counted):
+            second = threading.Thread(target=lambda: waiting.append(
+                windows.open_pipe(server.name, os.getpid(), seconds=10)), daemon=True)
+            second.start()
+            deadline = time.monotonic() + 10
+            while not waits and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(waits, 'the second client never found the instance busy')
+            with first:
+                first.sendall((json.dumps({'token': folder.token, 'command': 'status', 'params': {}})
+                               + '\n').encode())
+                reply = bytearray()
+                while b'\n' not in reply:
+                    chunk = first.recv(65536)
+                    self.assertTrue(chunk)
+                    reply.extend(chunk)
+            self.assertTrue(json.loads(bytes(reply))['ok'])
+            second.join(15)
+        self.assertEqual(len(waiting), 1)
+        with waiting[0] as connection:                               # the waiting client is served normally
+            connection.sendall((json.dumps({'token': folder.token, 'command': 'status', 'params': {}})
+                                + '\n').encode())
             reply = bytearray()
             while b'\n' not in reply:
-                chunk = first.recv(65536)
+                chunk = connection.recv(65536)
                 self.assertTrue(chunk)
                 reply.extend(chunk)
-        self.assertTrue(json.loads(bytes(reply))['ok'])
-        second.join(10)
-        self.assertEqual([value['runId'] for value in waiting], [folder.manifest['runId']])
+        self.assertEqual(json.loads(bytes(reply))['value']['runId'], folder.manifest['runId'])
+        self.assertEqual(set(waits), {server.name})
 
     def test_an_accept_with_no_client_returns_in_time(self):
         server = windows.PipeServer()
