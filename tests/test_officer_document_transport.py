@@ -27,8 +27,9 @@ from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
 # A call that must time out while the worker is held at a gated step (its connect, request or response) needs a
 # deadline the worker can reach that step within. On POSIX 50 ms is plenty; on Windows the durable store commits on
-# the way flush to disk and take longer, so the deadline is 2 s there. The step stays held either way.
-GATED = 2 if os.name == 'nt' else .05
+# the way flush to disk and take longer, so the deadline is 5 s there (margin for a loaded runner). The step stays
+# held either way.
+GATED = 5 if os.name == 'nt' else .05
 
 KEY = 'fictional-host-key'
 REAL_TLS_CONTEXT = transport._tls_context
