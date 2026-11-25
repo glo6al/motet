@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -287,6 +288,22 @@ class DeletionTests(unittest.TestCase):
             self.assertTrue(visited.wait(30), 'startup recovery skipped slot61 before cursor75')   # returns once visited
             worker.close(30)
         self.assertEqual(self.status(p)['state'], 'deleted')
+
+    def test_ordinary_sweep_reaches_work_past_a_full_batch_of_idle_rows(self):
+        # The cursor moves past a batch with nothing to do only by the write at the batch's end. Without it an
+        # ordinary sweep would rescan the same first 50 idle rows and never reach the pending row behind them.
+        for _ in range(100): self.add()
+        slots = self.store.db.execute('SELECT slot_id,source_id FROM deletion_source_slots ORDER BY slot_id').fetchall()
+        source = slots[70]['source_id']
+        lease = self.store.files.buffer_lease((source,)); p = self.prepare(source); self.confirm(p)
+        self.l.execute(p['id']); self.assertEqual(self.status(p)['state'], 'deleting')
+        lease.close()
+        self.store.db.execute("UPDATE meta SET value=? WHERE key='deletion_cursor'", (slots[0]['slot_id'],))
+        self.assertEqual(self.status(p)['state'], 'deleting')   # no worker exists to act on the release
+        # One ordinary sweep, as the worker runs after a storage event (not the startup recovery), on this thread.
+        DeletionWorker._sweep(SimpleNamespace(ledger=self.l, stop=threading.Event()), recover=False)
+        self.assertEqual(self.status(p)['state'], 'deleted')
+        self.assertFalse((self.store.files.root / 'objects' / source).exists())
 
     def test_deletion_uses_reserved_fence_space_at_actual_sqlite_full(self):
         source = self.add()
