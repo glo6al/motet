@@ -4,17 +4,24 @@
     python3 src/watch_tty.py --tail       one line per event as it arrives, greppable
     python3 src/watch_tty.py --once       one line, e.g. "2 waiting · 3 working", for a status bar
     python3 src/watch_tty.py --agent ID   one agent's log as it is written (ID as the server names it, e.g. c:1234abcd-…)
-    python3 src/watch_tty.py --tab        iTerm2: the board in a new window, which then opens one tab per agent
-    python3 src/watch_tty.py --split      iTerm2: the same, with each agent in a pane of the board's tab
+    python3 src/watch_tty.py --tab        iTerm2 or Windows Terminal: the board in a new window, which then opens one tab per agent
+    python3 src/watch_tty.py --split      iTerm2 or Windows Terminal: the same, with each agent in a pane of the board's tab
 A terminal bell rings when an agent starts waiting on you. In iTerm2 its tab (or its pane) also turns amber, and the
-board's tab carries a "2 waiting" badge, until it no longer waits.
+board's tab carries a "2 waiting" badge, until it no longer waits. In Windows Terminal the tab shows a full progress
+ring in its warning state instead (Windows Terminal has no code that recolours a tab from inside it).
 Read-only: it never answers a prompt. Standard library only."""
-import base64, json, os, re, shlex, shutil, subprocess, sys, tempfile, time, unicodedata, urllib.error, urllib.request
+import base64, json, ntpath, os, re, shlex, shutil, subprocess, sys, tempfile, time, unicodedata, urllib.error, urllib.request
 
 PORT = int(os.environ.get('PORT', '8793'))
 HERE = os.path.dirname(os.path.abspath(__file__))
 TTY = sys.stdout.isatty()                           # bells and escape codes only for a person, never into a pipe
 ITERM = TTY and os.environ.get('TERM_PROGRAM') == 'iTerm.app'
+WT = TTY and bool(os.environ.get('WT_SESSION'))     # Windows Terminal names every session it starts
+WT_WINDOW_RX = re.compile(r'motet-[0-9a-f]{12}\Z')  # the name of the window a --tab or --split board opens in
+# What wt.exe must never be handed in a value: ';' separates its own commands wherever it stands (a '\;' escape keeps
+# the backslash, so it cannot carry a path); '%' is expanded from the environment in a tab's command; '"' is not
+# escaped when Windows Terminal joins a command back together; a control character is not text.
+WT_UNSAFE = re.compile(r'[;%"\x00-\x1f\x7f]')
 PROFILE = os.path.expanduser('~/Library/Application Support/iTerm2/DynamicProfiles/project-watch.json')
 PROFILE_KEYS = {'Name', 'Guid', 'Badge Text', 'Background Color', 'Foreground Color', 'Bold Color', 'Cursor Color',
                 'Selection Color', 'Selected Text Color', 'Use Tab Color', 'Tab Color', 'Badge Color', 'Close Sessions On End'}
@@ -211,6 +218,74 @@ end tell''' % dict(beside=re.sub(r'[^0-9A-Fa-f-]', '', beside), with_=with_, pan
     return subprocess.run(['osascript', '-e', script], stdout=subprocess.DEVNULL).returncode
 
 
+def wt_command(args, window, title, pane=0):
+    """wt.exe's arguments (an argument list, never a shell string) that run this script with `args` in the Windows
+    Terminal window named `window`, in a new tab, or with `pane` (this agent's place among the board's panes, from
+    1), in a new pane of the board's tab (tab 0). Panes tile as in iTerm2: the first takes the lower half of the
+    board, and each later one halves the largest earlier pane, found by its place in the order panes were made
+    (wt.exe cannot read pane sizes; a pane closed meanwhile shifts the order, and only the layout suffers). The focus
+    then goes back to the board, since wt.exe cannot tell which tab or pane had it. Nothing from an agent's log is
+    in it: the title is ours and an agent id is checked against AID_RX before it gets here. Raises ValueError for a
+    value Windows Terminal would split, expand or misquote."""
+    run = [sys.executable, os.path.join(HERE, 'watch_tty.py'), '--port', str(PORT)] + list(args)
+    for v in [window, title, HERE] + run:
+        if not v or WT_UNSAFE.search(v) or (' ' in v and v.endswith('\\')):
+            raise ValueError(v)
+    if not (ntpath.isabs(HERE) and ntpath.isabs(sys.executable)) or title.startswith('-'):
+        raise ValueError(title)
+    new = ['--title', title, '-d', HERE] + run
+    if not pane:
+        return ['-w', window, 'new-tab'] + new + ([';', 'focus-tab', '-t', '0'] if '--agent' in args else [])
+    if pane == 1:
+        return ['-w', window, 'focus-tab', '-t', '0', ';', 'move-focus', 'first', ';', 'split-pane', '-H'] + new + [
+                ';', 'move-focus', 'first']
+    split = pane - 2 ** ((pane - 1).bit_length() - 1)      # 2->1, 3->1, 4->2, 5->1, 6->2: the largest, oldest first
+    return (['-w', window, 'focus-tab', '-t', '0', ';', 'move-focus', 'first', ';'] + ['move-focus', 'nextInOrder', ';'] * split
+            + ['split-pane'] + new + [';', 'move-focus', 'first'])
+
+
+def wt_open(wt_args):
+    """Hand wt.exe its arguments, without a shell, and wait a little for it to hand them on, so two agents' panes are
+    never laid out at once. wt.exe is found on PATH (an app execution alias in %LOCALAPPDATA%\\Microsoft\\WindowsApps)."""
+    exe = shutil.which('wt.exe')
+    if not exe:
+        raise SystemExit('Windows Terminal (wt.exe) was not found. Install Windows Terminal (it comes with Windows 11; for '
+                         'Windows 10 it is free in the Microsoft Store), or run the board without --tab or --split')
+    p = subprocess.Popen([exe] + wt_args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        return p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return 0            # ponytail: wt.exe normally returns at once; if it stays for its window, do not wait on it
+
+
+def wt_start(argv):
+    """--tab or --split on Windows: the board in a new Windows Terminal window with a name of its own, so the board's
+    later tabs and panes go to that window and no other."""
+    window = 'motet-' + os.urandom(6).hex()
+    try:
+        wt_args = wt_command(['--panes' if '--split' in argv else '--tabs', '--window', window], window, 'Motet')
+    except ValueError as e:
+        raise SystemExit('Windows Terminal cannot be handed this path, because it holds ; %% " or a control character: '
+                         '%s. Move Motet or Python to a folder without one, or run the board without --tab or --split' % e)
+    return wt_open(wt_args)
+
+
+def progress(on):           # Windows Terminal's own marker on a tab (and the taskbar): a full ring in the warning state
+    return '\x1b]9;4;4;100\a' if on else '\x1b]9;4;0;0\a'
+
+
+def vt_on():
+    """Windows: ask the console to act on escape codes rather than print them. Windows Terminal usually does already."""
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h, mode = k.GetStdHandle(-11), ctypes.c_uint32()
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            k.SetConsoleMode(h, mode.value | 0x0004)        # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except (AttributeError, OSError):
+        pass
+
+
 def current(agents, window):
     """Agents the server still lists, with a log entry inside its window, or with a command still seen running in the
     process list (such a command sends no new event while it runs): the rest are history, not the fleet."""
@@ -230,9 +305,16 @@ def draw(rows, note):       # on each server batch (the stream's 'health' line),
 
 def main():
     argv = sys.argv[1:]
+    if '--port' in argv:            # how a Windows Terminal tab is told the port: it gets that terminal's environment, not ours
+        port = argv[argv.index('--port') + 1] if '--port' in argv[:-1] else ''
+        if not re.fullmatch(r'[1-9][0-9]{0,4}', port) or int(port) > 65535:
+            raise SystemExit('--port needs a port number')
+        globals()['PORT'] = int(port)
     if '--tab' in argv or '--split' in argv:
+        if sys.platform == 'win32':
+            raise SystemExit(wt_start(argv))
         if sys.platform != 'darwin':
-            raise SystemExit('--tab and --split open iTerm2 on macOS; here, run the board in a terminal window of its own')
+            raise SystemExit('--tab and --split open iTerm2 on macOS or Windows Terminal on Windows; here, run the board in a terminal window of its own')
         install_profile()
         raise SystemExit(iterm_open(['--panes' if '--split' in argv else '--tabs']))
     tail, once, panes, pane = '--tail' in argv, '--once' in argv, '--panes' in argv, '--pane' in argv
@@ -241,8 +323,11 @@ def main():
     if '--agent' in argv and not AID_RX.match(one):
         raise SystemExit('--agent needs an id such as c:1234abcd-…; the board tab passes it for you')
     me = (os.environ.get('ITERM_SESSION_ID') or '').partition(':')[2]
-    if tabs and not (ITERM and me):
-        tabs = False        # outside iTerm2 (or inside tmux) there is no tab to open beside: show the board only
+    wt = argv[argv.index('--window') + 1] if '--window' in argv[:-1] else ''
+    if '--window' in argv and not WT_WINDOW_RX.match(wt):
+        raise SystemExit('--window needs the name --tab or --split gave the board')
+    if tabs and not (ITERM and me) and not (WT and wt):
+        tabs = False        # outside iTerm2 or Windows Terminal (or inside tmux) there is no tab to open beside: show the board only
     if ITERM and not one:
         sys.stdout.write('\x1b]1;Motet\a')
     agents, opened, skipped, shown, window, live = {}, set(), set(), None, 1200, False
@@ -270,7 +355,11 @@ def main():
                             skipped.add(x)
                             continue
                         opened.add(x)
-                        iterm_open(['--agent', x] + (['--pane'] if panes else []), me, panes)
+                        if ITERM and me:
+                            iterm_open(['--agent', x] + (['--pane'] if panes else []), me, panes)
+                        else:
+                            wt_open(wt_command(['--agent', x] + (['--pane'] if panes else []), wt, 'Motet ' + x,
+                                               len(opened) if panes else 0))
             if one:
                 n = int(bool(agents.get(one) and state(agents[one]).startswith('WAIT')))
             elif not tail:
@@ -281,6 +370,8 @@ def main():
                     mark(tint(n) if pane else amber(n), 'tint' if pane else 'amber')
                 else:
                     mark(amber(n) + badge('%d waiting' % n if n else ''), 'amber')
+            elif WT and n != shown and (n or shown is not None):
+                mark(progress(n), 'progress')
             shown = n
         if not aid or (one and aid != one):
             continue
@@ -292,8 +383,8 @@ def main():
         was = state(a).startswith('WAIT')
         if k == 'agent':
             a.update(known=True, name=clean(e.get('name') or aid[-6:], 20), where=clean(os.path.basename(e.get('cwd') or ''), 16))
-            if one and ITERM:
-                sys.stdout.write('\x1b]1;%s\a' % clean(a['name'] + ' · ' + a['where'], 40))      # the tab's title
+            if one and (ITERM or WT):         # the tab's title (Windows Terminal takes OSC 2, iTerm2 OSC 1)
+                sys.stdout.write('\x1b]%d;%s\a' % (1 if ITERM else 2, clean(a['name'] + ' · ' + a['where'], 40)))
         track(a, e)
         if live and TTY and not was and state(a).startswith('WAIT'):
             sys.stdout.write('\a')
@@ -308,6 +399,8 @@ def main():
 
 if __name__ == '__main__':
     sys.stdout.reconfigure(errors='replace')        # a character the terminal cannot encode is shown as ?, never a crash
+    if TTY and sys.platform == 'win32':
+        vt_on()
     try:
         for tries in range(20):     # the server frees a closed window's connection within seconds: wait for one, a minute at most
             try:
@@ -329,4 +422,6 @@ if __name__ == '__main__':
             sys.stdout.write(amber(False) + ('' if '--agent' in sys.argv else badge('')))
         if 'tint' in TOUCHED:
             sys.stdout.write(tint(False))
+        if 'progress' in TOUCHED:
+            sys.stdout.write(progress(False))
         sys.stdout.flush()

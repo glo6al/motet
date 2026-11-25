@@ -157,6 +157,10 @@ KEEP = {}                    # agents windows have pinned: aid -> {window: when 
 KEEP_DAYS, KEEP_LEASE = 1, 15 * 60      # a window re-sends its whole pin list every few minutes; a list not refreshed in 15 min lapses
 AID_LETTERS = 'cxkea'                              # c claude, x codex, k cursor, e cloud exec, a Antigravity
 AID_RX = re.compile(r'[%s]:[0-9a-f-]{8,64}\Z' % AID_LETTERS)
+# A Cursor transcript's path, and its project folder's name. On Windows a path may be written with either separator;
+# elsewhere a backslash is an ordinary character in a file name, so only '/' separates.
+CURSOR_IN = re.compile(r'[\\/]\.cursor[\\/]' if WIN else r'/\.cursor/')
+CURSOR_SLUG = re.compile(r'[\\/]\.cursor[\\/]projects[\\/]([^\\/]+)[\\/]' if WIN else r'/\.cursor/projects/([^/]+)/')
 
 
 def count(v):
@@ -204,7 +208,7 @@ def aid_of(path):
     if '/.codex/' in path:
         m = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$', stem)
         return 'x:' + (m.group(1) if m else stem)
-    if '/.cursor/' in path:
+    if CURSOR_IN.search(path):
         return 'k:' + stem
     proof = antigravity.identity(path, HOME)
     if proof:
@@ -2659,14 +2663,35 @@ _MON = {m: i for i, m in enumerate('Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov 
 CURSOR_CWD = {}
 
 
+def cursor_drive(letter):
+    """The root of drive `letter` (C:\\) when Windows reports it as a fixed local disk, else ''. A folder name in
+    Cursor's projects folder decides which drive is looked at, so a network, removable or optical drive is never
+    listed because of one."""
+    import ctypes
+    root = letter.upper() + ':\\'
+    return root if ctypes.windll.kernel32.GetDriveTypeW(root) == 3 else ''      # DRIVE_FIXED
+
+
 def cursor_cwd(slug):
     """Cursor names a project folder by the workspace path with '/' turned into '-'.
     A hyphen inside a real folder name can be read more than one way, so a path is returned
     only when exactly one existing directory unfolds to that name. Otherwise the log did not
-    record the folder, and the page is told nothing."""
+    record the folder, and the page is told nothing.
+    On Windows the name starts with the drive letter, lower-cased, then '-' in place of ':\\', and '\\' turns
+    into '-' like '/': F:\\DeepSeek-TUI-desktop is f-DeepSeek-TUI-desktop (seen in real folder names posted on
+    Cursor's forum, thread "Agents sidebar empty - 222 transcripts still on disk (Windows)"). An upper-case letter
+    is accepted as well (a third-party tool, cursor-helper, writes C-...; not confirmed against Cursor). Unverified,
+    so not handled: a network share (\\\\server\\share), a name without a drive letter, and any character other than
+    '\\' and ':' that Cursor might also replace (dots or spaces). A drive that is not a fixed disk is never listed.
+    Folder names are compared without case there, as Windows does.
+    The name itself never becomes a path: it is only compared with the names the walk lists, starting from '/' or a
+    drive's root, so a crafted name (with '..', a drive or a share in it) can choose nothing but an existing folder,
+    and the result is only shown as the agent's project, kept as its project's identity and used to shorten its file
+    paths: nothing in that folder is opened because of it."""
     if slug in CURSOR_CWD:
         return CURSOR_CWD[slug]
     hits = []
+    fold = str.lower if WIN else str
 
     def walk(so_far, rest):
         if len(hits) > 1 or not rest:
@@ -2676,12 +2701,21 @@ def cursor_cwd(slug):
         except OSError:
             return
         for name in names:
+            head, tail = rest[:len(name)], rest[len(name):]
+            if fold(head) != fold(name):
+                continue
             path = os.path.join(so_far, name) if so_far else os.path.join('/', name)
-            if rest == name and os.path.isdir(path):
+            if not tail and os.path.isdir(path):
                 hits.append(path)
-            elif rest.startswith(name + '-') and os.path.isdir(path):
-                walk(path, rest[len(name) + 1:])
-    walk('', slug)
+            elif tail.startswith('-') and os.path.isdir(path):
+                walk(path, tail[1:])
+    if WIN:
+        m = re.fullmatch(r'([A-Za-z])-(.+)', slug)
+        root = cursor_drive(m.group(1)) if m else ''
+        if root:
+            walk(root, m.group(2))
+    else:
+        walk('', slug)
     CURSOR_CWD[slug] = hits[0] if len(hits) == 1 else ''
     return CURSOR_CWD[slug]
 
@@ -2816,7 +2850,7 @@ class CursorTail(Tail):
     def __init__(self, path):
         stem = os.path.basename(path)[:-6]
         self.aid = 'k:' + stem
-        m = re.search(r'/\.cursor/projects/([^/]+)/', path)
+        m = CURSOR_SLUG.search(path)
         cwd = cursor_cwd(m.group(1)) if m else ''
         describe(self.aid, True, runtime='Cursor', name='Cursor ' + stem[:4], cwd=cwd)
         self.turn_ts, self.n = None, 0
