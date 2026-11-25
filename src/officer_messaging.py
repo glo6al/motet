@@ -126,9 +126,15 @@ def public(row):
     return result
 
 
-def posix_records_checkable():
-    """Attachment and managed-chat records, and Codex reply tracking, are checked with the POSIX folder walk, owner
-    and mode bits (and fcntl): macOS and Linux only."""
+def attachment_records_checkable():
+    """The attachment namespace and managed-registry records are checked through private_storage's no-link folder
+    walk (POSIX descriptors, owner and mode; Windows handles, owner and access list) and its lock: wherever that walk
+    is available, Windows included."""
+    return private_storage.folder_walk_available()
+
+
+def codex_records_checkable():
+    """Codex reply tracking checks transcripts with POSIX owner and mode rules: macOS and Linux only."""
     return not private_storage.WIN and private_storage.folder_walk_available()
 
 
@@ -217,9 +223,11 @@ class MessagingStore:
                 # share delete, so the file cannot be renamed or replaced in between.
                 fd = private_state_file(path, expected is None, DATABASE_REFUSED)
                 try:
-                    st = os.fstat(fd)
-                    if expected is not None and [st.st_dev, st.st_ino] != expected:
-                        raise OSError(DATABASE_REFUSED)
+                    if expected is not None:
+                        # [st_dev, st_ino] on POSIX; the handle's volume serial and file index on Windows.
+                        from attachments_native_namespace import descriptor_identity
+                        if descriptor_identity(fd) != expected:
+                            raise OSError(DATABASE_REFUSED)
                     if private_storage.WIN:
                         check_database_companions(path)
                     if expected is not None:
@@ -296,9 +304,8 @@ class MessagingStore:
                       root / 'managed-claude' / 'registry.sqlite3')
         if not any(present(path) for path in candidates):
             return None
-        if not posix_records_checkable():
-            # The fence opens these records by the POSIX folder walk and fcntl, so it runs on macOS and Linux only.
-            # Elsewhere they can only have come from a Mac or Linux copy of this folder; refuse rather than open the
+        if not attachment_records_checkable():
+            # The fence opens these records through the no-link folder walk; without it, refuse rather than open the
             # database unfenced.
             raise MessagingStorageUnavailable(RETAINED_STATE_UNAVAILABLE)
         from attachments_native_namespace import NativeNamespaceFence
@@ -1722,7 +1729,7 @@ class MessagingStore:
         for row in rows:
             if row.get('transport') == claude_mod.TRANSPORT:
                 continue  # HTTP claims/events exclusively own these rows; no stale tick writeback.
-            if row.get('runtime') == 'codex' and not posix_records_checkable():
+            if row.get('runtime') == 'codex' and not codex_records_checkable():
                 # Windows: a Codex row can only have come from a copy of a Mac's folder, since sending to Codex needs
                 # the Mac app. Its sending and reply tracking check transcripts with POSIX owner and mode rules;
                 # leave the row exactly as it is.

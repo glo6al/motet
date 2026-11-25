@@ -1,7 +1,6 @@
 """Disposable lock and identity proof. Production never imports this module."""
 from contextlib import closing, contextmanager
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -16,7 +15,19 @@ import uuid
 from attachments_owner_guards import LINKS, OUTCOMES, OwnerAttachmentGuard, OwnerGuardError, _table
 from attachments_owner_marker import CLEAR, UNCERTAIN
 from attachments_owner_transport import OwnerAttachmentLedger
-from claude_managed import Adapter, ManagedClaude, ManagedError, TestDependencies, VERSION
+try:
+    from claude_managed import Adapter, ManagedClaude, ManagedError, TestDependencies, VERSION
+    MANAGED_WHY = None
+except ImportError:              # Windows: claude_managed needs fcntl (managed Claude is Mac-only by design)
+    if os.name != 'nt':
+        raise                    # elsewhere a failed import is a real failure, not a skip
+    Adapter = ManagedClaude = TestDependencies = VERSION = None
+
+    class ManagedError(Exception):
+        def __init__(self, status, code, message):
+            super().__init__(message)
+            self.status, self.code = status, code
+    MANAGED_WHY = 'Managed Claude is Mac-only by design: its module needs POSIX locks (fcntl).'
 from new_chat_types import FrozenFolder
 from officer_messaging import MessagingStore
 from test_attachments_owner_guards import admission, uid
@@ -43,7 +54,7 @@ MANAGED_TABLES = {
     'operations': ('id TEXT PRIMARY KEY, run TEXT NOT NULL, digest TEXT NOT NULL, data TEXT NOT NULL', (('id',),)),
     MANAGED_IDENTITY: (IDENTITY, ()),
 }
-NOFOLLOW = os.O_NOFOLLOW | os.O_NONBLOCK
+NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)   # this fixture's proof runs on POSIX only
 
 
 def require(condition):
@@ -172,6 +183,7 @@ class Namespace:
 
     @contextmanager
     def host_fence(self):
+        import fcntl                     # POSIX only, like the rest of this fixture's proof
         with checked_fd(self.host) as (fd, _):
             end = time.monotonic() + self.timeout
             while True:

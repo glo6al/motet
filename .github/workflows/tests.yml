@@ -347,10 +347,11 @@ jobs:
       - run: python tests/test_attachments_availability.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-      # Off on Windows: delivery to agent chats (the native composition, and the fixture-only deletion built on it) is
-      # not ported, and NATIVE_ATTACHMENT_DELIVERY_HOST keeps it off there. The attachment store itself runs on Windows.
+      # On Windows the composition's tests import and skip with their reason: delivery to agent chats is not ported
+      # (NATIVE_ATTACHMENT_DELIVERY_HOST keeps it off there) and they race managed Claude, which is Mac-only.
       - run: python tests/test_attachments_native_composition.py
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
+      # Off on Windows: the fixture-only deletion is built on delivery to agent chats, which is not ported there.
       - run: python tests/test_attachments_native_deletion.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_attachments_native_handoff.py
@@ -367,6 +368,11 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_attachments_owner_startup.py
         if: ${{ !cancelled() }}
+      # The namespace fence and owner runtime on their Windows branch: simulated on macOS and Linux, for real on
+      # Windows (a second process holding the lock, junctions, inherited access lists, a path in another case).
+      - run: python tests/test_attachments_windows_namespace.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_delivery_admission.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
@@ -391,15 +397,15 @@ jobs:
       - run: python tests/test_codex_attachment_integration.py
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         timeout-minutes: 5
-      # Off on Windows: delivery to Claude chats (workspace copies, Git exclusion) and the managed namespace are not
-      # ported yet (step 6c.4 and 6c.5).
+      # Off on Windows: delivery to Claude chats (workspace copies, Git exclusion) is not ported yet (step 6c.5).
       - run: python tests/test_claude_attachment_adapter.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
       - run: python tests/test_claude_attachment_integration.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         timeout-minutes: 5
+      # On Windows these import and skip with their reason: they race managed Claude, which is Mac-only by design.
       - run: python tests/test_native_managed_namespace.py
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
       # Off on Windows: Python there has no IANA time-zone data unless the tzdata package is installed.
       - run: python tests/test_attachments_expiry_time.py
         if: ${{ !cancelled() && runner.os != 'Windows' }}

@@ -23,7 +23,7 @@ import officer_messaging as messaging
 import peer_bridge
 import peer_lifecycle
 import server
-from test_attachments_owner_guards import admission, insert, install
+from test_attachments_owner_guards import admission, insert, install, one_thread
 
 
 def uid():
@@ -67,7 +67,6 @@ class ManualWorker:
         self.joins += 1
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX private owner database')
 class StartupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -217,6 +216,12 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(self.workers, [])
 
     def test_first_install_starts_no_native_mutations_and_stops_once(self):
+        if not server.NATIVE_ATTACHMENT_DELIVERY_HOST:
+            # Windows: delivery to agent chats is not ported, so the server installs nothing with every switch on.
+            self.assertIsNone(self.server_bind(master=True, native=True, officer=False, service=object()))
+            self.assertEqual((self.catalog(), self.workers), ([], []))
+            self.assertIsNone(self.store._attachment_guard)
+            return
         instance = self.server_bind(master=True, native=True, officer=False, service=object())
         self.assertEqual(self.workers[0].starts, 1)
         self.assertIs(self.bind(), instance)
@@ -591,6 +596,7 @@ class StartupTests(unittest.TestCase):
         self.assertIsNone(self.store.db.execute('SELECT 1 FROM requests WHERE id=?', (row['request_id'],)).fetchone())
 
     def test_join_keeps_owner_db_open_through_in_flight_step(self):
+        one_thread(self)
         entered, release, closed = threading.Event(), threading.Event(), threading.Event()
         close_errors = []
         step_calls = []
