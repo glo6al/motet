@@ -551,6 +551,19 @@ def main():
         stack.callback(lambda: service.close())
         httpd = FixtureServer(('127.0.0.1', 0), Handler)
         stack.callback(httpd.server_close)
+        # Stopping (Ctrl-C or SIGINT on POSIX, a "stop" line on standard input) only records the request; a helper
+        # thread then asks serve_forever to end. A KeyboardInterrupt raised in the serving thread could land inside
+        # any lock acquire or release there (Python 3.9 then fails with "release unlocked lock" in Thread.start), so
+        # none is raised: the handler appends to a list, which takes no lock.
+        requested = []
+
+        def stop_when_requested():
+            while not requested and not stop.is_set():
+                time.sleep(0.05)
+            if requested:
+                httpd.shutdown()      # returns once serve_forever has ended; the same cleanup then runs
+        if os.name != 'nt':
+            signal.signal(signal.SIGINT, lambda signum, frame: requested.append('signal'))
         server.PORT = httpd.server_port
         if args.trace_startup:
             faulthandler.cancel_dump_traceback_later()
@@ -560,18 +573,17 @@ def main():
             print('EXTRA TEST INSTRUMENTATION: ' + args.browser_fault, flush=True)
         try:
             if args.stop_on_stdin:
-                import _thread
-
                 def stop_on_stdin():
                     for line in sys.stdin:
                         if line.strip() == 'stop':
                             break
-                    _thread.interrupt_main()      # the same KeyboardInterrupt as Ctrl-C, in the serving thread
+                    requested.append('stdin')
                 # A daemon thread, so a reader still waiting on standard input never holds up the exit.
                 threading.Thread(target=stop_on_stdin, name='fixture-stdin-stop', daemon=True).start()
+            threading.Thread(target=stop_when_requested, name='fixture-stop', daemon=True).start()
             httpd.serve_forever(poll_interval=0.2)
         except KeyboardInterrupt:
-            pass
+            pass        # a Ctrl-C before the handler below was installed
         finally:
             stop.set()
     # A final counter record certifies that owned handlers and services closed.
