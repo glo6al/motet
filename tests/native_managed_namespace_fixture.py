@@ -15,19 +15,12 @@ import uuid
 from attachments_owner_guards import LINKS, OUTCOMES, OwnerAttachmentGuard, OwnerGuardError, _table
 from attachments_owner_marker import CLEAR, UNCERTAIN
 from attachments_owner_transport import OwnerAttachmentLedger
-try:
-    from claude_managed import Adapter, ManagedClaude, ManagedError, TestDependencies, VERSION
-    MANAGED_WHY = None
-except ImportError:              # Windows: claude_managed needs fcntl (managed Claude is Mac-only by design)
-    if os.name != 'nt':
-        raise                    # elsewhere a failed import is a real failure, not a skip
-    Adapter = ManagedClaude = TestDependencies = VERSION = None
-
-    class ManagedError(Exception):
-        def __init__(self, status, code, message):
-            super().__init__(message)
-            self.status, self.code = status, code
-    MANAGED_WHY = 'Managed Claude is Mac-only by design: its module needs POSIX locks (fcntl).'
+from claude_managed import Adapter, ManagedClaude, ManagedError, TestDependencies, VERSION
+# These suites race managed Claude through POSIX fixtures (os.getuid, fcntl, dir_fd). Managed Claude runs on the Mac
+# only until step 8b.5, so the reason comes from the platform, never from whether its module imports.
+MANAGED_WHY = (None if os.name != 'nt' else
+               'Managed Claude runs on the Mac only until step 8b.5, and these fixtures are POSIX (owner ids, '
+               'fcntl locks, dir_fd).')
 from new_chat_types import FrozenFolder
 from officer_messaging import MessagingStore
 from test_attachments_owner_guards import admission, uid

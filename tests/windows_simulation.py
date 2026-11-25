@@ -7,10 +7,11 @@ answered by the POSIX implementation (links, owner and mode still refused), incl
 that still reached for them would show up as an error. A function handed to a held folder's method (``remove``'s
 ``expect``) is the caller's own code, so it runs as Windows again, and its POSIX-only calls fail too.
 
-Two Windows answers are modelled rather than taken from POSIX. A held folder reports ``file_system`` as the volume
+Three Windows answers are modelled rather than taken from POSIX. A held folder reports ``file_system`` as the volume
 named to ``simulated_windows`` (NTFS by default). ``file_identity`` (and a held folder's ``identity``) answers as
 Windows reads it from a handle: a fixed 32-bit volume serial (``SERIAL``) that is not ``fstat``'s ``st_dev``, with
 the file index, size and times; so code that took identities from ``os.fstat`` instead would not match.
+``path_identity`` (a user's own folder, opened by path) answers the same way: ``SERIAL`` and the file index.
 
 The switches between Windows and POSIX are process-wide, so only the thread that entered the simulation may use
 private_storage under it: a call from any other thread fails at once with AssertionError, before anything is
@@ -128,6 +129,12 @@ class _Simulation:
         info = self.real_fstat(fd)
         return SERIAL, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
+    def path_identity(self, path):
+        """What Windows reads from a handle opened by path: the volume serial and the file index."""
+        self.same_thread()
+        self.calls.append('path_identity')
+        return SERIAL, os.stat(path).st_ino
+
 
 @contextmanager
 def simulated_windows(folder_walk=True, file_system='NTFS'):
@@ -141,6 +148,7 @@ def simulated_windows(folder_walk=True, file_system='NTFS'):
             for name in CALLS:
                 stack.enter_context(patch.object(ps, name, simulation.posix(name)))
             stack.enter_context(patch.object(ps, 'file_identity', simulation.identity))
+            stack.enter_context(patch.object(ps, 'path_identity', simulation.path_identity))
             if not folder_walk:
                 stack.enter_context(patch.object(ps, 'folder_walk_available', return_value=False))
             stack.enter_context(_module('fcntl', None))                       # import fcntl now fails

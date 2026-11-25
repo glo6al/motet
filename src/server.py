@@ -6402,8 +6402,12 @@ def new_chat_inventory():
                 if canonical != cwd or not os.path.isdir(canonical):
                     continue
                 folder = os.stat(canonical)
+                from new_chat_inventory import folder_identity as _folder_identity
+                # Windows: the folder identity New chat's inventory records (from a handle), so they compare equal.
+                device, inode = (_folder_identity(canonical) if private_storage.WIN
+                                 else (folder.st_dev, folder.st_ino))
                 result.append(VerifiedIdentity(ident, canonical, path, st.st_dev, st.st_ino,
-                                               'inventory', folder.st_dev, folder.st_ino))
+                                               'inventory', device, inode))
         except (OSError, ValueError):
             continue
     return result
@@ -6428,8 +6432,10 @@ def admit_new_chat(identity, folder, tails, permit):
     def check(meta=None):
         try:
             fs = os.stat(folder.path)
+            from new_chat_inventory import folder_identity as _folder_identity
             if (not os.path.isdir(folder.path) or os.path.realpath(folder.path) != folder.path
-                    or (fs.st_dev, fs.st_ino) != (folder.device, folder.inode)):
+                    or ((_folder_identity(folder.path) if private_storage.WIN
+                         else (fs.st_dev, fs.st_ino)) != (folder.device, folder.inode))):
                 return False
             _, source, st, fresh = codex_transcript.open_pinned(
                 sessions, identity.source_path, identity.native_id, folder.path)
@@ -6516,6 +6522,7 @@ def new_chat_claude_inventory_identity(aid):
     """Known Claude folders come from verified native metadata, never page paths."""
     global NEW_CHAT_CLAUDE_DIRECTORY
     import chat_directory
+    from new_chat_inventory import folder_identity
     from new_chat_types import VerifiedIdentity
     try:
         if (NEW_CHAT_CLAUDE_DIRECTORY is None
@@ -6532,8 +6539,10 @@ def new_chat_claude_inventory_identity(aid):
                 or (st.st_dev, st.st_ino) != (source['device'], source['inode'])
                 or not directory.claude_proof_current(proof)):
             return None
+        # Windows: the folder identity from its handle, as New chat's inventory records it.
+        folder = folder_identity(cwd) if private_storage.WIN else (fs.st_dev, fs.st_ino)
         return VerifiedIdentity(aid[2:], cwd, source['path'], st.st_dev, st.st_ino,
-                                'inventory', fs.st_dev, fs.st_ino, provider='claude_code')
+                                'inventory', folder[0], folder[1], provider='claude_code')
     except Exception:
         return None
 

@@ -90,6 +90,11 @@ jobs:
       - run: python tests/test_managed_claude_http.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # The private storage managed Claude and New chat will use on Windows (the feature stays off there until step
+      # 8b.5): simulated on macOS and Linux, against real access lists on Windows.
+      - run: python tests/test_managed_windows_storage.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: node docs/fixtures/new-chat/managed-fixture.test.mjs
         if: ${{ !cancelled() }}
         timeout-minutes: 5

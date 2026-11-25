@@ -17,6 +17,7 @@ import threading
 import uuid
 
 from new_chat_types import FrozenFolder, VerifiedIdentity, NewChatError
+import private_storage as ps
 
 
 def canonical_uuid(value):
@@ -37,6 +38,29 @@ def _physical_path(path):
     return os.path.realpath(path)
 
 
+def _handle_identity(path):
+    """Windows: a project folder's volume serial and file index, read from a handle opened by path
+    (``private_storage.path_identity``), the same under every Python: 3.12 changed what ``os.stat`` reports there.
+    Not the private no-link walk: a project may be on a network share, another volume or a ``subst`` drive, or in
+    a OneDrive folder, as on the Mac. ``os.stat`` and ``realpath`` have already decided it is a folder, not a link."""
+    return ps.path_identity(path)
+
+
+def _identity(path, info):
+    """The identity recorded for the folder ``info`` describes: ``(st_dev, st_ino)`` on POSIX, as before; on
+    Windows the handle's (``_handle_identity``). ``os.stat`` still makes every other decision on both."""
+    return _handle_identity(path) if ps.WIN else (info.st_dev, info.st_ino)
+
+
+def folder_identity(path):
+    """(device, inode) of the folder at ``path``, not followed if it is a link: ``os.stat`` decides it is a folder
+    (anything else raises), and ``_identity`` gives the numbers."""
+    info = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, 'Not a folder.')
+    return _identity(path, info)
+
+
 def _directory_identity(path):
     try:
         info = os.stat(path, follow_symlinks=False)
@@ -44,7 +68,7 @@ def _directory_identity(path):
             # realpath is best-effort on Python 3.9. A remaining link means
             # resolution was incomplete or raced, rather than proven absence.
             raise OSError(errno.ELOOP, 'Folder anchor could not be resolved.')
-        return (info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else None
+        return _identity(path, info) if stat.S_ISDIR(info.st_mode) else None
     except (FileNotFoundError, NotADirectoryError):
         return None
 
@@ -55,7 +79,7 @@ def _ancestry(path):
         info = os.stat(path, follow_symlinks=False)
         if not stat.S_ISDIR(info.st_mode):
             raise ValueError()
-        rows.append((path, (info.st_dev, info.st_ino)))
+        rows.append((path, _identity(path, info)))
         parent = os.path.dirname(path)
         if parent == path:
             return rows
@@ -81,7 +105,7 @@ def validate_folder(folder):
                 or os.path.realpath(folder.path) != folder.path):
             raise ValueError()
         info = os.stat(folder.path, follow_symlinks=False)
-        if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != (folder.device, folder.inode):
+        if not stat.S_ISDIR(info.st_mode) or _identity(folder.path, info) != (folder.device, folder.inode):
             raise ValueError()
     except (OSError, ValueError, TypeError):
         raise NewChatError('folder_changed', 'The selected folder changed. Review its current entry.', 409) from None
@@ -102,10 +126,11 @@ class KnownFolderInventory:
         return hmac.new(self.key, json.dumps(value, ensure_ascii=True, sort_keys=True).encode(), hashlib.sha256).hexdigest()
 
     def _folder(self, path, directory):
+        # Windows: the handle's identity, not os.stat's; POSIX: the stat given, as before.
+        device, inode = _identity(path, directory)
         ident = self._digest(['folder', path])
-        revision = self._digest(['revision', path, directory.st_dev, directory.st_ino])
-        return FrozenFolder(ident, revision, os.path.basename(path) or path,
-                            path, directory.st_dev, directory.st_ino)
+        revision = self._digest(['revision', path, device, inode])
+        return FrozenFolder(ident, revision, os.path.basename(path) or path, path, device, inode)
 
     def require_allowed(self, folder):
         """Apply target-directory policy without changing shared physical proof."""
