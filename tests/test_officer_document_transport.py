@@ -25,6 +25,11 @@ import test_officer_document_ledger as execution_fixtures
 from test_officer_documents import response, wire
 from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
 
+# A call that must time out while the worker is held at a gated step (its connect, request or response) needs a
+# deadline the worker can reach that step within. On POSIX 50 ms is plenty; on Windows the durable store commits on
+# the way flush to disk and take longer, so the deadline is 2 s there. The step stays held either way.
+GATED = 2 if os.name == 'nt' else .05
+
 KEY = 'fictional-host-key'
 REAL_TLS_CONTEXT = transport._tls_context
 
@@ -245,7 +250,7 @@ class TransportTests(unittest.TestCase):
         gate = threading.Event(); self.release_events.append(gate)
         reply = FakeResponse(wire(response('Fictional answer.',citations=False)),gate=gate)
         item, factory = self.make(FakeConnection(reply))
-        result = self.call(item,ticket,seconds=.05)
+        result = self.call(item,ticket,seconds=GATED)
         self.assertEqual(result.state,'unknown')
         self.assertTrue(reply.entered.is_set())
         source = self.f.sources[0]
@@ -389,7 +394,7 @@ class TransportTests(unittest.TestCase):
     def test_delayed_connect_after_abandon_never_posts(self):
         ticket=self.ticket();gate=threading.Event();self.release_events.append(gate)
         connection=FakeConnection(connect_gate=gate);item,factory=self.make(connection)
-        result=self.call(item,ticket,seconds=.05)
+        result=self.call(item,ticket,seconds=GATED)
         self.assertTrue(connection.connect_entered.is_set());self.assertFalse(result.dispatch_started)
         self.assertTrue(self.store.files.io_active());self.busy()
         gate.set();item.close(timeout=2)
@@ -399,7 +404,7 @@ class TransportTests(unittest.TestCase):
     def test_close_between_connect_and_send_does_not_reconnect(self):
         ticket=self.ticket();gate=threading.Event();self.release_events.append(gate)
         connection=FakeConnection(request_gate=gate);item,factory=self.make(connection)
-        result=self.call(item,ticket,seconds=.05)
+        result=self.call(item,ticket,seconds=GATED)
         self.assertTrue(connection.request_entered.is_set());self.assertTrue(result.dispatch_started)
         # Simulate the real HTTPConnection.close race: sock=None would trigger
         # reconnect on request/send unless auto_open has been disabled.

@@ -311,9 +311,21 @@ class OfficerDeletion:
                 if not already_seen and (value['state'] == DELETING or recover and value['state'] == UNKNOWN):
                     try: self.execute(row['slot_id'], recover=recover)
                     except Exception: pass  # Committed fence remains authoritative; no refund.
-                with self.store._transaction(reclaim=True):
-                    self.store.db.execute("UPDATE meta SET value=? WHERE key='deletion_cursor'", (row['slot_id'],))
+                    # Record progress past each row that did work, so a crash does not repeat it.
+                    self._advance(row['slot_id'])
+            if rows:
+                # One durable cursor write per batch for rows with nothing to do: a sweep runs after every storage
+                # event, and a commit per idle row made each sweep cost one durable write per kept file (slow on
+                # Windows, where each commit flushes to disk and each store check walks from the drive). A crash
+                # before this write only rescans those idle rows.
+                self._advance(rows[-1]['slot_id'])
             return len(rows)
+
+    def _advance(self, slot_id):
+        if self.store.db.execute("SELECT value FROM meta WHERE key='deletion_cursor'").fetchone()[0] == slot_id:
+            return
+        with self.store._transaction(reclaim=True):
+            self.store.db.execute("UPDATE meta SET value=? WHERE key='deletion_cursor'", (slot_id,))
 
 
 class DeletionWorker:

@@ -10,7 +10,7 @@ import test_officer_document_coordinator as fixtures
 from attachments_types import AttachmentError
 import officer_documents as documents
 from officer_policy import AUTOMATIC
-from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY
+from attachment_host import POSIX, POSIX_WHY, STORE, STORE_WHY, private_folder
 
 
 @unittest.skipUnless(STORE, STORE_WHY)  # borrows the coordinator's storage setUp
@@ -63,7 +63,8 @@ class AutoDocumentTests(unittest.TestCase):
     def test_real_saved_auto_selection_routes_document_question_without_mutation(self):
         import server
         with tempfile.TemporaryDirectory(prefix='watch-auto-selection-') as directory, \
-                mock.patch.object(server, 'officer_model_path', return_value=str(Path(directory) / 'officer-model.json')), \
+                mock.patch.object(server, 'officer_model_path',
+                                  return_value=str(private_folder(Path(directory) / 'state') / 'officer-model.json')), \
                 mock.patch.object(server, 'OFFICER_MODEL', documents.MODEL), \
                 mock.patch.object(server, 'OFFICER_MODEL_ERROR', ''), \
                 mock.patch.object(server, 'OFFICER_KEY', 'fictional-officer-key'):

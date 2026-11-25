@@ -45,7 +45,9 @@ class FixtureProcess(unittest.TestCase):
             stderr=subprocess.PIPE, text=True)
         self.stopped = False
         self.addCleanup(self.stop)
-        startup = 60 if windows else 15         # Windows runners can be slow to start Python
+        # Windows runners can be slow to start Python, and a 51-file seed makes hundreds of durable commits, each a
+        # flush to disk there. A start that succeeds returns as soon as it is ready.
+        startup = 120 if windows else 15
         reader = None
         if windows:
             first = []

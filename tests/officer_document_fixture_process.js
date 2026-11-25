@@ -44,8 +44,9 @@ function waitForOwnerReady(child,args,{now=ownerNow,started=now(),readStderr=()=
 const WINDOWS=process.platform==='win32';
 const PYTHON=WINDOWS?'python':'python3';
 const stopFixture=WINDOWS?child=>{child.stdin.end('stop\n');}:child=>child.kill('SIGINT');
-// Windows runners can be slow to start Python: wait longer there; a start that succeeds returns as soon as it is ready.
-const STARTUP_MS=WINDOWS?60000:10000;
+// Windows runners can be slow to start Python, and a 51-file seed makes hundreds of durable commits, each a flush to
+// disk there: wait longer on Windows; a start that succeeds returns as soon as it is ready.
+const STARTUP_MS=WINDOWS?120000:10000;
 const CLEANUP_MS=WINDOWS?60000:5000;     // likewise for a fixture's clean stop
 
 async function ownerFixture(run,args=[],{model='claude-haiku-5-5',spawnChild=spawn,now=ownerNow,setTimer=setTimeout,clearTimer=clearTimeout,cleanupMs=CLEANUP_MS,killWaitMs=1000,stop=stopFixture,stdinStop=WINDOWS}={}) {
