@@ -18,8 +18,7 @@ from attachments_deletion_slots import (
 )
 from attachments_files import private
 from attachments_materialize import (
-    Materializer, RetainedCopyCleanup, WorkspaceContext, WorkspaceDirectories, copy_identity, FileIdentity,
-    relative_path,
+    Materializer, RetainedCopyCleanup, WorkspaceContext, WorkspaceDirectories, relative_path, source_identity,
 )
 from attachments_relay import RELAY_FORMATS
 from attachments_requests import (
@@ -439,7 +438,7 @@ class DisposableNativeDeletion:
                 authority = self._requests.authority(request_id)
                 writer.ensure_exclusion(context, authority, (spec,), lease)
                 with self._requests.source_handle(copy_id, lease) as fd:
-                    retained = copy_identity(FileIdentity.of(os.fstat(fd)))
+                    retained = source_identity(fd)
                     saved = writer.materialize(context, authority, spec, fd, retained, lease, directories=dirs)
                 self._requests.record_copy_result(saved, lease)
                 return saved

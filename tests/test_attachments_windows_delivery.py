@@ -13,6 +13,7 @@ from contextlib import nullcontext
 import hashlib
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -166,6 +167,22 @@ class DeliveryChecks:
         self.assertEqual(body['error'], {'code': 'workspace_unsafe', 'message': WORKSPACE_REFUSALS['workspace_unsafe'],
                                          'retryable': False})
 
+    def test_the_identity_send_records_is_the_one_materialize_reads(self):
+        """On every Python: the source identity Send passes is the handle's, as materialize reads it again."""
+        folder = self.base / 'private'
+        self.private_folder(folder)
+        source = folder / 'source'
+        source.write_bytes(CONTENT)
+        if os.name != 'nt':
+            source.chmod(0o600)
+        with self.windows():
+            fd = ps.open_no_links(str(source), single_link=True, private=True)
+            try:
+                self.assertEqual(materialize.source_identity(fd),
+                                 materialize.copy_identity(materialize._regular_fd(fd)))
+            finally:
+                os.close(fd)
+
     def test_a_workspace_that_is_not_a_repository_is_refused(self):
         folder = self.base / 'notes'
         self.private_folder(folder)
@@ -239,6 +256,88 @@ class SimulatedWindowsDeliveryTests(DeliveryChecks, unittest.TestCase):
         with self.as_program_files(), self.windows():
             self.assertEqual(wingit.find(), os.path.realpath(SYSTEM_GIT))
             self.assertIsNone(wingit.refusal())
+
+    @staticmethod
+    def python_312_stat():
+        """os.fstat and os.stat as Python 3.12 and later report them on Windows, where they no longer match the
+        handle's identity: st_dev the 64-bit volume serial (here another value above 2**32), st_ino another id, and
+        st_ctime another time. The simulation's handle identity uses the real fstat, so it is unchanged."""
+        sequence = ('st_mode', 'st_ino', 'st_dev', 'st_nlink', 'st_uid', 'st_gid', 'st_size')
+
+        def skew(st):
+            if not stat.S_ISREG(st.st_mode):
+                return st
+            extra = {name: getattr(st, name) for name in dir(st) if name.startswith('st_') and name not in sequence}
+            extra['st_ctime_ns'] = st.st_ctime_ns + 1000
+            values = list(st[:os.stat_result.n_sequence_fields])
+            values[1], values[2] = st.st_ino + 2 ** 33, st.st_dev + 2 ** 40
+            return os.stat_result(values, extra)
+        real_fstat, real_stat = os.fstat, os.stat
+        return mock.patch.multiple(os, fstat=lambda fd: skew(real_fstat(fd)),
+                                   stat=lambda *args, **kwargs: skew(real_stat(*args, **kwargs)))
+
+    def test_send_takes_the_source_identity_from_the_handle_not_from_pythons_stat(self):
+        """Windows CI, Python 3.12 and later: Send gave materialize the source's identity from os.fstat while
+        materialize reads it from the handle, so every Send failed with source_changed. Here the Claude service's own
+        Send loop runs with Windows simulated and Python's stat reporting as 3.12 does, and the copy is made."""
+        repo = self.base / 'orchard'
+        self.private_folder(repo)
+        subprocess.run([SYSTEM_GIT, '-c', 'init.templateDir=', 'init', '-q', str(repo)], check=True, capture_output=True,
+                       timeout=30, env={'PATH': '/usr/bin:/bin', 'HOME': str(self.base), 'GIT_CONFIG_NOSYSTEM': '1',
+                                        'GIT_CONFIG_GLOBAL': '/dev/null'})
+        (repo / '.git' / 'info').mkdir(exist_ok=True)
+        locks = self.base / 'locks'
+        self.private_folder(locks)
+        source = self.base / 'source'
+        source.write_bytes(CONTENT)
+        source.chmod(0o600)
+        destination = 'c:' + str(uuid.UUID(int=9))
+        with self.as_program_files(), self.windows(), self.python_312_stat():
+            context = service._workspace(str(repo))
+            resources = ResourceLocks(str(locks), enabled=True)
+            source_fd = ps.open_no_links(str(source), single_link=True, private=True)
+        try:
+            authority = RequestAuthority('a' * 32, 'b' * 64, 1, 'qualified-test', context.fingerprint,
+                                         context.workspace_fingerprint, 'd' * 64)
+            spec = CopyIntent('e' * 32, authority.request_id, 'f' * 32, 1, 1, 1, 'workspace',
+                              relative_path(authority.request_id, 'e' * 32, 'application/pdf'), len(CONTENT),
+                              hashlib.sha256(CONTENT).hexdigest(), 'application/pdf', '1' * 64)
+            send = object.__new__(service.ClaudeAttachmentService)
+            binding = mock.Mock(context=context, destination_record='{}', profile='fictional-profile')
+            enrollment = {'id': 'enrollment', 'grant_id': 'grant', 'agent': destination, 'project': str(repo)}
+            send.target = mock.Mock(return_value=(None, binding, enrollment))
+            send.composition, send.mirror, send.requests = mock.Mock(), mock.Mock(), mock.Mock()
+            send.store = mock.Mock()
+            send.store._gate.side_effect = lambda: nullcontext()
+            send.resources = resources
+            send._row = mock.Mock(return_value={'stage': 'intent', 'authorized_at': None,
+                                                'catalogue_destination': destination, 'catalogue_scope': 'scope'})
+            send._refuse_blocked_send = mock.Mock(return_value=False)
+            send._adapter = mock.Mock()
+            send._observation = mock.Mock(return_value={'fictional': 'observation'})
+            send.mirror.authorize_send.return_value = {'copies': [{'id': spec.id}]}
+            send.requests.resource_keys.return_value = resource_keys(context, authority, (spec,))
+            send.requests.authority.return_value = authority
+            send.requests.workspace_directories.return_value = {'root_identity': None, 'request_identity': None}
+            send.requests.claim_copy.return_value = spec
+            send.requests.source_handle.side_effect = lambda copy_id, lease: nullcontext(source_fd)
+            send.materializer = Materializer(enabled=True, validate_authority=lambda *args: True,
+                                             record_directory=lambda *args: True, record_created=lambda *args: True,
+                                             record_partial=lambda *args: True)
+            with self.as_program_files(), self.windows(), self.python_312_stat():
+                self.assertNotEqual(materialize.copy_identity(materialize.FileIdentity.of(os.fstat(source_fd))),
+                                    materialize.copy_identity(materialize._regular_fd(source_fd)))
+                result = send.send(authority.request_id, 'c' * 64, {'revision': 1, 'fingerprint': '7' * 64},
+                                   'fictional-command-key-0001')
+            self.assertEqual(result, {'observation': {'fictional': 'observation'}})
+            (saved, _), _ = send.requests.record_copy_result.call_args
+            self.assertEqual((saved.copy_id, saved.sha256, saved.bytes), (spec.id, spec.sha256, len(CONTENT)))
+            self.assertEqual((repo / spec.relative_path).read_bytes(), CONTENT)
+            send._adapter.return_value.offer.assert_called_once()
+        finally:
+            os.close(source_fd)
+            with self.windows():
+                resources.close()
 
     def test_a_copy_is_excluded_proved_ignored_by_git_copied_verified_and_removed(self):
         """The whole copy as a Send makes it, with Git's check-ignore and ls-files run by the Windows runner (reader
