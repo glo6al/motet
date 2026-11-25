@@ -102,6 +102,26 @@ def _relative(value):
     return value
 
 
+def _error_summary(error, step):
+    """Why the writer stopped, for diagnosing it later: the exception's type, its SQLite error name (Python 3.11+),
+    errno and Windows error code, and the step as a fixed word (write, verify, commit, gap, purge). Never record
+    content or a file path: a system OSError's message can name its file, so only the codes are kept; the message
+    is kept only for SQLite's own fixed phrases and for this module's own OSError and OverflowError reasons, which
+    carry neither. At most 300 characters, on one line. Internal: shown by no page, route or archive row."""
+    parts = [type(error).__name__]
+    if getattr(error, 'sqlite_errorname', None):
+        parts.append(str(error.sqlite_errorname))
+    for label in ('errno', 'winerror'):
+        if getattr(error, label, None) is not None:
+            parts.append('%s %s' % (label, getattr(error, label)))
+    summary = ' '.join(parts) + ' in ' + step
+    own = isinstance(error, OverflowError) or (isinstance(error, OSError) and error.errno is None
+                                                and error.filename is None and len(error.args) == 1)
+    if isinstance(error, sqlite3.Error) or own:
+        summary += ': ' + str(error)
+    return ' '.join(summary.split())[:300]
+
+
 class DeckLog(OfficerHistoryMixin):
     def __init__(self, state_dir, *, clock=time.time, limits=None):
         self.clock, self.limits = clock, dict(LIMITS, **(limits or {}))
@@ -122,6 +142,8 @@ class DeckLog(OfficerHistoryMixin):
         self.key = secrets.token_bytes(32)
         self.dropped = 0
         self.last_gap = ''
+        self.last_error = None        # why the writer last stopped (_error_summary); internal, for diagnosis
+        self._writer_step = 'write'
         self.last_purge = self.clock()
         self.thread = None
         self.erasure_observer = None
@@ -472,7 +494,9 @@ class DeckLog(OfficerHistoryMixin):
         scopes = ('all', self._scope_hash('chat', record['chat_id']), self._scope_hash('project', record['project_id']))
         if any(age <= r[0] for scope in scopes for r in self.db.execute('SELECT cutoff FROM erase_floors WHERE scope=?', (scope,))):
             return
+        self._writer_step = 'verify'
         self._verify()
+        self._writer_step = 'commit'
         if self.db.execute('SELECT 1 FROM erased_records WHERE key=?', (record['key'],)).fetchone():
             return
         self.db.execute('BEGIN IMMEDIATE')
@@ -507,15 +531,19 @@ class DeckLog(OfficerHistoryMixin):
             try:
                 with self.lock:
                     if self.clock() - self.last_purge >= 3600:
+                        self._writer_step = 'purge'
                         self._purge()
                         self.last_purge = self.clock()
                     if self.last_gap:
+                        self._writer_step = 'gap'
                         self._gap(self.last_gap)
                         self.last_gap = ''
                     if item:
+                        self._writer_step = 'write'
                         self._write(*item)
-            except (sqlite3.Error, OSError, OverflowError):
+            except (sqlite3.Error, OSError, OverflowError) as error:
                 with self.lock:
+                    self.last_error = _error_summary(error, self._writer_step)
                     self.active = False
                     self.reason = 'storage_full_or_unavailable'
                     with self.wake:

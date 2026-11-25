@@ -61,8 +61,9 @@ class IntegrationTests(unittest.TestCase):
         # Bulk synthetic batches retain per-record private-file checks. Allow
         # slower Windows runners to drain them without changing runtime limits.
         self.assertTrue(server.HISTORY.flush(30 if os.name == 'nt' else 10),
-                        'Synthetic archive writes did not settle: reason=%r, queued=%d, inflight=%d' %
-                        (server.HISTORY.reason, len(server.HISTORY.queue), server.HISTORY.inflight))
+                        'Synthetic archive writes did not settle: reason=%r, queued=%d, inflight=%d, last_error=%r' %
+                        (server.HISTORY.reason, len(server.HISTORY.queue), server.HISTORY.inflight,
+                         getattr(server.HISTORY, 'last_error', None)))
         return server.HISTORY.search(limit=100)['events']
 
     def test_future_fence_old_first_poll_and_recreation_receipt(self):
@@ -186,7 +187,8 @@ class IntegrationTests(unittest.TestCase):
         rows = self.events()
         status = history.status()
         diagnostics = (f"retained={len(rows)}, dropped={status['dropped']}, queued={status['queued']}, "
-                       f"inflight={history.inflight}, coverage={[row['reason'] for row in status['coverage']]}")
+                       f"inflight={history.inflight}, coverage={[row['reason'] for row in status['coverage']]}, "
+                       f"last_error={getattr(history, 'last_error', None)!r}")
         self.assertEqual(status['dropped'], 0, diagnostics)
         self.assertCountEqual([row['text'] for row in rows], expected, diagnostics)
         return self.DAILY_NOON.date().isoformat()
@@ -195,7 +197,8 @@ class IntegrationTests(unittest.TestCase):
         day = self.seed_daily_entries()
         out = server.officer_tool('session_day_summary', {'day': day}, [])
         self.assertTrue(out['truncated'])
-        self.assertEqual(out['counts']['message'], 45)
+        self.assertEqual(out['counts']['message'], 45,
+                         (server.HISTORY.status(), getattr(server.HISTORY, 'last_error', None)))
         self.assertEqual(out['omitted_count'], 45 - len(out['events']))
         ids, cursor = set(), None
         for _ in range(20):
