@@ -191,22 +191,26 @@ class MacChooser:
             raise
 
 
-def read_lines(process, timeout, started, *, valid=windows.windows_path):
+def read_lines(process, timeout, started, *, valid=windows.windows_path, pumps=None):
     """read_frames for Windows, where a pipe cannot be selected: a thread reads it, and this waits on that thread
-    with the same deadline, size limit and frame rules."""
+    with the same deadline, size limit and frame rules. The thread reads through the file object, never a bare
+    descriptor: once the pipe is closed it fails, so it can never read a descriptor number reused after a timeout."""
     import queue
-    chunks, fd = queue.Queue(), process.stdout.fileno()
+    chunks, stream = queue.Queue(), process.stdout
 
     def pump():
         try:
             while True:
-                chunk = os.read(fd, 4096)
+                chunk = stream.read1(4096)
                 chunks.put(chunk)
                 if not chunk:
                     return
-        except OSError:
+        except (OSError, ValueError):
             chunks.put(b'')
-    threading.Thread(target=pump, daemon=True).start()
+    thread = threading.Thread(target=pump, daemon=True)
+    if pumps is not None:
+        pumps.append(thread)        # the operation joins it after the helper is ended, before closing the pipe
+    thread.start()
     end, pending, total, terminal = time.monotonic() + timeout, bytearray(), 0, None
     seen_start = False
     while True:
@@ -246,7 +250,7 @@ class WindowsOperation:
     inside that process, so the process having exited is the proof that the window is gone."""
 
     def __init__(self, process, *, reader=read_lines):
-        self.process, self.reader = process, reader
+        self.process, self.reader, self.pumps = process, reader, []
         self.lock, self.started = threading.RLock(), threading.Event()
 
     @property
@@ -271,7 +275,7 @@ class WindowsOperation:
 
     def result(self):
         try:
-            value = self.reader(self.process, 125, self.started.set)
+            value = self.reader(self.process, 125, self.started.set, pumps=self.pumps)
             with self.lock:
                 self.process.wait(timeout=2)
                 if self.process.returncode != 0:
@@ -280,7 +284,10 @@ class WindowsOperation:
         finally:
             self.cancel()
             if self.exited() and self.process.stdout:
-                self.process.stdout.close()
+                for pump in self.pumps:     # the ended helper closed its end, so the reading thread finishes
+                    pump.join(2)
+                if not any(pump.is_alive() for pump in self.pumps):
+                    self.process.stdout.close()
 
 
 def windows_environment(source=os.environ):
@@ -295,23 +302,69 @@ def windows_environment(source=os.environ):
     return env
 
 
+def server_handle():
+    """An inheritable handle to this process (SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION only), for the helper
+    to recognise and watch the server by, and a function that closes this process's copy."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.GetCurrentProcess.argtypes, k.GetCurrentProcess.restype = [], wintypes.HANDLE
+    k.DuplicateHandle.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.HANDLE),
+                                  wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.DuplicateHandle.restype = wintypes.BOOL
+    k.CloseHandle.argtypes, k.CloseHandle.restype = [wintypes.HANDLE], wintypes.BOOL
+    me, out = k.GetCurrentProcess(), wintypes.HANDLE()
+    if not k.DuplicateHandle(me, me, me, ctypes.byref(out), 0x00100000 | 0x1000, True, 0):
+        raise OSError(ctypes.get_last_error(), 'The server could not hand its own process handle to the folder window.')
+    return out.value, lambda: k.CloseHandle(out.value)
+
+
+def allow_foreground(pid):
+    """Let the helper bring its window in front (AllowSetForegroundWindow). Windows grants this only while the
+    server may itself take the foreground, so the window can still open behind the browser; then it flashes in the
+    taskbar."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL('user32')
+        u.AllowSetForegroundWindow.argtypes, u.AllowSetForegroundWindow.restype = [wintypes.DWORD], wintypes.BOOL
+        return bool(u.AllowSetForegroundWindow(pid))
+    except (AttributeError, OSError):
+        return False
+
+
+def _startup(handles):
+    info = subprocess.STARTUPINFO() if hasattr(subprocess, 'STARTUPINFO') else type('STARTUPINFO', (), {})()
+    info.lpAttributeList = {'handle_list': list(handles)}
+    return info
+
+
 class WindowsChooser:
     """The Windows folder window: this server's Python, isolated (-I), runs new_chat_folder_chooser_windows.py with
-    one JSON argument. No shell and no console window; the folder hint is data in that argument."""
+    one JSON argument. No shell and no console window; the folder hint is data in that argument. The helper
+    inherits one handle besides its standard ones: a handle to this server, by which it recognises and watches it."""
     valid_path = staticmethod(windows.windows_path)
 
-    def __init__(self, root=None, popen=subprocess.Popen, reader=read_lines, env=None):
-        self.root, self.popen, self.reader = root, popen, reader
+    def __init__(self, root=None, popen=subprocess.Popen, reader=read_lines, env=None, handle=server_handle,
+                 foreground=allow_foreground):
+        self.root, self.popen, self.reader, self.handle, self.foreground = root, popen, reader, handle, foreground
         self.env = env if env is not None else windows_environment()
 
     def open(self, initial_path=None, before_spawn=None):
         if before_spawn:
             before_spawn()
-        data = {'parent': os.getpid(), 'initial': initial_path or ''}
-        process = self.popen([sys.executable, '-I', str(Path(windows.__file__).resolve()), json.dumps(data, ensure_ascii=True)],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             shell=False, env=self.env, close_fds=True,
-                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000))
+        server, close = self.handle()
+        try:
+            data = {'parent': os.getpid(), 'server': server, 'initial': initial_path or ''}
+            system = os.path.join(self.env.get('SYSTEMROOT') or 'C:\\Windows', 'System32')
+            process = self.popen([sys.executable, '-I', str(Path(windows.__file__).resolve()), json.dumps(data, ensure_ascii=True)],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 shell=False, env=self.env, close_fds=True, startupinfo=_startup([server]),
+                                 cwd=system,     # a DLL loaded by bare name is never looked for in the server's folder
+                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000))
+        finally:
+            close()
+        self.foreground(process.pid)
         return WindowsOperation(process, reader=self.reader)
 
 
@@ -324,9 +377,10 @@ class FolderChooser:
     def __init__(self, adapter, proof=None, *, clock=time.monotonic, maximum=128,
                  known_limit=65536, retention=150, schedule=True, timer_factory=None):
         self.adapter, self.proof = adapter, proof if proof is not None else LocalityProof()
-        # A folder as the adapter's window gives it: POSIX for the Mac window (and any adapter that says nothing),
-        # a drive or share path for the Windows one.
-        self.valid_path = getattr(adapter, 'valid_path', _path)
+        # A folder as the adapter's window gives it: a drive path for the Windows window, and POSIX for the Mac one
+        # and for any other adapter (a stand-in that merely has some valid_path attribute does not switch it).
+        windows_window = getattr(type(adapter), 'valid_path', None) is windows.windows_path
+        self.valid_path = windows.windows_path if windows_window else _path
         self.clock, self.maximum, self.known_limit, self.retention = clock, maximum, known_limit, retention
         self.schedule, self.epoch = schedule, str(uuid.uuid4())
         self.timer_factory = timer_factory if timer_factory is not None else threading.Timer

@@ -52,10 +52,18 @@ class FakeDialog:
 
 
 def run_helper(dialog, data=None, **kw):
-    frames = []
-    windows.helper(data or {'parent': 4242, 'initial': ''}, dialog=dialog, emit=frames.append,
-                   parent=lambda: 4242, alive=kw.pop('alive', lambda: True), **kw)
+    frames, alive = [], kw.pop('alive', lambda: True)
+    windows.helper(data or {'parent': 4242, 'server': 88, 'initial': ''}, dialog=dialog, emit=frames.append,
+                   server=kw.pop('server', lambda d: alive), **kw)
     return frames
+
+
+def local(path):
+    return 3                    # DRIVE_FIXED
+
+
+def remote(path):
+    return 4                    # DRIVE_REMOTE
 
 
 class PathRules(unittest.TestCase):
@@ -73,23 +81,29 @@ class PathRules(unittest.TestCase):
             with self.subTest(path=bad):
                 self.assertFalse(windows.windows_path(bad))
 
-    def test_a_hint_never_reaches_a_share(self):
+    def test_a_hint_never_reaches_a_network_folder(self):
         self.assertFalse(windows.windows_path('\\\\fictional-server\\share\\Orchard', share=False))
         looked = []
-        self.assertEqual(windows.initial_folder('\\\\fictional-server\\share\\Orchard', isdir=looked.append), '')
-        self.assertEqual(looked, [], 'a share hint is never looked at')
+        self.assertEqual(windows.initial_folder('\\\\fictional-server\\share\\Orchard', isdir=looked.append, kind=local), '')
+        self.assertEqual(windows.initial_folder('Z:\\Projects\\Orchard', isdir=looked.append, kind=remote), '')
+        self.assertEqual(looked, [], 'a share or a mapped network drive is never looked at')
+        self.assertTrue(windows.remote_drive('Z:\\Projects', remote))
+        self.assertFalse(windows.remote_drive('C:\\Projects', local))
+        if os.name != 'nt':
+            self.assertEqual(windows.drive_type('C:\\Projects'), 0, 'off Windows nothing is asked')
 
     def test_the_hint_opens_its_parent_as_on_the_mac(self):
-        self.assertEqual(windows.initial_folder('C:\\Projects\\Orchard', isdir=lambda p: p == 'C:\\Projects'), 'C:\\Projects')
-        self.assertEqual(windows.initial_folder('C:\\Projects\\Orchard\\', isdir=lambda p: True), 'C:\\Projects')
-        self.assertEqual(windows.initial_folder('C:\\Orchard', isdir=lambda p: True), 'C:\\')
-        self.assertEqual(windows.initial_folder('C:\\Projects\\Orchard', isdir=lambda p: False), '')
-        self.assertEqual(windows.initial_folder('', isdir=lambda p: True), '')
-        self.assertEqual(windows.initial_folder(None, isdir=lambda p: True), '')
+        self.assertEqual(windows.initial_folder('C:\\Projects\\Orchard', isdir=lambda p: p == 'C:\\Projects', kind=local),
+                         'C:\\Projects')
+        self.assertEqual(windows.initial_folder('C:\\Projects\\Orchard\\', isdir=lambda p: True, kind=local), 'C:\\Projects')
+        self.assertEqual(windows.initial_folder('C:\\Orchard', isdir=lambda p: True, kind=local), 'C:\\')
+        self.assertEqual(windows.initial_folder('C:\\Projects\\Orchard', isdir=lambda p: False, kind=local), '')
+        self.assertEqual(windows.initial_folder('', isdir=lambda p: True, kind=local), '')
+        self.assertEqual(windows.initial_folder(None, isdir=lambda p: True, kind=local), '')
 
         def slow(_):
             raise OSError('fictional unreachable drive')
-        self.assertEqual(windows.initial_folder('Z:\\Projects\\Orchard', isdir=slow), '')
+        self.assertEqual(windows.initial_folder('Y:\\Projects\\Orchard', isdir=slow, kind=local), '')
 
     def test_dialog_options(self):
         value = windows.dialog_options(windows.FOS_ALLNONSTORAGEITEMS | 0x10000)
@@ -107,7 +121,7 @@ class Helper(unittest.TestCase):
     def test_started_then_selected(self):
         dialog = FakeDialog()
         with patch.object(windows, 'initial_folder', return_value='C:\\Projects') as initial:
-            frames = run_helper(dialog, {'parent': 4242, 'initial': 'C:\\Projects\\Orchard'})
+            frames = run_helper(dialog, {'parent': 4242, 'server': 88, 'initial': 'C:\\Projects\\Orchard'})
         initial.assert_called_once_with('C:\\Projects\\Orchard')
         self.assertEqual(frames, [{'state': 'started'}, {'state': 'selected', 'path': 'C:\\Projects\\Orchard'}])
         self.assertEqual(dialog.calls, ['open', ('configure', 'C:\\Projects'), 'show', 'close'])
@@ -121,12 +135,18 @@ class Helper(unittest.TestCase):
                 self.assertEqual(run_helper(FakeDialog({'state': 'selected', 'path': path})),
                                  [{'state': 'started'}, {'state': 'failed'}])
 
-    def test_another_parent_never_opens_a_window(self):
+    def test_no_server_handle_never_opens_a_window(self):
         dialog, frames = FakeDialog(), []
-        windows.helper({'parent': 1, 'initial': ''}, dialog=dialog, emit=frames.append, parent=lambda: 2, alive=lambda: True)
+        windows.helper({'parent': 1, 'server': 88, 'initial': ''}, dialog=dialog, emit=frames.append, server=lambda d: None)
         self.assertEqual((frames, dialog.calls), ([{'state': 'cancelled'}], []))
-        windows.helper({'parent': '2'}, dialog=dialog, emit=frames.append, parent=lambda: 2, alive=lambda: True)
+
+        def broken(_):
+            raise OSError('fictional')
+        windows.helper({'parent': 1, 'server': 88}, dialog=dialog, emit=frames.append, server=broken)
         self.assertEqual(dialog.calls, [])
+        for data in ({'parent': 1}, {'parent': '1', 'server': 88}, {'parent': 1, 'server': '88'}, [], None):
+            with self.subTest(data=data):
+                self.assertIsNone(windows.server_watch(data), 'malformed data is refused before Windows is asked')
 
     def test_deadline_reports_cancelled_once_and_ends_the_process(self):
         block, ended = threading.Event(), []
@@ -160,19 +180,28 @@ class ServerSide(unittest.TestCase):
             spawned.append((argv, kw))
             return subprocess.Popen([sys.executable, '-c', 'pass'], stdout=subprocess.PIPE)
         hint = 'C:\\Users\\demo\\a"b; & %PATH% $(x)'
-        operation = chooser.WindowsChooser(popen=popen, env={'PATH': 'C:\\Windows\\System32'}).open(
+
+        def handle():
+            calls.append('handle')
+            return 777, lambda: calls.append('closed')
+        operation = chooser.WindowsChooser(popen=popen, env={'PATH': 'C:\\Windows\\System32', 'SYSTEMROOT': 'C:\\Windows'},
+                                           handle=handle, foreground=lambda pid: calls.append(('foreground', pid))).open(
             hint, before_spawn=lambda: calls.append('checked'))
         operation.cancel()
         operation.process.stdout.close()
         argv, kw = spawned[0]
-        self.assertEqual(calls, ['checked'])
+        self.assertEqual(calls, ['checked', 'handle', 'closed', ('foreground', operation.process.pid)],
+                         'the server keeps no copy of the inherited handle, and lets the window come forward')
         self.assertEqual(argv[:3], [sys.executable, '-I', str(Path(windows.__file__).resolve())])
-        self.assertEqual(json.loads(argv[3]), {'parent': os.getpid(), 'initial': hint})
+        self.assertEqual(json.loads(argv[3]), {'parent': os.getpid(), 'server': 777, 'initial': hint})
+        self.assertEqual(kw['startupinfo'].lpAttributeList, {'handle_list': [777]})
+        self.assertIs(kw['close_fds'], True)
+        self.assertEqual(kw['cwd'], os.path.join('C:\\Windows', 'System32'))
         self.assertEqual(len(argv), 4)
         self.assertIs(kw['shell'], False)
         self.assertEqual((kw['stdin'], kw['stdout'], kw['stderr']), (subprocess.DEVNULL, subprocess.PIPE, subprocess.DEVNULL))
         self.assertEqual(kw['creationflags'], 0x08000000)
-        self.assertEqual(kw['env'], {'PATH': 'C:\\Windows\\System32'})
+        self.assertEqual(kw['env'], {'PATH': 'C:\\Windows\\System32', 'SYSTEMROOT': 'C:\\Windows'})
 
     def test_a_refused_check_spawns_nothing(self):
         spawned = []
@@ -182,6 +211,14 @@ class ServerSide(unittest.TestCase):
         with self.assertRaises(ValueError):
             chooser.WindowsChooser(popen=lambda *a, **k: spawned.append(a), env={}).open(None, before_spawn=refuse)
         self.assertEqual(spawned, [])
+        closed = []
+
+        def fails(*a, **k):
+            raise OSError('fictional spawn failure')
+        with self.assertRaises(OSError):
+            chooser.WindowsChooser(popen=fails, env={}, handle=lambda: (5, lambda: closed.append(5)),
+                                   foreground=lambda pid: closed.append('foreground')).open(None)
+        self.assertEqual(closed, [5], 'the inheritable handle is closed even when the spawn fails')
 
     def test_environment_keeps_only_what_windows_needs(self):
         env = chooser.windows_environment({'SystemRoot': 'C:\\Windows', 'USERPROFILE': 'C:\\Users\\demo',
@@ -271,7 +308,55 @@ class ServerSide(unittest.TestCase):
             coordinator.close()
         self.assertFalse(chooser.FolderChooser(chooser.MacChooser('/fictional')).valid_path('C:\\Projects'),
                          'the Mac window keeps its POSIX rule')
+        from unittest.mock import Mock
+        stand_in = Mock()
+        stand_in.valid_path = lambda value: True
+        self.assertIs(chooser.FolderChooser(stand_in).valid_path, chooser._path, 'a stand-in cannot switch validation off')
+        self.assertIs(chooser.FolderChooser(chooser.WindowsChooser(env={})).valid_path, windows.windows_path)
         self.assertIs(chooser.host_chooser(), chooser.WindowsChooser if os.name == 'nt' else chooser.MacChooser)
+
+    def test_a_share_or_mapped_drive_choice_reaches_registration(self):
+        class Native:
+            window_started = True
+            def result(self):
+                return {'state': 'selected', 'path': '\\\\fictional-server\\share\\Orchard'}
+            def cancel(self):
+                return True
+            def exited(self):
+                return True
+
+        class Adapter(chooser.WindowsChooser):
+            def open(self, initial_path=None, before_spawn=None):
+                before_spawn()
+                return Native()
+        coordinator = chooser.FolderChooser(Adapter(env={}), schedule=False)
+        try:
+            ident = str(uuid.uuid4())
+            coordinator.begin({'requestId': ident, 'epoch': coordinator.epoch, 'gesture': {'trusted': True}},
+                              Connection(), lambda: None)
+            for _ in range(100):
+                view = coordinator.status(ident)
+                if view['state'] != 'pending':
+                    break
+                time.sleep(.02)
+            self.assertEqual(view['state'], 'selected')
+            receipt = {'schemaVersion': 1, 'folder': {'id': 'a' * 64, 'revision': 'b' * 64, 'label': 'Orchard',
+                                                      'displayPath': '\\\\fictional-server\\share\\Orchard', 'registered': True}}
+            got = []
+            result = coordinator.accept(ident, {'selectionToken': view['selectionToken']},
+                                        lambda value: got.append(value) or receipt, lambda: None)
+            self.assertEqual((result['state'], got), ('saved', [{'path': '\\\\fictional-server\\share\\Orchard'}]))
+        finally:
+            coordinator.close()
+
+    def test_the_pump_is_joined_before_the_pipe_is_closed(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)'], stdout=subprocess.PIPE)
+        operation = chooser.WindowsOperation(process, reader=lambda p, t, s, pumps: chooser.read_lines(p, .3, s, pumps=pumps))
+        with self.assertRaises(TimeoutError):
+            operation.result()
+        self.assertEqual(len(operation.pumps), 1)
+        self.assertFalse(operation.pumps[0].is_alive(), 'the reading thread ended before the pipe was closed')
+        self.assertTrue(process.stdout.closed)
 
 
 @unittest.skipUnless(os.name == 'nt', 'The real dialog exists only on Windows.')
@@ -300,12 +385,53 @@ class RealWindows(unittest.TestCase):
             self.assertEqual(after, windows.dialog_options(before))
             self.assertTrue(after & windows.FOS_PICKFOLDERS and after & windows.FOS_FORCEFILESYSTEM)
 
-    def test_the_parent_watch_holds_a_handle(self):
-        self.assertTrue(windows.parent_alive(os.getpid())())
-        child = subprocess.Popen([sys.executable, '-c', 'pass'])
-        alive = windows.parent_alive(child.pid)
-        child.wait()
-        self.assertFalse(alive())
+    def watch_from(self, launcher, data, handles):
+        """What server_watch says in a child of `launcher` started with `handles` inheritable."""
+        code = ('import json, os, sys; sys.path.insert(0, sys.argv[1]); import new_chat_folder_chooser_windows as w; '
+                'watch = w.server_watch(json.loads(sys.argv[2])); '
+                'print(json.dumps([watch is not None, bool(watch and watch()), os.getppid()]))')
+        out = subprocess.run([launcher, '-I', '-c', code, str(Path(windows.__file__).resolve().parent), json.dumps(data)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, close_fds=True,
+                             startupinfo=chooser._startup(handles), timeout=60)
+        return json.loads(out.stdout)
+
+    def test_the_server_is_known_by_its_handle_even_through_a_venv_launcher(self):
+        with tempfile.TemporaryDirectory() as folder:
+            venv = os.path.join(folder, 'venv')
+            subprocess.run([sys.executable, '-m', 'venv', '--without-pip', venv], check=True, timeout=180,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            launcher = os.path.join(venv, 'Scripts', 'python.exe')
+            handle, close = chooser.server_handle()
+            try:
+                found, alive, parent = self.watch_from(launcher, {'parent': os.getpid(), 'server': handle}, [handle])
+                self.assertEqual((found, alive), (True, True), 'the helper knows and watches the server through a venv')
+                print('note: venv parent is the server:', parent == os.getpid())
+                found, _, _ = self.watch_from(launcher, {'parent': os.getpid() + 4, 'server': handle}, [handle])
+                self.assertFalse(found, 'a handle to another process id is not the server')
+                found, _, _ = self.watch_from(sys.executable, {'parent': os.getpid(), 'server': handle}, [])
+                self.assertFalse(found, 'without the inherited handle there is no server')
+            finally:
+                close()
+
+    def test_the_watch_sees_the_server_end(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1)'])
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL('kernel32')
+        k.OpenProcess.argtypes, k.OpenProcess.restype = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k.OpenProcess(0x00100000 | 0x1000, False, child.pid)
+        try:
+            alive = windows.server_watch({'parent': child.pid, 'server': handle})
+            self.assertTrue(alive())
+            child.wait()
+            self.assertFalse(alive())
+        finally:
+            k.CloseHandle(handle)
+
+    def test_the_drive_type_is_asked(self):
+        self.assertIn(windows.drive_type(os.path.realpath(sys.executable)), (2, 3))      # removable or fixed
+        self.assertFalse(windows.remote_drive(os.path.realpath(sys.executable)))
 
     def test_a_real_hint_and_the_system_environment(self):
         with tempfile.TemporaryDirectory() as folder:

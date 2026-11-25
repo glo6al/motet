@@ -33,9 +33,9 @@ ITEM_DISPLAY_NAME = 5                   # IShellItem::GetDisplayName
 
 def windows_path(value, *, share=True):
     """A folder path as the dialog gives it on Windows: a drive path (C:\\Projects\\Orchard) or, with `share`, a
-    path inside a network share (\\\\server\\share\\Orchard). Never a device or long-path prefix (\\\\?\\, \\\\.\\),
-    a relative or drive-relative path, a stream (a second ':'), '/', '.' or '..' parts, an empty part except at
-    the end, or a control character."""
+    path inside a network share (\\\\server\\share\\Orchard), as the Mac accepts mounted network volumes. Never a
+    device or long-path prefix (\\\\?\\, \\\\.\\), a relative or drive-relative path, a stream (a second ':'), '/',
+    '.' or '..' parts, an empty part except at the end, or a control character."""
     if (type(value) is not str or not 3 <= len(value) <= 4096
             or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in value) or '/' in value):
         return False
@@ -55,10 +55,32 @@ def windows_path(value, *, share=True):
     return all(p not in ('.', '..') for p in parts) and '' not in parts[:-1]
 
 
-def initial_folder(hint, isdir=os.path.isdir):
-    """The folder the window opens in: the hinted folder's parent, as on the Mac, when it is a drive path (a share
-    is never contacted because of a hint) and an existing folder. Otherwise the dialog's own choice."""
-    if not windows_path(hint, share=False):
+def drive_type(path):
+    """GetDriveTypeW for the drive a drive path is on (4 is DRIVE_REMOTE, a letter mapped to a network share);
+    0 when it cannot be told, or off Windows."""
+    if os.name != 'nt' or not windows_path(path, share=False):
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL('kernel32')
+        k.GetDriveTypeW.argtypes, k.GetDriveTypeW.restype = [wintypes.LPCWSTR], ctypes.c_uint
+        return k.GetDriveTypeW(path[:3])
+    except (AttributeError, OSError):
+        return 0
+
+
+def remote_drive(path, kind=drive_type):
+    """Whether a drive path is on a drive letter mapped to a network share."""
+    return kind(path) == 4
+
+
+def initial_folder(hint, isdir=os.path.isdir, kind=drive_type):
+    """The folder the window opens in: the hinted folder's parent, as on the Mac, when it is an existing folder.
+    A hint inside a share (\\\\server\\share) is dropped unread, and so is one on a drive letter mapped to a network
+    share (DRIVE_REMOTE), so a hint never makes this process contact a network server. A chosen folder may still be
+    on either: that is the person's own choice in the window."""
+    if not windows_path(hint, share=False) or remote_drive(hint, kind):
         return ''
     parent = ntpath.dirname(hint.rstrip('\\')) if len(hint) > 3 else hint
     try:
@@ -165,21 +187,26 @@ class Dialog:
             self.initialized = False
 
 
-def parent_alive(pid):
-    """A function that says whether process `pid` still runs, holding a handle to it, so a new process given the
-    same number later is never taken for it."""
+def server_watch(data):
+    """The server, through the process handle it handed down: a function that says whether the server still runs,
+    or None when the handle in `data` is not a handle to process data['parent']. The server is not this process's
+    parent when Python runs from a venv (Scripts\\python.exe starts the base Python as its own child), so the server
+    is identified by the inherited handle, never by the parent's process id; a handle also never mistakes a later
+    process given the same number for the server."""
+    if type(data) is not dict or type(data.get('parent')) is not int or type(data.get('server')) is not int:
+        return None
     import ctypes
     from ctypes import wintypes
     k = ctypes.WinDLL('kernel32')
-    k.OpenProcess.argtypes, k.OpenProcess.restype = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE
+    k.GetProcessId.argtypes, k.GetProcessId.restype = [wintypes.HANDLE], wintypes.DWORD
     k.WaitForSingleObject.argtypes, k.WaitForSingleObject.restype = [wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD
-    handle = k.OpenProcess(0x00100000, False, pid)          # SYNCHRONIZE
-    if not handle:
-        return lambda: False
+    handle = data['server']
+    if not handle or k.GetProcessId(handle) != data['parent']:
+        return None
     return lambda: k.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT: still running
 
 
-def helper(data, *, dialog=None, emit=None, parent=os.getppid, alive=None, lifetime=LIFETIME, exit=os._exit):
+def helper(data, *, dialog=None, emit=None, server=server_watch, lifetime=LIFETIME, exit=os._exit):
     """One folder window. A watchdog thread ends the process if the server goes away, or when the window has been
     open for `lifetime` seconds (then it reports cancelled, as the Mac does). Only the first terminal frame counts."""
     out = threading.Lock()
@@ -193,10 +220,13 @@ def helper(data, *, dialog=None, emit=None, parent=os.getppid, alive=None, lifet
                 done.append(value)
             (emit or (lambda v: print(json.dumps(v, ensure_ascii=True), flush=True)))(value)
 
-    if type(data) is not dict or type(data.get('parent')) is not int or parent() != data['parent']:
+    try:
+        alive = server(data)
+    except (OSError, AttributeError, ValueError):
+        alive = None
+    if alive is None:
         say({'state': 'cancelled'})
         return
-    alive = alive or parent_alive(data['parent'])
     deadline = time.monotonic() + lifetime
     finished = threading.Event()
     opened = threading.Event()
