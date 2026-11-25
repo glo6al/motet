@@ -64,7 +64,7 @@ class SimulatedRunnerTests(Simulated, runner_tests.RunnerTests):
 
     def test_the_windows_branches_are_the_ones_used(self):
         self.runner()
-        for name in ('open_folder', 'try_lock', 'sqlite_companions_private'):
+        for name in ('open_folder', 'try_lock', 'sqlite_companions_private', 'path_identity'):
             self.assertIn(name, self.calls)
 
     def test_a_folder_identity_from_os_stat_is_refused(self):
@@ -187,6 +187,17 @@ class SimulatedServiceStorageTests(unittest.TestCase):
                 self.service()
 
 
+class CreateErrorTests(unittest.TestCase):
+    def test_an_existing_name_is_file_exists_with_its_windows_code(self):
+        for code in (80, 183):                # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+            error = ps._create_failed(code)
+            self.assertIsInstance(error, FileExistsError)
+            self.assertEqual(error.winerror, code)
+        error = ps._create_failed(5)          # access denied stays the plain refusal it was
+        self.assertIs(type(error), OSError)
+        self.assertEqual(error.winerror, 5)
+
+
 @unittest.skipUnless(REAL_WINDOWS, 'requires real Windows and its folder walk')
 class WindowsManagedStorageTests(unittest.TestCase):
     """On real Windows: the storage the feature will use, against real access lists. The runner is elevated, so the
@@ -233,6 +244,15 @@ class WindowsManagedStorageTests(unittest.TestCase):
             claude_managed._unlock(held)
         with NativeNamespaceFence(self.state).host_fence():
             pass
+
+    def test_the_registry_opens_again_and_existing_names_are_file_exists(self):
+        for _ in range(2):        # the second create finds the host lock, root, registry.lock and expected marker
+            with self.manager()._registry(create=True) as db:
+                self.assertEqual(db.execute('SELECT count(*) FROM runs').fetchone()[0], 0)
+        with self.assertRaises(FileExistsError):
+            ps.create_private_file(str(self.state / 'managed-claude.lock'))
+        with self.assertRaises(FileExistsError):
+            ps.make_private_folder(str(self.state / 'managed-claude'))
 
     def test_a_registry_lock_held_elsewhere_is_waited_for_then_refused(self):
         root = self.state / 'managed-claude'
@@ -287,6 +307,8 @@ class WindowsManagedStorageTests(unittest.TestCase):
             ps.check_private(str(self.state / 'new-chat' / name), single_link=True)
 
     def test_folder_identity_comes_from_the_handle(self):
+        """A project folder's identity is read from a handle opened by path (a project may be on a network share or
+        in OneDrive): the same volume serial and file index the walk reads for a private folder."""
         fd = ps.open_no_links(str(self.project), directory=True)
         try:
             expected = tuple(ps.file_identity(fd)[:2])

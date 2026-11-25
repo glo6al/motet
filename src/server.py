@@ -6402,8 +6402,12 @@ def new_chat_inventory():
                 if canonical != cwd or not os.path.isdir(canonical):
                     continue
                 folder = os.stat(canonical)
+                from new_chat_inventory import folder_identity as _folder_identity
+                # Windows: the folder identity New chat's inventory records (from a handle), so they compare equal.
+                device, inode = (_folder_identity(canonical) if private_storage.WIN
+                                 else (folder.st_dev, folder.st_ino))
                 result.append(VerifiedIdentity(ident, canonical, path, st.st_dev, st.st_ino,
-                                               'inventory', folder.st_dev, folder.st_ino))
+                                               'inventory', device, inode))
         except (OSError, ValueError):
             continue
     return result
@@ -6428,8 +6432,10 @@ def admit_new_chat(identity, folder, tails, permit):
     def check(meta=None):
         try:
             fs = os.stat(folder.path)
+            from new_chat_inventory import folder_identity as _folder_identity
             if (not os.path.isdir(folder.path) or os.path.realpath(folder.path) != folder.path
-                    or (fs.st_dev, fs.st_ino) != (folder.device, folder.inode)):
+                    or ((_folder_identity(folder.path) if private_storage.WIN
+                         else (fs.st_dev, fs.st_ino)) != (folder.device, folder.inode))):
                 return False
             _, source, st, fresh = codex_transcript.open_pinned(
                 sessions, identity.source_path, identity.native_id, folder.path)

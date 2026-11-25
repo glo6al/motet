@@ -39,11 +39,11 @@ def _physical_path(path):
 
 
 def _handle_identity(path):
-    """Windows: a folder's volume serial and file index, read from a handle opened through private_storage's no-link
-    walk (a link or junction anywhere on the way is refused). The same under every Python: 3.12 changed what
-    ``os.stat`` reports there (a 64-bit serial, and possibly a 128-bit file ID)."""
-    with ps.open_folder(path) as held:
-        return tuple(held.identity()[:2])
+    """Windows: a project folder's volume serial and file index, read from a handle opened by path
+    (``private_storage.path_identity``), the same under every Python: 3.12 changed what ``os.stat`` reports there.
+    Not the private no-link walk: a project may be on a network share, another volume or a ``subst`` drive, or in
+    a OneDrive folder, as on the Mac. ``os.stat`` and ``realpath`` have already decided it is a folder, not a link."""
+    return ps.path_identity(path)
 
 
 def _identity(path, info):

@@ -334,6 +334,19 @@ def _check_descriptor(user, directory, path=None, handle=None):
         kernel.LocalFree(sd)
 
 
+def _create_failed(code):
+    """The error for a failed create by name: an existing name (ERROR_FILE_EXISTS or ERROR_ALREADY_EXISTS) is
+    FileExistsError, as POSIX's O_EXCL or mkdir gives, with ``winerror`` kept; anything else the plain OSError as
+    before."""
+    if code in _EXISTS:
+        exists = FileExistsError(errno.EEXIST, 'private storage: the name exists')
+        exists.winerror = code
+        return exists
+    error = OSError('private storage unavailable')
+    error.winerror = code
+    return error
+
+
 def windows_security(path, directory=False, create=False):
     """Protected current-user/SYSTEM DACL, checked with actual Win32 APIs.
 
@@ -346,11 +359,11 @@ def windows_security(path, directory=False, create=False):
             with _PrivateAttributes(user) as sa:
                 if directory:
                     if not kernel.CreateDirectoryW(path, ctypes.byref(sa)):
-                        raise OSError('private storage unavailable')
+                        raise _create_failed(ctypes.get_last_error())
                 else:
                     handle = kernel.CreateFileW(path, 0xC0000000, 0, ctypes.byref(sa), 1, 0x80, None)
                     if handle == w.HANDLE(-1).value:
-                        raise OSError('private storage unavailable')
+                        raise _create_failed(ctypes.get_last_error())
                     kernel.CloseHandle(handle)
         _check_descriptor(user, directory, path=path)
 
@@ -614,7 +627,12 @@ def create_private_file(path):
         return fd
     with _CurrentUser() as user, _PrivateAttributes(user) as sa:
         # DELETE access lets a failed check remove the new file through this same handle.
-        handle = _win_open(path, _GENERIC_READ | _GENERIC_WRITE | _DELETE, 0, _CREATE_NEW, _ATTRIBUTE_NORMAL, sa)
+        try:
+            handle = _win_open(path, _GENERIC_READ | _GENERIC_WRITE | _DELETE, 0, _CREATE_NEW, _ATTRIBUTE_NORMAL, sa)
+        except OSError as e:
+            if getattr(e, 'winerror', 0) in _EXISTS:      # an existing name, links included, as O_EXCL refuses
+                raise _create_failed(e.winerror) from None
+            raise
     try:
         _win_check_handle(handle, False, 'file', True)
         import msvcrt
@@ -1851,6 +1869,33 @@ def _win_file_system(handle):
     if not kernel.GetVolumeInformationByHandleW(handle, None, 0, None, None, None, name, len(name)):
         raise _unavailable('folder')
     return name.value
+
+
+def path_identity(path):
+    """(volume, file index) of the file or folder ``path`` names, for a user's own folders (a project folder), where
+    the private no-link walk is the wrong rule: network shares, other volumes, ``subst`` drives and cloud (OneDrive)
+    folders are all fine there. POSIX: ``(st_dev, st_ino)`` of ``os.stat``. Windows: one ``CreateFileW`` by path with
+    attribute access only and FILE_FLAG_BACKUP_SEMANTICS (which a folder needs), sharing everything (nothing is
+    held against other programs), then GetFileInformationByHandle: the 32-bit volume serial and the 64-bit file
+    index, the same under every Python (3.12 changed what ``os.stat`` reports there). The caller has already decided
+    with ``os.stat`` and ``realpath`` that the name is a folder and not a link. A missing name raises
+    FileNotFoundError; any other failure OSError."""
+    if not WIN:
+        info = os.stat(path)
+        return info.st_dev, info.st_ino
+    kernel, w = _win_api()[1:3]
+    handle = kernel.CreateFileW(path, _FILE_READ_ATTRIBUTES, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE, None,
+                                _OPEN_EXISTING, _BACKUP_SEMANTICS, None)
+    if handle is None or handle == w.HANDLE(-1).value:
+        code = ctypes.get_last_error()
+        error = (FileNotFoundError(errno.ENOENT, 'no such folder') if code in _NOT_FOUND
+                 else OSError('folder identity unavailable'))
+        error.winerror = code
+        raise error
+    try:
+        return tuple(_win_identity(handle)[:2])
+    finally:
+        _win_close(handle)
 
 
 def check_private_fd(fd, directory=False, single_link=False):

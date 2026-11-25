@@ -112,7 +112,9 @@ def _directory(path, writable=False):
     through private_storage's walk (``writable`` lets files be created through it)."""
     path = os.path.abspath(os.fspath(path))
     if ps.WIN:
-        return ps.open_folder(path, private=True, writable=writable)
+        # A hold kept for the supervisor's lifetime: only the run folder's own handle (``alone``), as the attachment
+        # store keeps its folders; NTFS still refuses to rename the folders above it while it is open.
+        return ps.open_folder(path, private=True, writable=writable, alone=True)
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
     try:
         for component in path.split('/'):
@@ -171,10 +173,11 @@ def _folder(folder):
                 or type(folder['device']) is not int or type(folder['inode']) is not int):
             raise ValueError()
         if ps.WIN:
-            # The handle's identity through the no-link walk, as New chat's inventory records it.
-            with ps.open_folder(path) as held:
-                if tuple(held.identity()[:2]) != (folder['device'], folder['inode']):
-                    raise ValueError()
+            # The same checks; the identity is read from a handle opened by path, as New chat's inventory records it
+            # (a project folder may be on a network share or in OneDrive: not the private walk).
+            if (not stat.S_ISDIR(os.lstat(path).st_mode)
+                    or ps.path_identity(path) != (folder['device'], folder['inode'])):
+                raise ValueError()
             return
         info = os.lstat(path)
         if (not stat.S_ISDIR(info.st_mode)
@@ -236,6 +239,16 @@ def _validate_db(root_fd):
         os.close(_file(root_fd, 'ledger.sqlite3', 64 * 1024 * 1024))
         if not ps.sqlite_companions_private(os.path.join(root_fd.path, 'ledger.sqlite3'), folder=root_fd):
             _fail('unsafe_state')
+        for suffix in ('-journal', '-wal', '-shm'):      # the same 64 MiB bound as POSIX
+            try:
+                fd = root_fd.open('ledger.sqlite3' + suffix, single_link=True)
+            except FileNotFoundError:
+                continue
+            try:
+                if os.fstat(fd).st_size > 64 * 1024 * 1024:
+                    _fail('unsafe_state')
+            finally:
+                os.close(fd)
         return
     for name in ('ledger.sqlite3', 'ledger.sqlite3-journal', 'ledger.sqlite3-wal', 'ledger.sqlite3-shm'):
         try:
