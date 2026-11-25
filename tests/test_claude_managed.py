@@ -335,6 +335,33 @@ class Fixture(unittest.TestCase):
         self.assertEqual(len(results), 8)
         self.assertEqual(self.spawns, [])
 
+    def test_a_launch_that_sees_an_exit_never_unsettles_the_released_slot(self):
+        """Another caller's status() records Claude's confirmed exit first and releases the slot; the launch loop then
+        sees the exit too. Its uncertainty must not reopen the released row (an unoccupied row that is not 'exited'
+        fails registry validation, and every later registry open with it)."""
+        run_id = self.manager.reserve(self.folder, str(uuid.uuid4()))
+        spawn, request, first = self.spawn, self.request, []
+
+        def exiting(path):
+            spawn(path)
+            snapshot = self.snapshots[path.name]
+            snapshot.update(state='exited', identityVerified=False,
+                            nativeExit=dict(confirmed=True, code=0, incarnation=snapshot['incarnation']))
+
+        def status_first(path, command, params):
+            if command == 'status' and not first:
+                first.append(path.name)
+                self.manager.status(path.name)          # the other caller, first
+            return request(path, command, params)
+        self.manager._test = replace(self.dependencies, spawn=exiting, request=status_first)
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.launch_once(run_id, self.folder, lambda *_: None)
+        self.assertEqual(raised.exception.code, 'launch_outcome_unknown')
+        with self.manager._registry() as db:              # still valid
+            row = self.manager._row(db, run_id)
+        self.assertEqual((row['state'], row['occupied']), ('exited', False))
+        self.assertTrue(self.manager.reserve(self.folder, str(uuid.uuid4())))
+
     def test_private_manifest_separate_native_identity_and_launch_once(self):
         run_id, native = self.start()
         self.assertNotEqual(run_id, native)

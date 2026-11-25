@@ -436,12 +436,21 @@ def read_decision(run_dir, permission_id, request_id, decision):
 
 
 class NativeTransport:
-    """Pinned native JSONL, bounded reads/writes, one owned Popen instance."""
+    """Pinned native JSONL, bounded reads/writes, one owned Popen instance.
+
+    POSIX: non-blocking pipes under a selector; Shutdown sends SIGTERM and waits. Windows (step 8b.2; refused there
+    until 8b.5): Claude runs in a kill-on-close job and its pipes are read and written by threads
+    (claude_managed_windows: ``pipes`` and ``job`` are set), with the same line limit, budgets and deadlines;
+    Shutdown closes its input, waits as long, then ends the whole job. See claude_managed_windows for why Claude
+    ends with its supervisor there."""
     def __init__(self, manifest):
         self.manifest = manifest
         self.process = None
         self.selector = None
         self.buffer = bytearray()
+        self.pipes = None        # Windows: claude_managed_windows.ThreadedPipes
+        self.job = None          # Windows: claude_managed_windows.Job
+        self.stop_requested = False
 
     @property
     def pid(self):
@@ -486,6 +495,18 @@ class NativeTransport:
             if (path_info.st_dev, path_info.st_ino, path_info.st_mtime_ns, path_info.st_ctime_ns) != (
                     after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns):
                 raise ValueError()
+            if ps.WIN:
+                # Suspended, put in its own kill-on-close job, then resumed; refused if any step fails.
+                import claude_managed_windows as windows
+                self.process, self.job = windows.start_in_job(args, self.manifest['folder']['path'])
+                try:
+                    self.pipes = windows.ThreadedPipes(self.process)
+                except BaseException as error:
+                    self.close()              # ends the job: nothing runs without its pipes
+                    if isinstance(error, Exception) and not isinstance(error, (OSError, ValueError)):
+                        raise OSError('pipe threads unavailable') from error    # a thread that would not start
+                    raise
+                return
             self.process = subprocess.Popen(args, cwd=self.manifest['folder']['path'],
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)
@@ -505,6 +526,9 @@ class NativeTransport:
         raw = (_json(frame) + '\n').encode('utf-8')
         if len(raw) > MAX_NATIVE_LINE or self.poll() is not None:
             raise EOFError()
+        if self.pipes is not None:
+            self.pipes.write(raw, 2)            # the same 2 s deadline, by a writer thread
+            return
         view = memoryview(raw)
         deadline = time.monotonic() + 2
         with selectors.DefaultSelector() as selector:
@@ -518,8 +542,28 @@ class NativeTransport:
                 except BlockingIOError:
                     continue
 
+    def _threaded_fill(self, timeout):
+        """``read``'s fill from the reader thread: a chunk extends the buffer and the end of the stream is EOFError,
+        every time once seen, as a POSIX read of an ended pipe is. When the child has exited with nothing queued,
+        the reader is given up to two seconds to pass on what it already read and the end marker (a selector would
+        still report those bytes as readable); if it is still blocked then (a program outside the child holds the
+        pipe), that is the end too."""
+        if self.pipes.eof:
+            raise EOFError()
+        chunk = self.pipes.get(timeout)
+        if chunk == b'' and self.poll() is not None:
+            chunk = self.pipes.final()
+            if chunk == b'':
+                chunk = None
+        if chunk is None:
+            self.pipes.eof = True
+            raise EOFError()
+        self.buffer.extend(chunk)
+
     def read(self, timeout=0):
-        if b'\n' not in self.buffer:
+        if b'\n' not in self.buffer and self.pipes is not None:
+            self._threaded_fill(timeout)
+        elif b'\n' not in self.buffer:
             if self.selector.select(timeout):
                 chunk = os.read(self.process.stdout.fileno(), 65536)
                 if not chunk:
@@ -543,13 +587,39 @@ class NativeTransport:
 
     def terminate(self):
         # Only the original unreaped Popen child; never load or signal a saved PID.
+        if self.job is not None:
+            self.stop_requested = True          # Windows: ``wait`` closes input, waits, then ends the whole job
+            return
         if self.process and self.process.poll() is None:
             self.process.terminate()
 
     def wait(self, timeout=3):
+        if self.job is not None and self.stop_requested:
+            import claude_managed_windows as windows
+            return windows.stop_tree(self._close_input, lambda seconds: self.process.wait(timeout=seconds),
+                                     self.job.terminate, timeout,
+                                     input_blocked=lambda: self.pipes is not None and self.pipes.writing())
         return self.process.wait(timeout=timeout)
 
+    def _close_input(self):
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+
     def close(self):
+        if self.pipes is not None or self.job is not None:
+            # Windows: end the job first (Claude ends with its supervisor), so its ends of the pipes close and no
+            # pipe thread stays blocked; only then close the pipes, never one a thread is still in.
+            if self.job is not None:
+                try:
+                    self.job.terminate()
+                except OSError:
+                    pass                  # closing its only handle below ends it all the same
+                self.job.close()
+            if self.pipes is not None:
+                self.pipes.close()
+            return
         if self.selector:
             self.selector.close()
         if self.process:

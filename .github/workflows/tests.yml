@@ -95,6 +95,11 @@ jobs:
       - run: python tests/test_managed_windows_storage.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # Managed Claude's processes and pipes (step 8b.2): the threaded transport and the Shutdown decision on every
+      # system; Claude's kill-on-close job and the detached supervisor on real Windows, with a fictional "claude".
+      - run: python tests/test_managed_windows_process.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: node docs/fixtures/new-chat/managed-fixture.test.mjs
         if: ${{ !cancelled() }}
         timeout-minutes: 5
