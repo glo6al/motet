@@ -44,7 +44,7 @@ class DeckTests(unittest.TestCase):
     def offer(self, record=None, candidates=None):
         result = self.store.offer_record(record or self.record(), [self.prose()] if candidates is None else candidates, capture_epoch=self.epoch)
         self.assertEqual(result['status'], 'queued', result)
-        self.assertTrue(self.store.flush())
+        self.assertTrue(self.store.flush(), (self.store.status(), getattr(self.store, 'last_error', None)))
         return result
 
     def test_default_missing_archive_is_read_only_and_lazy(self):
@@ -97,7 +97,7 @@ class DeckTests(unittest.TestCase):
             self.assertEqual(self.store.inflight, 1)
             self.epoch = self.store.configure(enabled=True)['capture_epoch']
             self.store.activate(self.epoch)
-        self.assertTrue(self.store.flush())
+        self.assertTrue(self.store.flush(), (self.store.status(), getattr(self.store, 'last_error', None)))
         self.assertFalse(self.store.search()['events'])
 
     def test_fts_cleanup_also_runs_when_search_falls_back(self):
@@ -222,6 +222,24 @@ class DeckTests(unittest.TestCase):
         self.assertEqual(len(self.store.search()['events']), 1)
         self.assertEqual(self.store.status()['reason'], 'storage_full_or_unavailable')
 
+    def test_a_stopped_writer_says_why_without_content_or_paths(self):
+        self.store.limits['events'] = 0
+        result = self.store.offer_record(self.record(), [self.prose('private words')], capture_epoch=self.epoch)
+        self.assertEqual(result['status'], 'queued')
+        self.assertFalse(self.store.flush())
+        self.assertEqual(self.store.last_error, 'OverflowError in commit: storage_full')
+        error = PermissionError(13, 'Access is denied', os.path.join(self.root, 'deck-log.sqlite3-journal'))
+        summary = d._error_summary(error, 'verify')
+        self.assertEqual(summary, 'PermissionError errno 13 in verify')       # the code, never the path
+        self.assertEqual(d._error_summary(OSError('storage replaced'), 'verify'), 'OSError in verify: storage replaced')
+        failed = sqlite3.OperationalError('disk I/O\nerror ' + 'x' * 400)
+        summary = d._error_summary(failed, 'commit')
+        self.assertTrue(summary.startswith('OperationalError'), summary)
+        self.assertIn(' in commit: disk I/O error', summary)
+        self.assertNotIn('\n', summary)
+        self.assertLessEqual(len(summary), 300)
+        self.assertNotIn('last_error', json.dumps(self.store.status()))      # internal: not in the status
+
     def test_queue_bound_and_policy_generation(self):
         self.store.limits['queue'] = 1
         with self.store.wake:
@@ -230,7 +248,7 @@ class DeckTests(unittest.TestCase):
             self.assertEqual(first['status'], 'queued')
             self.assertEqual(second['status'], 'dropped')
             configured = self.store.configure(paused=True)
-        self.assertTrue(self.store.flush())
+        self.assertTrue(self.store.flush(), (self.store.status(), getattr(self.store, 'last_error', None)))
         self.assertFalse(self.store.search()['events'])
         self.assertNotEqual(configured['capture_epoch'], self.epoch)
         self.assertFalse(self.store.activate(configured['capture_epoch'])['recording'])
@@ -420,7 +438,7 @@ class DeckTests(unittest.TestCase):
             record = self.record(ts=time.time())
             result = archive.offer_record(record, [self.prose('existing directory evidence')], capture_epoch=epoch)
             self.assertEqual(result['status'], 'queued', result)
-            self.assertTrue(archive.flush())
+            self.assertTrue(archive.flush(), (archive.status(), getattr(archive, 'last_error', None)))
             self.assertEqual(archive.search()['events'][0]['text'], 'existing directory evidence')
         finally:
             archive.close()
@@ -500,7 +518,7 @@ class DeckTests(unittest.TestCase):
             record = self.record(ts=time.time())
             result = archive.offer_record(record, [self.prose('owner rights evidence')], capture_epoch=epoch)
             self.assertEqual(result['status'], 'queued', result)
-            self.assertTrue(archive.flush())
+            self.assertTrue(archive.flush(), (archive.status(), getattr(archive, 'last_error', None)))
             self.assertEqual(archive.search()['events'][0]['text'], 'owner rights evidence')
         finally:
             archive.close()
