@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, 'scripts', 'windows_probe.py')
@@ -235,6 +236,234 @@ class RunTests(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+def sid_bytes(text):
+    parts = [int(x) for x in text.split('-')[2:]]
+    return bytes([1, len(parts) - 1]) + parts[0].to_bytes(6, 'big') + b''.join(x.to_bytes(4, 'little') for x in parts[1:])
+
+
+def ace(kind, flags, mask, sid, extra=b''):
+    body = mask.to_bytes(4, 'little') + sid_bytes(sid) + extra
+    return bytes([kind, flags]) + (4 + len(body)).to_bytes(2, 'little') + body
+
+
+def acl(*aces):
+    body = b''.join(aces)
+    return bytes([2, 0]) + (8 + len(body)).to_bytes(2, 'little') + len(aces).to_bytes(2, 'little') + b'\0\0' + body
+
+
+ME = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+INSTALLER = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+MANIFEST = b"""<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3">
+  <Applications>
+    <Application Id="App" Executable="app\\ChatGPT.exe" EntryPoint="Windows.FullTrustApplication">
+      <Extensions>
+        <uap:Extension Category="windows.protocol"><uap:Protocol Name="codex"/></uap:Extension>
+        <uap3:Extension Category="windows.appExecutionAlias">
+          <uap3:AppExecutionAlias><uap3:ExecutionAlias Alias="fictional-alias.exe"/></uap3:AppExecutionAlias>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>"""
+
+
+class ProbeV2Tests(unittest.TestCase):
+    def test_sids_in_words(self):
+        self.assertEqual(probe.sid_text(sid_bytes('S-1-5-32-544')), 'S-1-5-32-544')
+        self.assertEqual(probe.sid_text(sid_bytes(ME)), ME)
+        self.assertEqual(probe.sid_label(ME, ME), 'you')
+        self.assertEqual(probe.sid_label('S-1-1-0', ME), 'Everyone (S-1-1-0)')
+        self.assertEqual(probe.sid_label('S-1-5-21-1111111111-2222222222-3333333333-1002', ME),
+                         'another account (S-1-5-21-...-1002)')
+        self.assertEqual(probe.sid_label('S-1-5-21-1111111111-2222222222-3333333333-513', ME), 'a domain group (S-1-5-21-...-513)')
+        self.assertEqual(probe.sid_label('S-1-5-21-1111111111-2222222222-3333333333-500', ME), 'a built-in account (S-1-5-21-...-500)')
+        self.assertEqual(probe.sid_label('S-1-15-2-123-456-789-1-2-3-4', ME), 'an app package (S-1-15-2-...)')
+        self.assertEqual(probe.sid_label('S-1-5-5-0-12345', ME), 'this logon session (S-1-5-5-...)')
+        for bad in (b'', b'\x02\x01' + b'\0' * 10, b'\x01\x05' + b'\0' * 8):
+            with self.assertRaises(ValueError):
+                probe.sid_text(bad)
+
+    def test_rights_in_words(self):
+        self.assertEqual(probe.rights(0x1F01FF), 'full control (0x1f01ff)')
+        self.assertEqual(probe.rights(0x10000000), 'full control (0x10000000)')
+        self.assertEqual(probe.rights(0x120089), 'read (0x120089)')
+        self.assertEqual(probe.rights(0x1200A9), 'read, execute (0x1200a9)')
+        self.assertEqual(probe.rights(0x12019F), 'read, write (0x12019f)')
+        self.assertEqual(probe.rights(0x100000), 'some rights (0x100000)')
+
+    def test_access_list_from_bytes(self):
+        raw = acl(ace(0, 0, 0x1F01FF, ME), ace(0, 0, 0x120089, 'S-1-1-0'), ace(1, 0x8, 0x120116, 'S-1-5-7'),
+                  ace(9, 0, 0x1200A9, 'S-1-15-2-1', extra=b'artx\x00\x00\x00\x00'), ace(17, 0, 0x1, 'S-1-16-4096'))
+        aces = probe.parse_acl(raw)
+        self.assertEqual([a[0] for a in aces], [0, 0, 1, 9, 17])
+        self.assertEqual(probe.acl_lines('S-1-5-18', aces, ME), [
+            '  owner: SYSTEM (S-1-5-18)',
+            '  allow you: full control (0x1f01ff)',
+            '  allow Everyone (S-1-1-0): read (0x120089)',
+            '  deny Anonymous (S-1-5-7): write (0x120116) (inherited by contents only)',
+            '  allow, with a condition ALL APPLICATION PACKAGES (S-1-15-2-1): read, execute (0x1200a9)',
+            '  entry of type 17 (not shown)'])
+        self.assertEqual(probe.acl_lines(ME, None, ME), ['  owner: you', '  access list: none (anyone may open it)'])
+        self.assertEqual(probe.acl_lines('', [], ME), ['  owner: unknown', '  access list: empty (no one may open it)'])
+        for bad in (b'\x02\x00', acl(ace(0, 0, 1, ME))[:-3]):
+            with self.assertRaises(ValueError):
+                probe.parse_acl(bad)
+
+    def test_appx_rows_and_manifest(self):
+        rows = probe.parse_appx('OpenAI.Codex|26.1.2.0|C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1.2.0_x64__fict0pub1d|'
+                                'OpenAI.Codex_fict0pub1d|fict0pub1d\r\nOld.Row|1.0|C:\\x\n|bad\n')
+        self.assertEqual(rows[0], {'name': 'OpenAI.Codex', 'version': '26.1.2.0', 'family': 'OpenAI.Codex_fict0pub1d',
+                                   'publisher': 'fict0pub1d',
+                                   'location': 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1.2.0_x64__fict0pub1d'})
+        self.assertEqual((rows[1]['family'], len(rows)), ('', 2))
+        apps = probe.parse_manifest(MANIFEST)
+        self.assertEqual(apps, [{'id': 'App', 'exe': 'app\\ChatGPT.exe', 'entry': 'Windows.FullTrustApplication',
+                                 'protocols': ['codex'], 'aliases': ['fictional-alias.exe']}])
+        self.assertEqual(probe.manifest_lines(apps), [
+            '    application App: executable app\\ChatGPT.exe; entry point Windows.FullTrustApplication',
+            '      protocols: codex://', '      execution aliases: fictional-alias.exe'])
+        self.assertEqual(probe.manifest_lines([]), ['    applications: none declared'])
+
+    def test_openai_packages_section(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, d, True)
+        with open(os.path.join(d, 'AppxManifest.xml'), 'wb') as f:
+            f.write(MANIFEST)
+        rows = [{'name': 'OpenAI.Codex', 'version': '26.1.2.0', 'location': d, 'family': 'OpenAI.Codex_fict0pub1d',
+                 'publisher': 'fict0pub1d'},
+                {'name': 'Anthropic.Claude', 'version': '1', 'location': d, 'family': 'x', 'publisher': 'y'},
+                {'name': 'OpenAI.Runtime', 'version': '2', 'location': os.path.join(d, 'gone'), 'family': 'f', 'publisher': 'p'}]
+        with patch.object(probe, 'appx_rows', return_value=rows):
+            lines = probe.check_openai_packages()
+        self.assertEqual(lines[:5], ['Package OpenAI.Codex 26.1.2.0',
+                                     '  family: OpenAI.Codex_fict0pub1d; publisher id: fict0pub1d',
+                                     '    application App: executable app\\ChatGPT.exe; entry point Windows.FullTrustApplication',
+                                     '      protocols: codex://', '      execution aliases: fictional-alias.exe'])
+        self.assertEqual(lines[5:], ['Package OpenAI.Runtime 2', '  family: f; publisher id: p', '  manifest: not found'])
+        with patch.object(probe, 'appx_rows', side_effect=RuntimeError('error: powershell exit 1')):
+            self.assertEqual(probe.check_openai_packages(), ['OpenAI packages: error: powershell exit 1'])
+
+    def test_codex_pipe_is_only_looked_for_in_the_listing(self):
+        note = '  (only the name was looked for in the pipe list; the probe never opens or connects to a pipe)'
+        self.assertEqual(probe.check_codex_pipe(['codex-app-tools-1', 'other']),
+                         ["codex-ipc (the Codex app's control pipe): not found", note])
+
+        class Kernel:
+            def __getattr__(self, name):
+                raise AssertionError('the probe called %s' % name)
+
+        def no_open(*a, **k):
+            raise AssertionError('the probe opened %r' % (a[:1],))
+        with patch.object(probe, 'win', return_value=(None, None, Kernel(), Kernel())) as api, \
+                patch('builtins.open', no_open), patch('os.open', no_open), \
+                patch.object(probe, 'list_dir', return_value=(['Codex-IPC', 'other'], '')):
+            lines = probe.check_codex_pipe()
+            self.assertEqual(lines, ["codex-ipc (the Codex app's control pipe): found", note])
+            api.assert_not_called()
+        for line in lines:
+            self.assertEqual(probe.redact(line, CTX), line, 'redaction leaves the facts readable')
+        for name in ('pipe_facts', 'pipe_lines', 'handle_security'):
+            self.assertFalse(hasattr(probe, name), name)
+        with open(SCRIPT, encoding='utf-8') as f:
+            src = f.read()
+        self.assertNotIn('CreateFileW', src)
+        self.assertNotIn('GetNamedPipeServerProcessId', src)
+
+    def test_processes_section(self):
+        app = r'C:\Program Files\WindowsApps\OpenAI.Codex_26.1.2.0_x64__fict0pub1d\app\ChatGPT.exe'
+        cli = r'C:\Users\demo\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe'
+        found = [(1, 'ChatGPT.exe'), (2, 'ChatGPT.exe'), (3, 'codex.exe'), (4, 'codex.exe')]
+        facts = {1: {'image': app, 'family': 'OpenAI.Codex_fict0pub1d', 'owner': ME},
+                 2: {'image': app, 'family': 'OpenAI.Codex_fict0pub1d', 'owner': ME},
+                 3: {'image': cli, 'family': 'none', 'owner': ME},
+                 4: {'image': '', 'family': '', 'owner': '', 'error': 'cannot be opened (error 5)'}}
+        with patch.object(probe, 'processes_named', return_value=found), patch.object(probe, 'my_sid', return_value=ME), \
+                patch.object(probe, 'process_facts', side_effect=lambda pid: facts[pid]):
+            lines = [probe.redact(line, CTX) for line in probe.check_app_processes()]
+        self.assertEqual(lines, ['ChatGPT.exe x2: ' + app, '  package: OpenAI.Codex_fict0pub1d; runs as: you',
+                                 'codex.exe x1: cannot be opened (error 5)',
+                                 'codex.exe x1: %LOCALAPPDATA%\\Programs\\OpenAI\\Codex\\bin\\codex.exe',
+                                 '  package: none; runs as: you'])
+        with patch.object(probe, 'processes_named', return_value=[]):
+            self.assertEqual(probe.check_app_processes(), ['ChatGPT.exe, Codex.exe, codex.exe: not running'])
+
+    def test_bundled_cli_section_never_runs_it(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, d, True)
+        os.makedirs(os.path.join(d, 'pkg', 'app', 'resources'))
+        os.makedirs(os.path.join(d, 'home', '.codex'))
+        cli = os.path.join(d, 'pkg', 'app', 'resources', 'codex.exe')
+        with open(cli, 'wb') as f:
+            f.write(b'MZ fictional')
+        rows = [{'name': 'OpenAI.Codex', 'version': '1', 'location': os.path.join(d, 'pkg'), 'family': 'f', 'publisher': 'p'}]
+        aces = [(9, 0, 0x1200A9, 'S-1-5-32-545'), (0, 0, 0x1F01FF, INSTALLER)]
+        with patch.object(probe, 'appx_rows', return_value=rows), patch.object(probe, 'my_sid', return_value=ME), \
+                patch.object(probe, 'path_security', return_value=(INSTALLER, aces)), \
+                patch.object(probe, 'signature', return_value=('valid', 'Fictional Signer, LLC')), \
+                patch.object(probe, 'run') as ran, patch('os.path.expanduser', return_value=os.path.join(d, 'home')):
+            lines = probe.check_codex_cli_file()
+            self.assertEqual(lines, [
+                cli + ': found (not run)',
+                '  owner: TrustedInstaller (S-1-5-80-...)',
+                '  allow, with a condition Users (S-1-5-32-545): read, execute (0x1200a9)',
+                '  allow TrustedInstaller (S-1-5-80-...): full control (0x1f01ff)',
+                '  signature: valid; signer: Fictional Signer, LLC',
+                '  (a file inside an app package usually has no signature of its own, since the package is signed as a '
+                'whole, so "not signed (no signature of its own)" is expected here)',
+                '%USERPROFILE%\\.codex\\app-server-control: not found'])
+            for line in lines[1:]:
+                self.assertEqual(probe.redact(line, CTX), line, 'redaction leaves the facts readable')
+            os.mkdir(os.path.join(d, 'home', '.codex', 'app-server-control'))
+            with patch.object(probe, 'signature', side_effect=OSError()):
+                lines = probe.check_codex_cli_file()
+            self.assertIn('  signature: unknown (OSError)', lines)
+            self.assertEqual(lines[-1], '%USERPROFILE%\\.codex\\app-server-control: found')
+            ran.assert_not_called()
+
+    def test_alias_and_package_file_are_told_apart(self):
+        class Info:
+            st_reparse_tag = probe.IO_REPARSE_TAG_APPEXECLINK
+        self.assertEqual(probe.not_run_reason(r'C:\Program Files\WindowsApps\OpenAI.Codex_1_x64__p\app\resources\codex.exe',
+                                              lstat=lambda p: object()), 'file inside a Store app package, not run')
+        self.assertEqual(probe.not_run_reason(r'C:\Users\demo\AppData\Local\Microsoft\WindowsApps\wt.exe',
+                                              lstat=lambda p: object()), 'app execution alias, not run')
+        self.assertEqual(probe.not_run_reason(r'D:\Tools\codex.exe', lstat=lambda p: Info()), 'app execution alias, not run')
+        self.assertEqual(probe.not_run_reason(r'D:\Tools\codex.exe', lstat=lambda p: object()), '')
+
+    def test_the_notes_survive_redaction(self):
+        for line in (probe.NEW_SECTIONS_NOTE, probe.FINAL_LINE):
+            self.assertEqual(probe.redact(line, CTX), line)
+        self.assertIn('read this output before posting', probe.FINAL_LINE)
+
+
+@unittest.skipUnless(os.name == 'nt', 'reads real Windows tokens, processes, the pipe list and files')
+class RealWindowsProbeV2(unittest.TestCase):
+    def test_own_process_and_token(self):
+        mine = probe.my_sid()
+        self.assertTrue(mine.startswith('S-1-5-'), mine)
+        facts = probe.process_facts(os.getpid())
+        self.assertEqual(facts['owner'], mine)
+        self.assertTrue(facts['image'].lower().endswith('.exe'), facts)
+        self.assertTrue(facts['family'])
+        name = os.path.basename(facts['image'])
+        self.assertIn(os.getpid(), [pid for pid, _ in probe.processes_named([name])])
+
+    def test_the_real_pipe_listing_is_read_without_opening(self):
+        lines = probe.check_codex_pipe()
+        self.assertTrue(lines[0].startswith("codex-ipc (the Codex app's control pipe): "), lines)
+
+    def test_file_permissions_and_signature_are_read(self):
+        owner, aces = probe.path_security(sys.executable)
+        self.assertTrue(owner.startswith('S-1-'))
+        self.assertTrue(probe.acl_lines(owner, aces, probe.my_sid()))
+        status, signer = probe.signature(sys.executable)
+        self.assertIsInstance(status, str)
+        self.assertIsInstance(signer, str)
 
 
 if __name__ == '__main__':
