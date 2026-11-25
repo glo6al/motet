@@ -10,6 +10,9 @@ const {spawn} = require('node:child_process');
 const {webcrypto} = require('node:crypto');
 const {install, MODES, UPLOAD_PAUSE_MS} = require('./fixtures/officer_documents/browser_faults.js');
 const {createOfficerDocumentsClient} = require('../src/web/officer-documents-client.js');
+// The shared start and stop: python3, or on Windows python stopped through its standard input, with Windows' longer
+// startup and cleanup limits.
+const {PYTHON, stopFixture, WINDOWS, STARTUP_MS, CLEANUP_MS} = require('./officer_document_fixture_process.js');
 const KEY = 'fictional-officer-browser-fixture-key';
 const ID = '1'.repeat(32), OTHER = '2'.repeat(32);
 const confirmPath = '/api/attachments/deletions/' + ID + '/confirm';
@@ -20,7 +23,7 @@ const END = '/* END OFFICER OFFLINE FIXTURE INSTRUMENTATION */\n';
 const tests = [];
 const liveChildren = new Set();
 const test = (name, run) => tests.push({name, run});
-const served = (name, run) => tests.push({name, run, skip: process.platform === 'win32'});
+const served = (name, run) => tests.push({name, run});      // against the actual offline fixture
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; });return {promise, resolve}; }
 function target(fetch) {
   const jobs = [], events = new Map(), entered = deferred();
@@ -106,14 +109,18 @@ function ownedFetch(origin) {
   });
 }
 async function fixture(mode, flags, run) {
-  const child=spawn('python3',[path.join(__dirname,'officer_document_live_fixture.py'),'--browser-fault',mode,...flags],
-    {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:['ignore','pipe','pipe']});
-  liveChildren.add(child);child.once('exit',()=>liveChildren.delete(child));
+  const child=spawn(PYTHON,[path.join(__dirname,'officer_document_live_fixture.py'),'--browser-fault',mode,...flags,
+    ...(WINDOWS?['--stop-on-stdin']:[])],
+    {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'},stdio:[WINDOWS?'pipe':'ignore','pipe','pipe']});
+  child.stdin?.on('error',()=>{});      // a fixture that already exited gives EPIPE: its close is what counts
+  liveChildren.add(child);
+  // 'close' (not 'exit') follows the child's last output, so the closing counters line has arrived by then.
+  const closed=new Promise(resolve=>child.once('close',(code,signal)=>{liveChildren.delete(child);resolve({code,signal});}));
   let output='',errors='',client;
   child.stderr.on('data',b=>{errors=(errors+b).slice(-10000);});
   try {
     const origin=await new Promise((resolve,reject)=>{
-      const timer=setTimeout(()=>reject(Error('Offline fixture startup timeout')),10000);
+      const timer=setTimeout(()=>reject(Error('Offline fixture startup timeout')),STARTUP_MS);
       child.stdout.on('data',b=>{output+=b;const m=output.match(/http:\/\/127\.0\.0\.1:\d+/);if(m){clearTimeout(timer);resolve(m[0]);}});
       child.once('error',error=>{clearTimeout(timer);reject(error);});
       child.once('exit',code=>{clearTimeout(timer);reject(Error('Offline fixture exited '+code+' '+errors));});
@@ -131,13 +138,12 @@ async function fixture(mode, flags, run) {
     const stats=await info();assert.equal(stats.fakeProviderCalls,0);assert.equal(stats.ordinaryAskBlocked,0);assert.equal(stats.outboundBlocked,0);
   } finally {
     client?.dispose();
-    const exited=child.exitCode!==null||child.signalCode!==null?Promise.resolve():new Promise(resolve=>child.once('exit',resolve));
-    if(child.exitCode===null&&child.signalCode===null)child.kill('SIGINT');
-    let timer;
-    try { await Promise.race([exited,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Fixture shutdown timeout')),10000);})]); }
-    catch(error){child.kill('SIGKILL');await exited;throw error;}
+    if(child.exitCode===null&&child.signalCode===null)stopFixture(child);
+    let timer,ended;
+    try { ended=await Promise.race([closed,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Fixture shutdown timeout')),Math.max(10000,CLEANUP_MS));})]); }
+    catch(error){child.kill('SIGKILL');await closed;throw error;}
     finally{clearTimeout(timer);}
-    assert.equal(child.exitCode,0,errors);
+    assert.equal(ended.code,0,errors);
     const stats=JSON.parse(output.trim().split('\n').at(-1));
     assert.deepEqual(stats,{fakeProviderCalls:0,ordinaryAskBlocked:0,outboundBlocked:0});
   }
@@ -174,9 +180,11 @@ served('served upload network loss leaves reservation evidence without inventing
 (async()=>{
   let completed=0,skipped=0;
   for(const {name,run,skip} of tests){
-    if(skip){skipped++;console.log('skip '+name+' (the offline fixture requires POSIX private storage)');continue;}
+    if(skip){skipped++;console.log('skip '+name);continue;}
+    // A served check starts the fixture: allow Windows' longer startup and cleanup on top of the check itself.
+    const limit=WINDOWS?STARTUP_MS+CLEANUP_MS+30000:15000;
     let timer;
-    try { await Promise.race([run(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Check timed out: '+name)),15000);})]); }
+    try { await Promise.race([run(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Check timed out: '+name)),limit);})]); }
     finally { clearTimeout(timer); }
     completed++;console.log('ok '+name);
   }

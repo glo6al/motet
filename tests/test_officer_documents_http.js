@@ -7,7 +7,7 @@ const {webcrypto,createHash} = require('node:crypto');
 const path = require('node:path');
 const {createOfficerDocumentsClient} = require('../src/web/officer-documents-client.js');
 const {createOfficerDocumentPending} = require('../src/web/officer-document-pending.js');
-const {PYTHON,stopFixture,WINDOWS,STARTUP_MS} = require('./officer_document_fixture_process.js');
+const {PYTHON,scrub,stopFixture,WINDOWS,STARTUP_MS} = require('./officer_document_fixture_process.js');
 const key = 'fictional-officer-browser-fixture-key';
 // On Windows the fixture is stopped through its standard input (see officer_document_fixture_process.js).
 const fixtureArgs = extra => [path.join(__dirname, 'officer_document_live_fixture.py'), ...extra, ...(WINDOWS ? ['--stop-on-stdin'] : [])];
@@ -67,7 +67,7 @@ const ready = new Promise((resolve,reject) => {
           request: request && {state: request.state, failure: request.failure, notAskedReason: request.notAskedReason,
             officerDelivery: request.officerDelivery, answerId: request.answerId},
           answers: view.answers.length, uncertain: view.uncertain, fakeProviderCalls: (await metadata()).fakeProviderCalls,
-          fixtureErrors: errors.slice(-2000)}));
+          fixtureErrors: scrub(errors.slice(-2000))}));
       }
       return view;
     };

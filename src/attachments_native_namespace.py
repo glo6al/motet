@@ -50,14 +50,19 @@ LIMIT = 4096
 
 
 class NamespaceError(ValueError):
-    def __init__(self, code='managed_unavailable'):
-        self.code = code
+    """``code`` is what callers report (unchanged). ``reason`` says why the fence refused, where that is known: 'busy'
+    (another holder kept the host lock past its short wait; retry later) or 'foreign' (an identity or nonce the
+    records hold does not match this folder's files, as when the records were made by Motet elsewhere); None for
+    anything else, such as a file the walk refused or a malformed record."""
+
+    def __init__(self, code='managed_unavailable', reason=None):
+        self.code, self.reason = code, reason
         super().__init__(code)
 
 
-def _require(condition):
+def _require(condition, reason=None):
     if not condition:
-        raise NamespaceError()
+        raise NamespaceError(reason=reason)
 
 
 @contextmanager
@@ -241,7 +246,7 @@ def _db_path(db, path, expected):
     else:
         _require(names in ([(0, 'main', str(path))], [(0, 'main', str(path)), (1, 'temp', '')]))
     with _open(path) as (_, opened):
-        _require(opened == expected)
+        _require(opened == expected, 'foreign')
 
 
 def _sidecars_absent(path):
@@ -251,7 +256,7 @@ def _sidecars_absent(path):
 @contextmanager
 def _reader(path, expected=None, *, strict=True):
     with _open(path) as (_, observed):
-        _require(expected is None or observed == expected)
+        _require(expected is None or observed == expected, 'foreign')
         if strict:
             _sidecars_absent(path)
         elif ps.WIN:
@@ -283,8 +288,9 @@ def _table_exists(db, name):
 def _read_identity(db, table, expected):
     found = dict(db.execute('SELECT name,sql FROM main.sqlite_schema WHERE name=?', (table,)))
     _table(db, found, table, IDENTITY, ())
-    _require([tuple(row) for row in db.execute(
-        f'SELECT slot,nonce FROM main.{table} LIMIT 2')] == [(1, expected)])
+    rows = [tuple(row) for row in db.execute(f'SELECT slot,nonce FROM main.{table} LIMIT 2')]
+    _require(len(rows) == 1 and rows[0][0] == 1)
+    _require(rows[0][1] == expected, 'foreign')
 
 
 class NativeNamespaceFence:
@@ -335,7 +341,7 @@ class NativeNamespaceFence:
         with _qualified(), _open(self.host) as (fd, _):
             deadline = time.monotonic() + .35
             while not _try_lock(fd):
-                _require(time.monotonic() < deadline)
+                _require(time.monotonic() < deadline, 'busy')
                 time.sleep(.005)
             try:
                 _validate_fd(self.host, fd)
@@ -355,8 +361,8 @@ class NativeNamespaceFence:
             value = values[0]
             _require(set(value) == {'v', 'owner', 'db', 'authority', 'host', 'root'}
                      and type(value['v']) is int and value['v'] == 1 and _nonce(value['owner'])
-                     and all(_identity(value[key]) for key in ('db', 'authority', 'host', 'root'))
-                     and value['root'] == root and value['host'] == _validate_fd(self.host, hostfd))
+                     and all(_identity(value[key]) for key in ('db', 'authority', 'host', 'root')))
+            _require(value['root'] == root and value['host'] == _validate_fd(self.host, hostfd), 'foreign')
             _flush(self.anchor, fd)
         _sync_directory(self.root)
         return value
@@ -376,10 +382,12 @@ class NativeNamespaceFence:
 
     def _state(self, record):
         with _open(self.authority) as (fd, identity):
-            _require(identity == record['authority'])
+            _require(identity == record['authority'], 'foreign')
             values = _records(fd)
             _require(1 <= len(values) <= 3 and type(values[0].get('v')) is int
-                     and values[0] == {'v': 1, 'state': 'never_created', 'owner': record['owner']})
+                     and set(values[0]) == {'v', 'state', 'owner'} and values[0]['v'] == 1
+                     and values[0]['state'] == 'never_created')
+            _require(values[0]['owner'] == record['owner'], 'foreign')
             if len(values) > 1:
                 intent = values[1]
                 _require(set(intent) == {'state', 'nonce'} and intent['state'] == 'creating' and _nonce(intent['nonce']))
@@ -415,7 +423,8 @@ class NativeNamespaceFence:
         return files
 
     def _registry_identity(self, db, state):
-        _require(state['state'] == 'initialized' and self._managed_files() == state['files'])
+        _require(state['state'] == 'initialized')
+        _require(self._managed_files() == state['files'], 'foreign')
         _db_path(db, self.registry, state['files'][REGISTRY])
         _require(db.execute('PRAGMA journal_mode').fetchone() == ('delete',)
                  and not db.execute("SELECT 1 FROM sqlite_temp_schema WHERE type IN ('table','view') LIMIT 1").fetchone())

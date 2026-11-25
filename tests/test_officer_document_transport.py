@@ -246,7 +246,7 @@ class TransportTests(unittest.TestCase):
             self.rejected('transport_disabled', lambda: item.call(prepared, self.f.l, permit, lease, lambda: KEY, time.monotonic()+1))
         item, factory = self.make()
         with mock.patch.object(self.f.l, 'consume', wraps=self.f.l.consume) as consume:
-            for deadline in (time.monotonic()-1, time.monotonic()+121, float('nan'), True):
+            for deadline in (time.monotonic()-1, time.monotonic()+121, float('nan'), float('inf'), True):
                 self.rejected('deadline_invalid', lambda deadline=deadline: item.call(prepared,self.f.l,permit,lease,lambda:KEY,deadline))
             self.rejected('request_invalid', lambda: item.call(replace(prepared, endpoint='https://foreign.invalid/'),
                 self.f.l,permit,lease,lambda:KEY,time.monotonic()+1))

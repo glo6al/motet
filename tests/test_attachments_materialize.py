@@ -23,7 +23,9 @@ from attachments_types import AttachmentError
 GIT = shutil.which('git')
 
 
-@unittest.skipUnless(os.name == 'posix' and GIT, 'Requires qualified POSIX primitives and Git')
+# POSIX: these use POSIX modes, links and Git (Git on Windows is step 6c.5b). The copy itself on Windows is tested in
+# test_attachments_windows_materialize.py.
+@unittest.skipUnless(os.name == 'posix' and GIT, 'POSIX modes and links, and Git; Windows: test_attachments_windows_materialize.py')
 class MaterializationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='attachment-copy-test-')
@@ -561,7 +563,7 @@ class MaterializationTests(unittest.TestCase):
         self.assertLess(time.monotonic()-started, 1)
 
 
-@unittest.skipUnless(os.name == 'posix', 'Requires POSIX flock')
+@unittest.skipUnless(os.name == 'posix', 'POSIX flock and modes; Windows: test_attachments_windows_materialize.py')
 class ResourceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='attachment-resource-test-')

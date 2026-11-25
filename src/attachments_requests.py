@@ -661,7 +661,8 @@ class RequestLedger:
                 or verification.copy_generations != tuple(sorted((c['id'], c['generation']) for c in copies))
                 or type(verification.checked_at) not in (int,float) or type(verification.expires_at) not in (int,float)
                 or not verification.checked_at <= ts <= verification.expires_at
-                or not 0 < verification.expires_at-verification.checked_at <= 5):
+                # Compared without subtracting: expires_at - checked_at can round above 5 (see the transport's deadline).
+                or not verification.checked_at < verification.expires_at <= verification.checked_at + 5):
             fail('proof_unavailable', 'Fresh attachment verification is required.', 503)
         token(verification.lease_id)
         self._sources_current(row)
@@ -793,7 +794,7 @@ class RequestLedger:
                     or evidence.request_id != request_id or evidence.owner_request_id != row['owner_request_id']
                     or evidence.fingerprint != fingerprint or type(evidence.checked_at) not in (int,float)
                     or type(evidence.expires_at) not in (int,float) or not evidence.checked_at <= ts <= evidence.expires_at
-                    or not 0 < evidence.expires_at-evidence.checked_at <= 5):
+                    or not evidence.checked_at < evidence.expires_at <= evidence.checked_at + 5):
                 fail('request_conflict', 'This attachment request cannot be continued.')
             copies = self._copies(request_id)
             if any(c['state'] not in ('reserved', 'available', 'removed') for c in copies):

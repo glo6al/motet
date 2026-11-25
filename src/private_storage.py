@@ -1409,6 +1409,19 @@ class NoLinkFolder:
         self._held()
         return _win_file_system(self._handles[-1]) if self._windows else None
 
+    def unwritable(self, system_owned=False):
+        """``unwritable`` for this held folder: nobody but its owner (and the system) can change it. POSIX: the owner
+        is this user (or root with ``system_owned``) and ``mode & 0o022 == 0``, on ``fstat``. Windows:
+        ``acl_write_verdict`` on the held handle's owner and access list (a hold has READ_CONTROL)."""
+        self._held()
+        if not self._windows:
+            _posix_unwritable(os.fstat(self._fd), system_owned, 'folder')
+            return
+        try:
+            windows_handle_unwritable(self._handles[-1], system_owned)
+        except PrivateStorageError as e:
+            raise PrivateStorageError(str(e), e.reason, 'folder') from None
+
     def identity(self):
         """This held folder's ``file_identity`` (on Windows read from its handle)."""
         self._held()

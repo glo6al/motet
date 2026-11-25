@@ -210,6 +210,27 @@ class RequestTests(unittest.TestCase):
             self.error('proof_unavailable',lambda:self.ledger.claim_handoff(r['id'],revision,r['fingerprint'],bad,lease))
         self.assertEqual(self.status(r)['state'],'materialized')
 
+    def test_a_five_second_window_is_accepted_whatever_the_rounding(self):
+        """checked_at + 5 is a valid window even where (checked_at + 5) - checked_at rounds above 5 (here just below
+        2**31 seconds); both the handoff proof and the finish evidence."""
+        start = 2147483643.003
+        self.assertGreater((start + 5.0) - start, 5)                   # what the old comparison refused
+        d,r,lease,intent=self.materialized();revision=self.status(r)['revision']
+        self.clock[0]=start
+        for bad in (dict(expires_at=start), dict(expires_at=start+5.001)):
+            self.error('proof_unavailable',lambda bad=bad:self.ledger.claim_handoff(r['id'],revision,r['fingerprint'],
+                       self.proof(r,'c'*64,'handoff',checked_at=start,**bad),lease))
+        out=self.ledger.claim_handoff(r['id'],revision,r['fingerprint'],
+                                      self.proof(r,'c'*64,'handoff',checked_at=start,expires_at=start+5.0),lease)
+        self.assertTrue(out['newClaim']);self.assertEqual(self.status(r)['state'],'handoff_claimed')
+        d,r,lease=self.send();status=self.status(r)
+        proof=self.proof(r,'c'*64,'finish',checked_at=start,expires_at=start+5.0)
+        absence=OwnerAbsenceEvidence(r['id'],r['ownerRequestId'],r['fingerprint'],start,start+5.0,True)
+        self.error('request_conflict',lambda:self.ledger.begin_finish(r['id'],r['capability'],status['revision'],
+                   r['fingerprint'],replace(absence,expires_at=start+5.001),proof,lease))
+        out=self.ledger.begin_finish(r['id'],r['capability'],status['revision'],r['fingerprint'],absence,proof,lease)
+        self.assertEqual(out['state'],'send_authorized')
+
     def test_metadata_full_cleanup_and_tombstones_survive_restart(self):
         self.store.close();self.store=self.open(overrides={'database_bytes':327680});self.ledger=RequestLedger(self.store)
         d,r,lease=self.send()
