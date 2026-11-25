@@ -1,13 +1,23 @@
-"""Explicit, verified setup for the optional English model; no import-time I/O."""
+"""Explicit, verified setup for the optional English model; no import-time I/O.
+
+POSIX keeps its checks: private (this user's, no group or other bits) regular files with one name and folders,
+found without links. Windows applies the same rules through private_storage: every model file, folder and the
+setup lock is opened through the no-link walk and checked private on its handle; files and staging folders are
+created private from the start; the setup lock is a private lock file. Windows may briefly hold a just-written file
+(Microsoft Defender scans it), so renames and removals of whole model folders are retried for a few seconds there.
+"""
 import contextlib
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
+import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,6 +25,47 @@ import urllib.request
 MODEL_BYTES = 142465862
 CHUNK_BYTES = 65536
 _MODEL_URL = 'https://download.moonshine.ai/model/small-streaming-en/quantized_26_11_02/'
+
+
+def _storage():
+    """private_storage from Motet's src folder, imported on first use."""
+    src = str(Path(__file__).resolve().parents[2] / 'src')
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    import private_storage
+    return private_storage
+
+
+def _windows():
+    return _storage().WIN
+
+
+def _binary(fd):
+    """Windows: binary mode, so model bytes are written as they are (the C runtime's default is text mode)."""
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.setmode(fd, os.O_BINARY)
+    return fd
+
+
+def _create(destination):
+    """A new file for model bytes: POSIX exactly as before; Windows private from the start (this user and SYSTEM)."""
+    if _windows():
+        return _binary(_storage().create_private_file(str(destination)))
+    return os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
+
+
+def _windows_retry(action, *args):
+    """Windows: a rename or removal that a scanner briefly blocks (a sharing violation) is tried again for up to
+    ten seconds; anything else, or a block that lasts, raises."""
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            return action(*args)
+        except PermissionError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(.25)
 
 
 class AssetsError(Exception):
@@ -70,12 +121,30 @@ def _private(item, directory=False):
         raise AssetsError('unsafe_model_path', 'Model setup requires private regular files and directories.')
 
 
+def _windows_path(path):
+    """Windows: the parent folder (and the model folder, if there) reached with no link and private."""
+    ps = _storage()
+    try:
+        with ps.open_folder(str(path.parent), private=True) as parent:
+            try:
+                parent.folder(path.name, private=True).close()
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        raise AssetsError('model_missing', 'Create the private helper state folder before model setup.') from None
+    except OSError:
+        raise AssetsError('unsafe_model_path', 'Model setup requires private regular files and directories.') from None
+    return path
+
+
 def _path(model_dir):
     # The caller supplies its canonical private state directory. Refusing links
     # also keeps an explicit setup action from writing through a replaced path.
     path = Path(os.path.abspath(os.fspath(model_dir)))
     if path == path.parent:
         raise AssetsError('unsafe_model_path', 'Choose a model folder inside private helper state.')
+    if _windows():
+        return _windows_path(path)
     current = Path(path.anchor)
     try:
         for component in path.parts[1:-1]:
@@ -94,6 +163,19 @@ def _path(model_dir):
 
 
 def _open_read(path):
+    if _windows():
+        # One name, no link on the way, private on its handle; held folders cannot change under the open.
+        try:
+            fd = _storage().open_no_links(str(path), single_link=True, private=True)
+        except FileNotFoundError:
+            raise AssetsError('model_missing', 'The English model has not been installed.') from None
+        except OSError:
+            raise AssetsError('unsafe_model_path', 'Model files must be private regular files without links.') from None
+        try:
+            return os.fdopen(fd, 'rb'), os.fstat(fd)
+        except BaseException:
+            os.close(fd)
+            raise
     flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
     try:
         before = path.lstat()
@@ -125,8 +207,7 @@ def _copy_verified(source, item, destination=None):
     output = None
     try:
         if destination is not None:
-            fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
-            output = os.fdopen(fd, 'wb')
+            output = os.fdopen(_create(destination), 'wb')
         with handle:
             while True:
                 chunk = handle.read(min(CHUNK_BYTES, item['size'] + 1 - count))
@@ -149,7 +230,31 @@ def _copy_verified(source, item, destination=None):
             output.close()
 
 
+def _windows_existing_files(path, info):
+    ps = _storage()
+    known = {item['filename'] for item in info['files']}
+    try:
+        with ps.open_folder(str(path), private=True, listing=True) as held:
+            for name in held.names():
+                if name == '.DS_Store':
+                    # Finder metadata copied from a Mac is not model input: ignored only as a regular file with one
+                    # name reached without a link, never as a link, folder or substitute for a model file.
+                    os.close(held.open(name, single_link=True))
+                    continue
+                if name not in known:
+                    raise AssetsError('unsafe_model_path', 'The model folder contains unrelated files.')
+                os.close(held.open(name, single_link=True, private=True))
+    except FileNotFoundError:
+        return
+    except AssetsError:
+        raise
+    except OSError:
+        raise AssetsError('unsafe_model_path', 'The model folder cannot be inspected safely.') from None
+
+
 def _existing_files(path, info):
+    if _windows():
+        return _windows_existing_files(path, info)
     if not path.exists():
         return
     known = {item['filename'] for item in info['files']}
@@ -184,42 +289,49 @@ def validate_model(model_dir):
 
 
 @contextlib.contextmanager
+def _windows_download_lock(path):
+    """Windows: a private lock file (no link, this user's alone) beside the model folder, locked without waiting."""
+    ps = _storage()
+    fd = None
+    try:
+        try:
+            fd = ps.open_lock_file(str(path.parent / ('.' + path.name + '.download.lock')))
+            held = ps.try_lock(fd)
+        except OSError:
+            raise AssetsError('unsafe_model_path', 'The model setup lock is unavailable.') from None
+        if not held:
+            raise AssetsError('download_busy', 'Another model setup is already running.')
+        yield
+    finally:
+        if fd is not None:
+            ps.close_lock(fd)
+
+
+@contextlib.contextmanager
 def _download_lock(path):
     """OS-held lock releases on process exit; its private file contains no key."""
+    if _windows():
+        with _windows_download_lock(path):
+            yield
+        return
     lock_path = path.parent / ('.' + path.name + '.download.lock')
     flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
     fd = None
-    locked = False
     try:
         if lock_path.exists() or lock_path.is_symlink():
             _private(lock_path.lstat())
         fd = os.open(str(lock_path), flags, 0o600)
         _private(os.fstat(fd))
-        if os.name == 'nt':
-            import msvcrt
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b'\0')
-            os.lseek(fd, 0, os.SEEK_SET)
-            try:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            except OSError:
-                raise AssetsError('download_busy', 'Another model setup is already running.') from None
-        else:
-            import fcntl
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                raise AssetsError('download_busy', 'Another model setup is already running.') from None
-        locked = True
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise AssetsError('download_busy', 'Another model setup is already running.') from None
         yield
     except OSError:
         raise AssetsError('unsafe_model_path', 'The model setup lock is unavailable.') from None
     finally:
         if fd is not None:
-            if locked and os.name == 'nt':
-                import msvcrt
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
             os.close(fd)
 
 
@@ -247,8 +359,7 @@ def _fetch(item, destination, opener, progress):
             parsed = urllib.parse.urlsplit(final)
             if parsed.scheme != 'https' or parsed.netloc != 'download.moonshine.ai':
                 raise AssetsError('download_failed', 'The model service returned an unexpected location.')
-            fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
-            with os.fdopen(fd, 'wb') as output:
+            with os.fdopen(_create(destination), 'wb') as output:
                 while True:
                     chunk = response.read(min(CHUNK_BYTES, item['size'] + 1 - count))
                     if not chunk:
@@ -267,6 +378,50 @@ def _fetch(item, destination, opener, progress):
         raise
     except Exception:
         raise AssetsError('download_failed', 'The English model download did not complete. Retry setup.') from None
+
+
+def _staging(path):
+    """A new private staging folder beside the model folder. POSIX: mkdtemp, then 0700, as before. Windows: a
+    unique name made private from the start."""
+    if not _windows():
+        stage = Path(tempfile.mkdtemp(prefix='.' + path.name + '.staging-', dir=str(path.parent)))
+        os.chmod(str(stage), 0o700)
+        return stage
+    for _ in range(100):
+        stage = path.parent / ('.' + path.name + '.staging-' + secrets.token_hex(8))
+        try:
+            _storage().make_private_folder(str(stage))
+            return stage
+        except FileExistsError:
+            continue
+    raise AssetsError('download_failed', 'The English model setup did not complete. Retry setup.')
+
+
+def _backup_name(path):
+    """An unused name for the previous model folder. POSIX: mkdtemp's, released again, as before."""
+    if not _windows():
+        backup = Path(tempfile.mkdtemp(prefix='.' + path.name + '.previous-', dir=str(path.parent)))
+        backup.rmdir()
+        return backup
+    return path.parent / ('.' + path.name + '.previous-' + secrets.token_hex(8))
+
+
+def _replace(source, target):
+    if _windows():
+        return _windows_retry(os.replace, str(source), str(target))
+    return os.replace(str(source), str(target))
+
+
+def _remove_tree(folder):
+    """POSIX: shutil.rmtree, as before. Windows: retried while a scanner holds a file; staging that a later setup
+    does not trust is left behind if it still cannot be removed."""
+    if not _windows():
+        shutil.rmtree(str(folder))
+        return
+    try:
+        _windows_retry(shutil.rmtree, str(folder))
+    except OSError:
+        pass
 
 
 def download_model(model_dir, accept_bytes, progress=None, opener=None):
@@ -294,8 +449,7 @@ def download_model(model_dir, accept_bytes, progress=None, opener=None):
                           'totalBytes': info['bytes'], 'downloadedBytes': 0})
                 return {'state': 'installed', 'bytes': info['bytes'], 'downloadedBytes': 0,
                         'modelId': info['modelId']}
-        stage = Path(tempfile.mkdtemp(prefix='.' + path.name + '.staging-', dir=str(path.parent)))
-        os.chmod(str(stage), 0o700)
+        stage = _staging(path)
         backup = None
         completed = 0
         downloaded = 0
@@ -338,16 +492,15 @@ def download_model(model_dir, accept_bytes, progress=None, opener=None):
                     if exc.code not in ('model_missing', 'model_integrity'):
                         raise
                 if not active:
-                    backup = Path(tempfile.mkdtemp(prefix='.' + path.name + '.previous-', dir=str(path.parent)))
-                    backup.rmdir()
-                    os.replace(str(path), str(backup))
+                    backup = _backup_name(path)
+                    _replace(path, backup)
             if not active:
                 try:
-                    os.replace(str(stage), str(path))
+                    _replace(stage, path)
                     active = True
                 except BaseException:
                     if backup is not None:
-                        os.replace(str(backup), str(path))
+                        _replace(backup, path)
                         backup = None
                     raise
             progress({'phase': 'complete', 'file': None, 'completedBytes': info['bytes'],
@@ -360,6 +513,6 @@ def download_model(model_dir, accept_bytes, progress=None, opener=None):
             raise AssetsError('download_failed', 'The English model setup did not complete. Retry setup.') from None
         finally:
             if stage.exists():
-                shutil.rmtree(str(stage))
+                _remove_tree(stage)
             if backup is not None and backup.exists() and active:
-                shutil.rmtree(str(backup))
+                _remove_tree(backup)

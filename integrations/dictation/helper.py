@@ -456,6 +456,30 @@ def probe(home, port):
         return {'schemaVersion': 1, 'state': 'not_running', 'code': 'connection_unavailable'}
 
 
+def _stop_on_stdin(server):
+    """Stop ``server`` once standard input reads a "stop" line or closes. The reader only records the request; a
+    second thread then asks serve_forever to end, so no exception is raised in the serving thread and the usual
+    server_close runs. Uses threads only: no signal, and no select on a pipe (Windows selects sockets only)."""
+    requested = []
+
+    def read():
+        try:
+            for line in sys.stdin:
+                if line.strip() == 'stop':
+                    break
+        except (OSError, ValueError):
+            pass
+        requested.append(True)
+
+    def stop_when_requested():
+        while not requested and not server.stopped.is_set():
+            time.sleep(.05)
+        if requested and not server.stopped.is_set():
+            server.shutdown()
+    threading.Thread(target=read, name='helper-stdin-stop', daemon=True).start()
+    threading.Thread(target=stop_when_requested, name='helper-stop', daemon=True).start()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('model-info', 'download-model', 'serve', 'status'))
@@ -465,6 +489,9 @@ def main(argv=None):
     parser.add_argument('--model', type=Path, help='Private directory containing the pinned English model')
     parser.add_argument('--accept-bytes', type=int, help='Explicitly confirm the displayed model download size')
     parser.add_argument('--demo', action='store_true', help='Report disabled without state, download or runtime access')
+    parser.add_argument('--stop-on-stdin', action='store_true',
+                        help='Stop serving when standard input reads "stop" or closes (for a parent process; '
+                             'Windows has no Ctrl-C for a child)')
     args = parser.parse_args(argv)
     if args.demo:
         print(json.dumps({'schemaVersion': 1, 'state': 'disabled', 'code': 'demo'}))
@@ -494,6 +521,8 @@ def main(argv=None):
             def terminate(signum, frame):
                 raise KeyboardInterrupt()
             signal.signal(signal.SIGTERM, terminate)
+            if args.stop_on_stdin:
+                _stop_on_stdin(server)
             print('Local dictation helper on 127.0.0.1:%d; owner credential required.' % server.server_port, flush=True)
             try:
                 server.serve_forever(poll_interval=.2)

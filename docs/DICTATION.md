@@ -2,7 +2,7 @@
 
 The helper is a separate, optional component. Motet runs as usual without it.
 The page adds a microphone beside Send. The helper and its server proxy are
-separately enabled; normal typing works without either one. Page checks use generated audio plus an earlier real-microphone proof; the native engine has been verified only on Apple Silicon macOS. The whole feature is off on Windows, not only the engine: the helper and its proxy refuse to start there.
+separately enabled; normal typing works without either one. Page checks use generated audio plus an earlier real-microphone proof; the native engine has been verified only on Apple Silicon macOS. On Windows the helper, its private state, Motet's proxy and model setup now run, checked by automated tests but not yet on a real PC; the speech engine has a Windows build for 64-bit Intel and AMD PCs that nobody has run yet, and none for Windows on ARM (see [On Windows](#on-windows)).
 
 Recognition uses Moonshine Small Streaming English on this computer, without an
 account or inference service. The helper accepts audio supplied by an authorized
@@ -19,7 +19,8 @@ The separate native recognition environment needs Python **3.10 or later** and
 minimum, its eager type annotations need Python 3.10. The native path has been
 checked on Apple Silicon macOS. Check the selected wheel's platform requirements
 before installation; other native platforms have not been qualified here.
-The private-state CLI currently requires POSIX filesystem protections.
+The private state needs POSIX filesystem protections, or on Windows Motet's
+handle-based folder walk (see [On Windows](#on-windows)).
 
 No command installs Python or pip packages automatically. `serve`, `status` and
 imports never download models. The optional runtime has its own environment;
@@ -109,6 +110,52 @@ and verifies size and SHA256 before activating a complete model folder. A valid
 installed bundle is reused without a transfer. Failed transfers leave the old
 folder intact. An interrupted process may leave private staging files; a later
 setup does not trust them. No inference or microphone activity occurs in setup.
+
+### On Windows
+
+Everything above applies, with these differences. Use PowerShell from the
+repository folder, and `py` (Python from python.org or winget, not the
+Microsoft Store) for the commands that start with `python3` above.
+
+- The speech engine, `moonshine-voice==0.1.6`, ships one Windows build:
+  64-bit Intel and AMD PCs (`win_amd64`), for any Python 3.10 or later. It has
+  no build for Windows on ARM, so there the pip step fails and the helper
+  reports the runtime as missing (`not_installed`, `dependency_missing`);
+  typing still works. Nobody has run the engine on Windows yet. If it does not
+  load (for example a missing Microsoft Visual C++ runtime), the helper reports
+  `dependency_missing` or `model_error` and the draft is kept.
+- The helper's state is `%USERPROFILE%\.live-room\dictation`. Motet opens it
+  with the same handle-by-handle walk as its other private folders: no link or
+  junction anywhere below your user folder, and `.live-room`, `dictation`, the
+  credential and every model file owned by you with an access list naming only
+  you and SYSTEM (Administrators may also appear on the folders). The helper
+  creates them that way; it never repairs an existing folder. If you first
+  started Motet from an administrator window, see the `icacls` command in the
+  [Windows guide](WINDOWS.md).
+- Create the environment and install the engine with its Windows paths:
+
+  ```powershell
+  $state = "$env:USERPROFILE\.live-room\dictation"
+  py integrations\dictation\helper.py serve --home $env:USERPROFILE
+  # stop it with Ctrl+C once it prints its address, then:
+  py -3.12 -m venv "$state\.venv"
+  & "$state\.venv\Scripts\python.exe" -m pip install 'moonshine-voice==0.1.6'
+  py integrations\dictation\helper.py download-model --home $env:USERPROFILE --accept-bytes 142465862
+  py integrations\dictation\helper.py serve --home $env:USERPROFILE
+  ```
+
+- The helper listens on `127.0.0.1` only, which Windows Firewall does not
+  normally ask about (not yet seen on a real PC). Ctrl+C stops it in its own
+  window. A program that starts the helper should pass `--stop-on-stdin` and
+  write `stop` (or close its standard input) to stop it: Windows has no Ctrl+C
+  for a child process.
+- Microsoft Defender scans the 142.5 MB of new model files. Setup tries a folder
+  rename again for a few seconds while a scan holds a file, and the first load
+  can be slower while the files are scanned. The model's paths are short; a
+  very long user folder name can still pass Windows' 260-character limit on a
+  PC without its long-path setting, which shows as `model_missing_or_invalid`.
+- Start Motet with the proxy on in the same PowerShell window:
+  `$env:WATCH_DICTATION_ENABLED = '1'; py src\server.py`.
 
 Run `serve` again to load the installed runtime/model. `--python` and `--model`
 can explicitly select an existing runtime environment and a private verified
@@ -258,6 +305,7 @@ Normal checks need neither Moonshine nor a model:
 python3 tests/test_dictation_assets.py
 python3 tests/test_dictation_runtime.py
 python3 tests/test_dictation_helper.py
+python3 tests/test_dictation_windows.py
 ```
 
 With an already installed runtime and model, explicitly run
@@ -343,7 +391,9 @@ private state. Status reports distinguish missing/unsafe helper state
 (`not_installed`) from a configured helper that gives no answer (`not_running`).
 
 The helper's private `header` is read from `.live-room/dictation` under the home
-selected for Motet, with no fallback to another home. The existing POSIX owner
+selected for Motet, with no fallback to another home. On Windows it is read
+through the handle-based folder walk, each folder and the file checked private
+on its handle. Elsewhere the existing POSIX owner
 and private-file protections apply. Disabled and demo requests do not inspect
 helper state or open a connection. Browser microphone access remains a separate
 browser permission; the proxy does not request or infer it.

@@ -281,7 +281,8 @@ class Upstream(BaseHTTPRequestHandler):
 
 
 class BusyTests(unittest.TestCase):
-    @unittest.skipUnless(os.name == 'posix', 'Private helper state integration')
+    @unittest.skipUnless(os.name == 'posix' or proxy.ps.folder_walk_available(),
+                         'Private helper state integration (POSIX, or the Windows folder walk)')
     def test_actual_pool_pressure_returns_busy_over_owner_http_without_model_failure(self):
         sys.path.insert(0, str(ROOT))
         from integrations.dictation.helper import HelperServer
