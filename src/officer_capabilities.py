@@ -13,7 +13,7 @@ import secrets
 import time
 
 from deck_log import _prose, _relative, _text
-from attribution import CATEGORIES as ATTRIBUTIONS
+from attribution import stored_label
 
 
 ANSWER_CHARS = 12000
@@ -243,8 +243,9 @@ def live_view(boot, agents, log, pending, history=None, floor=0, now=None):
             row['observation_source'] = 'process_list; running command observed, no native conversation or success proof'
         if kind in ('user', 'say', 'ask'):
             row.update(kind='message', role='user' if kind == 'user' else 'assistant', text=_prose(str(event.get('text') or ''), 2048)[0])
-            if kind == 'user' and event.get('attribution') in ATTRIBUTIONS:
-                row['attribution'] = event['attribution']      # who wrote it (src/attribution.py)
+            label = stored_label(event.get('attribution'), event.get('attribution_detail') or '') if kind == 'user' else None
+            if label:
+                row['attribution'] = label      # who wrote it (src/attribution.py)
         elif kind in ('turn_start', 'turn_end'):
             row['kind'] = kind
         elif kind in ('run', 'read', 'write', 'edit', 'patch', 'search', 'web', 'spawn', 'tool', 'result'):

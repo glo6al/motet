@@ -180,8 +180,8 @@ def load_configuration_readiness(state_dir, *, enabled=False, demo=False):
 # Who put a message in a managed chat: the owner's own typed words, Motet's wording at the owner's request, or the
 # first instruction of a new managed chat.
 MESSAGE_SOURCES = ('owner', 'motet', 'new_chat')
-MOTET_SOURCE_REFUSED = ('Not delivered: this managed chat was started by an older Motet. Restart this managed chat to '
-                        'receive messages Motet words.')
+MOTET_SOURCE_REFUSED = ('This managed chat refused the message; it may have been started by an older Motet. '
+                        'Restart it to receive messages Motet words.')
 
 
 def _keep_author(old, message):
@@ -417,8 +417,8 @@ def client_request(run_dir, command, params):
             code = value.get('error', {}).get('code')
             if code in ('request_conflict', 'conflict', 'stale_permission'):
                 _fail('request_conflict')
-            if code == 'invalid_request':
-                _fail('runner_refused', 400)       # a definite refusal: the runner stored nothing
+            if code == 'invalid_request' and command == 'enqueue':
+                _fail('runner_refused', 400)       # the runner refused this message; whether it kept it is unknown
             _fail('managed_not_ready')
         if set(value) != {'ok', 'value'}:
             _fail()
@@ -466,10 +466,10 @@ def _windows_request(path, token, command, params):
             if not chunk or len(response) + len(chunk) > MAX_RESPONSE:
                 _fail()
             response.extend(chunk)
-    return _reply(response)
+    return _reply(response, command)
 
 
-def _reply(response):
+def _reply(response, command=None):
     """Windows only: the supervisor's reply line, checked exactly as client_request's POSIX path checks it (one
     line, an object with ``ok``, provider error text never forwarded). A copy of that code, which POSIX keeps
     inline; a change to either belongs in both."""
@@ -483,8 +483,8 @@ def _reply(response):
         code = value.get('error', {}).get('code')
         if code in ('request_conflict', 'conflict', 'stale_permission'):
             _fail('request_conflict')
-        if code == 'invalid_request':
-            _fail('runner_refused', 400)           # a definite refusal: the runner stored nothing
+        if code == 'invalid_request' and command == 'enqueue':
+            _fail('runner_refused', 400)           # the runner refused this message; whether it kept it is unknown
         _fail('managed_not_ready')
     if set(value) != {'ok', 'value'}:
         _fail()
@@ -1153,8 +1153,9 @@ class ManagedClaude:
         except ManagedError as error:
             # The claim is retained even when the response was lost. Never reissue.
             if error.code == 'runner_refused' and source == 'motet':
-                # A supervisor started before Motet recorded who wrote a message refuses source 'motet'. That is a
-                # definite refusal, so say so instead of leaving it unknown; never resend it as the owner's.
+                # A supervisor started before Motet recorded who wrote a message refuses source 'motet'. The same
+                # refusal can follow a storage fault after the runner kept the message, so the state stays unknown
+                # and the words say so; it is never resent, and never as the owner's.
                 self._refused(request_id, run_id, digest, MOTET_SOURCE_REFUSED)
         except Exception:
             pass
@@ -1166,8 +1167,8 @@ class ManagedClaude:
             row = db.execute('SELECT run,digest,data FROM messages WHERE id=?', (request_id,)).fetchone()
             if row and row[:2] == (run_id, digest):
                 message = json.loads(row[2])
-                if message.get('state') == 'unknown':
-                    message.update(state='failed', error=reason)
+                if message.get('state') == 'unknown' and not message.get('error'):
+                    message['error'] = reason          # the state stays unknown: delivery is not certain either way
                     db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(message), request_id))
 
     @staticmethod

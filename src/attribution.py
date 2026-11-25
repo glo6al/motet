@@ -20,6 +20,11 @@ import re
 
 CATEGORIES = ('motet_delivery', 'agent_message', 'automatic', 'voice', 'unverified_user')
 UNVERIFIED = 'unverified_user'
+# Stored labels: a category, or an unverified_user detail whose citation and evidence wording differ. Saved rows and
+# live evidence carry the label; events carry the category and detail separately.
+EXEC_LABEL = 'unverified_user/exec_prompt'
+FORM_LABEL = 'unverified_user/question_reply'
+LABELS = CATEGORIES + (EXEC_LABEL, FORM_LABEL)
 
 # Motet's wording for text it composed at the owner's request (envelope version 3, live steering and managed
 # Claude delivery). Shared here so the classifier recognizes exactly what Motet writes.
@@ -108,6 +113,9 @@ def from_text(text):
     inner = unwrap(text).lstrip()
     if inner.startswith(MOTET_WORDING + '\n'):
         return 'motet_delivery', 'motet_wording'
+    if _CHANNEL.match(text.lstrip()):
+        # A channel server passed this in; without a Motet envelope inside, it is not the owner typing.
+        return 'automatic', 'channel'
     tag = _tag(inner)
     for name, detail in _AUTOMATIC_TAGS:
         if tag == name:
@@ -192,14 +200,34 @@ def normal(value):
     return value if value in CATEGORIES else 'automatic'
 
 
-def of_row(row):
-    """The category of a saved or live user-role row. A row from before attributions were recorded gets only the
+def stored_label(category, detail=''):
+    """The label saved for an event's category and detail, or None for an unknown category."""
+    if category == UNVERIFIED and detail in ('exec_prompt', 'question_reply'):
+        return UNVERIFIED + '/' + detail
+    return category if category in CATEGORIES else None
+
+
+def split_label(value):
+    """(category, detail) for a stored label, or None."""
+    if value not in LABELS:
+        return None
+    category, _, detail = value.partition('/')
+    return category, detail
+
+
+def label_of_row(row):
+    """The label of a saved or live user-role row. A row from before attributions were recorded gets only the
     text rules, so a Motet envelope or an automatic prompt in old history is still not called the owner."""
     row = row if isinstance(row, dict) else {}
-    if row.get('attribution') in CATEGORIES:
+    if row.get('attribution') in LABELS:
         return row['attribution']
     found = from_text(row.get('text'))
-    return found[0] if found else UNVERIFIED
+    return stored_label(*found) if found else UNVERIFIED
+
+
+def of_row(row):
+    """The category of a saved or live user-role row (see label_of_row)."""
+    return split_label(label_of_row(row))[0]
 
 
 def display_text(text, category, detail=''):
@@ -303,7 +331,8 @@ def describe(category, detail='', text='', delivery=None):
                 'task_notification': 'an automatic task notification (not the owner): ',
                 'side_session': 'an automatic side-session event (not the owner): ',
                 'plugin': 'a prompt a plugin submitted (automatic, not the owner typing): ',
-                'artifact_comment': 'a comment left on a published page, passed in by the app (the commenter is not checked; not the owner typing): '}.get(
+                'artifact_comment': 'a comment left on a published page, passed in by the app (the commenter is not checked; not the owner typing): ',
+                'channel': 'a message passed in by a channel server (not the owner typing): '}.get(
                     detail, 'an automatic system message (not the owner): ')
     # motet_delivery
     if detail == 'proof':
@@ -341,7 +370,11 @@ def describe(category, detail='', text='', delivery=None):
 
 
 def citation_label(category):
-    """The speaker shown for a user-role row in a citation."""
+    """The speaker shown for a user-role row in a citation; takes a category or a stored label."""
+    if category == EXEC_LABEL:
+        return 'prompt given to a codex exec run (who wrote it is not recorded)'
+    if category == FORM_LABEL:
+        return "answer recorded by the app's question form (not checked as the owner's own words)"
     return {'motet_delivery': 'message Motet delivered',
             'agent_message': 'message from another agent or chat',
             'automatic': 'automatic message, not the owner',
@@ -349,6 +382,10 @@ def citation_label(category):
 
 
 def evidence_value(category):
-    """The ``attribution`` value an evidence record carries for a user-role row."""
+    """The ``attribution`` value an evidence record carries for a user-role row; takes a category or a label."""
+    if category == EXEC_LABEL:
+        return 'codex_exec_prompt'
+    if category == FORM_LABEL:
+        return 'question_form_answer'
     category = normal(category)
     return 'owner_message' if category == UNVERIFIED else category

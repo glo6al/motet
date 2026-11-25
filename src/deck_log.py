@@ -35,7 +35,8 @@ OPERATIONS = frozenset(('', 'read', 'write', 'edit', 'patch', 'run', 'search', '
 CANDIDATE_KEYS = frozenset(('kind', 'role', 'text', 'operation', 'operation_id',
                            'phase', 'outcome', 'file_ref', 'chat_name', 'project_name', 'source', 'certainty', 'attribution'))
 # Who wrote a user-role message (src/attribution.py). '' is a row saved before attributions were recorded.
-ATTRIBUTIONS = frozenset(('motet_delivery', 'agent_message', 'automatic', 'voice', 'unverified_user'))
+ATTRIBUTIONS = frozenset(('motet_delivery', 'agent_message', 'automatic', 'voice', 'unverified_user',
+                          'unverified_user/exec_prompt', 'unverified_user/question_reply'))
 EVENT_COLUMNS = ('id,record_key,slot,provider,chat_id,chat_name,project_id,project_name,source_ts,observed_ts,time_basis,'
                  'kind,role,text,operation,operation_id,phase,outcome,file_ref,redacted,certainty,attribution')
 SECRET = re.compile(r'(?i)(?:\b(?:api[_-]?key|password|passwd|secret|access[_-]?token|authorization)[\"\']?\s*[:=]|\bBearer\s+\S+|sk-(?:ant-)?[\w-]{12,}|gh[pousr]_[\w]{20,}|AKIA[A-Z0-9]{16}|-----BEGIN [^-]*PRIVATE KEY-----)')

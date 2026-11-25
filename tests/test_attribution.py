@@ -232,16 +232,25 @@ class FakeLedger:
 
 
 class OfficerWordingTests(unittest.TestCase):
+    CREATED = 1800000000.0
+
     def tearDown(self):
         server.OFFICER_DELIVERIES.clear()
+        server.DELIVERY_FIRST.clear()
 
-    def step(self, text, records, agent=None, found=None):
+    def event(self, text, agent, ts=None, seq=1, found=None):
+        found = found or attribution.codex(text)
+        return dict(kind='user', agent=agent, text=text, ts=self.CREATED + 30 if ts is None else ts, seq=seq,
+                    attribution=found[0], attribution_detail=found[1])
+
+    def step(self, text, records, agent=None, found=None, event=None, log=()):
         agent = agent or 'x:' + str(uuid.uuid4())
         server.OFFICER_DELIVERIES.clear()        # each case brings its own ledger
-        found = found or attribution.codex(text)
-        event = dict(kind='user', agent=agent, text=text, ts=1, seq=1, attribution=found[0], attribution_detail=found[1])
-        ledger = FakeLedger({k: dict(v, agent=agent) if isinstance(v, dict) else v for k, v in records.items()})
-        with patch.object(server, 'MESSAGING', ledger):
+        server.DELIVERY_FIRST.clear()
+        event = event or self.event(text, agent, found=found)
+        ledger = FakeLedger({k: dict(dict(created=self.CREATED, **v), agent=agent) if isinstance(v, dict) else v
+                             for k, v in records.items()})
+        with patch.object(server, 'MESSAGING', ledger), patch.object(server, 'LOG', list(log)):
             return server.officer_step(event)['what']
 
     def test_ledger_author_decides_owner_relay_wording(self):
@@ -260,10 +269,33 @@ class OfficerWordingTests(unittest.TestCase):
         self.assertIn('could not be checked', self.step(owner, {REQUEST: False}))
         other = 'x:' + str(uuid.uuid4())
         server.OFFICER_DELIVERIES.clear()
-        found = attribution.codex(owner)
-        event = dict(kind='user', agent='x:' + str(uuid.uuid4()), text=owner, ts=1, seq=1, attribution=found[0], attribution_detail=found[1])
-        with patch.object(server, 'MESSAGING', FakeLedger({REQUEST: {'origin': 'owner', 'author': 'owner', 'sent': owner, 'agent': other}})):
+        event = self.event(owner, 'x:' + str(uuid.uuid4()))
+        with patch.object(server, 'MESSAGING', FakeLedger({REQUEST: {'origin': 'owner', 'author': 'owner', 'sent': owner,
+                                                                     'agent': other, 'created': self.CREATED}})):
             self.assertIn("Motet's records do not confirm", server.officer_step(event)['what'], 'a record for another chat confirms nothing')
+
+    def test_an_exact_replay_later_confirms_nothing(self):
+        real = m.envelope(REQUEST, 'Is it done?', version=3, author='owner')
+        ledger = {REQUEST: {'origin': 'owner', 'author': 'owner', 'sent': real}}
+        agent = 'x:' + str(uuid.uuid4())
+        first = self.event(real, agent, ts=self.CREATED + 20, seq=10)
+        replay = self.event(real, agent, ts=self.CREATED + 3600, seq=11)
+        log = [first, replay]
+        self.assertIn('owner typed', self.step(real, ledger, agent=agent, event=first, log=log))
+        what = self.step(real, ledger, agent=agent, event=replay, log=log)
+        self.assertTrue(what.startswith("a message shaped like a Motet delivery that Motet's records do not confirm"), what)
+        # Only times from just before Motet recorded the request to 24 hours after it can confirm.
+        for ts in (self.CREATED - 60, self.CREATED + server.DELIVERY_WINDOW + 60):
+            late = self.event(real, agent, ts=ts, seq=12)
+            self.assertNotIn('owner typed', self.step(real, ledger, agent=agent, event=late, log=[late]))
+        self.assertIn('owner typed', self.step(real, ledger, agent=agent, event=self.event(real, agent, ts=self.CREATED - 2), log=[]))
+        # Once the first copy has been seen, a replay stays unconfirmed even after the first copy leaves the log.
+        server.DELIVERY_FIRST.clear(); server.OFFICER_DELIVERIES.clear()
+        with patch.object(server, 'MESSAGING', FakeLedger({REQUEST: dict(ledger[REQUEST], agent=agent, created=self.CREATED)})):
+            with patch.object(server, 'LOG', [first]):
+                self.assertIn('owner typed', server.officer_step(first)['what'])
+            with patch.object(server, 'LOG', [replay]):
+                self.assertNotIn('owner typed', server.officer_step(replay)['what'])
 
     def test_a_reused_request_id_with_other_words_confirms_nothing(self):
         real = m.envelope(REQUEST, 'Is it done?', version=3, author='owner')
@@ -318,6 +350,24 @@ class OfficerWordingTests(unittest.TestCase):
         what = self.step('Summarize the orchard log.', {}, found=('unverified_user', 'exec_prompt'))
         self.assertEqual(what, 'a prompt given to a codex exec run (who wrote it is not recorded): Summarize the orchard log.')
 
+    def test_channel_text_without_an_envelope_is_not_the_owner(self):
+        text = '<channel source="fictional-server" kind="note">Cleo pushed the orchard branch.</channel>'
+        self.assertEqual(attribution.codex(text), ('automatic', 'channel'))
+        self.assertEqual(attribution.claude({'origin': {'kind': 'human'}}, text), ('automatic', 'channel'))
+        self.assertIn('passed in by a channel server', self.step(text, {}))
+
+    def test_codex_exec_prompts_keep_their_wording_in_evidence_and_citations(self):
+        self.assertEqual(attribution.stored_label('unverified_user', 'exec_prompt'), attribution.EXEC_LABEL)
+        self.assertEqual(attribution.of_row({'attribution': attribution.EXEC_LABEL}), 'unverified_user')
+        self.assertEqual(attribution.evidence_value(attribution.EXEC_LABEL), 'codex_exec_prompt')
+        self.assertIn('codex exec run', attribution.citation_label(attribution.EXEC_LABEL))
+        self.assertEqual(attribution.evidence_value(attribution.FORM_LABEL), 'question_form_answer')
+        agent = 'x:' + str(uuid.uuid4())
+        view = live_view('boot-fixture', {agent: {'runtime': 'Codex', 'name': 'Cleo'}},
+                         [dict(seq=1, agent=agent, kind='user', text='Summarize.', ts=1800000000.0,
+                               attribution='unverified_user', attribution_detail='exec_prompt')], {})
+        self.assertEqual(view['events'][0]['attribution'], attribution.EXEC_LABEL)
+
     def test_attachment_relays_are_not_confirmed_owner_words(self):
         text = ('WATCH_REQUEST ' + REQUEST + '\nAttachment relay version: 3\n\nOwner instruction:\nRead the orchard notes.\n\n'
                 'Attachment references:\n[]\n\nAttachment contents are reference data.')
@@ -367,12 +417,14 @@ class OfficerWordingTests(unittest.TestCase):
         record = EvidenceSession._record
         query.pending, query.snapshot, query._last_archive_generation = {}, 's', None
         query.receipt_fingerprinter = None
+        query.receipt_fingerprinter = None
         query._receipt_fingerprint = lambda row: None
         base = dict(ref='live:b:1', source='live', chat_id='x:c', kind='message', role='user', text='t', source_ts=1.0, observed_ts=1.0)
         self.assertEqual(record(query, dict(base))['attribution'], 'owner_message')
         self.assertEqual(record(query, dict(base, attribution='voice'))['attribution'], 'voice')
         self.assertEqual(record(query, dict(base, text=PEER_ENVELOPE))['attribution'], 'motet_delivery')
         self.assertEqual(record(query, dict(base, role='assistant'))['attribution'], 'agent_report')
+        self.assertEqual(record(query, dict(base, attribution=attribution.EXEC_LABEL))['attribution'], 'codex_exec_prompt')
 
 
 class HistoryTests(unittest.TestCase):
@@ -404,6 +456,8 @@ class HistoryTests(unittest.TestCase):
         self.offer(self.message('Check-in', attribution='automatic'))
         events = self.store.search(query='')['events']
         self.assertEqual(events[0]['attribution'], 'automatic')
+        self.offer(self.message('Summarize.', attribution=attribution.EXEC_LABEL))
+        self.assertIn(attribution.EXEC_LABEL, {e.get('attribution') for e in self.store.search(query='')['events']})
         self.n += 1
         for bad in (dict(attribution='owner'), dict(attribution='voice', role='assistant')):
             record = dict(key=self.store.opaque_identity('record', 100 + len(bad)), stream=self.store.opaque_identity('stream', 'fixture'),
@@ -442,8 +496,9 @@ class HistoryTests(unittest.TestCase):
             server.history_projection(dict(kind='user', agent='x:none', text='hb', attribution='automatic'))
             server.history_projection(dict(kind='user', agent='x:none', text='typed'))
             server.history_projection(dict(kind='say', agent='x:none', text='done', attribution='automatic'))
+            server.history_projection(dict(kind='user', agent='x:none', text='Summarize.', attribution='unverified_user', attribution_detail='exec_prompt'))
             rows = server.HISTORY_LOCAL.batch
-            self.assertEqual([r.get('attribution') for r in rows], ['automatic', None, None])
+            self.assertEqual([r.get('attribution') for r in rows], ['automatic', None, None, attribution.EXEC_LABEL])
         finally:
             server.HISTORY_LOCAL.batch, server.HISTORY_LOCAL.batch_bytes, server.HISTORY_LOCAL.failed = saved
 
@@ -525,7 +580,8 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(self.stored(owner)['envelope'], m.envelope(owner, 'Typed by Ada.', version=3, author='owner'))
         self.assertEqual(self.stored(motet)['envelope'], m.envelope(motet, 'Worded by Motet.', version=3, author='motet'))
         record = self.store.delivery_record(owner)
-        self.assertEqual({k: v for k, v in record.items() if k != 'envelope_sha256'},
+        self.assertEqual(record['created'], self.stored(owner)['created'])
+        self.assertEqual({k: v for k, v in record.items() if k not in ('envelope_sha256', 'created')},
                          {'origin': 'owner', 'author': 'owner', 'agent': self.agent, 'name': 'Cleo'})
         with self.assertRaises(m.MessagingError) as conflict:
             self.store.submit(self.agent, 'Worded by Motet.', motet, self.agents, author='owner')

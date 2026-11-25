@@ -521,7 +521,7 @@ def deck_attributed(out):
     rows = out.get('events') if isinstance(out, dict) and isinstance(out.get('events'), list) else [out]
     for row in rows:
         if isinstance(row, dict) and row.get('role') == 'user':
-            row['attribution'] = attribution.of_row(row)
+            row['attribution'] = attribution.label_of_row(row)
     return out
 
 
@@ -534,8 +534,9 @@ def history_projection(event):
     if kind in ('user', 'say', 'ask'):
         row = {'kind': 'message', 'role': 'user' if kind == 'user' else 'assistant',
                'text': str(event.get('text') or '')}
-        if kind == 'user' and event.get('attribution') in attribution.CATEGORIES:
-            row['attribution'] = event['attribution']      # who wrote it; saved so retained history keeps the label
+        label = attribution.stored_label(event.get('attribution'), event.get('attribution_detail') or '') if kind == 'user' else None
+        if label:
+            row['attribution'] = label      # who wrote it; saved so retained history keeps the label
     elif kind in ('turn_start', 'turn_end'):
         row = {'kind': kind}
     elif kind in ('run', 'read', 'write', 'edit', 'patch', 'search', 'web', 'spawn', 'tool', 'result'):
@@ -3357,9 +3358,44 @@ def officer_find(name):
 
 
 OFFICER_DELIVERIES = {}          # request ID -> (checked at, record): a short-lived read cache for labelling only
+DELIVERY_FIRST = {}              # (chat, request ID) -> (time, seq) of the earliest exact copy seen in this run
+# A delivered copy is confirmed only when it is the first exact copy in that chat and its time is no earlier than
+# DELIVERY_SKEW seconds before Motet recorded the request and no later than DELIVERY_WINDOW after it: 24 hours, as
+# long as the ledger keeps a row (officer_messaging.RETENTION). Later copies are replays and confirm nothing.
+DELIVERY_SKEW, DELIVERY_WINDOW = 5, 86400
 
 
-def officer_delivery(text, agent):
+def delivery_first_copy(e, request_id, digest, created):
+    """True when event e is the first exact copy of that envelope in its chat, inside the delivery window."""
+    def stamp(event):
+        ts = event.get('ts')
+        return ts if type(ts) in (int, float) and math.isfinite(ts) else None
+
+    def inside(event):
+        ts = stamp(event)
+        return ts is not None and created - DELIVERY_SKEW <= ts <= created + DELIVERY_WINDOW
+
+    if type(created) not in (int, float) or not math.isfinite(created) or not inside(e):
+        return False
+    agent, mine = e.get('agent'), (stamp(e), e.get('seq') if type(e.get('seq')) is int else -1)
+    copies = [mine]
+    for other in list(LOG):
+        if (other is not e and other.get('agent') == agent and other.get('kind') == 'user' and inside(other)
+                and attribution.envelope_of(str(other.get('text') or '')) is not None
+                and attribution.envelope_of(str(other.get('text') or ''))[1] == request_id
+                and hashlib.sha256(attribution.delivered_form(str(other.get('text') or '')).encode('utf-8', 'surrogatepass')).hexdigest() == digest):
+            copies.append((stamp(other), other.get('seq') if type(other.get('seq')) is int else -1))
+    key = (agent, request_id)
+    if key in DELIVERY_FIRST:
+        copies.append(DELIVERY_FIRST[key])
+    first = min(copies)
+    if len(DELIVERY_FIRST) > 1024:
+        DELIVERY_FIRST.clear()
+    DELIVERY_FIRST[key] = first
+    return first == mine
+
+
+def officer_delivery(text, agent, event=None):
     """Motet's own record for the request a delivered envelope names, confirmed only when it was for this chat AND the
     message is exactly the envelope Motet stored (``words_match``). None when there is no such record or the words
     differ (a reused request ID confirms nothing); False when the records could not be checked. Labelling only."""
@@ -3382,11 +3418,13 @@ def officer_delivery(text, agent):
         if len(OFFICER_DELIVERIES) > 256:
             OFFICER_DELIVERIES.clear()
         OFFICER_DELIVERIES[found[1]] = (now, record)
-    if not isinstance(record, dict) or record.get('agent') != agent:
+    if not isinstance(record, dict) or record.get('agent') != agent or not isinstance(event, dict):
         return None
     sent = hashlib.sha256(attribution.delivered_form(text).encode('utf-8', 'surrogatepass')).hexdigest()
     if not hmac.compare_digest(sent, str(record.get('envelope_sha256') or '')):
         return None
+    if not delivery_first_copy(event, found[1], sent, record.get('created')):
+        return None              # an exact copy at another time is a replay: it confirms nothing
     return dict(record, words_match=True)
 
 
@@ -3398,7 +3436,7 @@ def officer_user_words(e):
     category = attribution.of_row(e)
     detail = str(e.get('attribution_detail') or '') if e.get('attribution') in attribution.CATEGORIES else (
         (attribution.from_text(text) or ('', ''))[1])
-    delivery = officer_delivery(text, e.get('agent')) if category == 'motet_delivery' else None
+    delivery = officer_delivery(text, e.get('agent'), e) if category == 'motet_delivery' else None
     words = attribution.display_text(text, category, detail)
     return attribution.describe(category, detail, text, delivery) + str(words)[:300]
 
@@ -4440,7 +4478,7 @@ def officer_surviving_answer(session, refs, omitted=0, actions=None, reason='era
         else:
             detail = ', '.join(str(row[key]) for key in ('kind', 'operation', 'phase', 'outcome', 'file_ref') if row.get(key))
         detail = detail[:1600] + (' [excerpt ends]' if len(detail) > 1600 else '')
-        speaker = (attribution.citation_label(attribution.of_row(row)) if row.get('role') == 'user'
+        speaker = (attribution.citation_label(attribution.label_of_row(row)) if row.get('role') == 'user'
                    else 'agent report' if row.get('role') == 'assistant' else 'observation')
         stamp = row.get('source_ts') if row.get('time_basis') == 'source' else row.get('observed_ts')
         if type(stamp) not in (int, float):

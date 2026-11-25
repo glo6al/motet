@@ -464,7 +464,7 @@ class EvidenceSession:
                        observation_source=_text(item.get('observation_source','process_observation' if chat.startswith('e:') else '')),
                        source_qualification=_text(item.get('source_qualification','Process-list observation only; agent prose and completion are not established.' if chat.startswith('e:') else ''),240),
                        text=str(item.get('text', ''))[:60000], file_ref=_relative(item.get('file_ref', '')))
-            if row['role'] == 'user' and item.get('attribution') in attribution.CATEGORIES:
+            if row['role'] == 'user' and item.get('attribution') in attribution.LABELS:
                 row['attribution'] = item['attribution']
             if SECRET.search(row['text']):
                 row['text'] = '[content omitted]'
@@ -519,7 +519,7 @@ class EvidenceSession:
                 value.pop(key,None)
             # Only plain user-role text with no other evidence is the owner's (unverified) message; Motet's
             # deliveries, other chats, automatic prompts and voice-mode rewordings say so (src/attribution.py).
-            value['attribution']=attribution.evidence_value(attribution.of_row(row)) if row.get('role')=='user' else 'agent_report'
+            value['attribution']=attribution.evidence_value(attribution.label_of_row(row)) if row.get('role')=='user' else 'agent_report'
         if row.get('timestamp_qualification'): value['timestamp_qualification'] = row['timestamp_qualification']
         value['text'] = _excerpt(str(row.get('text', '')), match or dict(text='', mode='literal'), 2048 if full else 480)
         value['text_complete'] = value['text'] == str(row.get('text', ''))

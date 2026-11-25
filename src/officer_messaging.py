@@ -1016,8 +1016,8 @@ class MessagingStore:
     def delivery_record(self, request_id):
         """Read-only: Motet's own record of a request a delivered envelope names, for labelling only.
 
-        Returns origin ('owner' route or 'peer'), author ('owner', 'motet' or 'unknown'), agent, name and the
-        SHA-256 of the exact envelope Motet sent, so a caller can confirm the words match; None when Motet holds no
+        Returns origin ('owner' route or 'peer'), author ('owner', 'motet' or 'unknown'), agent, name, the time
+        Motet recorded the request (created) and the SHA-256 of the exact envelope Motet sent, so a caller can confirm the words match; None when Motet holds no
         such request; False when the ledger was busy (it never waits behind delivery work). It never grants
         anything; an unknown author is never the owner."""
         if not valid_uuid(request_id):
@@ -1034,6 +1034,7 @@ class MessagingStore:
         sent = outgoing_message(row)
         return {'origin': origin, 'author': 'unknown' if origin == 'peer' else message_author(row),
                 'agent': str(row.get('agent') or ''), 'name': str(row.get('name') or '')[:120],
+                'created': row['created'] if self._timestamp(row.get('created')) else None,
                 'envelope_sha256': hashlib.sha256(sent.encode('utf-8', 'surrogatepass')).hexdigest() if isinstance(sent, str) else ''}
 
     @staticmethod
