@@ -460,9 +460,12 @@ def start_in_job(args, cwd, image=None, image_of=None):
     ``image`` (volume serial, file index) is the file the caller hashed and still holds open sharing reading only.
     Before the thread is resumed, the program the suspended process was actually started from is identified
     (``process_image_identity``; ``image_of`` stands in for it in tests) and must be that same file; otherwise the
-    process is ended without ever running. While the caller's handle is open the checked file cannot be written,
-    renamed or deleted, so another file can never be found at its name; and a file found there whose index is the
-    checked one is the checked file."""
+    process is ended without ever running.
+
+    This check, like the caller's hold, relies on NTFS refusing to rename or delete a file that is open without
+    delete sharing, and refusing to rename any folder above such a file (the real-Windows tests check both). So
+    while the caller's handle is open, neither the file nor any folder on its path can be moved or replaced, and a
+    file found at that path whose volume and index are the checked file's is the checked file."""
     process = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, bufsize=0,
                                creationflags=CREATE_SUSPENDED | CREATE_NO_WINDOW)
@@ -1059,7 +1062,11 @@ def _open_held(path, pin):
     """Open the program at ``path`` through the no-link walk with one name only, sharing reading only (nobody can
     write, rename or delete it while the descriptor is open, and a writer already holding it makes the open fail),
     after refusing a missing pin, a refused location or a path that is not its own real path; and refuse it unless
-    its size is the pin's. Returns the descriptor."""
+    its size is the pin's. Returns the descriptor.
+
+    The hold relies on NTFS: a file open without delete sharing cannot be renamed or deleted, and no folder above it
+    can be renamed either, so the whole path keeps naming this file until the descriptor is closed (the walk's own
+    folder handles are already let go by then). The real-Windows tests check this."""
     import private_storage as ps
     if pin is None or refused_location(path) is not None or os.path.realpath(path) != path:
         raise ValueError('not the pinned Claude Code')
@@ -1088,22 +1095,46 @@ def open_pinned(path, pin):
         raise
 
 
+def change_time(fd):
+    """NTFS's change time of what ``fd`` has open (FILE_BASIC_INFO.ChangeTime, read through the handle with
+    GetFileInformationByHandleEx): the file system moves it on every write and every change of times or attributes.
+    SetFileTime cannot set it back; SetFileInformationByHandle can."""
+    import msvcrt
+    ctypes, w, k = _api()[:3]
+
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [('CreationTime', w.LARGE_INTEGER), ('LastAccessTime', w.LARGE_INTEGER),
+                    ('LastWriteTime', w.LARGE_INTEGER), ('ChangeTime', w.LARGE_INTEGER), ('FileAttributes', w.DWORD)]
+    query = k.GetFileInformationByHandleEx
+    query.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
+    query.restype = w.BOOL
+    info = BasicInfo()
+    if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(info), ctypes.sizeof(info)):     # FileBasicInfo
+        raise _failed('file times unavailable')
+    return info.ChangeTime
+
+
 def verify_pinned(path, pin, known=None):
     """Check the program at ``path`` against ``pin`` without starting it, for the availability checks (readiness,
     the New chat menu, a launch before it is handed to the supervisor), and return what was verified: the path, the
-    pin and the identity read from the held descriptor (private_storage.file_identity: volume serial, file index,
-    size, last-write and creation times). Given ``known``, an earlier result, the full hash is skipped only when
-    the file opened now has exactly that identity, for the same path and pin; a replaced file (another index), a
-    changed size or a rewritten one (a new last-write time) is hashed again, and a failed check returns nothing to
-    remember. The identity is read under the handle that shares reading only, so it describes the bytes hashed.
+    pin and the identity read from the held descriptor (volume serial, file index, size and last-write time from
+    private_storage.file_identity, and NTFS's change time, ``change_time``). Given ``known``, an earlier result, the
+    full hash is skipped only when the file opened now has exactly that identity, for the same path and pin; a
+    replaced file (another index), a changed size or a rewritten one (a new change time, whatever its last-write
+    time says) is hashed again, and a failed check returns nothing to remember. The identity is read under the
+    handle that shares reading only, so it describes the bytes hashed.
 
-    What this does not catch: a program of this same user that rewrites the file in place at the same size and then
-    sets its last-write time back. Then availability could say yes, but nothing would run: the supervisor hashes the
-    file in full before every start (``open_pinned``) and checks that Claude was started from it (``start_in_job``)."""
+    What this does not catch, both only by a program of this same user: one that rewrites the file in place at the
+    same size and then sets its change time back too (SetFileInformationByHandle, not SetFileTime); and one that
+    writes through a memory mapping of the file it set up before the hold (a mapping outlives its handle, and
+    sharing modes govern handles only). Then availability could say yes, but nothing would run: the supervisor
+    hashes the file in full before every start (``open_pinned``) and checks that Claude was started from it
+    (``start_in_job``)."""
     import private_storage as ps
     fd = _open_held(path, pin)
     try:
-        verified = (path, tuple(pin), tuple(ps.file_identity(fd)))
+        volume, index, size, written = tuple(ps.file_identity(fd))[:4]
+        verified = (path, tuple(pin), (volume, index, size, written, change_time(fd)))
         if verified != known and hash_open_file(fd, WINDOWS_HASH_SECONDS) != pin[0]:
             raise ValueError('not the pinned Claude Code')
         return verified

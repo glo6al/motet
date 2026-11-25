@@ -241,6 +241,8 @@ class SimulatedExecutableTests(unittest.TestCase):
         stack = ExitStack()
         stack.enter_context(simulated_windows())
         stack.enter_context(mock.patch.object(windows, 'windows_pin', return_value=self.pin))
+        # NTFS's change time, simulated by POSIX's ctime: both move on every write and cannot be set by utime.
+        stack.enter_context(mock.patch.object(windows, 'change_time', lambda fd: os.fstat(fd).st_ctime_ns))
         self.addCleanup(stack.close)
 
     def manager(self):
@@ -321,9 +323,10 @@ class SimulatedExecutableTests(unittest.TestCase):
             grown.write(b'!')
         self.assertEqual(self.available(manager), (False, 'app_version_unsupported'))
         self.assertIsNone(manager._windows_verified)
-        path.write_bytes(self.content)                                # the right bytes again: hashed again
-        os.utime(str(path), ns=(info.st_atime_ns, info.st_mtime_ns))  # even with the old last-write time
-        self.assertEqual(self.available(manager), (True, ''))
+        path.write_bytes(self.content)                                # the right bytes again,
+        os.utime(str(path), ns=(info.st_atime_ns, info.st_mtime_ns))  # with the old last-write time:
+        self.assertEqual(self.available(manager), (True, ''))         # hashed, as the refusal forgot the pass
+        self.assertEqual(len(hashed), 2)
         self.assertEqual(len(hashed), 2)
         copy = self.versions / 'copy'
         copy.write_bytes(self.content)
@@ -335,6 +338,19 @@ class SimulatedExecutableTests(unittest.TestCase):
         path.write_bytes(b'fictional other build!')                   # same size, other bytes
         self.assertEqual(self.available(manager), (False, 'app_version_unsupported'))
         self.assertEqual(len(hashed), 4)
+
+    def test_the_change_time_not_the_creation_time_is_remembered(self):
+        path = str(self.install())
+        hashed, changed = self.counting_hashes(), [1]
+        identity = ps.file_identity
+        with mock.patch.object(windows, 'change_time', lambda fd: changed[0]):
+            verified = windows.verify_pinned(path, self.pin)
+            with mock.patch.object(ps, 'file_identity', lambda fd: tuple(identity(fd))[:4] + (12345,)):
+                self.assertEqual(windows.verify_pinned(path, self.pin, verified), verified)   # creation time: unused
+            self.assertEqual(len(hashed), 1)
+            changed[0] = 2                        # the file system saw a write, whatever the last-write time says
+            windows.verify_pinned(path, self.pin, verified)
+            self.assertEqual(len(hashed), 2)
 
     def test_an_earlier_check_counts_only_for_the_same_path_and_pin(self):
         path = str(self.install())
@@ -462,6 +478,34 @@ class WindowsExecutableTests(unittest.TestCase):
             os.close(fd)
         with self.assertRaises(ValueError):
             windows.open_pinned(str(self.path), ('0' * 64, len(self.content)))
+
+    def test_the_hold_keeps_the_whole_path_in_place(self):
+        fd = ps.open_no_links(str(self.path), single_link=True, deny_writers=True)
+        try:
+            with self.assertRaises(PermissionError):             # the folder above it
+                os.rename(str(self.base), str(self.base) + '-moved')
+            with self.assertRaises(PermissionError):             # the file itself
+                os.rename(str(self.path), str(self.base / 'moved'))
+            with self.assertRaises(PermissionError):
+                os.remove(str(self.path))
+        finally:
+            os.close(fd)
+        os.rename(str(self.path), str(self.base / 'moved'))      # once it is let go
+
+    def test_the_change_time_moves_on_a_write_that_setfiletime_cannot_hide(self):
+        def changed():
+            fd = ps.open_no_links(str(self.path), single_link=True)
+            try:
+                return windows.change_time(fd)
+            finally:
+                os.close(fd)
+        before, info = changed(), os.stat(str(self.path))
+        time.sleep(0.1)
+        with open(str(self.path), 'r+b') as rewrite:              # same size, other bytes
+            rewrite.write(b'F')
+        os.utime(str(self.path), ns=(info.st_atime_ns, info.st_mtime_ns))
+        self.assertEqual(os.stat(str(self.path)).st_mtime_ns, info.st_mtime_ns)
+        self.assertNotEqual(changed(), before)
 
     def test_a_junction_on_the_way_is_refused(self):
         link = self.base / 'versions-link'

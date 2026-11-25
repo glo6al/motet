@@ -532,7 +532,8 @@ class ManagedClaude:
         """Windows: Claude Code 2.1.323 for this machine's architecture, found only where the native installer is
         expected to keep it (claude_managed_windows.locate_claude), refused if it is a shim, an alias, the desktop
         app's copy or reached through a link or junction, and hashed through a handle that shares reading only.
-        The hash is taken again only when the file's identity (volume, index, size, times) has changed since the
+        The hash is taken again only when the file's identity (volume, index, size, last-write and NTFS change
+        times) has changed since the
         last check that passed, so the New chat menu does not read ~367 MB each time it asks; the supervisor still
         hashes in full before it starts Claude."""
         import claude_managed_windows as windows

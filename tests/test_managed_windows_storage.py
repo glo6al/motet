@@ -48,6 +48,8 @@ class Simulated:
         stack = ExitStack()
         self.calls = stack.enter_context(simulated_windows())
         stack.enter_context(mock.patch.object(claude_managed_windows, 'native_architecture', return_value='x64'))
+        stack.enter_context(mock.patch.object(claude_managed_windows, 'change_time',
+                                              lambda fd: os.fstat(fd).st_ctime_ns))
         self.addCleanup(stack.close)
         super().setUp()
 

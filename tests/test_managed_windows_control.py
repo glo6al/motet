@@ -182,6 +182,7 @@ class SimulatedControlRecordTests(unittest.TestCase):
         stack = ExitStack()
         self.calls = stack.enter_context(simulated_windows())
         stack.enter_context(mock.patch.object(windows, 'native_architecture', return_value='x64'))
+        stack.enter_context(mock.patch.object(windows, 'change_time', lambda fd: os.fstat(fd).st_ctime_ns))
         self.addCleanup(stack.close)
         self.base = fixture(self)
         with ps.open_folder(str(self.base.project)) as held:
