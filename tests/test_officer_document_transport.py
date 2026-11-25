@@ -220,6 +220,23 @@ class TransportTests(unittest.TestCase):
         with mock.patch.object(self.store.files, 'read', side_effect=AssertionError('no retirement IO')):
             self.assertTrue(self.f.l.retire_permit(permit))
 
+    def test_a_deadline_read_in_the_same_clock_tick_is_accepted(self):
+        """The coordinator passes ``clock() + 120``. Read in the same tick as the transport's own read (likely where the
+        clock is coarse: time.monotonic on Windows before Python 3.13 ticks every 15.6 ms), it is a valid deadline,
+        although ``deadline - now`` rounds above 120 when ``now + 120`` crosses a power of two."""
+        now = 1930.001
+        self.assertGreater((now + 120.0) - now, 120)          # what the old comparison refused, after the claim
+        ticket = self.ticket()
+        _, _, permit, prepared, lease = ticket
+        item, factory = self.make(clock=lambda: now)
+        for deadline in (now, now - 1, now + 120.0 + 1e-9, now + 121):
+            self.rejected('deadline_invalid', lambda deadline=deadline: item.call(prepared, self.f.l, permit, lease,
+                                                                                    lambda: KEY, deadline))
+        result = item.call(prepared, self.f.l, permit, lease, lambda: KEY, now + 120.0)
+        self.results.append(result)
+        self.assertIs(type(result), transport.OwnedDocumentResult)
+        self.assertEqual(len(factory.calls), 1)
+
     def test_gate_demo_bad_deadline_and_request_have_zero_consume_or_connections(self):
         ticket = self.ticket()
         _, _, permit, prepared, lease = ticket

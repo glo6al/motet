@@ -354,9 +354,13 @@ class DirectDocumentTransport:
         if not self.enabled:
             _reject('transport_disabled')
         now = self.clock()
+        # Compared as ``deadline <= now + 120``, never ``deadline - now <= 120``: a caller's ``clock() + 120`` read in
+        # the same clock tick then compares equal. The subtraction can round to just above 120 whenever ``now + 120``
+        # crosses a power of two, and a coarse clock makes the same tick likely (time.monotonic on Windows before
+        # Python 3.13 ticks every 15.6 ms), so a valid deadline was refused there at random after the claim.
         if (type(now) not in (int, float) or not math.isfinite(now)
                 or type(deadline) not in (int, float) or not math.isfinite(deadline)
-                or not 0 < deadline - now <= 120):
+                or not now < deadline <= now + 120):
             _reject('deadline_invalid')
         if not callable(credential):
             _reject('credential_unavailable')

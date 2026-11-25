@@ -54,6 +54,23 @@ const ready = new Promise((resolve,reject) => {
     const changes=[];let digestCalls=0;
     const crypto={randomUUID:()=>webcrypto.randomUUID(),subtle:{digest:(...args)=>{digestCalls++;return webcrypto.subtle.digest(...args);}}};
     const metadata = async()=> (await fetch(origin+'/fixture/metadata',{headers:{'X-Live-Room-Key':key}})).json();
+    // Every question that should be answered goes through here. The ask returns only after the fixture has recorded
+    // the question's outcome, and send reloads after it, so no answer means the question ended without one (it is not
+    // waited for: it will not change). Say how it ended, wherever that happens.
+    const asked = async (text, options) => {
+      const view = await client.send(text, options);
+      assert.equal(view.error, null, JSON.stringify(view.error));
+      const requestId = view.lastSend?.requestId ?? null;
+      if (!view.answers.some(a => a.requestId === requestId)) {
+        const request = view.requests.find(r => r.requestId === requestId) || null;
+        assert.fail('No answer was recorded for ' + JSON.stringify(text) + ': ' + JSON.stringify({requestId,
+          request: request && {state: request.state, failure: request.failure, notAskedReason: request.notAskedReason,
+            officerDelivery: request.officerDelivery, answerId: request.answerId},
+          answers: view.answers.length, uncertain: view.uncertain, fakeProviderCalls: (await metadata()).fakeProviderCalls,
+          fixtureErrors: errors.slice(-2000)}));
+      }
+      return view;
+    };
     let dropPreparation = false, lostPrepared = null, observeDeletionConfirm = false,dropConfirmation=false,lostConfirmKey=null;
     let recordedPrepareDigest=null,journalGeneration=0;
     const browserStorage=new Map(),storage={getItem:k=>browserStorage.get(k)??null,setItem:(k,v)=>browserStorage.set(k,v),removeItem:k=>browserStorage.delete(k)};
@@ -102,16 +119,8 @@ const ready = new Promise((resolve,reject) => {
     assert.equal(s.usableFileCount,2);
     const admissionRequestId=s.requests[0].requestId;assert(s.files.every(f=>f.admissionRequestId===admissionRequestId));
     assert.equal((await metadata()).fakeProviderCalls,0);
-    s = await client.send('What does the fictional file say?',{keptFiles:s.files.filter(f=>f.available)});
-    assert.equal(s.error,null,JSON.stringify(s.error));
-    // The ask returns only after the fixture has recorded the question's outcome, and send reloads after it, so no
-    // answer here means the question ended without one. Say how it ended (it is not waited for: it will not change).
-    if(s.answers.length!==1){
-      const asked=s.requests.find(r=>r.requestId===s.lastSend?.requestId)||s.requests[s.requests.length-1];
-      assert.fail('No answer was recorded: '+JSON.stringify({answers:s.answers.length,request:asked&&{state:asked.state,
-        failure:asked.failure,officerDelivery:asked.officerDelivery,answerId:asked.answerId},uncertain:s.uncertain,
-        fakeProviderCalls:(await metadata()).fakeProviderCalls,fixtureErrors:errors.slice(-2000)}));
-    }
+    s = await asked('What does the fictional file say?',{keptFiles:s.files.filter(f=>f.available)});
+    assert.equal(s.answers.length,1);
     assert.equal(s.answers[0].state,'available');
     assert.deepEqual(s.answers[0].priorAnswerWindow,{policy:'recent_available_8',includedCount:0,omittedOlder:false});
     assert(Number.isFinite(s.answers[0].answeredAt));
@@ -136,8 +145,7 @@ const ready = new Promise((resolve,reject) => {
     s=await client.editText('Separate fictional private draft text.');assert.equal(s.error,null);
     s=await client.remove(removedStaged);assert.equal(s.error,null);assert.deepEqual(s.draft.files,[]);
     const untouchedDraft=s.draft,retainedFollowupStart=requests.length;
-    s = await client.send('Summarize your earlier answer.',{keptFiles:s.files.filter(f=>f.available)});
-    assert.equal(s.error,null,JSON.stringify(s.error));
+    s = await asked('Summarize your earlier answer.',{keptFiles:s.files.filter(f=>f.available)});
     assert.deepEqual(s.draft,untouchedDraft);assert.equal(s.draft.text,'Separate fictional private draft text.');
     assert.deepEqual(requests.slice(retainedFollowupStart).filter(r=>r.method!=='GET').map(r=>r.url),
       ['/api/attachments/conversations/'+s.conversation.id+'/question-intent','/api/attachments/requests/'+s.lastSend.requestId+'/ask']);
@@ -198,8 +206,7 @@ const ready = new Promise((resolve,reject) => {
     assert.equal(s.error,null,JSON.stringify(s.error));
     const laterFileId=s.uploads[0].fileId;
     assert.equal(requests.filter(r=>r.url==='/api/attachments/drafts'&&r.method==='POST').at(-1).modelId,'auto');
-    s = await client.send('Read this fictional file using the saved Auto selection.');
-    assert.equal(s.error,null,JSON.stringify(s.error));
+    s = await asked('Read this fictional file using the saved Auto selection.');
     assert.equal(s.context.modelId,'@automatic');
     assert.equal(s.answers.length,3);
     assert.equal(s.draft,null);assert.deepEqual(s.uploads,[]);
@@ -273,7 +280,7 @@ const ready = new Promise((resolve,reject) => {
     s=await client.send('');assert.equal(s.error,null);assert.equal(s.usableFileCount,2);
     const recorded=[];
     for(let n=0;n<10;n++){
-      s=await client.send('Fictional window question '+n,{keptFiles:s.files.filter(f=>f.available)});assert.equal(s.error,null,JSON.stringify(s.error));
+      s=await asked('Fictional window question '+n,{keptFiles:s.files.filter(f=>f.available)});
       const a=s.answers.find(a=>a.requestId===s.lastSend.requestId),q=s.requests.find(r=>r.requestId===s.lastSend.requestId);
       const post=requests.findLast(r=>r.url.endsWith('/question-intent'));
       assert.equal(post.priorPolicy,'recent_available_8');assert.deepEqual(post.priorIds,recorded.slice(-8));
