@@ -28,7 +28,7 @@ import encodings.idna  # noqa: F401  (imported before the simulation, which rest
 import private_storage as ps
 import attachments_materialize as materialize
 from attachments_materialize import (Materializer, WorkspaceContext, FileIdentity, WorkspaceDirectories,
-                                     relative_path, resource_keys, copy_identity)
+                                     WORKSPACE_REFUSALS, relative_path, resource_keys, copy_identity)
 from attachments_requests import RequestAuthority, CopyIntent
 from attachments_resources import ResourceLocks
 from attachments_types import AttachmentError
@@ -217,10 +217,32 @@ class CopyChecks:
         self.owned_by_administrators(self.repo / '.git')
         with self.assertRaises(AttachmentError) as raised:
             self.copied()
-        self.assertEqual(raised.exception.code, 'workspace_not_yours')
+        self.assertEqual(raised.exception.code, 'workspace_git_not_yours')
+        self.assertEqual(str(raised.exception), WORKSPACE_REFUSALS['workspace_git_not_yours'])
         self.assertIn("The selected workspace's .git folder belongs to another account (often Administrators",
                       str(raised.exception))
         self.assertIn('Take ownership of it, or choose a folder you made.', str(raised.exception))
+
+    def test_an_exclude_file_owned_by_another_account_is_named_in_plain_words(self):
+        exclude = self.repo / '.git' / 'info' / 'exclude'
+        self.make_exclude(exclude)
+        self.exclude_owned_by_administrators(exclude)
+        with self.assertRaises(AttachmentError) as raised:
+            self.copied()
+        self.assertEqual(raised.exception.code, 'workspace_exclude_not_yours')
+        self.assertEqual(str(raised.exception), WORKSPACE_REFUSALS['workspace_exclude_not_yours'])
+        self.assertIn("The selected workspace's Git exclude file (.git\\info\\exclude) belongs to another account",
+                      str(raised.exception))
+
+    def test_a_removal_that_finds_no_copy_checks_again_before_saying_absent(self):
+        verified = self.copied()
+        real = ps.NoLinkFolder.remove
+        with mock.patch.object(ps.NoLinkFolder, 'remove', lambda folder, name, expect: 'absent'):
+            # The copy is still there: an 'absent' answer is not taken on trust.
+            self.assertEqual(self.code(lambda: self.remove(verified)), 'copy_changed')
+        self.assertEqual(self.remove(verified).result, 'removed')
+        self.assertEqual(self.remove(verified).result, 'absent')
+        self.assertIs(ps.NoLinkFolder.remove, real)
 
     def test_a_workspace_reached_through_a_link_is_named_in_plain_words(self):
         link = self.base / 'orchard-link'
@@ -301,6 +323,22 @@ class SimulatedWindowsCopyTests(CopyChecks, unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def make_exclude(self, path):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+
+    def exclude_owned_by_administrators(self, path):
+        """POSIX cannot give the file away without root, so the held folder's append answers as Windows would."""
+        real = ps.NoLinkFolder.open_append
+
+        def open_append(folder, name, create=True):
+            if name == 'exclude':
+                raise ps.PrivateStorageError('file owned elsewhere', 'owner', 'file')
+            return real(folder, name, create)
+        patcher = mock.patch.object(ps.NoLinkFolder, 'open_append', open_append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def owned_by_administrators(self, path):
         """POSIX cannot give the folder away without root, so the held folder's check answers as Windows would."""
         real = ps.NoLinkFolder.unwritable
@@ -355,6 +393,13 @@ class WindowsCopyTests(CopyChecks, unittest.TestCase):
 
     def workspace_link(self, link, target):
         junction(link, target)
+
+    def make_exclude(self, path):
+        path.write_bytes(b'')
+
+    def exclude_owned_by_administrators(self, path):
+        subprocess.run(['icacls', str(path), '/setowner', '*S-1-5-32-544'], check=True, capture_output=True,
+                       timeout=30)
 
     def owned_by_administrators(self, path):
         """As a repository cloned from an administrator window is."""

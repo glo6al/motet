@@ -1059,6 +1059,69 @@ test('an exchanged Prepare receipt for a newer preview cannot settle the origina
   assert.equal((await f.rpc('counters')).execute, 0);
 });
 
+test('a workspace copy held open elsewhere is shown as in use, at the attempt revision', async t => {
+  // Windows: another program has the copy open, so its removal is left and retried ('copy_in_use'). The attempt
+  // raised the revision, and the copy piece settles to unknown at that revision, as removal_unconfirmed does.
+  const {f, client, files: [target]} = await deletionCase(t);
+  const prepared = await prepareRetained(client, target);
+  f.setFault({test: path => DELETE_CONFIRM.test(path), when: 'after'});
+  await client.confirmDeletion(prepared.confirmHandle);
+  await client.refresh();
+  const pending = await openRetained(client, target);
+  const start = f.requests.length;
+  f.setFault({test: path => /\/deletions\/[a-f0-9]{32}\?/.test(path), when: 'replace', modify(raw) {
+    raw.operation.revision = pending.revision + 1;
+    raw.operation.pieces[1].state = 'unknown';
+    raw.operation.pieces[1].reason = 'copy_in_use';
+    raw.operation.state = 'unknown';
+    raw.operation.canRecover = true;
+    return raw;
+  }});
+  const held = await client.refresh();
+  assert.equal(held.error, null);
+  assert.equal(held.deletion.revision, pending.revision + 1);
+  assert.equal(held.deletion.copies[1].state, 'unknown');
+  assert.equal(held.deletion.copies[1].reason, 'copy_in_use');
+  onlyGets(f.requests.slice(start));
+});
+
+test('a copy whose removal was unconfirmed can settle to in use at the same attempt revision, not back', async t => {
+  // Windows: the attempt first records the copy piece as unknown/removal_unconfirmed at its new revision, then
+  // settles it to unknown/copy_in_use at that same revision when another program holds the copy open.
+  const {f, client, files: [target]} = await deletionCase(t);
+  const prepared = await prepareRetained(client, target);
+  f.setFault({test: path => DELETE_CONFIRM.test(path), when: 'after'});
+  await client.confirmDeletion(prepared.confirmHandle);
+  await client.refresh();
+  const pending = await openRetained(client, target);
+  const start = f.requests.length;
+  const settle = reason => f.setFault({test: path => /\/deletions\/[a-f0-9]{32}\?/.test(path), when: 'replace', modify(raw) {
+    raw.operation.revision = pending.revision + 1;
+    raw.operation.pieces[1].state = 'unknown';
+    raw.operation.pieces[1].reason = reason;
+    raw.operation.state = 'unknown';
+    raw.operation.canRecover = true;
+    return raw;
+  }});
+  settle('removal_unconfirmed');
+  const attempted = await client.refresh();
+  assert.equal(attempted.error, null);
+  assert.equal(attempted.deletion.revision, pending.revision + 1);
+  assert.equal(attempted.deletion.copies[1].reason, 'removal_unconfirmed');
+  settle('copy_in_use');
+  const held = await client.refresh();
+  assert.equal(held.error, null);
+  assert.equal(held.deletion.revision, pending.revision + 1);
+  assert.equal(held.deletion.copies[1].state, 'unknown');
+  assert.equal(held.deletion.copies[1].reason, 'copy_in_use');
+  // A settled reason does not go back to unconfirmed without a new attempt (a new revision).
+  settle('removal_unconfirmed');
+  const back = await client.refresh();
+  assert.equal(back.error?.code, 'deletion_incomplete');
+  assert.equal(back.deletion.copies[1].reason, 'copy_in_use');
+  onlyGets(f.requests.slice(start));
+});
+
 test('pending-source occupancy hints can change on the same real deletion revision', async t => {
   const {f, client, files: [target]} = await deletionCase(t);
   const prepared = await prepareRetained(client, target);

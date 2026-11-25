@@ -430,7 +430,8 @@ class NativeReadsTests(unittest.TestCase):
                     self.assertIsNone(self.receipt('draft_create', later)['match'])
                 finally:
                     server.fault.release.set()
-                self.assertEqual(self.receipt('draft_create', later)['match'], {'draftId': create.result(timeout=3)['id']})
+                created = create.result(timeout=10)['id']           # committed before its receipt is read
+                self.assertEqual(self.receipt('draft_create', later)['match'], {'draftId': created})
             for when in ('before', 'after'):
                 key = self.command()
                 self.lost(when, 'POST', '/drafts', lambda: self.create(key), 201)

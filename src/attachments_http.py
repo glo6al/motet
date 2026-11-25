@@ -73,10 +73,14 @@ class LimitedReader:
 
 
 def handle_http(handler, service, owner_key, port, *, native=None,
-                unavailable=('attachments_disabled', 'Attachments are unavailable.'), native_unavailable=None):
+                unavailable=('attachments_disabled', 'Attachments are unavailable.'), native_unavailable=None,
+                native_refusal=None):
     """``unavailable`` is the (code, words) every request gets while ``service`` is None: why the store is not running.
     ``native_unavailable`` is the (code, words) requests for files sent to agent chats get while the store runs but
-    this host cannot deliver them (``native`` is None there)."""
+    this host cannot deliver them (``native`` is None there). ``native_refusal(destination_id)`` gives (code, words)
+    when this host cannot deliver to that one chat (on Windows a Codex chat, or Git for Windows missing), else None;
+    it answers only a selection with nothing to show (no current or retained context), so receipts, status, history
+    and recovery of earlier sends stay readable, as where delivery runs."""
     handler.close_connection = True
     def headers(name):
         return handler.headers.get_all(name, [])
@@ -248,7 +252,12 @@ def handle_http(handler, service, owner_key, port, *, native=None,
             with native.operation():
                 destination_id = query['destinationId']
                 if route == '/native/selection':
-                    return reply(200, native.native_selection(destination_id))
+                    selection = native.native_selection(destination_id)
+                    if selection.get('context') is None and native_refusal is not None:
+                        refused = native_refusal(destination_id)
+                        if refused is not None:
+                            return error(503, *refused)
+                    return reply(200, selection)
                 reads, _, _ = native.scoped_reads(destination_id, query['scopeId'])
                 if native_receipt:
                     return reply(200, reads.native_receipt(native_receipt[1], destination_id, query['scopeId'],

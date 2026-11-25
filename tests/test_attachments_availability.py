@@ -236,7 +236,7 @@ class DemoTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == 'nt', 'The real Windows start; simulated on POSIX by tests/test_attachments_windows_store.py')
 class RealWindowsStartupTests(unittest.TestCase):
-    def test_real_start_attachments_starts_the_store_and_keeps_agent_delivery_off(self):
+    def test_real_start_attachments_starts_the_store_with_agent_delivery_on(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(os.path.realpath(temporary))
             private_live_room(home)
@@ -252,7 +252,7 @@ class RealWindowsStartupTests(unittest.TestCase):
                     # No reading policy is saved in this test, so Motet's own file reading stays off.
                     self.assertEqual((value['attachments_enabled'], value['documents_enabled']), (True, False))
                     self.assertNotIn('attachments_reason', value)
-                    self.assertIs(server.NATIVE_ATTACHMENT_DELIVERY_HOST, False)
+                    self.assertIs(server.NATIVE_ATTACHMENT_DELIVERY_HOST, True)       # on since step 6c.5b
                 finally:
                     if service is not None:
                         service.close()
@@ -326,7 +326,9 @@ class RefusalCodeTests(unittest.TestCase):
 
         def handle(handler, service, key, port, *, native=None, unavailable, **options):
             seen.append(options)
-        for host, expected in ((False, {'native_unavailable': ('attachments_windows_unavailable', WINDOWS)}), (True, {})):
+        delivering = {'native_refusal': server.windows_native_refusal} if server.WIN else {}
+        for host, expected in ((False, {'native_unavailable': ('attachments_windows_unavailable', WINDOWS)}),
+                               (True, delivering)):
             with mock.patch.multiple(server, ATTACHMENTS=mock.Mock(), ATTACHMENTS_OFF=None, ATTACHMENTS_ENABLED=True,
                                      NATIVE_AGENT_ATTACHMENTS_ENABLED=True, NATIVE_ATTACHMENT_DELIVERY_HOST=host), \
                     mock.patch.dict(os.environ, {'WATCH_DEMO': '0'}), mock.patch('attachments_http.handle_http', side_effect=handle):
@@ -377,15 +379,150 @@ class RefusalCodeTests(unittest.TestCase):
         client = (ROOT / 'src' / 'web' / 'native-agent-attachments-client.js').read_text(encoding='utf-8')
         page = (ROOT / 'src' / 'web' / 'native-agent-attachments-page.js').read_text(encoding='utf-8')
         passive = re.search(r"const passiveFileRefusal = s => !!s && \[([^\]]*)\]", page).group(1)
-        for code in ('attachments_windows_unavailable', 'attachments_storage_unavailable'):
-            self.assertIn("  %s: '%s'," % (code, server.ATTACHMENTS_OFF_WHY[code]), client)
+        import attachments_windows_git
+        words = dict(server.ATTACHMENTS_OFF_WHY, **attachments_windows_git.WHY)
+        for code in ('attachments_windows_unavailable', 'attachments_storage_unavailable', 'attachments_codex_mac_only',
+                     *attachments_windows_git.WHY):
+            self.assertIn("  %s: '%s'," % (code, words[code]), client)
             self.assertIn("'%s'" % code, passive, 'the agent stage shows it as a quiet refusal, with no Look again')
+        # Windows: each refused workspace folder or file, in the server's exact words (they hold apostrophes and
+        # backslashes, so the page writes them as JSON strings).
+        from attachments_materialize import WORKSPACE_REFUSALS
+        self.assertEqual(len(WORKSPACE_REFUSALS), 15)
+        for code, text in WORKSPACE_REFUSALS.items():
+            self.assertIn("  %s: %s,\n" % (code, json.dumps(text)), client)
+            self.assertIn("'%s'" % code, passive)
+
+    def test_windows_tells_a_codex_chat_why_and_a_claude_chat_only_when_git_is_unusable(self):
+        import attachments_windows_git
+        self.assertEqual(server.windows_native_refusal('x:fictional'),
+                         ('attachments_codex_mac_only', 'Sending files to Codex chats needs the Codex desktop app on a Mac.'))
+        with mock.patch.object(attachments_windows_git, 'refusal', return_value=None):
+            self.assertIsNone(server.windows_native_refusal('c:fictional'))
+        missing = ('attachments_git_missing', attachments_windows_git.WHY['attachments_git_missing'])
+        with mock.patch.object(attachments_windows_git, 'refusal', return_value=missing):
+            self.assertEqual(server.windows_native_refusal('c:fictional'), missing)
+
+    def test_http_asks_the_refusal_for_the_named_chat_only(self):
+        import attachments_http
+
+        class Headers:
+            def __init__(self, values):
+                self.values = values
+
+            def get_all(self, name, default):
+                return self.values.get(name, default)
+
+            def __iter__(self):
+                return iter(self.values)
+
+        class Handler:
+            command = 'GET'
+            connection = mock.Mock()
+
+            def __init__(self, path):
+                self.path = '/api/attachments' + path
+                self.headers = Headers({'X-Live-Room-Key': [KEY], 'Host': ['127.0.0.1:18801']})
+                self.sent = None
+
+            def send(self, code, body, kind=None, extra=()):
+                self.sent = code, json.loads(body)
+
+        asked = []
+
+        def refusal(destination):
+            asked.append(destination)
+            return ('attachments_codex_mac_only', 'Fictional words.') if destination.startswith('x:') else None
+        native = mock.Mock()
+        native.operation.return_value.__enter__ = mock.Mock(return_value=None)
+        native.operation.return_value.__exit__ = mock.Mock(return_value=False)
+        native.native_selection.return_value = {'context': None}
+        handler = Handler('/native/selection?destinationId=x:fictional')
+        attachments_http.handle_http(handler, mock.Mock(), KEY, 18801, native=native, native_refusal=refusal)
+        self.assertEqual((handler.sent[0], handler.sent[1]['error']['code']), (503, 'attachments_codex_mac_only'))
+        native.native_selection.assert_called_once_with('x:fictional')
+        handler = Handler('/native/selection?destinationId=c:fictional')
+        attachments_http.handle_http(handler, mock.Mock(), KEY, 18801, native=native, native_refusal=refusal)
+        self.assertEqual(handler.sent[0], 200)
+        self.assertEqual(asked, ['x:fictional', 'c:fictional'])
+
+    def test_windows_keeps_retained_history_readable_when_it_cannot_deliver(self):
+        """A chat this host cannot deliver to (a Codex chat on Windows, or no usable Git) keeps what earlier sends
+        left: a selection with retained context, its receipts, history and status are answered as where delivery runs,
+        and the refusal is asked only for a selection with nothing to show."""
+        import attachments_http
+
+        class Headers:
+            def __init__(self, values):
+                self.values = values
+
+            def get_all(self, name, default):
+                return self.values.get(name, default)
+
+            def __iter__(self):
+                return iter(self.values)
+
+        class Handler:
+            command = 'GET'
+            connection = mock.Mock()
+
+            def __init__(self, path):
+                self.path = '/api/attachments' + path
+                self.headers = Headers({'X-Live-Room-Key': [KEY], 'Host': ['127.0.0.1:18801']})
+                self.sent = None
+
+            def send(self, code, body, kind=None, extra=()):
+                self.sent = code, json.loads(body)
+
+        asked = []
+
+        def refusal(destination):
+            asked.append(destination)
+            return ('attachments_codex_mac_only', 'Fictional words.')
+        retained = {'mode': 'retained_only', 'destinationId': 'x:fictional', 'scopeId': 'b' * 32}
+        native = mock.Mock()
+        native.operation.return_value.__enter__ = mock.Mock(return_value=None)
+        native.operation.return_value.__exit__ = mock.Mock(return_value=False)
+        native.native_selection.return_value = {'context': retained}
+        native.history.return_value = {'requests': ['fictional-earlier-send'], 'nextCursor': None}
+        native.status.return_value = {'request': 'fictional-earlier-send'}
+        reads = mock.Mock()
+        reads.native_receipt.return_value = {'receipt': 'fictional'}
+        native.scoped_reads.return_value = (reads, None, None)
+        query = '?destinationId=x:fictional&scopeId=' + 'b' * 32
+        for path, expected in (('/native/selection?destinationId=x:fictional', {'context': retained}),
+                               ('/native/requests' + query, {'requests': ['fictional-earlier-send'], 'nextCursor': None}),
+                               ('/native/requests/' + 'a' * 32 + query, {'request': 'fictional-earlier-send'}),
+                               ('/native/receipts/draft_create' + query + '&commandDigest=' + 'd' * 64,
+                                {'receipt': 'fictional'})):
+            with self.subTest(path=path.split('?')[0]):
+                handler = Handler(path)
+                attachments_http.handle_http(handler, mock.Mock(), KEY, 18801, native=native, native_refusal=refusal)
+                self.assertEqual(handler.sent[0], 200, handler.sent)
+                self.assertEqual({k: handler.sent[1][k] for k in expected}, expected)
+        self.assertEqual(asked, [])
+        native.native_selection.return_value = {'context': None}
+        handler = Handler('/native/selection?destinationId=x:fictional')
+        attachments_http.handle_http(handler, mock.Mock(), KEY, 18801, native=native, native_refusal=refusal)
+        self.assertEqual((handler.sent[0], handler.sent[1]['error']['code']), (503, 'attachments_codex_mac_only'))
+        self.assertEqual(asked, ['x:fictional'])
 
 
 class HostFlagTests(unittest.TestCase):
-    def test_native_delivery_is_a_named_host_capability_off_on_windows(self):
-        self.assertIs(server.NATIVE_ATTACHMENT_DELIVERY_HOST, not server.WIN)
-        self.assertIs(server.NATIVE_ATTACHMENT_DELIVERY_HOST, os.name != 'nt')
+    def test_native_delivery_is_a_named_host_capability_on_everywhere(self):
+        """On since step 6c.5b, Windows included; the switch stays, and off it still installs nothing."""
+        self.assertIs(server.NATIVE_ATTACHMENT_DELIVERY_HOST, True)
+
+    def test_windows_builds_no_codex_delivery(self):
+        messaging, service = mock.Mock(_attachment_guard=None), mock.Mock(store=object())
+        for windows in (True, False):
+            with mock.patch.multiple(server, ATTACHMENTS_ENABLED=True, NATIVE_AGENT_ATTACHMENTS_ENABLED=True,
+                                     NATIVE_ATTACHMENT_DELIVERY_HOST=True, WIN=windows), \
+                    mock.patch.dict(os.environ, {'WATCH_DEMO': '0'}), \
+                    mock.patch('attachments_native_composition.bind_native_composition') as bind:
+                server.start_native_attachment_maintenance(messaging, service)
+            self.assertIs(bind.call_args.kwargs['claude_room'], server.claude_attachment_room)
+            self.assertIs(bind.call_args.kwargs['codex_room'], None if windows else server.codex_attachment_room)
 
     def test_host_flag_off_never_installs_native_delivery_even_with_a_running_store(self):
         messaging, service = mock.Mock(_attachment_guard=None), mock.Mock(store=object())

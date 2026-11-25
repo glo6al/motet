@@ -550,6 +550,19 @@ class MaterializationTests(unittest.TestCase):
         with self.hold() as lease:
             self.assert_code('exclusion_unavailable', lambda: self.make(lease))
 
+    def test_config_include_after_a_header_or_byte_order_mark_is_refused(self):
+        original = (self.repo/'.git/config').read_bytes()
+        for config in (original + b'\n[core] [include]\n path = missing-fictional-config\n',
+                       b'\xef\xbb\xbf[include]\n path = missing-fictional-config\n' + original,
+                       original + b'\n[includeIf.gitdir:/fictional/]\n path = missing-fictional-config\n'):
+            with self.subTest(config=config[:40]):
+                (self.repo/'.git/config').write_bytes(config)
+                with self.hold() as lease:
+                    self.assert_code('exclusion_unavailable', lambda: self.make(lease))
+        (self.repo/'.git/config').write_bytes(original + b'\n[includes]\n\tfictional = 1\n')
+        with self.hold() as lease:
+            self.make(lease)
+
     def test_fake_git_output_and_timeout_are_bounded(self):
         exe = self.base/'fictional-git'
         exe.write_text('#!' + sys.executable + '\nimport sys\nsys.stdout.write("x"*20000)\n')

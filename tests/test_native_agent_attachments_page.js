@@ -145,11 +145,31 @@ test('opening the picker from saved drafts does not create an empty draft', asyn
   assert.deepEqual(h.calls,[['picker']]);
 });
 
-for (const [code, expected] of [
+for (const [code, expected, status = 503] of [
   ['sqlite_unavailable', 'Sending files to agents is unavailable because this Python uses an older database library. Install a newer Python and use it to restart Motet.'],
   ['legacy_managed_storage', "Sending files to agents is unavailable because Motet's Claude chats were first set up with an older Python. Ordinary messages still work."],
   ['attachments_windows_unavailable', 'Sending files is not available on Windows yet. Ordinary messages still work.'],
   ['attachments_storage_unavailable', 'Sending files is unavailable because Motet could not open its private file storage. Restart Motet to try again. Ordinary messages still work.'],
+  ['attachments_git_missing', 'Sending files to Claude chats needs Git for Windows installed for all users (in Program Files). Ordinary messages still work.'],
+  ['attachments_git_per_user', 'Sending files to Claude chats needs Git for Windows installed for all users (in Program Files). Git installed only for your account can be changed by any program you run, so Motet does not use it. Ordinary messages still work.'],
+  ['attachments_git_unsafe', 'Sending files is unavailable because the Git in Program Files can be changed by programs you run. Reinstall Git for Windows for all users. Ordinary messages still work.'],
+  ['attachments_codex_mac_only', 'Sending files to Codex chats needs the Codex desktop app on a Mac.'],
+  // Windows: a workspace Motet refuses, named with its reason (409, as src/attachments_materialize.py sends them).
+  ["workspace_unsafe", "The selected workspace folder can be changed by other people using this computer, so files are not copied into the workspace. A folder made directly under a drive (such as C:\\src) lets every signed-in user change it, as a folder others can write to does on a Mac. Choose a folder inside your user folder.", 409],
+  ["workspace_not_yours", "The selected workspace folder belongs to another account (often Administrators, when it was made from an administrator window), so files are not copied into the workspace. Take ownership of it, or choose a folder you made.", 409],
+  ["workspace_linked", "The selected workspace folder is reached through a link or junction, which Motet does not follow. Choose the folder's real location.", 409],
+  ["workspace_git_unsafe", "The selected workspace's .git folder can be changed by other people using this computer, so files are not copied into the workspace. A folder made directly under a drive (such as C:\\src) lets every signed-in user change it, as a folder others can write to does on a Mac. Choose a folder inside your user folder.", 409],
+  ["workspace_git_not_yours", "The selected workspace's .git folder belongs to another account (often Administrators, when it was made from an administrator window), so files are not copied into the workspace. Take ownership of it, or choose a folder you made.", 409],
+  ["workspace_git_linked", "The selected workspace's .git folder is reached through a link or junction, which Motet does not follow. Choose the folder's real location.", 409],
+  ["workspace_git_info_unsafe", "The selected workspace's .git\\info folder can be changed by other people using this computer, so files are not copied into the workspace. A folder made directly under a drive (such as C:\\src) lets every signed-in user change it, as a folder others can write to does on a Mac. Choose a folder inside your user folder.", 409],
+  ["workspace_git_info_not_yours", "The selected workspace's .git\\info folder belongs to another account (often Administrators, when it was made from an administrator window), so files are not copied into the workspace. Take ownership of it, or choose a folder you made.", 409],
+  ["workspace_git_info_linked", "The selected workspace's .git\\info folder is reached through a link or junction, which Motet does not follow. Choose the folder's real location.", 409],
+  ["workspace_exclude_unsafe", "The selected workspace's Git exclude file (.git\\info\\exclude) can be changed by other people using this computer, so files are not copied into the workspace. Make it changeable by you alone, or choose another workspace.", 409],
+  ["workspace_exclude_not_yours", "The selected workspace's Git exclude file (.git\\info\\exclude) belongs to another account (often Administrators, when it was made from an administrator window), so files are not copied into the workspace. Take ownership of it, or choose a folder you made.", 409],
+  ["workspace_exclude_linked", "The selected workspace's Git exclude file (.git\\info\\exclude) is a link or junction, which Motet does not follow. Choose another workspace.", 409],
+  ["workspace_git_file_unsafe", "A file Git reads in the selected workspace can be changed by other people using this computer, so files are not copied into the workspace. Make it changeable by you alone, or choose another workspace.", 409],
+  ["workspace_git_file_not_yours", "A file Git reads in the selected workspace belongs to another account (often Administrators, when it was made from an administrator window), so files are not copied into the workspace. Take ownership of it, or choose a folder you made.", 409],
+  ["workspace_git_file_linked", "A file Git reads in the selected workspace is a link or junction, which Motet does not follow. Choose another workspace.", 409],
 ]) test(code+' notice leaves ordinary words and Send usable only without retained work', async () => {
   const {createNativeAgentAttachmentsClient} = require('../src/web/native-agent-attachments-client.js');
   const calls=[];
@@ -157,7 +177,7 @@ for (const [code, expected] of [
     crypto:require('node:crypto').webcrypto,AbortController,fetch:async (path,init)=>{
       calls.push([path,init.method]);
       return new Response(JSON.stringify({schemaVersion:1,fixture:false,serverTime:'2030-01-01T00:00:00Z',
-        error:{code,message:'Untrusted wire text.',retryable:false}}),{status:503});
+        error:{code,message:'Untrusted wire text.',retryable:false}}),{status});
     }});
   const passive=await client.connect({destinationId:destination});
   const h=await harness(passive);

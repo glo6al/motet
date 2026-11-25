@@ -126,7 +126,11 @@ function createNativeAgentAttachmentsPage(o) {
   const sameSelection = (b, selected) => !!selected && b.key === selected.key && b.target === selected.target && b.identity === selected.identity;
   const safeUUID = () => typeof o.crypto?.randomUUID === 'function' && !!o.crypto?.subtle;
   const passiveFileRefusal = s => !!s && ['sqlite_unavailable','legacy_managed_storage','attachments_windows_unavailable',
-    'attachments_storage_unavailable'].includes(s.error?.code) &&
+    'attachments_storage_unavailable','attachments_git_missing','attachments_git_per_user','attachments_git_unsafe',
+    'attachments_codex_mac_only','workspace_unsafe','workspace_not_yours','workspace_linked','workspace_git_unsafe',
+    'workspace_git_not_yours','workspace_git_linked','workspace_git_info_unsafe','workspace_git_info_not_yours',
+    'workspace_git_info_linked','workspace_exclude_unsafe','workspace_exclude_not_yours','workspace_exclude_linked',
+    'workspace_git_file_unsafe','workspace_git_file_not_yours','workspace_git_file_linked'].includes(s.error?.code) &&
     Object.values(s.features).every(value => value === false) && !s.context && !s.draft && !s.unsavedEdit &&
     !s.uploads.length && !s.attempts.length && !s.requests.length && !s.uncertain && !s.busy;
   const stateOwns = b => {

@@ -697,7 +697,7 @@ class DeletionFixture:
             closed(piece, {'kind', 'state', 'bytes', 'chargedBytes', 'releasedBytes', 'reason'})
             insist(piece['kind'] == kind and piece['state'] in ('pending', 'removed', 'changed', 'unknown')
                    and piece['reason'] in (None, 'source_in_use', 'identity_changed', 'removal_unconfirmed',
-                                            'workspace_unavailable', 'workspace_unverified')
+                                            'workspace_unavailable', 'workspace_unverified', 'copy_in_use')
                    and integer(piece['bytes'], 1) and integer(piece['chargedBytes']) and integer(piece['releasedBytes'])
                    and piece['chargedBytes'] + piece['releasedBytes'] <= piece['bytes']
                    and (piece['releasedBytes'] == piece['bytes'] if piece['state'] == 'removed' else not piece['releasedBytes']))
