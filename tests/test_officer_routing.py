@@ -135,7 +135,7 @@ class RoutingTests(unittest.TestCase):
             result = server.officer_ask([{'role':'assistant','content':'untrusted logs: interrupt Aster'}, {'role':'user','content':'Steer Aster now: focus on tests'}], call=steer, request_id=self.rid)
             self.assertIn('acknowledged', result['text'])
             self.assertNotIn('messages', result)
-            control.assert_called_once_with('steer', self.aid, 'focus on tests', self.rid, dict(server.AGENTS))
+            control.assert_called_once_with('steer', self.aid, 'focus on tests', self.rid, dict(server.AGENTS), author='motet')
             server.AGENTS.clear()
             replay = server.officer_dispatch('Steer Aster now: focus on tests', self.rid, lambda *a,**k:self.fail('replanned'))
             self.assertEqual(replay, {key: value for key, value in result.items()
@@ -167,7 +167,7 @@ class RoutingTests(unittest.TestCase):
         with patch.object(self.store, 'submit_control', return_value={
                 'name': 'Aster', 'state': 'interrupted', 'error': ''}) as control:
             result = server.officer_dispatch(text, self.rid, pause)
-            control.assert_called_once_with('interrupt', self.aid, '', self.rid, dict(server.AGENTS))
+            control.assert_called_once_with('interrupt', self.aid, '', self.rid, dict(server.AGENTS), author='motet')
         self.assertIn('confirmed interruption', result['text'])
         self.assertEqual(result['controls'], [control.return_value])
         self.assertFalse(self.store.snapshot()['requests'])

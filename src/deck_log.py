@@ -33,11 +33,25 @@ KINDS = frozenset(('message', 'user', 'say', 'operation', 'read', 'write', 'edit
 OPERATIONS = frozenset(('', 'read', 'write', 'edit', 'patch', 'run', 'search', 'web',
                         'tool', 'spawn', 'task', 'delete', 'check', 'compact', 'see'))
 CANDIDATE_KEYS = frozenset(('kind', 'role', 'text', 'operation', 'operation_id',
-                           'phase', 'outcome', 'file_ref', 'chat_name', 'project_name', 'source', 'certainty'))
+                           'phase', 'outcome', 'file_ref', 'chat_name', 'project_name', 'source', 'certainty', 'attribution'))
+# Who wrote a user-role message (src/attribution.py). '' is a row saved before attributions were recorded.
+ATTRIBUTIONS = frozenset(('motet_delivery', 'agent_message', 'automatic', 'voice', 'unverified_user',
+                          'unverified_user/exec_prompt', 'unverified_user/question_reply'))
+EVENT_COLUMNS = ('id,record_key,slot,provider,chat_id,chat_name,project_id,project_name,source_ts,observed_ts,time_basis,'
+                 'kind,role,text,operation,operation_id,phase,outcome,file_ref,redacted,certainty,attribution')
 SECRET = re.compile(r'(?i)(?:\b(?:api[_-]?key|password|passwd|secret|access[_-]?token|authorization)[\"\']?\s*[:=]|\bBearer\s+\S+|sk-(?:ant-)?[\w-]{12,}|gh[pousr]_[\w]{20,}|AKIA[A-Z0-9]{16}|-----BEGIN [^-]*PRIVATE KEY-----)')
 MACHINE = re.compile(r'<(?:task-notification|system-reminder|environment_context|tool_result|svg|html|script)\b', re.I)
 LOCAL_CAPABILITY = re.compile(r'(?i)(?:https?://(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[^\s<>]*)|(?<![\w:/])/?fs/[^\s<>]+)')
 
+
+
+def _plain(row):
+    """A saved event as a dict. A row saved before attributions were recorded reads exactly as it did then, so
+    source proofs made from it stay valid."""
+    value = dict(row)
+    if value.get('attribution') == '':
+        del value['attribution']
+    return value
 
 
 def _finite(value):
@@ -204,7 +218,7 @@ class DeckLog(OfficerHistoryMixin):
         self.db.executescript('''
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS source_records(key TEXT PRIMARY KEY,stream TEXT NOT NULL,chat_id TEXT NOT NULL,project_id TEXT NOT NULL,source_ts REAL NOT NULL,observed_ts REAL NOT NULL,age_ts REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,record_key TEXT NOT NULL REFERENCES source_records(key) ON DELETE CASCADE,slot TEXT NOT NULL,provider TEXT NOT NULL,chat_id TEXT NOT NULL,chat_name TEXT NOT NULL,project_id TEXT NOT NULL,project_name TEXT NOT NULL,source_ts REAL NOT NULL,observed_ts REAL NOT NULL,time_basis TEXT NOT NULL,kind TEXT NOT NULL,role TEXT NOT NULL,text TEXT NOT NULL,operation TEXT NOT NULL,operation_id TEXT NOT NULL,phase TEXT NOT NULL,outcome TEXT NOT NULL,file_ref TEXT NOT NULL,redacted INTEGER NOT NULL,certainty TEXT NOT NULL DEFAULT 'recorded');
+        CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,record_key TEXT NOT NULL REFERENCES source_records(key) ON DELETE CASCADE,slot TEXT NOT NULL,provider TEXT NOT NULL,chat_id TEXT NOT NULL,chat_name TEXT NOT NULL,project_id TEXT NOT NULL,project_name TEXT NOT NULL,source_ts REAL NOT NULL,observed_ts REAL NOT NULL,time_basis TEXT NOT NULL,kind TEXT NOT NULL,role TEXT NOT NULL,text TEXT NOT NULL,operation TEXT NOT NULL,operation_id TEXT NOT NULL,phase TEXT NOT NULL,outcome TEXT NOT NULL,file_ref TEXT NOT NULL,redacted INTEGER NOT NULL,certainty TEXT NOT NULL DEFAULT 'recorded',attribution TEXT NOT NULL DEFAULT '');
         CREATE INDEX IF NOT EXISTS events_time ON events(source_ts,id);
         CREATE INDEX IF NOT EXISTS events_scope ON events(chat_id,project_id);
         CREATE TABLE IF NOT EXISTS erased_records(key TEXT PRIMARY KEY);
@@ -216,6 +230,9 @@ class DeckLog(OfficerHistoryMixin):
             raise ValueError('unsupported archive schema')
         if 'certainty' not in {r[1] for r in self.db.execute('PRAGMA table_info(events)')}:
             self.db.execute("ALTER TABLE events ADD COLUMN certainty TEXT NOT NULL DEFAULT 'recorded'")
+        if 'attribution' not in {r[1] for r in self.db.execute('PRAGMA table_info(events)')}:
+            # Additive: rows saved earlier keep '' (not recorded), which readers never treat as more than unverified.
+            self.db.execute("ALTER TABLE events ADD COLUMN attribution TEXT NOT NULL DEFAULT ''")
         # A separate table preserves old event/source insert contracts and IDs.
         # AUTOINCREMENT survives deletion, VACUUM and reopening; source time is not an ingest fence.
         self.db.execute('CREATE TABLE IF NOT EXISTS event_ingest(seq INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT UNIQUE NOT NULL)')
@@ -392,6 +409,8 @@ class DeckLog(OfficerHistoryMixin):
                 raise ValueError('invalid_slot')
             slots.add(source['slot'])
             role = c.get('role', '')
+            if c.get('attribution', '') not in ATTRIBUTIONS | {''} or (c.get('attribution') and role != 'user'):
+                raise ValueError('invalid_attribution')
             if role not in ('', 'user', 'assistant') or c.get('operation', '') not in OPERATIONS or c.get('phase', '') not in ('', 'started', 'result', 'observation') or c.get('outcome', 'unknown') not in ('success', 'failure', 'unknown', 'pending') or c.get('certainty', 'recorded') not in ('recorded', 'inferred', 'probably'):
                 raise ValueError('invalid_outcome')
             text, redacted = ('', False)
@@ -410,7 +429,8 @@ class DeckLog(OfficerHistoryMixin):
             event_id = hmac.new(self.key, (record['key'] + ':' + source['slot']).encode(), hashlib.sha256).hexdigest()
             rows.append((event_id, record['key'], source['slot'], provider, chat, name, project, project_name,
                          record['source_ts'], now, record['time_basis'], c['kind'], role, text, c.get('operation', ''),
-                         operation_id, c.get('phase', ''), c.get('outcome', 'unknown'), _relative(c.get('file_ref', '')), int(redacted), c.get('certainty', 'recorded')))
+                         operation_id, c.get('phase', ''), c.get('outcome', 'unknown'), _relative(c.get('file_ref', '')), int(redacted), c.get('certainty', 'recorded'),
+                         c.get('attribution', '')))
         return dict(record), rows, now
 
     def offer_record(self, record, candidates, *, capture_epoch):
@@ -465,7 +485,7 @@ class DeckLog(OfficerHistoryMixin):
                 return
             if self.db.execute('SELECT COUNT(*) FROM events').fetchone()[0] + len(rows) > self.limits['events'] or self.db.execute('SELECT (SELECT COUNT(*) FROM source_records)+(SELECT COUNT(*) FROM erased_records)').fetchone()[0] > self.limits['records']:
                 raise OverflowError('storage_full')
-            self.db.executemany('INSERT INTO events VALUES (' + ','.join('?' * 21) + ')', rows)
+            self.db.executemany('INSERT INTO events(' + EVENT_COLUMNS + ') VALUES (' + ','.join('?' * 22) + ')', rows)
             self.db.executemany('INSERT INTO event_ingest(event_id) VALUES (?)', [(r[0],) for r in rows])
             if self.fts:
                 self.db.executemany('INSERT INTO event_fts(id,text) VALUES (?,?)', [(r[0], ' '.join(str(r[i]) for i in (13, 11, 14, 17, 18, 5, 7, 20))) for r in rows])
@@ -641,7 +661,7 @@ class DeckLog(OfficerHistoryMixin):
 
     @staticmethod
     def _event(row):
-        value = dict(row)
+        value = _plain(row)
         value['citation'] = 'deck:' + value['id']
         value['historical'] = True
         return value
@@ -789,7 +809,7 @@ class DeckLog(OfficerHistoryMixin):
             rows=[]
             if ids:
                 rows=self.db.execute('SELECT * FROM events WHERE id IN ('+','.join('?' for _ in ids)+')',ids).fetchall()
-            records={row['id']:dict(row) for row in rows}
+            records={row['id']:_plain(row) for row in rows}
             return dict(available=True,identity=identity,records=records,missing=sorted(set(ids)-set(records)),reason='')
 
     def evidence_rows(self, fence, spec, *, max_work=250000, metadata_only=False, seconds=2.0):
@@ -837,7 +857,7 @@ class DeckLog(OfficerHistoryMixin):
                     return dict(available=True, rows=[], work=0, required_work=count, complete=False, reason='query_work_exhausted')
                 columns = 'e.id,e.chat_id,e.chat_name,e.provider,e.project_id,e.project_name,e.source_ts,e.observed_ts' if metadata_only else 'e.*'
                 rows = self.db.execute('SELECT ' + columns + clause + ' ORDER BY e.source_ts,e.id', args).fetchall()
-                return dict(available=True, rows=[dict(r) for r in rows], work=count, complete=True, reason='',erasure=current['erasure'])
+                return dict(available=True, rows=[_plain(r) for r in rows], work=count, complete=True, reason='',erasure=current['erasure'])
             except sqlite3.OperationalError as error:
                 if 'interrupt' in str(error).lower() or 'locked' in str(error).lower():
                     return dict(available=True, rows=[], work=0, complete=False, reason='query_deadline')

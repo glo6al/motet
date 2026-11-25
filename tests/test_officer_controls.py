@@ -41,7 +41,8 @@ class ControlTests(unittest.TestCase):
     def test_pin_and_private_result(self):
         result = self.send()
         self.assertEqual(result['state'], 'acknowledged')
-        self.bridge.assert_called_once_with('steer', self.sid, instruction='Focus on tests', expected_turn_id=self.turn, cwd=self.tmp.name)
+        # Steering the Officer composed reaches the chat as Motet's wording, never as the owner typing it.
+        self.bridge.assert_called_once_with('steer', self.sid, instruction=m.motet_worded('Focus on tests'), expected_turn_id=self.turn, cwd=self.tmp.name)
         self.assertNotIn('cwd', result); self.assertNotIn('expected_turn_id', result)
         row = json.loads(self.store.db.execute('SELECT data FROM controls').fetchone()[0])
         self.assertEqual(row['expected_turn_id'], self.turn)

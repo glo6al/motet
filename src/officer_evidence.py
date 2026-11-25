@@ -13,6 +13,7 @@ import re
 import secrets
 import sqlite3
 import time
+import attribution
 
 from deck_log import CHAT, HEX, KINDS, OPERATIONS, SECRET, _prose, _relative, _text
 
@@ -142,7 +143,7 @@ def _stamp(row, basis):
 def _fingerprint(row):
     keys = ('ref', 'source', 'id', 'chat_id', 'subject', 'field', 'value', 'chat_name', 'provider', 'project_id', 'project_name', 'source_ts', 'kind', 'role', 'text', 'operation', 'operation_id', 'phase', 'outcome', 'file_ref', 'certainty', 'qualification', 'freshness')
     value={k:row[k] for k in keys if k in row}
-    for key in ('time_basis','observation_source','source_qualification','redacted'):
+    for key in ('time_basis','observation_source','source_qualification','redacted','attribution'):
         if key in row:value[key]=row[key]
     if not row.get('field') and 'observed_ts' in row:value['observed_ts']=row['observed_ts']
     return hashlib.sha256(_json(value).encode()).hexdigest()
@@ -463,6 +464,8 @@ class EvidenceSession:
                        observation_source=_text(item.get('observation_source','process_observation' if chat.startswith('e:') else '')),
                        source_qualification=_text(item.get('source_qualification','Process-list observation only; agent prose and completion are not established.' if chat.startswith('e:') else ''),240),
                        text=str(item.get('text', ''))[:60000], file_ref=_relative(item.get('file_ref', '')))
+            if row['role'] == 'user' and item.get('attribution') in attribution.LABELS:
+                row['attribution'] = item['attribution']
             if SECRET.search(row['text']):
                 row['text'] = '[content omitted]'
             if row['kind'] not in KINDS or row['certainty'] not in FILTERS['certainty']:
@@ -514,7 +517,9 @@ class EvidenceSession:
         if row.get('kind') in ('message','say','user','ask','assign'):
             for key in ('operation','operation_id','phase','outcome'):
                 value.pop(key,None)
-            value['attribution']='owner_message' if row.get('role')=='user' else 'agent_report'
+            # Only plain user-role text with no other evidence is the owner's (unverified) message; Motet's
+            # deliveries, other chats, automatic prompts and voice-mode rewordings say so (src/attribution.py).
+            value['attribution']=attribution.evidence_value(attribution.label_of_row(row)) if row.get('role')=='user' else 'agent_report'
         if row.get('timestamp_qualification'): value['timestamp_qualification'] = row['timestamp_qualification']
         value['text'] = _excerpt(str(row.get('text', '')), match or dict(text='', mode='literal'), 2048 if full else 480)
         value['text_complete'] = value['text'] == str(row.get('text', ''))

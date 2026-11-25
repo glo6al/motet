@@ -74,6 +74,10 @@ jobs:
         timeout-minutes: 5
       - run: python tests/test_officer_messaging.py
         if: ${{ !cancelled() }}
+      - name: Check who wrote each user-role message and each relayed message
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python tests/test_attribution.py
       - run: python tests/test_officer_routing.py
         if: ${{ !cancelled() }}
       - run: python tests/test_new_chat_service.py

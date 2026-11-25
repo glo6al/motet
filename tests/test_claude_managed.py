@@ -246,6 +246,8 @@ class Fixture(unittest.TestCase):
         if self.disconnected:
             raise OSError('private runtime error must not escape')
         snapshot = self.snapshots[path.name]
+        if command == 'enqueue' and params.get('source') in getattr(self, 'refused_sources', ()):
+            managed._fail('runner_refused', 400)      # an older supervisor refusing a source it does not know
         if command == 'enqueue':
             message = dict(params, digest=hashlib.sha256(params['text'].encode()).hexdigest(),
                            state='delivered' if self.echo else 'queued', nativeEcho=self.echo,
@@ -717,6 +719,74 @@ class Fixture(unittest.TestCase):
         self.manager.close()
         self.assertEqual(self.manager.owner_send('c:' + native, 'hello', request)['state'], 'awaiting_reply')
         self.assertEqual(len([c for c in self.commands if c[1] == 'enqueue']), 1)
+
+    def test_only_owner_typed_text_uses_the_owner_source(self):
+        import attribution
+        run_id, native = self.admit()
+        self.echo = True
+        owner, motet = uid(), uid()
+        typed = self.manager.owner_send('c:' + native, 'Ada typed this.', owner, author='owner')
+        worded = self.manager.owner_send('c:' + native, 'Is the orchard index rebuilt?', motet, author='motet')
+        sent = {c[2]['requestId']: c[2] for c in self.commands if c[1] == 'enqueue'}
+        self.assertEqual((sent[owner]['source'], sent[owner]['text']), ('owner', 'Ada typed this.'))
+        self.assertEqual(sent[motet]['source'], 'motet')
+        self.assertEqual(sent[motet]['text'], attribution.motet_worded('Is the orchard index rebuilt?'))
+        self.assertEqual((typed['author'], typed['question']), ('owner', 'Ada typed this.'))
+        self.assertEqual((worded['author'], worded['question']), ('motet', 'Is the orchard index rebuilt?'))
+        self.manager.status(run_id)   # a runner snapshot does not carry the author; the registry keeps it
+        listed = {row['request_id']: row for row in self.manager.owner_snapshot()['requests']}
+        self.assertEqual((listed[owner]['author'], listed[motet]['author']), ('owner', 'motet'))
+        self.assertEqual(listed[motet]['question'], 'Is the orchard index rebuilt?')
+        with self.assertRaises(managed.ManagedError):
+            self.manager.owner_send('c:' + native, 'Ada typed this.', owner, author='motet')
+        with self.assertRaises(managed.ManagedError):
+            self.manager.owner_send('c:' + native, 'Hello', uid(), author='Bram')
+
+    def test_an_older_runner_refusing_motets_source_is_reported_and_never_resent(self):
+        run_id, native = self.admit()
+        self.refused_sources = ('motet',)
+        request = uid()
+        row = self.manager.owner_send('c:' + native, 'Is the orchard index rebuilt?', request, author='motet')
+        self.assertEqual(row['state'], 'unknown', 'a refusal does not prove nothing was kept')
+        self.assertEqual(row['error'], managed.MOTET_SOURCE_REFUSED)
+        self.assertIn('may have been started by an older Motet', row['error'])
+        sent = [c[2] for c in self.commands if c[1] == 'enqueue']
+        self.assertEqual([c['source'] for c in sent], ['motet'], 'never resent as the owner')
+        self.manager.status(run_id)
+        self.assertEqual(self.manager.lookup_message(request)['state'], 'unknown')
+        self.assertEqual(self.manager.lookup_message(request)['error'], managed.MOTET_SOURCE_REFUSED)
+        self.assertEqual(self.manager.owner_send('c:' + native, 'Is the orchard index rebuilt?', request, author='motet')['state'], 'unknown')
+        self.assertEqual(len([c for c in self.commands if c[1] == 'enqueue']), 1)
+        refusal = b'{"ok":false,"error":{"code":"invalid_request"}}\n'
+        with self.assertRaises(managed.ManagedError) as refused:
+            managed._reply(refusal, 'enqueue')
+        self.assertEqual(refused.exception.code, 'runner_refused')
+        for command in (None, 'status', 'decision', 'shutdown'):
+            with self.assertRaises(managed.ManagedError) as other:
+                managed._reply(refusal, command)
+            self.assertEqual(other.exception.code, 'managed_not_ready', command)
+        with self.assertRaises(managed.ManagedError) as other:
+            managed._reply(b'{"ok":false,"error":{"code":"unavailable"}}\n')
+        self.assertEqual(other.exception.code, 'managed_not_ready')
+
+    def test_owner_rows_stored_before_authors_stay_unknown(self):
+        run_id, native = self.admit()
+        self.echo = True
+        request = uid()
+        self.manager.owner_send('c:' + native, 'Old words.', request, author='owner')
+        with self.manager._registry() as db:     # a row as an earlier Motet stored it: source owner, no author
+            data = json.loads(db.execute('SELECT data FROM messages WHERE id=?', (request,)).fetchone()[0])
+            data.pop('author')
+            db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(data), request))
+        self.snapshots[run_id]['messages'][-1].pop('author', None)
+        self.manager.status(run_id)
+        row = next(r for r in self.manager.owner_snapshot()['requests'] if r['request_id'] == request)
+        self.assertNotIn('author', row, 'an old owner-source row is unknown, never the owner')
+        before = len([c for c in self.commands if c[1] == 'enqueue'])
+        replay = self.manager.owner_send('c:' + native, 'Old words.', request, author='motet')
+        self.assertEqual(replay['request_id'], request)
+        self.assertNotIn('author', replay)
+        self.assertEqual(len([c for c in self.commands if c[1] == 'enqueue']), before)
 
     def test_disconnection_preserves_echo_but_reports_unknown_delivery(self):
         run_id, native = self.admit()

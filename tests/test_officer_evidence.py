@@ -13,6 +13,7 @@ import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+import deck_log
 from deck_log import DeckLog
 from officer_evidence import EvidenceService, _interval
 
@@ -45,7 +46,7 @@ class EvidenceTests(unittest.TestCase):
             rows.extend(prepared)
         with self.archive.lock:
             self.archive.db.executemany('INSERT INTO source_records VALUES (?,?,?,?,?,?,?)',records)
-            self.archive.db.executemany('INSERT INTO events VALUES ('+','.join('?'*21)+')',rows)
+            self.archive.db.executemany('INSERT INTO events('+deck_log.EVENT_COLUMNS+') VALUES ('+','.join('?'*22)+')',rows)
             self.archive.db.executemany('INSERT INTO event_ingest(event_id) VALUES (?)',[(r[0],) for r in rows])
             self.archive.db.commit()
         return [r[0] for r in rows]

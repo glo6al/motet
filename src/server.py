@@ -60,6 +60,7 @@ from officer_messaging import (MessageNotSubmitted, MessagingError, MessagingSto
 from officer_capabilities import (ANSWER_CHARS, ANSWER_SCHEMA, EVIDENCE_SYSTEM, EVIDENCE_TOOLS, READ_NAMES, EvidenceAliases, parse_answer,
                                   live_view as officer_live_projection, sign_receipt, verify_receipt, authenticate_receipt, receipt_refs, record_fingerprint)
 from officer_evidence import EvidenceService
+import attribution
 from anthropic_reporting import report as anthropic_report
 import private_storage
 from officer_request import BudgetPolicy, RequestBudget, BudgetExceeded, AssertionRegistry
@@ -514,6 +515,16 @@ def history_private(value):
     return value
 
 
+def deck_attributed(out):
+    """Say who wrote each saved user-role message the Deck Log page shows (src/attribution.py), so a row saved before
+    attributions were recorded still gets the text rules instead of reading as the owner's."""
+    rows = out.get('events') if isinstance(out, dict) and isinstance(out.get('events'), list) else [out]
+    for row in rows:
+        if isinstance(row, dict) and row.get('role') == 'user':
+            row['attribution'] = attribution.label_of_row(row)
+    return out
+
+
 def history_projection(event):
     """Positive projection: never copy commands, outputs, tool input, code or images."""
     if getattr(HISTORY_LOCAL, 'failed', False):
@@ -523,6 +534,9 @@ def history_projection(event):
     if kind in ('user', 'say', 'ask'):
         row = {'kind': 'message', 'role': 'user' if kind == 'user' else 'assistant',
                'text': str(event.get('text') or '')}
+        label = attribution.stored_label(event.get('attribution'), event.get('attribution_detail') or '') if kind == 'user' else None
+        if label:
+            row['attribution'] = label      # who wrote it; saved so retained history keeps the label
     elif kind in ('turn_start', 'turn_end'):
         row = {'kind': kind}
     elif kind in ('run', 'read', 'write', 'edit', 'patch', 'search', 'web', 'spawn', 'tool', 'result'):
@@ -2178,14 +2192,17 @@ class ClaudeTail(Tail):
                 elif b.get('type') == 'text' and shown(b.get('text')).strip():
                     if self.sub and not self.seen_prompt:
                         self.seen_prompt = True
-                        emit(aid, 'assign', old, ts, text=shown(b.get('text')).strip())
+                        emit(aid, 'assign', old, ts, text=shown(b.get('text')).strip(), attribution='agent_message', attribution_detail='parent')
                         set_goal(aid, shown(b.get('text')).strip(), ts, self.backfilling)
                         continue
-                    txt = clean_user(shown(b.get('text')))
+                    raw = shown(b.get('text'))
+                    txt = clean_user(raw)
                     if txt:
                         if not self.sub:
                             remember_prompt(aid, txt, ts, self.backfilling)
-                        emit(aid, 'user', old, ts, text=txt)
+                        # Who wrote it, by fixed rules (attribution.py); the event kind stays 'user'.
+                        who, detail = attribution.claude(d, raw if attribution.from_text(raw) else txt, sub_agent=self.sub)
+                        emit(aid, 'user', old, ts, text=txt, attribution=who, **({'attribution_detail': detail} if detail else {}))
             if d.get('toolEndsTurn') is True:       # the log marks this tool result as the end of the turn (a sub-agent handing back its report)
                 emit(aid, 'turn_end', old, ts, how='handed back its report' if self.sub else '')
         elif t == 'assistant':
@@ -2459,6 +2476,7 @@ class CodexTail(Tail):
         if text_of(m.get('id')):                    # identity fields are taken only as strings (see text_of)
             self.aid = 'x:' + text_of(m.get('id'))
         self.skip = m.get('thread_source') == 'guardian_review'
+        self.thread_source = text_of(m.get('thread_source'))
         self.agent_path = text_of(m.get('agent_path'))
         p0 = text_of(m.get('parent_thread_id'))
         self.parent = ('x:' + p0) if p0 and p0 != text_of(m.get('id')) else ''
@@ -2584,14 +2602,19 @@ class CodexTail(Tail):
             elif kind == 'ImageView':
                 saw(aid, old, ts, shown(it.get('path')), 'Image it opened')
             elif kind == 'UserMessage':
-                txt = clean_user(texts())
+                raw = texts()
+                txt = clean_user(raw)
                 if txt:
                     first = aid not in FIRST_PROMPT
                     remember_prompt(aid, txt, ts, self.backfilling) if getattr(self, 'exec', False) or self.parent else (FIRST_PROMPT.setdefault(aid, (txt, ts)), set_goal(aid, txt, ts, self.backfilling))
                     if first and getattr(self, 'exec', False) and not AGENTS.get(aid, {}).get('parent'):
                         EXEC_KIDS[aid] = None          # matched now if possible, and retried as other logs are read
                         match_work(aid, txt, ts)
-                    emit(aid, 'user', old, ts, text=txt)
+                    # Who wrote it, by fixed rules (attribution.py); the event kind stays 'user'.
+                    who, detail = attribution.codex(raw if attribution.from_text(raw) else txt, child=bool(self.parent),
+                                                    thread_source=getattr(self, 'thread_source', ''),
+                                                    exec_run=bool(getattr(self, 'exec', False)))
+                    emit(aid, 'user', old, ts, text=txt, attribution=who, **({'attribution_detail': detail} if detail else {}))
             elif kind == 'CommandExecution':
                 cmd = it.get('command') or []
                 cmd = shown(cmd[-1] if isinstance(cmd, list) and cmd else cmd)
@@ -3334,6 +3357,93 @@ def officer_find(name):
     return hits[0] if len(hits) == 1 else None
 
 
+OFFICER_DELIVERIES = {}          # request ID -> (checked at, record): a short-lived read cache for labelling only
+DELIVERY_FIRST = {}              # (chat, request ID) -> seq of the first exact copy seen in this run
+# A delivered copy is confirmed only when it is the first exact copy in that chat, by log order (seq: the order Motet
+# read the records, which the log's own timestamps cannot change), and its time is no earlier than
+# DELIVERY_SKEW seconds before Motet recorded the request and no later than DELIVERY_WINDOW after it: 24 hours, as
+# long as the ledger keeps a row (officer_messaging.RETENTION). Later copies are replays and confirm nothing.
+DELIVERY_SKEW, DELIVERY_WINDOW = 5, 86400
+
+
+def delivery_first_copy(e, request_id, digest, created):
+    """True when event e is the first exact copy of that envelope in its chat, inside the delivery window. "First" is
+    log order (seq) alone: a record's own timestamp is written by the agent, so it only bounds the window."""
+    def stamp(event):
+        ts = event.get('ts')
+        return ts if type(ts) in (int, float) and math.isfinite(ts) else None
+
+    def inside(event):
+        ts = stamp(event)
+        return ts is not None and created - DELIVERY_SKEW <= ts <= created + DELIVERY_WINDOW
+
+    if type(created) not in (int, float) or not math.isfinite(created) or not inside(e) or type(e.get('seq')) is not int:
+        return False
+    agent, mine = e.get('agent'), e['seq']
+    copies = [mine]
+    for other in list(LOG):
+        if (other is not e and other.get('agent') == agent and other.get('kind') == 'user' and inside(other)
+                and attribution.envelope_of(str(other.get('text') or '')) is not None
+                and attribution.envelope_of(str(other.get('text') or ''))[1] == request_id
+                and hashlib.sha256(attribution.delivered_form(str(other.get('text') or '')).encode('utf-8', 'surrogatepass')).hexdigest() == digest
+                and type(other.get('seq')) is int):
+            copies.append(other['seq'])
+    key = (agent, request_id)
+    if key in DELIVERY_FIRST:
+        copies.append(DELIVERY_FIRST[key])
+    first = min(copies)
+    if len(DELIVERY_FIRST) > 1024:
+        DELIVERY_FIRST.clear()
+    DELIVERY_FIRST[key] = first
+    return first == mine
+
+
+def officer_delivery(text, agent, event=None):
+    """Motet's own record for the request a delivered envelope names, confirmed only when it was for this chat AND the
+    message is exactly the envelope Motet stored (``words_match``). None when there is no such record or the words
+    differ (a reused request ID confirms nothing); False when the records could not be checked. Labelling only."""
+    found = attribution.envelope_of(text)
+    if not found or found[0] not in ('owner', 'peer'):
+        return None              # proofs, reply notices and attachment relays are not in the message ledger
+    if MESSAGING is None:
+        return False
+    now = time.monotonic()
+    cached = OFFICER_DELIVERIES.get(found[1])
+    if cached and now - cached[0] < 5:
+        record = cached[1]
+    else:
+        try:
+            record = MESSAGING.delivery_record(found[1])
+        except Exception:
+            return False
+        if record is False:
+            return False         # busy: not cached, so the next look checks again
+        if len(OFFICER_DELIVERIES) > 256:
+            OFFICER_DELIVERIES.clear()
+        OFFICER_DELIVERIES[found[1]] = (now, record)
+    if not isinstance(record, dict) or record.get('agent') != agent or not isinstance(event, dict):
+        return None
+    sent = hashlib.sha256(attribution.delivered_form(text).encode('utf-8', 'surrogatepass')).hexdigest()
+    if not hmac.compare_digest(sent, str(record.get('envelope_sha256') or '')):
+        return None
+    if not delivery_first_copy(event, found[1], sent, record.get('created')):
+        return None              # an exact copy at another time is a replay: it confirms nothing
+    return dict(record, words_match=True)
+
+
+def officer_user_words(e):
+    """A user-role message for the Officer, said for who wrote it (src/attribution.py). Only plain user-role text
+    with no other evidence, or an envelope Motet's records confirm word for word as the owner's own typing, carries
+    the owner's words; neither is ever proof of approval."""
+    text = str(e.get('text') or '')
+    category = attribution.of_row(e)
+    detail = str(e.get('attribution_detail') or '') if e.get('attribution') in attribution.CATEGORIES else (
+        (attribution.from_text(text) or ('', ''))[1])
+    delivery = officer_delivery(text, e.get('agent'), e) if category == 'motet_delivery' else None
+    words = attribution.display_text(text, category, detail)
+    return attribution.describe(category, detail, text, delivery) + str(words)[:300]
+
+
 def officer_step(e, calls=None, results=None):
     """One recorded step as a short line for the model, with its number so the page can show the entry, keeping the
     record's own qualifications: a guessed command stays "probably"; a step whose result is not recorded yet stays
@@ -3360,7 +3470,7 @@ def officer_step(e, calls=None, results=None):
             'search': outcome('search for', 'searched for', t('q', 200)), 'tool': outcome('use the tool', 'used the tool', t('name', 80) or 'it does not name'),
             'see': outcome('look at', 'looked at', 'an image'),
             'say': 'said: ' + t('text', 300), 'ask': 'asked the owner: ' + t('text', 300),
-            'user': 'the owner said: ' + t('text', 300), 'perm': 'asked permission to run: ' + t('text', 200), 'perm_end': 'the permission request ended',
+            'user': officer_user_words(e), 'perm': 'asked permission to run: ' + t('text', 200), 'perm_end': 'the permission request ended',
             'turn_end': 'its turn ended' + ((' (' + t('how', 80) + ')') if e.get('how') else ''), 'turn_start': 'a turn began',
             'waiting': 'the stage marked it as needing the owner', 'forget': 'left the stage'}.get(k)
     n = e.get('seq')
@@ -4123,7 +4233,8 @@ def officer_dispatch(user_text, request_id, call, model_snapshot=None, route_out
         if not MESSAGING:
             return {'error': MESSAGING_WHY}
         if decision['kind'] == 'control':
-            result = MESSAGING.owner_action(decision['action'], decision['agent'], decision['instruction'], request_id, dict(AGENTS))
+            # The Officer composed this instruction from the owner's message: it is recorded and sent as Motet's wording.
+            result = MESSAGING.owner_action(decision['action'], decision['agent'], decision['instruction'], request_id, dict(AGENTS), author='motet')
             name, state = result['name'], result['state']
             if state == 'acknowledged':
                 text = 'Codex acknowledged the steering request for ' + name + '. This does not confirm the agent has read or acted on it; Codex may apply it to the turn active at dispatch.'
@@ -4138,7 +4249,8 @@ def officer_dispatch(user_text, request_id, call, model_snapshot=None, route_out
             else:
                 text = 'The control for ' + name + ' failed. ' + result['error']
             return {'text': text, 'controls': [result], 'actions': [], 'cites': []}
-        result = MESSAGING.owner_action('queue', decision['agent'], decision['question'], request_id, dict(AGENTS))
+        # The Officer composed this question from the owner's message: it is recorded and sent as Motet's wording.
+        result = MESSAGING.owner_action('queue', decision['agent'], decision['question'], request_id, dict(AGENTS), author='motet')
         return {'text': 'The message and its delivery status are shown here.',
                 'messages': [result], 'actions': [], 'cites': []}
     except MessageNotSubmitted as e:
@@ -4369,7 +4481,8 @@ def officer_surviving_answer(session, refs, omitted=0, actions=None, reason='era
         else:
             detail = ', '.join(str(row[key]) for key in ('kind', 'operation', 'phase', 'outcome', 'file_ref') if row.get(key))
         detail = detail[:1600] + (' [excerpt ends]' if len(detail) > 1600 else '')
-        speaker = 'owner message' if row.get('role') == 'user' else 'agent report' if row.get('role') == 'assistant' else 'observation'
+        speaker = (attribution.citation_label(attribution.label_of_row(row)) if row.get('role') == 'user'
+                   else 'agent report' if row.get('role') == 'assistant' else 'observation')
         stamp = row.get('source_ts') if row.get('time_basis') == 'source' else row.get('observed_ts')
         if type(stamp) not in (int, float):
             stamp = row.get('source_ts') or row.get('observed_ts')
@@ -5263,7 +5376,7 @@ class H(BaseHTTPRequestHandler):
                 elif route == '/history/projects': out = HISTORY.projects(**query)
                 elif re.fullmatch(r'/history/event/[0-9a-f]{64}', route): out = HISTORY.get_event(route.rsplit('/', 1)[1])
                 else: return answer(404, {'error': 'Deck Log entry unavailable.'})
-                return answer(200, history_result(out))
+                return answer(200, history_result(deck_attributed(out)))
             data = self.body()
             if not isinstance(data, dict) or parsed.query:
                 raise ValueError('Expected a settings object.')
@@ -6292,7 +6405,8 @@ def owner_target_call(method, agent, *args):
     """Only an absent exact Claude target gets a private metadata projection."""
     def invoke(snapshot):
         if method == 'owner_action':
-            return MESSAGING.owner_action('queue', agent, *args, snapshot)
+            # This route carries the exact words the owner typed in Motet's own send box.
+            return MESSAGING.owner_action('queue', agent, *args, snapshot, author='owner')
         result = MESSAGING.owner_capabilities(agent, snapshot)
         if isinstance(agent, str) and agent.startswith('c:'):
             result['permissionOwnership'] = ownership

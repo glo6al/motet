@@ -130,7 +130,9 @@ const nativeOpenSource=html.split('\n').find(line=>line.startsWith('function nat
     assert.equal(h.deckCitation({event_id:'a'.repeat(64)}),true);
     for(const event_id of ['1','a'.repeat(63),'a'.repeat(64)+'" onclick="x','X'.repeat(64)])assert.equal(h.deckCitation({event_id}),false);
     assert.equal(h.deckRows({chats:[{id:'durable'}]})[0].id,'durable');
-    assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'user'}),'You → Atlas');assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'assistant'}),'Atlas');assert.equal(h.deckSpeaker({chat_id:'private-native-id'}),'Archived chat');
+    assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'user'}),'You → Atlas');assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'user',attribution:'unverified_user'}),'You → Atlas');
+    assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'user',attribution:'motet_delivery'}),'Motet → Atlas');assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'user',attribution:'automatic'}),'Automatic → Atlas');
+    assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'user',attribution:'agent_message'}),'Another agent → Atlas');assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'user',attribution:'voice'}),'Voice mode → Atlas');assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'user',attribution:'unverified_user/exec_prompt'}),'Codex exec prompt → Atlas');assert.equal(h.deckSpeaker({chat_name:'Atlas',role:'assistant'}),'Atlas');assert.equal(h.deckSpeaker({chat_id:'private-native-id'}),'Archived chat');
     assert.equal(h.deckEventText({operation:'run',phase:'result',outcome:'unknown'}),'Run · Outcome not recorded');
     assert.equal(h.deckEventText({operation:'run',phase:'started',outcome:'pending',certainty:'probably'}),'Probably · Run · Started; no result recorded');
     assert.equal(h.deckEventText({text:'related activity',certainty:'inferred'}),'Inferred · related activity');
@@ -501,7 +503,12 @@ function unifiedChecks(code=unifiedCode){
   const hostPrefix='The watch-owner plugin sent a message:\n',hostSuffix="\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.",wrap=text=>hostPrefix+text+hostSuffix;
   const current=requestText.replace('the Officer of the Watch','Motet').replace('This is a question, not permission to change files or send messages.',"This message relays the owner's request. Preserve its scope and authorization: an explicit work instruction authorizes that work under your existing permissions; a status question asks only for information. Do not infer additional tasks or permissions.");
   const channel='WATCH_REQUEST '+id+'\nThe owner asks through the Officer of the Watch:\nHello\nUse this channel\'s reply tool with request_id '+id+" and your answer in text. Preserve the owner's scope and authorization: an explicit work instruction authorizes that work under your existing permissions; a status question asks only for information. Do not infer additional tasks or permissions. For a progress question, inspect your own current state.";
-  for(const envelope of [requestText,requestText.replace('the Officer of the Watch','Motet'),current,channel]){
+  /* Version 3 says who wrote the words: the owner's own typing, or Motet's wording at the owner's request. */
+  const ownerV3=current.replace('The owner asks through Motet:',"The owner asks through Motet, in the owner's own words:");
+  const motetV3='WATCH_REQUEST '+id+"\nMotet asks, at the owner's request (Motet's wording):\nHello\nReply in your final answer with WATCH_REPLY "+id+" on its own line, followed by your answer. Motet wrote this wording at the owner's request; it is not the owner's own words. It carries only the request the owner made of Motet, under your existing permissions, and adds no new tasks or permissions. Do not infer additional tasks or permissions. A status question asks only for information. For a progress question, inspect your own current state.";
+  for(const text of [ownerV3,motetV3])assert.equal(api.cuEnvelopeMatch({t:'you',text},record.agent,records),true,'version 3 request is the recorded message');
+  assert.equal(api.cuEnvelopeMatch({t:'you',text:ownerV3.replace("The owner asks through Motet, in the owner's own words:","Motet asks, at the owner's request (Motet's wording):")},record.agent,records),false,'Motet wording never carries owner guidance');
+  for(const envelope of [requestText,requestText.replace('the Officer of the Watch','Motet'),current,channel,ownerV3,motetV3]){
     const text=wrap(envelope);
     assert.equal(api.cuEnvelopeMatch({t:'you',text},record.agent,records),true,'the whole official host-wrapped request is a duplicate');
     assert.equal(api.cuEnvelopeMatch({t:'you',text},record.agent,new Map()),false,'unproven messages remain visible');

@@ -32,6 +32,7 @@ import uuid
 from xml.parsers.expat import ExpatError
 
 from new_chat_inventory import canonical_uuid, validate_folder
+from attribution import AUTHORS, motet_worded, motet_words
 import private_storage as ps
 from new_chat_types import (Capability, ExecutionResult, FrozenFolder, NewChatError, VerifiedIdentity,
                             MANAGED_PERMISSION_TIMEOUT_SECONDS)
@@ -176,6 +177,24 @@ def load_configuration_readiness(state_dir, *, enabled=False, demo=False):
             os.close(parent_fd)
 
 
+# Who put a message in a managed chat: the owner's own typed words, Motet's wording at the owner's request, or the
+# first instruction of a new managed chat.
+MESSAGE_SOURCES = ('owner', 'motet', 'new_chat')
+MOTET_SOURCE_REFUSED = ('This managed chat refused the message; it may have been started by an older Motet. '
+                        'Restart it to receive messages Motet words.')
+
+
+def _keep_author(old, message):
+    """A runner snapshot does not carry the author; keep the one the registry recorded (absent stays absent)."""
+    try:
+        previous = json.loads(old) if isinstance(old, str) else old
+    except ValueError:
+        previous = None
+    if isinstance(previous, dict) and previous.get('author') in AUTHORS and 'author' not in message:
+        return dict(message, author=previous['author'])
+    return message
+
+
 def _permission_resolution(value):
     """Project retained facts, leaving older rows' unavailable facts unknown."""
     fields = {key: value.get(key) for key in ('decision', 'resolutionReason', 'decisionState', 'resolvedAt')}
@@ -209,6 +228,7 @@ def _fail(code='managed_unavailable', status=409):
         'identity_unavailable': 'The exact Claude session and folder could not be verified.',
         'launch_outcome_unknown': 'The launch outcome is unknown. It will not be repeated.',
         'managed_not_ready': 'This managed Claude session is not ready for new messages.',
+        'runner_refused': 'This managed Claude session refused the request. Nothing was queued.',
         'supervisor_detach_refused': ('Motet cannot start a Claude supervisor that outlives this window: the program '
                                       'Motet runs in does not let it leave its job. Try starting Motet from an '
                                       'ordinary terminal window or a shortcut.'),
@@ -397,6 +417,8 @@ def client_request(run_dir, command, params):
             code = value.get('error', {}).get('code')
             if code in ('request_conflict', 'conflict', 'stale_permission'):
                 _fail('request_conflict')
+            if code == 'invalid_request' and command == 'enqueue':
+                _fail('runner_refused', 400)       # the runner refused this message; whether it kept it is unknown
             _fail('managed_not_ready')
         if set(value) != {'ok', 'value'}:
             _fail()
@@ -444,10 +466,10 @@ def _windows_request(path, token, command, params):
             if not chunk or len(response) + len(chunk) > MAX_RESPONSE:
                 _fail()
             response.extend(chunk)
-    return _reply(response)
+    return _reply(response, command)
 
 
-def _reply(response):
+def _reply(response, command=None):
     """Windows only: the supervisor's reply line, checked exactly as client_request's POSIX path checks it (one
     line, an object with ``ok``, provider error text never forwarded). A copy of that code, which POSIX keeps
     inline; a change to either belongs in both."""
@@ -461,6 +483,8 @@ def _reply(response):
         code = value.get('error', {}).get('code')
         if code in ('request_conflict', 'conflict', 'stale_permission'):
             _fail('request_conflict')
+        if code == 'invalid_request' and command == 'enqueue':
+            _fail('runner_refused', 400)           # the runner refused this message; whether it kept it is unknown
         _fail('managed_not_ready')
     if set(value) != {'ok', 'value'}:
         _fail()
@@ -985,7 +1009,7 @@ class ManagedClaude:
         messages = []
         for message in value['messages']:
             if (not isinstance(message, dict) or not canonical_uuid(message.get('requestId'))
-                    or message.get('state') not in PUBLIC_STATES or message.get('source') not in ('owner', 'new_chat')):
+                    or message.get('state') not in PUBLIC_STATES or message.get('source') not in MESSAGE_SOURCES):
                 _fail()
             clean = {k: message.get(k) for k in ('requestId', 'source', 'text', 'digest', 'state', 'nativeEcho', 'reply', 'error', 'createdAt', 'replyTruncated') if k in message}
             if type(clean.get('text', '')) is not str or len(clean.get('text', '')) > 8000:
@@ -1089,15 +1113,15 @@ class ManagedClaude:
                 current['occupied'] = False
             self._save(db, current)
             for message in snapshot['messages']:
-                old = db.execute('SELECT run,source,digest FROM messages WHERE id=?', (message['requestId'],)).fetchone()
-                if old and old == (run_id, message['source'], message.get('digest')):
-                    db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(message), message['requestId']))
+                old = db.execute('SELECT run,source,digest,data FROM messages WHERE id=?', (message['requestId'],)).fetchone()
+                if old and old[:3] == (run_id, message['source'], message.get('digest')):
+                    db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(_keep_author(old[3], message)), message['requestId']))
         return snapshot
 
     def enqueue(self, run_id, request_id, source, text):
         self._active()
         digest = _text(text)
-        if not canonical_uuid(request_id) or source not in ('owner', 'new_chat'):
+        if not canonical_uuid(request_id) or source not in MESSAGE_SOURCES:
             _fail('invalid_request', 400)
         with self._registry(reservation_id=request_id) as db:
             run = self._row(db, run_id)
@@ -1119,14 +1143,33 @@ class ManagedClaude:
                 _fail('capacity', 429)
             message = dict(requestId=request_id, source=source, text=text, digest=digest,
                            state='unknown', nativeEcho=False, reply='', error='', createdAt=time.time())
+            if source in AUTHORS:
+                # Who wrote the words, kept across status updates (_keep_author). A row stored before this was
+                # recorded has no author and reads as unknown, never as the owner, whatever its source says.
+                message['author'] = source
             db.execute('INSERT INTO messages VALUES (?,?,?,?,?)', (request_id, run_id, source, digest, json.dumps(message)))
         try:
             self._request(run_id, 'enqueue', dict(requestId=request_id, source=source, text=text))
-        except Exception:
+        except ManagedError as error:
             # The claim is retained even when the response was lost. Never reissue.
+            if error.code == 'runner_refused' and source == 'motet':
+                # A supervisor started before Motet recorded who wrote a message refuses source 'motet'. The same
+                # refusal can follow a storage fault after the runner kept the message, so the state stays unknown
+                # and the words say so; it is never resent, and never as the owner's.
+                self._refused(request_id, run_id, digest, MOTET_SOURCE_REFUSED)
+        except Exception:
             pass
         self.status(run_id)
         return self.lookup_message(request_id)
+
+    def _refused(self, request_id, run_id, digest, reason):
+        with self._registry() as db:
+            row = db.execute('SELECT run,digest,data FROM messages WHERE id=?', (request_id,)).fetchone()
+            if row and row[:2] == (run_id, digest):
+                message = json.loads(row[2])
+                if message.get('state') == 'unknown' and not message.get('error'):
+                    message['error'] = reason          # the state stays unknown: delivery is not certain either way
+                    db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(message), request_id))
 
     @staticmethod
     def _retained(message):
@@ -1164,7 +1207,7 @@ class ManagedClaude:
                     # Read-only evidence can add a receipt or terminal outcome. It
                     # cannot erase a stronger live status with its disconnect view.
                     if checked['state'] in ('completed', 'failed') or checked.get('nativeEcho') and not message.get('nativeEcho'):
-                        message = checked
+                        message = _keep_author(message, checked)
                         with self._registry() as db:
                             db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(message), request_id))
             except Exception:
@@ -1338,12 +1381,22 @@ class ManagedClaude:
             db.execute('UPDATE operations SET data=? WHERE id=?', (json.dumps(binding), request_id))
         return receipt
 
-    def owner_send(self, agent, text, request_id):
-        digest = _text(text)
+    def owner_send(self, agent, text, request_id, author='motet'):
+        """Queue text in a managed chat. ``author`` is 'owner' only for the exact words the owner typed in Motet's
+        send box; those go in as typed with source 'owner'. Text Motet composed goes in with source 'motet', worded
+        as Motet's (attribution.motet_worded), so it never reaches the chat as the owner typing it."""
+        if author not in AUTHORS:
+            _fail('invalid_request', 400)
+        source = author
+        delivered = text if author == 'owner' else motet_worded(text)
+        digest = _text(delivered)
         old = self.lookup_message(request_id)
         if old:
             owned = self.ownership(agent[2:]) if isinstance(agent, str) and agent.startswith('c:') else None
-            if (not owned or old['runId'] != owned['runId'] or old['source'] != 'owner' or old['digest'] != digest):
+            # A replay of a request stored before authors were recorded matches its original text and source.
+            legacy = old.get('source') == 'owner' and old.get('author') is None and old.get('digest') == _text(text)
+            if (not owned or old['runId'] != owned['runId']
+                    or not (legacy or (old['source'] == source and old['digest'] == digest))):
                 _fail('request_conflict')
             return self._public_message(old, agent)
         self._active()
@@ -1357,12 +1410,15 @@ class ManagedClaude:
         snapshot = self.status(owned['runId'])
         if snapshot['state'] not in ('ready', 'running', 'needs_attention') or not snapshot['identityVerified']:
             _fail('managed_not_ready')
-        return self._public_message(self.enqueue(owned['runId'], request_id, 'owner', text), agent)
+        return self._public_message(self.enqueue(owned['runId'], request_id, source, delivered), agent)
 
     @staticmethod
     def _public_message(message, agent):
         state = message.get('state', 'unknown')
-        result = dict(request_id=message['requestId'], agent=agent, name='Claude', question=message.get('text', ''),
+        text = message.get('text', '')
+        if message.get('source') == 'motet':
+            text = motet_words(text) if motet_words(text) is not None else text
+        result = dict(request_id=message['requestId'], agent=agent, name='Claude', question=text,
                       state=PUBLIC_STATES.get(state, 'unknown'), reply=message.get('reply', ''),
                       error=message.get('error', ''), created=message.get('createdAt', 0),
                       transport=TRANSPORT, runtime='claude', delivery_state=state)
@@ -1370,6 +1426,9 @@ class ManagedClaude:
             result['reply_truncated'] = True
         if message.get('textExpired'):
             result['text_expired'] = True
+        author = 'motet' if message.get('source') == 'motet' else message.get('author')
+        if author in AUTHORS:
+            result['author'] = author
         return result
 
     def owner_snapshot(self):
@@ -1391,7 +1450,7 @@ class ManagedClaude:
         with self._registry() as db:
             if db:
                 for row in runs:
-                    for (raw,) in db.execute("SELECT data FROM messages WHERE run=? AND source='owner'", (row['runId'],)):
+                    for (raw,) in db.execute("SELECT data FROM messages WHERE run=? AND source IN ('owner','motet')", (row['runId'],)):
                         rows.append(self._public_message(self._retained(json.loads(raw)), 'c:' + row['nativeId']))
         return dict(requests=sorted(rows, key=lambda row: row['created']), available=ready,
                     capabilities={'claude_managed': ready})

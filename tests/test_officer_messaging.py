@@ -104,7 +104,7 @@ class MessagingTests(unittest.TestCase):
 
     def user(self, turn='t1', text=None):
         self.append('event_msg', {'type': 'task_started', 'turn_id': turn})
-        self.append('response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': text if text is not None else m.envelope(self.rid, self.question)}]})
+        self.append('response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': text if text is not None else m.envelope(self.rid, self.question, version=3, author='motet')}]})
 
     def answer(self, turn='t1', text=None, partial=False):
         self.append('event_msg', {'type': 'task_complete', 'turn_id': turn,
@@ -124,10 +124,10 @@ class MessagingTests(unittest.TestCase):
 
     def test_work_authorization_and_status_scope_preserved(self):
         self.question = 'Implement the Claude connection now. Codex clearly works.'
-        self.submit()
+        self.store.submit(self.agent, self.question, self.rid, self.agents, author='owner')   # typed in Motet's send box
         launch = self.tick()
         sent = launch.call_args.args[0][-1]
-        self.assertIn('The owner asks through Motet:\n' + self.question, sent)
+        self.assertIn("The owner asks through Motet, in the owner's own words:\n" + self.question, sent)
         self.assertIn('an explicit work instruction authorizes that work under your existing permissions', sent)
         self.assertIn('a status question asks only for information', sent)
         self.assertNotIn('not permission to change files', sent)
@@ -211,7 +211,7 @@ class MessagingTests(unittest.TestCase):
     def test_queue_acceptance_is_not_answer(self):
         self.assertEqual(self.submit()['state'], 'sending')
         call = self.tick().call_args
-        self.assertEqual(call.args[0], [m.CLI, 'queue', '--thread', self.ident, '--message', m.envelope(self.rid, self.question)])
+        self.assertEqual(call.args[0], [m.CLI, 'queue', '--thread', self.ident, '--message', m.envelope(self.rid, self.question, version=3, author='motet')])
         self.assertEqual(self.row()['state'], 'queued')
         self.user()
         self.store.tick()
@@ -241,7 +241,7 @@ class MessagingTests(unittest.TestCase):
         self.append('event_msg', {'type': 'task_started', 'turn_id': 'new'})
         self.append('response_item', {'type': 'message', 'role': 'user',
             'internal_chat_message_metadata_passthrough': {'turn_id': 'old'},
-            'content': [{'text': m.envelope(self.rid, self.question)}]})
+            'content': [{'text': m.envelope(self.rid, self.question, version=3, author='motet')}]})
         self.answer('new')
         self.store.tick()
         self.assertEqual(self.row()['state'], 'awaiting_reply')
@@ -262,7 +262,7 @@ class MessagingTests(unittest.TestCase):
         for nested in ({'turn_id': 'old'}, {'turn_id': []}, 'old'):
             self.append('response_item', {'type': 'message', 'role': 'user', 'turn_id': 'new',
                 'internal_chat_message_metadata_passthrough': nested,
-                'content': [{'text': m.envelope(self.rid, self.question)}]})
+                'content': [{'text': m.envelope(self.rid, self.question, version=3, author='motet')}]})
         self.answer('new'); self.store.tick()
         self.assertEqual(self.row()['state'], 'queued')
 
@@ -325,10 +325,10 @@ class MessagingTests(unittest.TestCase):
         self.store.submit(self.agent, text, followup, self.agents)
         launch = self.tick()
         self.assertEqual(launch.call_count, 1)
-        self.assertIn(m.envelope(followup, text), launch.call_args.args[0])
+        self.assertIn(m.envelope(followup, text, version=3, author='motet'), launch.call_args.args[0])
         self.assertEqual(self.tick().call_count, 0)
         # The follow-up completes first. Its marker cannot answer the old request.
-        self.user('later', m.envelope(followup, text))
+        self.user('later', m.envelope(followup, text, version=3, author='motet'))
         self.answer('later', 'WATCH_REPLY ' + followup + '\nContinuing.')
         self.store.tick()
         rows = {r['request_id']: r for r in self.store.snapshot()['requests']}
@@ -371,7 +371,7 @@ class MessagingTests(unittest.TestCase):
         self.assertEqual(self.tick().call_count, 2)
         self.user('shared')
         self.append('response_item', {'type': 'message', 'role': 'user',
-                    'content': [{'type': 'input_text', 'text': m.envelope(followup, text)}]})
+                    'content': [{'type': 'input_text', 'text': m.envelope(followup, text, version=3, author='motet')}]})
         self.answer('shared', 'WATCH_REPLY ' + followup + '\nSecond request only.')
         self.store.tick()
         rows = {r['request_id']: r for r in self.store.snapshot()['requests']}

@@ -189,7 +189,7 @@ class ClaudeModTests(unittest.TestCase):
         status, poll = self.poll();self.assertEqual(status,200,poll)
         claim = poll['claim']
         self.assertEqual(claim['native_id'],self.sid)
-        self.assertEqual(claim['envelope'],messaging.envelope(payload['request_id'],payload['question']))
+        self.assertEqual(claim['envelope'],messaging.envelope(payload['request_id'],payload['question'],version=3,author='owner'))
         self.assertNotIn('reply tool',claim['envelope'])
         turn = uid()
         self.assertEqual(self.event(claim,'started',turn_id=turn)[1]['state'],'awaiting_reply')
