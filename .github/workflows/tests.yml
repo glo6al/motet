@@ -4,7 +4,8 @@ permissions:
   contents: read
 jobs:
   tests:
-    timeout-minutes: 40
+    # The Windows suites grew with the parity work: a Windows job now takes 29 to 40 minutes.
+    timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
