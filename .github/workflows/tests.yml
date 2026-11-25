@@ -373,6 +373,11 @@ jobs:
       - run: python tests/test_attachments_windows_namespace.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # Workspace copies and resource locks on their Windows branch: simulated on macOS and Linux, for real on Windows
+      # (junctions, a workspace others can change, a copy held open, a lock held by another process).
+      - run: python tests/test_attachments_windows_materialize.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_delivery_admission.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5

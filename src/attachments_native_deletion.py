@@ -1092,6 +1092,8 @@ class NativeDeletion:
             return {'removed': (REMOVED, 0), 'absent': (REMOVED, 0), 'changed': (CHANGED, 2),
                     'busy': (UNKNOWN, 1)}.get(result, (UNKNOWN, 3))
         except AttachmentError as error:
+            if error.code == 'cleanup_busy':
+                return UNKNOWN, 1       # Windows: the copy is open in another program; retried later, as a busy source
             return (CHANGED, 2) if error.code == 'copy_changed' else (UNKNOWN, 3)
         except OSError:
             return UNKNOWN, 3
