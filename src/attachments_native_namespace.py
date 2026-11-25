@@ -201,7 +201,9 @@ def same_database_path(name, path):
     try:
         return canonical(name) == canonical(str(path))
     except (OSError, ValueError):
-        return False                 # a name the walk refuses by its shape (a device or UNC path) is not this file
+        # A name the walk refuses by its shape is not taken as this file, so the check fails closed: one starting
+        # with two backslashes (a \\?\ long-path or device prefix, or a UNC share), a data stream, or a device name.
+        return False
 
 
 def _line(record):

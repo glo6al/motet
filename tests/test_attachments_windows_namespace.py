@@ -10,11 +10,12 @@ list inherited from the folder, and a database path in another case. Synthetic f
 
 Run: python tests/test_attachments_windows_namespace.py
 """
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -59,8 +60,8 @@ def inbox_as_on_windows():
     return mock.patch.object(peer_inbox, 'load_config', return_value=None)
 
 
-class FenceChecks:
-    """The same checks with Windows simulated (``windows`` is the simulation) or for real (``windows`` does nothing)."""
+class FenceBase:
+    """Helpers for checks with Windows simulated (``windows`` is the simulation) or not (``windows`` does nothing)."""
 
     def windows(self):
         raise NotImplementedError
@@ -128,7 +129,7 @@ class FenceChecks:
         while True:
             try:
                 return self.open_store()
-            except NamespaceError:
+            except (NamespaceError, messaging.MessagingStorageUnavailable):
                 if time.monotonic() > end:
                     raise
 
@@ -139,6 +140,59 @@ class FenceChecks:
                     pass
             with self.assertRaises((NamespaceError, OSError, ValueError)):
                 messaging.MessagingStore(str(self.state), str(self.sessions)).close()
+
+    def copied_home(self):
+        """A home folder whose .live-room holds a copy of this witnessed state: the same bytes in new private files,
+        as copying a folder from another computer or folder makes them."""
+        home = self.base / 'home'
+        home.mkdir()
+        live = home / '.live-room'
+        self.private_folder(live)
+        for name in sorted(os.listdir(self.state)):
+            if (self.state / name).is_file():
+                self.make_private(live / name, (self.state / name).read_bytes())
+        return home
+
+    def start_messaging(self, home):
+        with self.windows(), mock.patch.object(server, 'HOME', str(home)):
+            return server.start_messaging()
+
+
+class FenceChecks(FenceBase):
+    """The checks, with Windows simulated or for real."""
+
+    def test_a_witness_copied_from_another_folder_is_refused_with_its_own_reason(self):
+        """The anchor's identities belong to where it was made, so a copy never passes; Windows says why in plain
+        words instead of the storage reason, whose ownership advice does not apply."""
+        self.witnessed()
+        store, reason = self.start_messaging(self.copied_home())
+        self.assertIsNone(store)
+        self.assertEqual(reason, messaging.RETAINED_STATE_FOREIGN)
+        self.assertNotEqual(reason, server.MESSAGING_STORAGE_WHY)
+
+    def test_records_without_a_witness_open_without_the_fence(self):
+        """An old managed registry that never had an identity, with no anchor or authority, is no witness: nothing
+        was installed here to fence, so messaging opens as it always has. An owner database that carries the owner
+        identity without its witness is refused, with the copied-records reason on Windows."""
+        managed = self.state / namespace.MANAGED
+        self.private_folder(managed)
+        self.make_private(managed / namespace.REGISTRY, b'')
+        with closing(sqlite3.connect(str(managed / namespace.REGISTRY))) as db:
+            db.execute('CREATE TABLE runs (id TEXT PRIMARY KEY)')
+            db.commit()
+        with self.windows():
+            self.assertIsNone(messaging.MessagingStore._retained_namespace_before_open(str(self.state)))
+        self.assertIsNone(self.open_store()._attachment_guard)
+        self.close_store()
+        shutil.rmtree(managed)
+        self.witnessed()
+        for name in (namespace.ANCHOR, namespace.AUTHORITY):
+            os.remove(self.state / name)
+        with self.windows():
+            self.assertIsNone(messaging.MessagingStore._retained_namespace_before_open(str(self.state)))
+            with self.assertRaises(messaging.MessagingStorageUnavailable) as raised:
+                messaging.MessagingStore(str(self.state), str(self.sessions)).close()
+        self.assertEqual(str(raised.exception), messaging.RETAINED_STATE_FOREIGN)
 
     def test_witness_is_made_and_messaging_starts_with_it_after_each_restart(self):
         fence = self.witnessed()
@@ -219,16 +273,8 @@ class FenceChecks:
         self.assertIn(os.sep + 'STATE' + os.sep, name)
 
 
-@unittest.skipIf(os.name == 'nt', SIMULATED_WHY)
-class SimulatedWindowsFenceTests(FenceChecks, unittest.TestCase):
-    """The checks with Windows simulated. A POSIX symbolic link stands in for a junction and mode 0644 for an access
-    list that names others; real Windows checks those for real (WindowsFenceTests)."""
-
-    @contextmanager
-    def windows(self):
-        from windows_simulation import simulated_windows
-        with simulated_windows(), inbox_as_on_windows():
-            yield
+class PosixFiles:
+    """Private files and folders, and stand-ins, made with POSIX calls."""
 
     def private_folder(self, path):
         os.mkdir(path, 0o700)
@@ -260,6 +306,32 @@ class SimulatedWindowsFenceTests(FenceChecks, unittest.TestCase):
 
     def unlink_folder(self, path):
         os.remove(path)
+
+
+@unittest.skipIf(os.name == 'nt', 'checks POSIX itself')
+class PosixCopiedWitnessTests(PosixFiles, FenceBase, unittest.TestCase):
+    """POSIX keeps its own refusal of copied records: the generic storage reason, as before."""
+
+    def windows(self):
+        return nullcontext()
+
+    def test_a_copied_witness_keeps_the_posix_reason(self):
+        self.witnessed()
+        store, reason = self.start_messaging(self.copied_home())
+        self.assertIsNone(store)
+        self.assertEqual(reason, server.MESSAGING_STORAGE_WHY)
+
+
+@unittest.skipIf(os.name == 'nt', SIMULATED_WHY)
+class SimulatedWindowsFenceTests(PosixFiles, FenceChecks, unittest.TestCase):
+    """The checks with Windows simulated. A POSIX symbolic link stands in for a junction and mode 0644 for an access
+    list that names others; real Windows checks those for real (WindowsFenceTests)."""
+
+    @contextmanager
+    def windows(self):
+        from windows_simulation import simulated_windows
+        with simulated_windows(), inbox_as_on_windows():
+            yield
 
     def test_windows_calls_are_the_ones_made(self):
         """The Windows branch reads identities from handles and never reaches for os.getuid or fcntl (the
