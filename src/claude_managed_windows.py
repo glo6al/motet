@@ -88,6 +88,7 @@ class ThreadedPipes:
         self.closed = threading.Event()
         self.eof = False
         self.writer = None
+        self.written = None           # the last write's completion: set once it has written all or failed
         self.reader = threading.Thread(target=self._read, name='managed-claude-reader', daemon=True)
         self.reader.start()
 
@@ -133,8 +134,9 @@ class ThreadedPipes:
                 return b''
 
     def writing(self):
-        """Whether an earlier write is still blocked in its thread."""
-        return self.writer is not None and self.writer.is_alive()
+        """Whether an earlier write has not completed (it is still blocked in its thread). A write that completed
+        is not "writing" even while its thread is still returning."""
+        return self.written is not None and not self.written.is_set()
 
     def write(self, raw, seconds):
         """Write all of ``raw`` within ``seconds``, or raise TimeoutError; a pipe error is raised as it happened."""
@@ -154,10 +156,12 @@ class ThreadedPipes:
                 failed.append(error)
             finally:
                 done.set()
+        self.written = done
         self.writer = threading.Thread(target=write, name='managed-claude-writer', daemon=True)
         self.writer.start()
         if not done.wait(max(0, seconds)):
             raise TimeoutError()
+        self.writer.join(1)               # it has completed and is only returning
         if failed:
             error = failed[0]
             raise error if isinstance(error, OSError) else OSError(str(error))

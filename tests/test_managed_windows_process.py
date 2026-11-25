@@ -73,10 +73,22 @@ class ThreadedTransportTests(unittest.TestCase):
         self.assertEqual(transport.poll(), 0)
 
     def test_many_frames_in_order_and_split_lines(self):
+        # Each echo is read before the next write, so nothing waits on a full pipe (Windows pipes hold 4 KiB).
         transport = self.transport(ECHO)
+        seen = []
         for value in range(200):
             transport.write({'value': value})
-        self.assertEqual([frame(transport)['value'] for _ in range(200)], list(range(200)))
+            seen.append(frame(transport)['value'])
+        self.assertEqual(seen, list(range(200)))
+        transport.process.stdin.close()
+        self.assertEqual(transport.wait(timeout=10), 0)
+
+    def test_back_to_back_writes_never_refuse_each_other(self):
+        """A write that completed is never taken for one still blocked, even while its thread is returning."""
+        transport = self.transport('import sys; sys.stdin.buffer.read()')     # drains its input
+        for value in range(500):
+            transport.write({'value': value})
+        self.assertFalse(transport.pipes.writing())
         transport.process.stdin.close()
         self.assertEqual(transport.wait(timeout=10), 0)
 
