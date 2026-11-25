@@ -197,6 +197,9 @@ def _fail(code='managed_unavailable', status=409):
         'identity_unavailable': 'The exact Claude session and folder could not be verified.',
         'launch_outcome_unknown': 'The launch outcome is unknown. It will not be repeated.',
         'managed_not_ready': 'This managed Claude session is not ready for new messages.',
+        'supervisor_detach_refused': ('Motet cannot start a Claude supervisor that outlives this window: the program '
+                                      'Motet runs in does not let it leave its job. Start Motet from an ordinary '
+                                      'terminal or a shortcut.'),
     }
     raise ManagedError(status, code, messages.get(code, messages['managed_unavailable']))
 
@@ -386,7 +389,12 @@ def client_request(run_dir, command, params):
 
 
 def spawn_runner(run_dir):
-    """Start one detached supervisor after a manager's durable launch claim."""
+    """Start one detached supervisor after a manager's durable launch claim. Windows: detached from the console,
+    its process group and the server's job (claude_managed_windows.spawn_detached), or refused."""
+    if ps.WIN:
+        import claude_managed_windows as windows
+        return windows.spawn_detached([sys.executable, str(Path(__file__).with_name('claude_managed_runner.py')),
+                                       str(run_dir)])
     return subprocess.Popen([sys.executable, str(Path(__file__).with_name('claude_managed_runner.py')), str(run_dir)],
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True, close_fds=True)
@@ -720,6 +728,11 @@ class ManagedClaude:
         executable = self._executable()
         if not self.configuration_ready:
             _fail('configuration_unverified', 503)
+        if ps.WIN and not self._test:
+            # Before any claim: a supervisor that could not leave the server's job would end with its window.
+            import claude_managed_windows as windows
+            if windows.breakaway_refusal() is not None:
+                _fail('supervisor_detach_refused', 503)
         with self._registry() as db:
             row = self._row(db, run_id)
             if row['folder'] != asdict(folder):

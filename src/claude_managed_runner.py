@@ -436,12 +436,21 @@ def read_decision(run_dir, permission_id, request_id, decision):
 
 
 class NativeTransport:
-    """Pinned native JSONL, bounded reads/writes, one owned Popen instance."""
+    """Pinned native JSONL, bounded reads/writes, one owned Popen instance.
+
+    POSIX: non-blocking pipes under a selector; Shutdown sends SIGTERM and waits. Windows (step 8b.2; refused there
+    until 8b.5): Claude runs in a kill-on-close job and its pipes are read and written by threads
+    (claude_managed_windows: ``pipes`` and ``job`` are set), with the same line limit, budgets and deadlines;
+    Shutdown closes its input, waits as long, then ends the whole job. See claude_managed_windows for why Claude
+    ends with its supervisor there."""
     def __init__(self, manifest):
         self.manifest = manifest
         self.process = None
         self.selector = None
         self.buffer = bytearray()
+        self.pipes = None        # Windows: claude_managed_windows.ThreadedPipes
+        self.job = None          # Windows: claude_managed_windows.Job
+        self.stop_requested = False
 
     @property
     def pid(self):
@@ -486,6 +495,12 @@ class NativeTransport:
             if (path_info.st_dev, path_info.st_ino, path_info.st_mtime_ns, path_info.st_ctime_ns) != (
                     after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns):
                 raise ValueError()
+            if ps.WIN:
+                # Suspended, put in its own kill-on-close job, then resumed; refused if any step fails.
+                import claude_managed_windows as windows
+                self.process, self.job = windows.start_in_job(args, self.manifest['folder']['path'])
+                self.pipes = windows.ThreadedPipes(self.process)
+                return
             self.process = subprocess.Popen(args, cwd=self.manifest['folder']['path'],
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)
@@ -505,6 +520,9 @@ class NativeTransport:
         raw = (_json(frame) + '\n').encode('utf-8')
         if len(raw) > MAX_NATIVE_LINE or self.poll() is not None:
             raise EOFError()
+        if self.pipes is not None:
+            self.pipes.write(raw, 2)            # the same 2 s deadline, by a writer thread
+            return
         view = memoryview(raw)
         deadline = time.monotonic() + 2
         with selectors.DefaultSelector() as selector:
@@ -518,8 +536,23 @@ class NativeTransport:
                 except BlockingIOError:
                     continue
 
+    def _threaded_fill(self, timeout):
+        """``read``'s fill from the reader thread: a chunk extends the buffer, the end of the stream is EOFError,
+        and an exited child with nothing waiting is EOFError, after one short look for bytes the reader had
+        already taken (a selector would still have reported those as readable)."""
+        chunk = self.pipes.get(timeout)
+        if not chunk and chunk is not None and self.poll() is not None:
+            chunk = self.pipes.get(.1)
+            if not chunk:
+                raise EOFError()
+        if chunk is None:
+            raise EOFError()
+        self.buffer.extend(chunk)
+
     def read(self, timeout=0):
-        if b'\n' not in self.buffer:
+        if b'\n' not in self.buffer and self.pipes is not None:
+            self._threaded_fill(timeout)
+        elif b'\n' not in self.buffer:
             if self.selector.select(timeout):
                 chunk = os.read(self.process.stdout.fileno(), 65536)
                 if not chunk:
@@ -543,13 +576,32 @@ class NativeTransport:
 
     def terminate(self):
         # Only the original unreaped Popen child; never load or signal a saved PID.
+        if self.job is not None:
+            self.stop_requested = True          # Windows: ``wait`` closes input, waits, then ends the whole job
+            return
         if self.process and self.process.poll() is None:
             self.process.terminate()
 
     def wait(self, timeout=3):
+        if self.job is not None and self.stop_requested:
+            import claude_managed_windows as windows
+            return windows.stop_tree(self._close_input, lambda seconds: self.process.wait(timeout=seconds),
+                                     self.job.terminate, timeout)
         return self.process.wait(timeout=timeout)
 
+    def _close_input(self):
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+
     def close(self):
+        if self.pipes is not None:
+            # Windows: closing the job's only handle ends anything still in it (Claude ends with its supervisor).
+            self.pipes.close()
+            if self.job is not None:
+                self.job.close()
+            return
         if self.selector:
             self.selector.close()
         if self.process:
