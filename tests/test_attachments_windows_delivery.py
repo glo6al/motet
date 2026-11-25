@@ -33,6 +33,7 @@ import attachments_materialize as materialize
 from attachments_requests import RequestAuthority, CopyIntent
 from attachments_resources import ResourceLocks
 from attachments_types import AttachmentError
+from windows_git_diagnosis import diagnosis
 
 CONTENT = b'%PDF-1.4\nFictional orchard attachment.\n%%EOF'
 SYSTEM_GIT = '/usr/bin/git'
@@ -62,7 +63,7 @@ class DeliveryChecks:
         return raised.exception.code
 
     def fake_git(self, folder, program=None):
-        """A git program this user made: a file at Git\\mingw64\\bin\\git.exe (or ``program``) under ``folder``
+        """A git program this user made: a file at Git\\ucrt64\\bin\\git.exe (or ``program``) under ``folder``
         (never run)."""
         program = folder.joinpath(*(program or wingit.PROGRAM))
         program.parent.mkdir(parents=True)
@@ -88,7 +89,8 @@ class DeliveryChecks:
             with self.windows():
                 self.assertEqual(self.code(wingit.find), 'attachments_git_unsafe')
 
-    def test_the_arm64_and_32_bit_builds_are_found_and_checked_too(self):
+    def test_every_other_build_is_found_and_checked_too(self):
+        """x64 before Git for Windows 2.56 (mingw64), ARM64 and the older 32-bit build."""
         for build in wingit.PROGRAMS[1:]:
             with self.subTest(build=build[1]):
                 programs = self.base / ('programs-' + build[1])
@@ -220,6 +222,19 @@ class SimulatedWindowsDeliveryTests(DeliveryChecks, unittest.TestCase):
         status, body = self.selection_over_http(str(repo))
         self.assertEqual((status, body['context']), (200, None))
 
+    def test_a_lookup_that_fails_says_what_it_saw(self):
+        with self.as_program_files(), self.windows():
+            found = diagnosis()
+        self.assertIn("roots tried: ['/usr']", found)
+        self.assertIn('/usr/bin/git: file', found)
+        self.assertIn('/usr/Git/ucrt64/bin/git.exe: absent', found)
+        self.assertIn('check of /usr/bin/git:', found)
+        self.assertIn('  /usr: accepted', found)
+        self.assertIn('  /usr/bin: accepted', found)
+        self.assertIn('  %s: accepted' % os.path.realpath(SYSTEM_GIT), found)
+        self.assertIn('where', found)
+        self.assertIn('git', found.split('\n')[-1])
+
     def test_the_system_git_is_found_and_checked(self):
         with self.as_program_files(), self.windows():
             self.assertEqual(wingit.find(), os.path.realpath(SYSTEM_GIT))
@@ -307,13 +322,34 @@ class WindowsDeliveryTests(DeliveryChecks, unittest.TestCase):
                        timeout=30)
 
     def test_git_for_windows_for_all_users_is_found_and_checked(self):
-        program = wingit.find()
-        self.assertTrue(program.lower().endswith(os.path.join('git', 'mingw64', 'bin', 'git.exe')))
+        """The runner's Git for Windows (installed by the image for all users under Program Files) is found and
+        passes the check. If not, the failure names every place looked at and what Windows itself finds."""
+        try:
+            program = wingit.find()
+        except wingit.GitUnavailable as error:
+            self.fail('find() refused with %s.\n%s' % (error.code, diagnosis()))
+        builds = [os.path.join(*build).lower() for build in wingit.PROGRAMS]
+        self.assertTrue(any(program.lower().endswith(os.sep + build) for build in builds), (program, diagnosis()))
         self.assertIsNone(wingit.refusal())
         result = subprocess.run([program, '--version'], env=wingit.environment(program), capture_output=True,
                                 timeout=30)
-        self.assertEqual((result.returncode, result.stderr), (0, b''))
+        self.assertEqual((result.returncode, result.stderr), (0, b''), result)
         self.assertTrue(result.stdout.startswith(b'git version '))
+
+    def test_git_reads_no_system_or_user_configuration(self):
+        """With the environment Motet gives it, Git reads only what the command line sets: no system file (the
+        image adds safe.directory there) and no user file (GIT_CONFIG_GLOBAL=/dev/null, which Git for Windows
+        2.56.0 briefly mishandled for NUL)."""
+        try:
+            program = wingit.find()
+        except wingit.GitUnavailable as error:
+            self.fail('find() refused with %s.\n%s' % (error.code, diagnosis()))
+        folder = self.base / 'outside-any-repository'
+        self.private_folder(folder)
+        result = subprocess.run([program, 'config', '--list', '--show-origin'], cwd=str(folder),
+                                env=wingit.environment(program), capture_output=True, timeout=30)
+        self.assertEqual(result.stderr, b'', result)
+        self.assertEqual(result.stdout, b'', result)
 
 
 if __name__ == '__main__':
