@@ -289,6 +289,18 @@ class OfficerWordingTests(unittest.TestCase):
             late = self.event(real, agent, ts=ts, seq=12)
             self.assertNotIn('owner typed', self.step(real, ledger, agent=agent, event=late, log=[late]))
         self.assertIn('owner typed', self.step(real, ledger, agent=agent, event=self.event(real, agent, ts=self.CREATED - 2), log=[]))
+        # The first copy is chosen by log order, never by the record's own (agent-written) timestamp.
+        real_copy = self.event(real, agent, ts=self.CREATED + 60, seq=10)
+        backdated = self.event(real, agent, ts=self.CREATED + 30, seq=20)
+        log = [real_copy, backdated]
+        self.assertNotIn('owner typed', self.step(real, ledger, agent=agent, event=backdated, log=log))
+        self.assertIn('owner typed', self.step(real, ledger, agent=agent, event=real_copy, log=log))
+        server.DELIVERY_FIRST.clear(); server.OFFICER_DELIVERIES.clear()
+        with patch.object(server, 'MESSAGING', FakeLedger({REQUEST: dict(ledger[REQUEST], agent=agent, created=self.CREATED)})), \
+                patch.object(server, 'LOG', log):
+            self.assertNotIn('owner typed', server.officer_step(backdated)['what'])
+            self.assertEqual(server.DELIVERY_FIRST[(agent, REQUEST)], 10, 'the remembered first copy is the real one')
+            self.assertIn('owner typed', server.officer_step(real_copy)['what'])
         # Once the first copy has been seen, a replay stays unconfirmed even after the first copy leaves the log.
         server.DELIVERY_FIRST.clear(); server.OFFICER_DELIVERIES.clear()
         with patch.object(server, 'MESSAGING', FakeLedger({REQUEST: dict(ledger[REQUEST], agent=agent, created=self.CREATED)})):

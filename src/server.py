@@ -3358,15 +3358,17 @@ def officer_find(name):
 
 
 OFFICER_DELIVERIES = {}          # request ID -> (checked at, record): a short-lived read cache for labelling only
-DELIVERY_FIRST = {}              # (chat, request ID) -> (time, seq) of the earliest exact copy seen in this run
-# A delivered copy is confirmed only when it is the first exact copy in that chat and its time is no earlier than
+DELIVERY_FIRST = {}              # (chat, request ID) -> seq of the first exact copy seen in this run
+# A delivered copy is confirmed only when it is the first exact copy in that chat, by log order (seq: the order Motet
+# read the records, which the log's own timestamps cannot change), and its time is no earlier than
 # DELIVERY_SKEW seconds before Motet recorded the request and no later than DELIVERY_WINDOW after it: 24 hours, as
 # long as the ledger keeps a row (officer_messaging.RETENTION). Later copies are replays and confirm nothing.
 DELIVERY_SKEW, DELIVERY_WINDOW = 5, 86400
 
 
 def delivery_first_copy(e, request_id, digest, created):
-    """True when event e is the first exact copy of that envelope in its chat, inside the delivery window."""
+    """True when event e is the first exact copy of that envelope in its chat, inside the delivery window. "First" is
+    log order (seq) alone: a record's own timestamp is written by the agent, so it only bounds the window."""
     def stamp(event):
         ts = event.get('ts')
         return ts if type(ts) in (int, float) and math.isfinite(ts) else None
@@ -3375,16 +3377,17 @@ def delivery_first_copy(e, request_id, digest, created):
         ts = stamp(event)
         return ts is not None and created - DELIVERY_SKEW <= ts <= created + DELIVERY_WINDOW
 
-    if type(created) not in (int, float) or not math.isfinite(created) or not inside(e):
+    if type(created) not in (int, float) or not math.isfinite(created) or not inside(e) or type(e.get('seq')) is not int:
         return False
-    agent, mine = e.get('agent'), (stamp(e), e.get('seq') if type(e.get('seq')) is int else -1)
+    agent, mine = e.get('agent'), e['seq']
     copies = [mine]
     for other in list(LOG):
         if (other is not e and other.get('agent') == agent and other.get('kind') == 'user' and inside(other)
                 and attribution.envelope_of(str(other.get('text') or '')) is not None
                 and attribution.envelope_of(str(other.get('text') or ''))[1] == request_id
-                and hashlib.sha256(attribution.delivered_form(str(other.get('text') or '')).encode('utf-8', 'surrogatepass')).hexdigest() == digest):
-            copies.append((stamp(other), other.get('seq') if type(other.get('seq')) is int else -1))
+                and hashlib.sha256(attribution.delivered_form(str(other.get('text') or '')).encode('utf-8', 'surrogatepass')).hexdigest() == digest
+                and type(other.get('seq')) is int):
+            copies.append(other['seq'])
     key = (agent, request_id)
     if key in DELIVERY_FIRST:
         copies.append(DELIVERY_FIRST[key])
