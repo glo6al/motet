@@ -1887,7 +1887,8 @@ def path_identity(path):
     attribute access only and FILE_FLAG_BACKUP_SEMANTICS (which a folder needs), sharing everything (nothing is
     held against other programs), then GetFileInformationByHandle: the 32-bit volume serial and the 64-bit file
     index, the same under every Python (3.12 changed what ``os.stat`` reports there). The caller has already decided
-    with ``os.stat`` and ``realpath`` that the name is a folder and not a link. A missing name raises
+    with ``os.stat`` and ``realpath`` that the name is a folder and not a link; managed Claude also uses it on the
+    program file a started process reports (claude_managed_windows.process_image_identity). A missing name raises
     FileNotFoundError; any other failure OSError."""
     if not WIN:
         info = os.stat(path)
@@ -1897,8 +1898,8 @@ def path_identity(path):
                                 _OPEN_EXISTING, _BACKUP_SEMANTICS, None)
     if handle is None or handle == w.HANDLE(-1).value:
         code = ctypes.get_last_error()
-        error = (FileNotFoundError(errno.ENOENT, 'no such folder') if code in _NOT_FOUND
-                 else OSError('folder identity unavailable'))
+        error = (FileNotFoundError(errno.ENOENT, 'no such file or folder') if code in _NOT_FOUND
+                 else OSError('identity unavailable'))
         error.winerror = code
         raise error
     try:

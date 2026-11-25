@@ -483,13 +483,16 @@ class NativeTransport:
     def _windows_start(self, exe):
         """Windows: open the pinned build through the no-link walk sharing reading only, hash it through that
         handle, and keep the handle open until Claude has been started from the same file in its kill-on-close
-        job, so it cannot be replaced in between; the handle is closed in every path."""
+        job, so it cannot be replaced in between. Before Claude's thread is resumed, the file it was started from
+        must be that hashed file (start_in_job's ``image``). The handle is closed in every path."""
         import claude_managed_windows as windows
         fd = None
         try:
             fd = windows.open_pinned(exe, _windows_pin())
+            image = tuple(ps.file_identity(fd)[:2])
             _folder(self.manifest['folder'])
-            self.process, self.job = windows.start_in_job(self._args(exe), self.manifest['folder']['path'])
+            self.process, self.job = windows.start_in_job(self._args(exe), self.manifest['folder']['path'],
+                                                          image=image)
             try:
                 self.pipes = windows.ThreadedPipes(self.process)
             except BaseException as error:

@@ -512,6 +512,7 @@ class ManagedClaude:
         self._lock = threading.RLock()
         self._proofs = {}
         self._directory = None
+        self._windows_verified = None     # Windows: the last executable check that passed (verify_pinned)
         self.closed = False
         # No state creation, provider access, socket calls, or process work here.
 
@@ -530,8 +531,13 @@ class ManagedClaude:
     def _windows_executable(self):
         """Windows: Claude Code 2.1.323 for this machine's architecture, found only where the native installer is
         expected to keep it (claude_managed_windows.locate_claude), refused if it is a shim, an alias, the desktop
-        app's copy or reached through a link or junction, and hashed through a handle that shares reading only."""
+        app's copy or reached through a link or junction, and hashed through a handle that shares reading only.
+        The hash is taken again only when the file's identity (volume, index, size, last-write and NTFS change
+        times) has changed since the
+        last check that passed, so the New chat menu does not read ~367 MB each time it asks; the supervisor still
+        hashes in full before it starts Claude."""
         import claude_managed_windows as windows
+        known, self._windows_verified = self._windows_verified, None
         try:
             if self._test:
                 configured = self._test.executable
@@ -546,7 +552,7 @@ class ManagedClaude:
                 checked = pin
             if type(configured['path']) is not str or configured['version'] != VERSION:
                 raise ValueError()
-            os.close(windows.open_pinned(configured['path'], checked))
+            self._windows_verified = windows.verify_pinned(configured['path'], checked, known)
             return dict(configured)
         except (OSError, ValueError, TypeError, KeyError):
             _fail('app_version_unsupported', 503)

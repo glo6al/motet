@@ -435,9 +435,37 @@ def _resume_only_thread(pid):
         k.CloseHandle(thread)
 
 
-def start_in_job(args, cwd):
+def process_image_identity(process_handle):
+    """(volume serial, file index) of the program file the process ``process_handle`` was started from: its image
+    name (QueryFullProcessImageNameW, which answers for a process still suspended at creation) opened again and
+    identified (private_storage.path_identity, attribute access only, which no sharing mode refuses). Windows offers
+    no documented call that identifies a process's image file by handle, so the name is the way in; see
+    ``start_in_job`` for why comparing the identity is still sound."""
+    import private_storage as ps
+    ctypes, w, k = _api()[:3]
+    query = k.QueryFullProcessImageNameW
+    query.argtypes = [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)]
+    query.restype = w.BOOL
+    size = w.DWORD(32768)
+    name = ctypes.create_unicode_buffer(size.value)
+    if not query(process_handle, 0, name, ctypes.byref(size)):
+        raise _failed('the started program could not be identified')
+    return tuple(ps.path_identity(name.value))
+
+
+def start_in_job(args, cwd, image=None, image_of=None):
     """Start Claude suspended and without a window, put it in a new kill-on-close job, then resume its thread.
-    Returns (Popen, Job). If any step fails the suspended process is ended (it never ran) and JobError is raised."""
+    Returns (Popen, Job). If any step fails the suspended process is ended (it never ran) and JobError is raised.
+
+    ``image`` (volume serial, file index) is the file the caller hashed and still holds open sharing reading only.
+    Before the thread is resumed, the program the suspended process was actually started from is identified
+    (``process_image_identity``; ``image_of`` stands in for it in tests) and must be that same file; otherwise the
+    process is ended without ever running.
+
+    This check, like the caller's hold, relies on NTFS refusing to rename or delete a file that is open without
+    delete sharing, and refusing to rename any folder above such a file (the real-Windows tests check both). So
+    while the caller's handle is open, neither the file nor any folder on its path can be moved or replaced, and a
+    file found at that path whose volume and index are the checked file's is the checked file."""
     process = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, bufsize=0,
                                creationflags=CREATE_SUSPENDED | CREATE_NO_WINDOW)
@@ -445,6 +473,8 @@ def start_in_job(args, cwd):
     try:
         job = Job()
         job.assign(int(process._handle))
+        if image is not None and tuple((image_of or process_image_identity)(int(process._handle))) != tuple(image):
+            raise JobError('the started program is not the checked Claude Code')
         _resume_only_thread(process.pid)
         return process, job
     except BaseException as error:
@@ -851,6 +881,7 @@ WINDOWS_PINS = {
     'arm64': ('3071c54f466e40e668c273b53ed8942efce35bf069d66a69668f74299b0cb888', 349943968),
 }
 IMAGE_FILE_MACHINES = {0x8664: 'x64', 0xAA64: 'arm64'}      # IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64
+PROCESSOR_ARCHITECTURES = {9: 'x64', 12: 'arm64'}           # PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM64
 WINDOWS_HASH_SECONDS = 60      # hashing ~367 MB while Microsoft Defender scans it (POSIX keeps 10 s)
 RSMB = 0x52534D42              # 'RSMB': the raw SMBIOS firmware table provider
 
@@ -877,6 +908,10 @@ def parse_smbios_uuid(raw):
             if size < 0x19:
                 raise ValueError('SMBIOS system information has no UUID')
             value = table[offset + 8:offset + 24]
+            # Unset is refused. A well-known placeholder some boards ship with (03000200-0400-0500-0006-000700080009,
+            # say) passes: the identity only ties a readiness record to the machine and user it was made on, it
+            # does not prove who is asking. Two machines sharing a placeholder and one domain account could share
+            # a record, which still runs only the pinned build, checked again before every start.
             if value in (b'\x00' * 16, b'\xff' * 16):
                 raise ValueError('SMBIOS system UUID is not set')
             return uuid.UUID(bytes_le=value) if (major, minor) >= (2, 6) else uuid.UUID(bytes=value)
@@ -918,24 +953,50 @@ def host_fingerprint(machine, sid):
     return hashlib.sha256(('watch-managed-claude/v1/windows/%s/%s' % (machine, sid)).encode('ascii')).hexdigest()
 
 
-def native_architecture(query=None):
+def native_architecture(query=None, older=None):
     """'x64' or 'arm64' for this machine's own architecture, else None. IsWow64Process2 gives the native machine
-    even when this Python is emulated (x64 Python on an ARM64 PC); ``query`` stands in for it in tests and returns
-    the native IMAGE_FILE_MACHINE value."""
-    if query is None:
-        ctypes, w, k = _api()[:3]
-        query_function = getattr(k, 'IsWow64Process2', None)
-        if query_function is None:
-            return None                                  # before Windows 10 1709: not qualified
-        query_function.argtypes = [w.HANDLE, ctypes.POINTER(w.USHORT), ctypes.POINTER(w.USHORT)]
-        query_function.restype = w.BOOL
+    even when this Python is emulated (x64 Python on an ARM64 PC). Windows 10 before version 1709 does not have it;
+    there GetNativeSystemInfo answers, which is right on those versions: it sees through WOW64 (32-bit Python on
+    64-bit Windows), and the one thing it cannot see through, x64 emulation on ARM64, only exists on versions that
+    have IsWow64Process2 (ARM64 Windows itself began with 1709). ``query`` stands in for IsWow64Process2 in tests
+    (the native IMAGE_FILE_MACHINE value, or None where it is missing) and ``older`` for GetNativeSystemInfo (its
+    PROCESSOR_ARCHITECTURE value)."""
+    machine = (query or _native_machine)()
+    if machine is not None:
+        return IMAGE_FILE_MACHINES.get(machine)
+    return PROCESSOR_ARCHITECTURES.get((older or _native_system_architecture)())
 
-        def query():
-            process, native = w.USHORT(), w.USHORT()
-            if not query_function(k.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(native)):
-                raise _failed('machine architecture unavailable')
-            return native.value
-    return IMAGE_FILE_MACHINES.get(query())
+
+def _native_machine():
+    """IsWow64Process2's native IMAGE_FILE_MACHINE value, or None where Windows does not have the call."""
+    ctypes, w, k = _api()[:3]
+    try:
+        query_function = k.IsWow64Process2
+    except AttributeError:
+        return None                                      # Windows 10 before version 1709
+    query_function.argtypes = [w.HANDLE, ctypes.POINTER(w.USHORT), ctypes.POINTER(w.USHORT)]
+    query_function.restype = w.BOOL
+    process, native = w.USHORT(), w.USHORT()
+    if not query_function(k.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(native)):
+        raise _failed('machine architecture unavailable')
+    return native.value
+
+
+def _native_system_architecture():
+    """GetNativeSystemInfo's PROCESSOR_ARCHITECTURE value."""
+    ctypes, w, k = _api()[:3]
+
+    class SystemInfo(ctypes.Structure):
+        _fields_ = [('wProcessorArchitecture', w.WORD), ('wReserved', w.WORD), ('dwPageSize', w.DWORD),
+                    ('lpMinimumApplicationAddress', w.LPVOID), ('lpMaximumApplicationAddress', w.LPVOID),
+                    ('dwActiveProcessorMask', ctypes.c_size_t), ('dwNumberOfProcessors', w.DWORD),
+                    ('dwProcessorType', w.DWORD), ('dwAllocationGranularity', w.DWORD),
+                    ('wProcessorLevel', w.WORD), ('wProcessorRevision', w.WORD)]
+    k.GetNativeSystemInfo.argtypes = [ctypes.POINTER(SystemInfo)]
+    k.GetNativeSystemInfo.restype = None
+    info = SystemInfo()
+    k.GetNativeSystemInfo(ctypes.byref(info))
+    return info.wProcessorArchitecture
 
 
 def windows_pin(architecture=None):
@@ -977,7 +1038,13 @@ def locate_claude(home):
 
 def hash_open_file(fd, seconds, read=os.read, clock=None):
     """SHA-256 of what ``fd`` has open, read through it in 1 MiB pieces within ``seconds`` (ValueError when the
-    bound passes). ``read`` and ``clock`` stand in for os.read and time.monotonic in tests."""
+    bound passes). ``read`` and ``clock`` stand in for os.read and time.monotonic in tests.
+
+    The bound is checked between reads; a single read is not interrupted. The file can only be on a local volume:
+    the no-link walk that opened it refuses UNC paths and network drives (and ``subst`` drives) at the root, and a
+    cloud placeholder is a reparse point it refuses, so a home folder on a network share or in OneDrive's
+    files-on-demand never reaches a read here. A local disk read that hangs (failing hardware) is not bounded, as
+    it is not on POSIX."""
     import hashlib
     import time
     clock = clock or time.monotonic
@@ -991,20 +1058,85 @@ def hash_open_file(fd, seconds, read=os.read, clock=None):
         digest.update(chunk)
 
 
-def open_pinned(path, pin):
-    """Open the program at ``path`` through the no-link walk, sharing reading only (nobody can write, rename or
-    delete it while the descriptor is open), and check it against ``pin`` (SHA-256, size) by hashing through that
-    same descriptor within WINDOWS_HASH_SECONDS. Returns the open descriptor, which the caller keeps until the
-    program has been started from it, and closes in every path; ValueError or OSError if it is refused."""
+def _open_held(path, pin):
+    """Open the program at ``path`` through the no-link walk with one name only, sharing reading only (nobody can
+    write, rename or delete it while the descriptor is open, and a writer already holding it makes the open fail),
+    after refusing a missing pin, a refused location or a path that is not its own real path; and refuse it unless
+    its size is the pin's. Returns the descriptor.
+
+    The hold relies on NTFS: a file open without delete sharing cannot be renamed or deleted, and no folder above it
+    can be renamed either, so the whole path keeps naming this file until the descriptor is closed (the walk's own
+    folder handles are already let go by then). The real-Windows tests check this."""
     import private_storage as ps
     if pin is None or refused_location(path) is not None or os.path.realpath(path) != path:
         raise ValueError('not the pinned Claude Code')
     fd = ps.open_no_links(path, single_link=True, deny_writers=True)
     try:
-        sha256, size = pin
-        if os.fstat(fd).st_size != size or hash_open_file(fd, WINDOWS_HASH_SECONDS) != sha256:
+        if os.fstat(fd).st_size != pin[1]:
             raise ValueError('not the pinned Claude Code')
         return fd
     except BaseException:
         os.close(fd)
         raise
+
+
+def open_pinned(path, pin):
+    """Open the program at ``path`` (``_open_held``) and check it against ``pin`` (SHA-256, size) by hashing all of
+    it through that same descriptor within WINDOWS_HASH_SECONDS. Returns the open descriptor, which the caller keeps
+    until the program has been started from it, and closes in every path; ValueError or OSError if it is refused.
+    The supervisor uses this before every start: it never relies on an earlier check."""
+    fd = _open_held(path, pin)
+    try:
+        if hash_open_file(fd, WINDOWS_HASH_SECONDS) != pin[0]:
+            raise ValueError('not the pinned Claude Code')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def change_time(fd):
+    """NTFS's change time of what ``fd`` has open (FILE_BASIC_INFO.ChangeTime, read through the handle with
+    GetFileInformationByHandleEx): the file system moves it on every write and every change of times or attributes.
+    SetFileTime cannot set it back; SetFileInformationByHandle can."""
+    import msvcrt
+    ctypes, w, k = _api()[:3]
+
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [('CreationTime', w.LARGE_INTEGER), ('LastAccessTime', w.LARGE_INTEGER),
+                    ('LastWriteTime', w.LARGE_INTEGER), ('ChangeTime', w.LARGE_INTEGER), ('FileAttributes', w.DWORD)]
+    query = k.GetFileInformationByHandleEx
+    query.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
+    query.restype = w.BOOL
+    info = BasicInfo()
+    if not query(msvcrt.get_osfhandle(fd), 0, ctypes.byref(info), ctypes.sizeof(info)):     # FileBasicInfo
+        raise _failed('file times unavailable')
+    return info.ChangeTime
+
+
+def verify_pinned(path, pin, known=None):
+    """Check the program at ``path`` against ``pin`` without starting it, for the availability checks (readiness,
+    the New chat menu, a launch before it is handed to the supervisor), and return what was verified: the path, the
+    pin and the identity read from the held descriptor (volume serial, file index, size and last-write time from
+    private_storage.file_identity, and NTFS's change time, ``change_time``). Given ``known``, an earlier result, the
+    full hash is skipped only when the file opened now has exactly that identity, for the same path and pin; a
+    replaced file (another index), a changed size or a rewritten one (a new change time, whatever its last-write
+    time says) is hashed again, and a failed check returns nothing to remember. The identity is read under the
+    handle that shares reading only, so it describes the bytes hashed.
+
+    What this does not catch, both only by a program of this same user: one that rewrites the file in place at the
+    same size and then sets its change time back too (SetFileInformationByHandle, not SetFileTime); and one that
+    writes through a memory mapping of the file it set up before the hold (a mapping outlives its handle, and
+    sharing modes govern handles only). Then availability could say yes, but nothing would run: the supervisor
+    hashes the file in full before every start (``open_pinned``) and checks that Claude was started from it
+    (``start_in_job``)."""
+    import private_storage as ps
+    fd = _open_held(path, pin)
+    try:
+        volume, index, size, written = tuple(ps.file_identity(fd))[:4]
+        verified = (path, tuple(pin), (volume, index, size, written, change_time(fd)))
+        if verified != known and hash_open_file(fd, WINDOWS_HASH_SECONDS) != pin[0]:
+            raise ValueError('not the pinned Claude Code')
+        return verified
+    finally:
+        os.close(fd)
