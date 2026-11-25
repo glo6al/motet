@@ -213,7 +213,7 @@ class ManagedIntegrationTests(unittest.TestCase):
         self.assertFalse(self.store._rows())
         before = len([x for x in self.native.commands if x[1] == 'enqueue'])
         self.native.disconnected = True
-        replay = self.store.owner_action('queue', self.aid, text, request, {})
+        replay = self.store.owner_action('queue', self.aid, text, request, {}, author='owner')
         self.assertEqual(replay['request_id'], request)
         self.assertEqual(len([x for x in self.native.commands if x[1] == 'enqueue']), before)
 

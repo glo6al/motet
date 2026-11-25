@@ -718,6 +718,47 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.manager.owner_send('c:' + native, 'hello', request)['state'], 'awaiting_reply')
         self.assertEqual(len([c for c in self.commands if c[1] == 'enqueue']), 1)
 
+    def test_only_owner_typed_text_uses_the_owner_source(self):
+        import attribution
+        run_id, native = self.admit()
+        self.echo = True
+        owner, motet = uid(), uid()
+        typed = self.manager.owner_send('c:' + native, 'Ada typed this.', owner, author='owner')
+        worded = self.manager.owner_send('c:' + native, 'Is the orchard index rebuilt?', motet, author='motet')
+        sent = {c[2]['requestId']: c[2] for c in self.commands if c[1] == 'enqueue'}
+        self.assertEqual((sent[owner]['source'], sent[owner]['text']), ('owner', 'Ada typed this.'))
+        self.assertEqual(sent[motet]['source'], 'motet')
+        self.assertEqual(sent[motet]['text'], attribution.motet_worded('Is the orchard index rebuilt?'))
+        self.assertEqual((typed['author'], typed['question']), ('owner', 'Ada typed this.'))
+        self.assertEqual((worded['author'], worded['question']), ('motet', 'Is the orchard index rebuilt?'))
+        self.manager.status(run_id)   # a runner snapshot does not carry the author; the registry keeps it
+        listed = {row['request_id']: row for row in self.manager.owner_snapshot()['requests']}
+        self.assertEqual((listed[owner]['author'], listed[motet]['author']), ('owner', 'motet'))
+        self.assertEqual(listed[motet]['question'], 'Is the orchard index rebuilt?')
+        with self.assertRaises(managed.ManagedError):
+            self.manager.owner_send('c:' + native, 'Ada typed this.', owner, author='motet')
+        with self.assertRaises(managed.ManagedError):
+            self.manager.owner_send('c:' + native, 'Hello', uid(), author='Bram')
+
+    def test_owner_rows_stored_before_authors_stay_unknown(self):
+        run_id, native = self.admit()
+        self.echo = True
+        request = uid()
+        self.manager.owner_send('c:' + native, 'Old words.', request, author='owner')
+        with self.manager._registry() as db:     # a row as an earlier Motet stored it: source owner, no author
+            data = json.loads(db.execute('SELECT data FROM messages WHERE id=?', (request,)).fetchone()[0])
+            data.pop('author')
+            db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(data), request))
+        self.snapshots[run_id]['messages'][-1].pop('author', None)
+        self.manager.status(run_id)
+        row = next(r for r in self.manager.owner_snapshot()['requests'] if r['request_id'] == request)
+        self.assertNotIn('author', row, 'an old owner-source row is unknown, never the owner')
+        before = len([c for c in self.commands if c[1] == 'enqueue'])
+        replay = self.manager.owner_send('c:' + native, 'Old words.', request, author='motet')
+        self.assertEqual(replay['request_id'], request)
+        self.assertNotIn('author', replay)
+        self.assertEqual(len([c for c in self.commands if c[1] == 'enqueue']), before)
+
     def test_disconnection_preserves_echo_but_reports_unknown_delivery(self):
         run_id, native = self.admit()
         self.echo = True

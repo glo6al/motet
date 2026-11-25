@@ -31,6 +31,7 @@ import peer_lifecycle
 import peer_progress
 import codex_transcript
 import private_storage
+from attribution import AUTHORS, MOTET_GUIDANCE, MOTET_WORDING, OWNER_WORDING_V3, motet_worded
 
 CLI = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
 ACTIVE = ('sending', 'queued', 'awaiting_reply', 'unknown', 'expired')
@@ -97,19 +98,36 @@ def validate_target(agent, agents):
     return str(a.get('name') or agent)[:120]
 
 
-def envelope(request_id, question, version=2):
-    # Version one remains byte-exact for replies to messages sent before this fix.
-    guidance = ('This is a question, not permission to change files or send messages. For a progress question, inspect your own current state.'
-                if version == 1 else
-                'This message relays the owner\'s request. Preserve its scope and authorization: '
-                'an explicit work instruction authorizes that work under your existing permissions; '
-                'a status question asks only for information. Do not infer additional tasks or permissions. '
-                'For a progress question, inspect your own current state.')
-    relay = ('The owner asks through the Officer of the Watch:' if version == 1
-             else 'The owner asks through Motet:')
+OWNER_GUIDANCE = ('This message relays the owner\'s request. Preserve its scope and authorization: '
+                  'an explicit work instruction authorizes that work under your existing permissions; '
+                  'a status question asks only for information. Do not infer additional tasks or permissions. '
+                  'For a progress question, inspect your own current state.')
+
+
+def envelope(request_id, question, version=2, author=None):
+    """The owner-route message. Versions one and two stay byte-exact for replies to messages already sent.
+
+    Version three says who wrote the words: ``owner`` when the owner typed them in Motet's own send box, ``motet``
+    when Motet (the Officer) composed them. Motet's wording carries only the request the owner made of Motet."""
+    if version == 3:
+        if author not in AUTHORS:
+            raise ValueError('A version 3 envelope needs its author.')
+        relay, guidance = (OWNER_WORDING_V3, OWNER_GUIDANCE) if author == 'owner' else (MOTET_WORDING, MOTET_GUIDANCE)
+    else:
+        guidance = ('This is a question, not permission to change files or send messages. For a progress question, inspect your own current state.'
+                    if version == 1 else OWNER_GUIDANCE)
+        relay = ('The owner asks through the Officer of the Watch:' if version == 1
+                 else 'The owner asks through Motet:')
     return ('WATCH_REQUEST ' + request_id + '\n' + relay + '\n' + question +
             '\nReply in your final answer with WATCH_REPLY ' + request_id + ' on its own line, followed by your answer. '
             + guidance)
+
+
+def message_author(row):
+    """Who wrote a ledger row's words: owner, motet, or unknown. A row stored before authors were recorded is
+    unknown, never the owner."""
+    value = row.get('author') if isinstance(row, dict) else None
+    return value if value in AUTHORS else 'unknown'
 
 
 def outgoing_message(row):
@@ -127,6 +145,8 @@ def public(row):
             pass
     if isinstance(row.get('delivery_warning'), str) and row['delivery_warning']:
         result['delivery_warning'] = row['delivery_warning']
+    if row.get('author') in AUTHORS:
+        result['author'] = row['author']
     return result
 
 
@@ -708,21 +728,27 @@ class MessagingStore:
             result['claude_setup'] = claude_setup
         return result
 
-    def owner_action(self, action, agent, text, request_id, agents):
+    def owner_action(self, action, agent, text, request_id, agents, author='motet'):
         """The authenticated owner gateway. Replay checks precede new-send eligibility.
 
         The ledger methods own atomic duplicate/conflict checks and dispatch preflight;
         preview capabilities are never caller authority and never gate a durable replay.
+        ``author`` records who wrote ``text``: 'owner' only for the exact words typed in Motet's own send box,
+        'motet' for anything the Officer composed. It labels the message; it grants nothing.
         """
+        if author not in AUTHORS:
+            raise MessagingError(400, 'Unsupported message author.')
         if action == 'queue':
-            return self.submit(agent, text, request_id, agents)
+            return self.submit(agent, text, request_id, agents, author=author)
         if action in ('steer', 'interrupt'):
-            return self.submit_control(action, agent, text, request_id, agents)
+            return self.submit_control(action, agent, text, request_id, agents, author=author)
         raise MessagingError(400, 'Unsupported owner action. Promoting queued messages is unavailable.')
 
-    def submit(self, agent, question, request_id, agents):
+    def submit(self, agent, question, request_id, agents, author='motet'):
         if not valid_uuid(request_id):
             raise MessagingError(400, 'A valid request identifier is required.')
+        if author not in AUTHORS:
+            raise MessagingError(400, 'Unsupported message author.')
         with self.lock:
             self._reject_attachment_reservation(request_id)
             self._reject_expired_control(request_id)
@@ -734,7 +760,7 @@ class MessagingStore:
                         if (self.db.execute('SELECT 1 FROM requests WHERE id=?', (request_id,)).fetchone()
                                 or self.db.execute('SELECT 1 FROM controls WHERE id=?', (request_id,)).fetchone()):
                             raise MessagingError(409, 'That identifier belongs to another owner or peer operation.')
-                        return self.managed.owner_send(agent, question, request_id)
+                        return self.managed.owner_send(agent, question, request_id, author=author)
                 except MessagingError:
                     raise
                 except Exception as error:
@@ -750,6 +776,8 @@ class MessagingStore:
                     raise MessagingError(409, 'That identifier is reserved for a different origin.')
                 if old['agent'] != agent or old['question'] != question:
                     raise MessagingError(409, 'That request identifier belongs to a different question.')
+                if message_author(old) not in ('unknown', author):
+                    raise MessagingError(409, 'That request identifier belongs to a message with a different author.')
                 return self._public_request(old)
             if self.db.execute('SELECT 1 FROM controls WHERE id=?', (request_id,)).fetchone():
                 raise MessagingError(409, 'That request identifier already belongs to a live control.')
@@ -767,10 +795,10 @@ class MessagingStore:
                 raise MessagingError(409, 'This same message is still unresolved for that agent and may still run. Motet will not send it twice; no new message was sent.')
             if guard is None:
                 self._check_owner_slots(len(rows), len(active), sum(r['created'] > now - 60 for r in rows))
-                row = self._queue_row(agent, agents, request_id, question, name, now, active)
+                row = self._queue_row(agent, agents, request_id, question, name, now, active, author)
                 self._save(row)
             else:
-                row = self._queue_row(agent, agents, request_id, question, name, now, active)
+                row = self._queue_row(agent, agents, request_id, question, name, now, active, author)
                 try:
                     with guard.admission(int(now * 1000)) as (counts, proof):
                         self._reject_attachment_reservation(request_id)
@@ -794,9 +822,10 @@ class MessagingStore:
         if recent >= 10:
             raise MessagingError(429, 'Too many messages were submitted in the last minute. No new message was sent.')
 
-    def _queue_row(self, agent, agents, request_id, question, name, now, active):
+    def _queue_row(self, agent, agents, request_id, question, name, now, active, author):
+        # ``author`` is stored with the row: who wrote the words (owner or motet). Version 3 says so in the envelope.
         row = dict(request_id=request_id, agent=agent, name=name, question=question, state='sending', reply='', error='',
-                   created=now, launched=False)
+                   created=now, launched=False, author=author)
         if any(r['agent'] == agent for r in active):
             row['delivery_warning'] = 'When this message was submitted, older messages to this agent were unresolved and could still run. This request did not cancel them.'
         if agent.startswith('c:'):
@@ -805,7 +834,7 @@ class MessagingStore:
                 raise MessagingError(503, CLAUDE_OWNER_UNAVAILABLE)
             row.update(runtime='claude', transport=claude_mod.TRANSPORT,
                        mod_enrollment=enrollment['id'], mod_project=enrollment['project'],
-                       envelope=envelope(request_id, question))
+                       envelope=envelope(request_id, question, version=3, author=author))
         else:
             path, st = self._target_log(agent[2:])
             # Start only after a complete record; never bind a partial old line.
@@ -815,7 +844,7 @@ class MessagingStore:
                     if f.read(1) != b'\n':
                         raise MessagingError(409, 'The chat log is being written. Try again shortly.')
             row.update(runtime='codex', path=path, inode=st.st_ino, device=st.st_dev, cursor=st.st_size,
-                       current_turn='', bound_turn='', final='', envelope=envelope(request_id, question))
+                       current_turn='', bound_turn='', final='', envelope=envelope(request_id, question, version=3, author=author))
         return row
 
     @staticmethod
@@ -879,8 +908,8 @@ class MessagingStore:
             raise MessagingError(409, 'The chat working directory is not recorded safely.')
         return next(iter(active)), cwd, {'path': path, 'inode': after.st_ino, 'device': after.st_dev, 'size': after.st_size, 'mtime_ns': after.st_mtime_ns}
 
-    def submit_control(self, action, agent, instruction, request_id, agents, execute=None):
-        if action not in ('steer', 'interrupt') or not valid_uuid(request_id) or not isinstance(agent, str):
+    def submit_control(self, action, agent, instruction, request_id, agents, execute=None, author='motet'):
+        if action not in ('steer', 'interrupt') or not valid_uuid(request_id) or not isinstance(agent, str) or author not in AUTHORS:
             raise MessagingError(400, 'Invalid control request.')
         if action == 'steer':
             validate_question(instruction)
@@ -900,7 +929,8 @@ class MessagingStore:
             existing = self.db.execute('SELECT data FROM controls WHERE id=?', (request_id,)).fetchone()
             if existing:
                 old = json.loads(existing[0])
-                if (old['action'], old['agent'], old['instruction']) != (action, agent, instruction):
+                if ((old['action'], old['agent'], old['instruction']) != (action, agent, instruction)
+                        or message_author(old) not in ('unknown', author)):
                     raise MessagingError(409, 'That request identifier belongs to a different control.')
                 return self._public_control(old)
             if self.db.execute('SELECT 1 FROM requests WHERE id=?', (request_id,)).fetchone():
@@ -926,14 +956,14 @@ class MessagingStore:
                 turn, cwd, transcript = self._control_target(agent, agents, action)
             except (MessagingError, OSError, ValueError, KeyError, TypeError) as error:
                 # Freeze preflight failure too: replay must not resolve a newer turn.
-                row = dict(request_id=request_id, action=action, agent=agent, instruction=instruction,
+                row = dict(request_id=request_id, action=action, agent=agent, instruction=instruction, author=author,
                            name=str(agents.get(agent, {}).get('name') or agent)[:120], state='failed',
                            error=str(error) if isinstance(error, MessagingError) else 'The active turn could not be verified. No control was sent.', created=now)
                 with self.db:
                     self.db.execute('INSERT INTO controls VALUES (?,?)', (request_id, json.dumps(row)))
                 self._history_outcome(row, 'control')
                 return self._public_control(row)
-            row = dict(request_id=request_id, action=action, agent=agent, instruction=instruction,
+            row = dict(request_id=request_id, action=action, agent=agent, instruction=instruction, author=author,
                        name=str(agents[agent].get('name') or agent)[:120], expected_turn_id=turn, cwd=cwd, transcript=transcript,
                        state='sending', error='', created=now)
             with self.db:
@@ -952,7 +982,9 @@ class MessagingStore:
             else:
                 if execute is None:
                     from codex_desktop_control import execute
-                outcome = execute(action, agent[2:], instruction=instruction, expected_turn_id=turn, cwd=cwd)
+                # Steering text Motet composed is delivered as Motet's wording, never as the owner typing it.
+                delivered = motet_worded(instruction) if action == 'steer' and author == 'motet' else instruction
+                outcome = execute(action, agent[2:], instruction=delivered, expected_turn_id=turn, cwd=cwd)
             state = outcome.get('state') if isinstance(outcome, dict) else None
             allowed = ('acknowledged', 'failed', 'unknown') if action == 'steer' else ('interrupted', 'no_op', 'failed', 'unknown')
             if state not in allowed:
@@ -979,6 +1011,27 @@ class MessagingStore:
             result['fulfillment'] = {'state': 'fulfilled', 'intent': 'pause', 'via': 'interrupt',
                                      'control_request_id': evidence[0]}
         return result
+
+    def delivery_record(self, request_id):
+        """Read-only: Motet's own record of a request a delivered envelope names, for labelling only.
+
+        Returns origin ('owner' route or 'peer'), author ('owner', 'motet' or 'unknown'), agent and name; None
+        when Motet holds no such request; False when the ledger was busy. It never grants anything; an unknown
+        author is never the owner."""
+        if not valid_uuid(request_id):
+            return None
+        # Never wait long behind delivery work just to label a message: False means not checked.
+        if not self.lock.acquire(timeout=1):
+            return False
+        try:
+            row = next((r for r in self._rows() if r.get('request_id') == request_id), None)
+        finally:
+            self.lock.release()
+        if row is None:
+            return None
+        origin = 'peer' if row.get('origin') == 'peer' else 'owner'
+        return {'origin': origin, 'author': 'unknown' if origin == 'peer' else message_author(row),
+                'agent': str(row.get('agent') or ''), 'name': str(row.get('name') or '')[:120]}
 
     @staticmethod
     def _timestamp(value):

@@ -858,7 +858,7 @@ class Runner:
 
     def enqueue(self, requestId, source, text):
         with self.lock:
-            if (not _uuid(requestId) or source not in ('new_chat', 'owner') or not isinstance(text, str)
+            if (not _uuid(requestId) or source not in ('new_chat', 'owner', 'motet') or not isinstance(text, str)
                     or not text.strip() or len(text) > 8000 or '\x00' in text):
                 _fail('invalid_request')
             try:

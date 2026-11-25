@@ -220,6 +220,14 @@ class RunnerTests(unittest.TestCase):
         self.assert_error('conflict', lambda: self.send(runner, source='new_chat', request=request))
         self.assert_error('unavailable', lambda: self.send(runner))
 
+    def test_motet_source_is_its_own_binding(self):
+        runner = self.runner()
+        request = uid()
+        sent = self.send(runner, 'Motet wording.', source='motet', request=request)
+        self.assertEqual(sent['source'], 'motet')
+        self.assert_error('conflict', lambda: self.send(runner, 'Motet wording.', source='owner', request=request))
+        self.assert_error('invalid_request', lambda: self.send(runner, 'Bram wording.', source='peer'))
+
     def test_partial_write_claim_is_unknown_and_never_replayed(self):
         runner = self.runner(fail_user=True)
         request = uid()
