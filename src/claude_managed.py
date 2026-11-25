@@ -180,6 +180,8 @@ def load_configuration_readiness(state_dir, *, enabled=False, demo=False):
 # Who put a message in a managed chat: the owner's own typed words, Motet's wording at the owner's request, or the
 # first instruction of a new managed chat.
 MESSAGE_SOURCES = ('owner', 'motet', 'new_chat')
+MOTET_SOURCE_REFUSED = ('Not delivered: this managed chat was started by an older Motet. Restart this managed chat to '
+                        'receive messages Motet words.')
 
 
 def _keep_author(old, message):
@@ -226,6 +228,7 @@ def _fail(code='managed_unavailable', status=409):
         'identity_unavailable': 'The exact Claude session and folder could not be verified.',
         'launch_outcome_unknown': 'The launch outcome is unknown. It will not be repeated.',
         'managed_not_ready': 'This managed Claude session is not ready for new messages.',
+        'runner_refused': 'This managed Claude session refused the request. Nothing was queued.',
         'supervisor_detach_refused': ('Motet cannot start a Claude supervisor that outlives this window: the program '
                                       'Motet runs in does not let it leave its job. Try starting Motet from an '
                                       'ordinary terminal window or a shortcut.'),
@@ -414,6 +417,8 @@ def client_request(run_dir, command, params):
             code = value.get('error', {}).get('code')
             if code in ('request_conflict', 'conflict', 'stale_permission'):
                 _fail('request_conflict')
+            if code == 'invalid_request':
+                _fail('runner_refused', 400)       # a definite refusal: the runner stored nothing
             _fail('managed_not_ready')
         if set(value) != {'ok', 'value'}:
             _fail()
@@ -478,6 +483,8 @@ def _reply(response):
         code = value.get('error', {}).get('code')
         if code in ('request_conflict', 'conflict', 'stale_permission'):
             _fail('request_conflict')
+        if code == 'invalid_request':
+            _fail('runner_refused', 400)           # a definite refusal: the runner stored nothing
         _fail('managed_not_ready')
     if set(value) != {'ok', 'value'}:
         _fail()
@@ -1143,11 +1150,25 @@ class ManagedClaude:
             db.execute('INSERT INTO messages VALUES (?,?,?,?,?)', (request_id, run_id, source, digest, json.dumps(message)))
         try:
             self._request(run_id, 'enqueue', dict(requestId=request_id, source=source, text=text))
-        except Exception:
+        except ManagedError as error:
             # The claim is retained even when the response was lost. Never reissue.
+            if error.code == 'runner_refused' and source == 'motet':
+                # A supervisor started before Motet recorded who wrote a message refuses source 'motet'. That is a
+                # definite refusal, so say so instead of leaving it unknown; never resend it as the owner's.
+                self._refused(request_id, run_id, digest, MOTET_SOURCE_REFUSED)
+        except Exception:
             pass
         self.status(run_id)
         return self.lookup_message(request_id)
+
+    def _refused(self, request_id, run_id, digest, reason):
+        with self._registry() as db:
+            row = db.execute('SELECT run,digest,data FROM messages WHERE id=?', (request_id,)).fetchone()
+            if row and row[:2] == (run_id, digest):
+                message = json.loads(row[2])
+                if message.get('state') == 'unknown':
+                    message.update(state='failed', error=reason)
+                    db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(message), request_id))
 
     @staticmethod
     def _retained(message):

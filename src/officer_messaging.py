@@ -5,6 +5,7 @@ by a matching completed turn can produce an answer. Uncertain sends are never re
 """
 import copy
 import errno
+import hashlib
 import hmac
 import json
 import math
@@ -1015,13 +1016,13 @@ class MessagingStore:
     def delivery_record(self, request_id):
         """Read-only: Motet's own record of a request a delivered envelope names, for labelling only.
 
-        Returns origin ('owner' route or 'peer'), author ('owner', 'motet' or 'unknown'), agent and name; None
-        when Motet holds no such request; False when the ledger was busy. It never grants anything; an unknown
-        author is never the owner."""
+        Returns origin ('owner' route or 'peer'), author ('owner', 'motet' or 'unknown'), agent, name and the
+        SHA-256 of the exact envelope Motet sent, so a caller can confirm the words match; None when Motet holds no
+        such request; False when the ledger was busy (it never waits behind delivery work). It never grants
+        anything; an unknown author is never the owner."""
         if not valid_uuid(request_id):
             return None
-        # Never wait long behind delivery work just to label a message: False means not checked.
-        if not self.lock.acquire(timeout=1):
+        if not self.lock.acquire(blocking=False):
             return False
         try:
             row = next((r for r in self._rows() if r.get('request_id') == request_id), None)
@@ -1030,8 +1031,10 @@ class MessagingStore:
         if row is None:
             return None
         origin = 'peer' if row.get('origin') == 'peer' else 'owner'
+        sent = outgoing_message(row)
         return {'origin': origin, 'author': 'unknown' if origin == 'peer' else message_author(row),
-                'agent': str(row.get('agent') or ''), 'name': str(row.get('name') or '')[:120]}
+                'agent': str(row.get('agent') or ''), 'name': str(row.get('name') or '')[:120],
+                'envelope_sha256': hashlib.sha256(sent.encode('utf-8', 'surrogatepass')).hexdigest() if isinstance(sent, str) else ''}
 
     @staticmethod
     def _timestamp(value):

@@ -2611,7 +2611,8 @@ class CodexTail(Tail):
                         match_work(aid, txt, ts)
                     # Who wrote it, by fixed rules (attribution.py); the event kind stays 'user'.
                     who, detail = attribution.codex(raw if attribution.from_text(raw) else txt, child=bool(self.parent),
-                                                    thread_source=getattr(self, 'thread_source', ''))
+                                                    thread_source=getattr(self, 'thread_source', ''),
+                                                    exec_run=bool(getattr(self, 'exec', False)))
                     emit(aid, 'user', old, ts, text=txt, attribution=who, **({'attribution_detail': detail} if detail else {}))
             elif kind == 'CommandExecution':
                 cmd = it.get('command') or []
@@ -3359,11 +3360,12 @@ OFFICER_DELIVERIES = {}          # request ID -> (checked at, record): a short-l
 
 
 def officer_delivery(text, agent):
-    """Motet's own record for the request a delivered envelope names, when it was for this chat; None when there is
-    no such record, False when the records could not be checked. Labelling only: it grants nothing."""
+    """Motet's own record for the request a delivered envelope names, confirmed only when it was for this chat AND the
+    message is exactly the envelope Motet stored (``words_match``). None when there is no such record or the words
+    differ (a reused request ID confirms nothing); False when the records could not be checked. Labelling only."""
     found = attribution.envelope_of(text)
-    if not found or found[0] == 'proof':
-        return None
+    if not found or found[0] not in ('owner', 'peer'):
+        return None              # proofs, reply notices and attachment relays are not in the message ledger
     if MESSAGING is None:
         return False
     now = time.monotonic()
@@ -3375,23 +3377,29 @@ def officer_delivery(text, agent):
             record = MESSAGING.delivery_record(found[1])
         except Exception:
             return False
+        if record is False:
+            return False         # busy: not cached, so the next look checks again
         if len(OFFICER_DELIVERIES) > 256:
             OFFICER_DELIVERIES.clear()
         OFFICER_DELIVERIES[found[1]] = (now, record)
-    if record is False:
-        return False
-    return record if isinstance(record, dict) and record.get('agent') == agent else None
+    if not isinstance(record, dict) or record.get('agent') != agent:
+        return None
+    sent = hashlib.sha256(attribution.delivered_form(text).encode('utf-8', 'surrogatepass')).hexdigest()
+    if not hmac.compare_digest(sent, str(record.get('envelope_sha256') or '')):
+        return None
+    return dict(record, words_match=True)
 
 
 def officer_user_words(e):
     """A user-role message for the Officer, said for who wrote it (src/attribution.py). Only plain user-role text
-    with no other evidence is called the owner's, and that is never proof of approval."""
+    with no other evidence, or an envelope Motet's records confirm word for word as the owner's own typing, carries
+    the owner's words; neither is ever proof of approval."""
     text = str(e.get('text') or '')
     category = attribution.of_row(e)
     detail = str(e.get('attribution_detail') or '') if e.get('attribution') in attribution.CATEGORIES else (
         (attribution.from_text(text) or ('', ''))[1])
     delivery = officer_delivery(text, e.get('agent')) if category == 'motet_delivery' else None
-    words = attribution.inner_text(text) if category == 'motet_delivery' else text
+    words = attribution.display_text(text, category, detail)
     return attribution.describe(category, detail, text, delivery) + str(words)[:300]
 
 

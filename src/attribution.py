@@ -49,8 +49,13 @@ PLUGIN_PREFIX = 'The watch-owner plugin sent a message:\n'
 PLUGIN_SUFFIX = ("\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn "
                  "in the user's place. Address the message above.")
 _UUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-_ENVELOPE = re.compile(r'(WATCH_REQUEST|WATCH_PEER_REQUEST|WATCH_MOD_PROOF_REQUEST) (' + _UUID + r')(?:\n|\Z)', re.I)
+_ENVELOPE = re.compile(r'(WATCH_REQUEST|WATCH_PEER_REQUEST|WATCH_MOD_PROOF_REQUEST|WATCH_PEER_REPLY|WATCH_REPLY) ('
+                       + _UUID + r')(?:\n|\Z)', re.I)
+_KINDS = {'WATCH_REQUEST': 'owner', 'WATCH_PEER_REQUEST': 'peer', 'WATCH_MOD_PROOF_REQUEST': 'proof',
+          'WATCH_PEER_REPLY': 'reply', 'WATCH_REPLY': 'reply'}
+_ATTACHMENT_RELAY = 'Attachment relay version: 3\n'
 _CHANNEL = re.compile(r'<channel\b[^>]*>\s*', re.I)
+_CHANNEL_END = re.compile(r'\s*</channel>\s*\Z', re.I)
 # Leading machine tags that mark an automatic prompt, whatever the record's origin says.
 _AUTOMATIC_TAGS = (('scheduled-task', 'scheduled'), ('side-sessions-event', 'side_session'),
                    ('heartbeat', 'heartbeat'), ('task-notification', 'task_notification'))
@@ -72,16 +77,25 @@ def unwrap(text):
             text = text[:-len(PLUGIN_SUFFIX)]
     m = _CHANNEL.match(text)
     if m:
-        text = text[m.end():]
+        text = _CHANNEL_END.sub('', text[m.end():])
     return text
 
 
+def delivered_form(text):
+    """The exact message a delivered envelope arrived as, for comparing with Motet's stored envelope."""
+    return unwrap(text).strip()
+
+
 def envelope_of(text):
-    """(kind, request_id) for a Motet envelope at the start of the message, or None. kind is owner, peer or proof."""
-    m = _ENVELOPE.match(unwrap(text).lstrip())
+    """(kind, request_id) for a Motet envelope at the start of the message, or None. kind is owner, attachment,
+    peer, proof or reply (Motet's notice carrying another chat's answer)."""
+    raw = unwrap(text).lstrip()
+    m = _ENVELOPE.match(raw)
     if not m:
         return None
-    kind = {'WATCH_REQUEST': 'owner', 'WATCH_PEER_REQUEST': 'peer', 'WATCH_MOD_PROOF_REQUEST': 'proof'}[m.group(1).upper()]
+    kind = _KINDS[m.group(1).upper()]
+    if kind == 'owner' and raw[m.end():].startswith(_ATTACHMENT_RELAY):
+        kind = 'attachment'
     return kind, m.group(2).lower()
 
 
@@ -106,6 +120,9 @@ def from_text(text):
         return UNVERIFIED, 'question_reply'
     if inner.startswith('[Cross-session message'):
         return 'agent_message', 'cross_session'
+    if inner.startswith('[Artifact comment sent to'):
+        # A comment someone left on a published page, passed to the chat by the app; the commenter is not checked.
+        return 'automatic', 'artifact_comment'
     return None
 
 
@@ -122,6 +139,10 @@ def claude(record, text, *, sub_agent=False):
     kind, name = _field(origin.get('kind')), _field(origin.get('name'))
     prompt_source, turn_origin = _field(record.get('promptSource')), _field(record.get('turnOrigin'))
     found = from_text(text)
+    if found and found[0] == 'motet_delivery' and (kind in ('peer', 'coordinator') or turn_origin == 'peer' or sub_agent):
+        # Motet never delivers into another chat's relay or a sub-agent: envelope-shaped text from there is that
+        # chat's or the lead agent's message, whatever it looks like.
+        return 'agent_message', 'parent' if kind == 'coordinator' or sub_agent else 'peer'
     if found and found[0] != UNVERIFIED:
         return found
     if kind == 'plugin':
@@ -146,22 +167,29 @@ def claude(record, text, *, sub_agent=False):
     return found or (UNVERIFIED, '')
 
 
-def codex(text, *, child=False, thread_source=''):
-    """(category, detail) for one Codex UserMessage text. ``child`` is a thread with a parent thread."""
+def codex(text, *, child=False, thread_source='', exec_run=False):
+    """(category, detail) for one Codex UserMessage text. ``child`` is a thread with a parent thread;
+    ``exec_run`` a ``codex exec`` session, whose prompt came from whoever started the run."""
     found = from_text(text)
+    source = _field(thread_source)
+    child = child or source in ('subagent', 'agent_created_thread')
+    if found and found[0] == 'motet_delivery' and child:
+        return 'agent_message', 'parent'        # Motet never delivers into a child thread
     if found and found[0] != UNVERIFIED:
         return found
-    source = _field(thread_source)
-    if child or source in ('subagent', 'agent_created_thread'):
+    if child:
         return 'agent_message', 'parent'
     if source in ('automation', 'heartbeat', 'scheduled'):
         return 'automatic', 'heartbeat' if source == 'heartbeat' else 'scheduled'
+    if exec_run and not found:
+        return UNVERIFIED, 'exec_prompt'
     return found or (UNVERIFIED, '')
 
 
 def normal(value):
-    """A stored attribution value, or unverified_user for anything else (a missing value is legacy text)."""
-    return value if value in CATEGORIES else UNVERIFIED
+    """A known attribution value, or automatic for anything unrecognized: an unknown label is never the owner.
+    (A row with no label at all goes through of_row, which applies the text rules.)"""
+    return value if value in CATEGORIES else 'automatic'
 
 
 def of_row(row):
@@ -174,6 +202,23 @@ def of_row(row):
     return found[0] if found else UNVERIFIED
 
 
+def display_text(text, category, detail=''):
+    """The words worth showing for a message: an envelope's inner words, a question-form answer's question and
+    answer, or the text as it is."""
+    if category == 'motet_delivery':
+        return inner_text(text)
+    if detail == 'question_reply':
+        m = re.search(r'<send_user_message_question_reply>(.*?)</send_user_message_question_reply>', text or '', re.S)
+        try:
+            items = json.loads(m.group(1)) if m else None
+        except ValueError:
+            items = None
+        if isinstance(items, list) and items and all(isinstance(i, dict) for i in items):
+            return '; '.join('asked "%s", answered "%s"' % (str(i.get('question') or '')[:200], str(i.get('answer') or '')[:400])
+                             for i in items[:4])
+    return text
+
+
 def inner_text(text):
     """The words a Motet envelope carries, for describing it; other text is returned unchanged."""
     raw = unwrap(text if isinstance(text, str) else '').lstrip()
@@ -184,6 +229,11 @@ def inner_text(text):
             return body[:-len(MOTET_GUIDANCE) - 1] if body.endswith('\n' + MOTET_GUIDANCE) else body
         return text
     body = raw[found.end():]
+    if body.startswith(_ATTACHMENT_RELAY):
+        m = re.search(r'\nOwner instruction:\n(.*?)\n\nAttachment references:\n', body, re.S)
+        return m.group(1) if m else body
+    if _KINDS[found.group(1).upper()] == 'reply':
+        return body
     if found.group(1).upper() == 'WATCH_PEER_REQUEST':
         m = re.search(r'(?:^Message: |^Peer text \(JSON string\): )(".*")$', body, re.M)
         if m:
@@ -231,12 +281,15 @@ def describe(category, detail='', text='', delivery=None):
     """How the Officer is told about a user-role message: a short lead-in ending in ': ', then the words.
 
     ``delivery`` is Motet's own record for an envelope's request ID when there is one: a dict with ``origin``
-    (owner or peer), ``author`` (owner, motet or unknown) and optionally ``name``; None when Motet holds no such
-    record; False when its records could not be checked. Only unverified_user keeps the owner's wording."""
+    (owner or peer), ``author`` (owner, motet or unknown), and ``words_match`` True only when the message is
+    exactly the envelope Motet stored for that request; None when Motet holds no such record for this chat; False
+    when its records could not be checked. A record whose words do not match confirms nothing. Only unverified_user keeps the owner's wording."""
     category, detail = normal(category), detail or ''
     if category == UNVERIFIED:
         if detail == 'question_reply':
             return "an answer recorded by the app's question form (the app's wrapper; not checked as the owner's own words): "
+        if detail == 'exec_prompt':
+            return 'a prompt given to a codex exec run (who wrote it is not recorded): '
         return 'the owner said: '
     if category == 'voice':
         return "a voice-mode message (a model's rewording of the owner's speech, not the owner's exact words): "
@@ -249,17 +302,23 @@ def describe(category, detail='', text='', delivery=None):
                 'heartbeat': 'an automatic check-in (not the owner): ',
                 'task_notification': 'an automatic task notification (not the owner): ',
                 'side_session': 'an automatic side-session event (not the owner): ',
-                'plugin': 'a prompt a plugin submitted (automatic, not the owner typing): '}.get(
+                'plugin': 'a prompt a plugin submitted (automatic, not the owner typing): ',
+                'artifact_comment': 'a comment left on a published page, passed in by the app (the commenter is not checked; not the owner typing): '}.get(
                     detail, 'an automatic system message (not the owner): ')
     # motet_delivery
     if detail == 'proof':
         return 'a connection check Motet sent (not the owner): '
+    if detail == 'reply':
+        return "a reply notice Motet delivered (another chat's answer, not the owner): "
+    if detail == 'attachment':
+        return ("a message with attachments in Motet's delivery form (its \"Owner instruction\" is not checked against "
+                "Motet's attachment records here, so it is not confirmed as the owner's typing): ")
     if detail == 'motet_wording':
         return "a message Motet wrote at the owner's request (Motet's wording, not the owner's): "
     if detail == 'peer':
         sender = declared_sender(text)
         named = (' (it says it is from ' + sender + '; not verified)') if sender else ''
-        if delivery and delivery.get('origin') == 'peer':
+        if delivery and delivery.get('origin') == 'peer' and delivery.get('words_match') is True:
             return 'a message Motet delivered from another chat' + named + ', not from the owner: '
         if delivery is False:
             return "a message in Motet's delivery form from another chat" + named + " (Motet's records could not be checked just now); not from the owner: "
@@ -268,7 +327,7 @@ def describe(category, detail='', text='', delivery=None):
         return "a prompt Motet's plugin submitted (not the owner typing): "
     if delivery is False:
         return "a message in Motet's delivery form (Motet's records could not be checked just now), not the owner typing: "
-    if not isinstance(delivery, dict):
+    if not isinstance(delivery, dict) or delivery.get('words_match') is not True:
         return ("a message shaped like a Motet delivery that Motet's records do not confirm"
                 + (" (it says Motet worded it)" if envelope_author(text) == 'motet' else '') + ', not the owner typing: ')
     if delivery.get('origin') == 'peer':

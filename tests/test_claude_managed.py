@@ -246,6 +246,8 @@ class Fixture(unittest.TestCase):
         if self.disconnected:
             raise OSError('private runtime error must not escape')
         snapshot = self.snapshots[path.name]
+        if command == 'enqueue' and params.get('source') in getattr(self, 'refused_sources', ()):
+            managed._fail('runner_refused', 400)      # an older supervisor refusing a source it does not know
         if command == 'enqueue':
             message = dict(params, digest=hashlib.sha256(params['text'].encode()).hexdigest(),
                            state='delivered' if self.echo else 'queued', nativeEcho=self.echo,
@@ -739,6 +741,27 @@ class Fixture(unittest.TestCase):
             self.manager.owner_send('c:' + native, 'Ada typed this.', owner, author='motet')
         with self.assertRaises(managed.ManagedError):
             self.manager.owner_send('c:' + native, 'Hello', uid(), author='Bram')
+
+    def test_an_older_runner_refusing_motets_source_is_a_definite_failure(self):
+        run_id, native = self.admit()
+        self.refused_sources = ('motet',)
+        request = uid()
+        row = self.manager.owner_send('c:' + native, 'Is the orchard index rebuilt?', request, author='motet')
+        self.assertEqual(row['state'], 'failed')
+        self.assertEqual(row['error'], managed.MOTET_SOURCE_REFUSED)
+        self.assertIn('Restart this managed chat', row['error'])
+        sent = [c[2] for c in self.commands if c[1] == 'enqueue']
+        self.assertEqual([c['source'] for c in sent], ['motet'], 'never resent as the owner')
+        self.manager.status(run_id)
+        self.assertEqual(self.manager.lookup_message(request)['state'], 'failed')
+        self.assertEqual(self.manager.owner_send('c:' + native, 'Is the orchard index rebuilt?', request, author='motet')['state'], 'failed')
+        self.assertEqual(len([c for c in self.commands if c[1] == 'enqueue']), 1)
+        with self.assertRaises(managed.ManagedError) as refused:
+            managed._reply(b'{"ok":false,"error":{"code":"invalid_request"}}\n')
+        self.assertEqual(refused.exception.code, 'runner_refused')
+        with self.assertRaises(managed.ManagedError) as other:
+            managed._reply(b'{"ok":false,"error":{"code":"unavailable"}}\n')
+        self.assertEqual(other.exception.code, 'managed_not_ready')
 
     def test_owner_rows_stored_before_authors_stay_unknown(self):
         run_id, native = self.admit()
