@@ -104,13 +104,23 @@ def check_folders(root, name=None, history=True):
                         % (e.subject, e.reason)) from None
 
 
+def binary(fd):
+    """Self files, records and markers are bytes on every system: on Windows a C runtime descriptor in text mode would
+    turn LF into CRLF (and stop reading at Ctrl-Z), so every descriptor is put in binary mode before it is used."""
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.setmode(fd, os.O_BINARY)
+    return fd
+
+
 def read_private(path, limit):
-    """Bytes of a private regular file with one name, or SelfError."""
+    """Bytes of a private regular file with one name, exactly as stored, or SelfError."""
     try:
         fd, info = private_storage.open_private_file(path, single_link=True)
     except private_storage.PrivateStorageError as e:
         raise SelfError('A self file is missing or not private (%s); nothing was changed.' % e.reason) from None
     try:
+        binary(fd)
         if info.st_size > limit:
             raise SelfError('A self file is larger than Motet allows.')
         chunks, total = [], 0
@@ -128,7 +138,8 @@ def read_private(path, limit):
 
 
 def decode_text(raw):
-    """Self files are UTF-8 text without NUL; the bytes are kept as written (line endings included)."""
+    """Self files are UTF-8 text without NUL. Nothing is normalised: CRLF and LF line endings are kept as written, so a
+    version's content is exactly the file's bytes decoded as UTF-8."""
     try:
         text = raw.decode('utf-8')
     except UnicodeError:

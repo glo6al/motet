@@ -36,7 +36,7 @@ class SelfFolderTests(unittest.TestCase):
         self.source = base / 'prepared'
         (self.source / 'skills').mkdir(parents=True)
         for name, text in FILES.items():
-            (self.source / name).write_text(text, encoding='utf-8')
+            (self.source / name).write_bytes(text.encode('utf-8'))   # bytes: no newline translation
         self.root = Path(history.self_folder(self.home))
         self.pending = self.root / '.history' / history.PENDING
 
@@ -50,17 +50,16 @@ class SelfFolderTests(unittest.TestCase):
         return history.list_history(self.home, name)[name]
 
     def edit(self, name, text):
-        # Rewrite in place, as an editor that keeps the file's permissions does.
-        with open(self.root / name, 'r+', encoding='utf-8', newline='') as f:
-            f.seek(0)
-            f.truncate()
-            f.write(text)
+        # Rewrite in place, byte for byte, as an editor that keeps the file's permissions does.
+        with open(self.root / name, 'r+b') as f:
+            f.truncate(0)
+            f.write(text.encode('utf-8'))
 
     def history_bytes(self):
         return {p: p.read_bytes() for p in (self.root / '.history').rglob('v*.json')}
 
     def text(self, name):
-        return (self.root / name).read_text(encoding='utf-8')
+        return (self.root / name).read_bytes().decode('utf-8')
 
     # -- init ---------------------------------------------------------------------------------------------------
 
@@ -82,7 +81,7 @@ class SelfFolderTests(unittest.TestCase):
         with self.assertRaisesRegex(history.SelfError, 'RULES.md'):
             self.install()
         self.assertFalse(self.root.exists())
-        (self.source / 'RULES.md').write_text(FILES['RULES.md'], encoding='utf-8')
+        (self.source / 'RULES.md').write_bytes(FILES['RULES.md'].encode('utf-8'))
         for marker in motet_self.TEMPLATE_ONLY:
             with self.subTest(marker=marker):
                 (self.source / marker).write_text('template\n', encoding='utf-8')
@@ -167,6 +166,38 @@ class SelfFolderTests(unittest.TestCase):
         self.assertEqual(self.text('RULES.md'), 'third, typed by hand\n')
         with self.assertRaisesRegex(history.SelfError, 'no version 9'):
             motet_self.restore('RULES.md', 9, home=self.home)
+
+    def test_crlf_and_lf_round_trip_byte_for_byte(self):
+        crlf = '## Rules\r\n\r\n- Ask the owner first.\r\n'
+        (self.source / 'RULES.md').write_bytes(crlf.encode('utf-8'))
+        self.install()
+        root = str(self.root)
+        self.assertEqual((self.root / 'RULES.md').read_bytes(), crlf.encode('utf-8'))
+        self.assertEqual((self.root / 'SOUL.md').read_bytes(), FILES['SOUL.md'].encode('utf-8'))
+        self.assertEqual(history.read_version(root, 'RULES.md', 1)['content'], crlf)
+        # A save keeps whichever line endings it is given.
+        mixed = 'lf line\ncrlf line\r\nlone cr\rend'
+        motet_self.save('RULES.md', mixed, 'owner', 'mixed endings', home=self.home)
+        self.assertEqual((self.root / 'RULES.md').read_bytes(), mixed.encode('utf-8'))
+        self.assertEqual(history.read_version(root, 'RULES.md', 2)['content'], mixed)
+        # An editor that saves with CRLF is a genuine edit, recorded as it is.
+        self.edit('SOUL.md', FILES['SOUL.md'].replace('\n', '\r\n'))
+        self.assertEqual(dict(motet_self.scan(self.home))['SOUL.md'], 'recorded v2')
+        self.assertEqual(history.read_version(root, 'SOUL.md', 2)['content'], FILES['SOUL.md'].replace('\n', '\r\n'))
+        # Restores reproduce the recorded bytes exactly, in both directions.
+        motet_self.restore('SOUL.md', 1, home=self.home)
+        self.assertEqual((self.root / 'SOUL.md').read_bytes(), FILES['SOUL.md'].encode('utf-8'))
+        motet_self.restore('SOUL.md', 2, home=self.home)
+        self.assertEqual((self.root / 'SOUL.md').read_bytes(), FILES['SOUL.md'].replace('\n', '\r\n').encode('utf-8'))
+        motet_self.restore('RULES.md', 1, home=self.home)
+        self.assertEqual((self.root / 'RULES.md').read_bytes(), crlf.encode('utf-8'))
+        self.assertEqual(history.read_version(root, 'RULES.md', 3)['content'], crlf)
+        self.assertEqual(dict(motet_self.scan(self.home))['RULES.md'], 'unchanged')
+        self.assertEqual(dict(motet_self.scan(self.home))['SOUL.md'], 'unchanged')
+        # Version records and the latest marker are written byte for byte too.
+        for path in (self.root / '.history').rglob('*.json'):
+            with self.subTest(record=path.name):
+                self.assertNotIn(b'\r\n', path.read_bytes().replace(b'\\r\\n', b''))
 
     def test_names_and_versions_are_strict(self):
         self.install()

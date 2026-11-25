@@ -27,8 +27,8 @@ import time
 
 import private_storage
 from motet_self_history import (AUTHORS, CORE_FILES, HISTORY, LATEST, MAX_FILE_BYTES, MAX_REASON, MAX_RECORD_BYTES,
-                                PENDING, SCHEMA, SKILLS, SelfError, check_folders, check_name, decode_text, digest,
-                                history_dir, load_history, parse_record, read_private, self_folder, sha256,
+                                PENDING, SCHEMA, SKILLS, SelfError, binary, check_folders, check_name, decode_text,
+                                digest, history_dir, load_history, parse_record, read_private, self_folder, sha256,
                                 skill_name, tracked_names, version_file, working_path)
 
 LOCK = '.lock'
@@ -84,6 +84,7 @@ def _write(folder, name, data, new=False):
     fd, temporary = private_storage.create_private_temp(folder, '.tmp-')
     try:
         try:
+            binary(fd)
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view):]
