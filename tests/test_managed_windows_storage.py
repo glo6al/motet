@@ -402,7 +402,7 @@ class WindowsManagedStorageTests(unittest.TestCase):
                     'folder': {'id': 'fictional', 'revision': 'one', 'label': 'Fictional orchard',
                                'path': str(self.project), 'device': device, 'inode': inode},
                     'executable': {'path': 'C:\\fictional\\claude.exe', 'version': claude_managed_runner.PINNED_VERSION,
-                                   'sha256': claude_managed_runner.PINNED_SHA256},
+                                   'sha256': claude_managed_runner._pinned_sha256()},     # this machine's pin
                     'profile': 'restricted_test', 'createdAt': 1000}
         for name, data in (('manifest.json', json.dumps(manifest).encode()), ('token', b'a' * 64), ('run.lock', b'')):
             fd = ps.create_private_file(str(run / name))
