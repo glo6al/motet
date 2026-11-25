@@ -459,3 +459,307 @@ def start_in_job(args, cwd):
         if not isinstance(error, Exception):
             raise                         # an interrupt stays an interrupt; the process was still ended
         raise JobError(reason) from error
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The control channel (step 8b.3): a named pipe in place of POSIX's private Unix socket.
+#
+# The supervisor creates one pipe instance with a random name (``\\.\pipe\motet-`` and 32 random hex digits),
+# FILE_FLAG_FIRST_PIPE_INSTANCE (if anything already holds that name, creating it fails: no squatting) and
+# PIPE_REJECT_REMOTE_CLIENTS, under private_storage's protected this-user/SYSTEM security descriptor. Only after the
+# pipe exists does it write the name and its own process ID to ``control.json`` in its private run folder. The web
+# server reads that file through private_storage and opens the pipe with identification-only impersonation. It
+# talks only if the pipe's server process is the recorded supervisor (GetNamedPipeServerProcessId) and the pipe's
+# owner and access list are this user's private ones (read back from the opened handle); only then is the token
+# sent. A pipe another account made fails the owner check. A process that later receives the supervisor's
+# recorded process ID cannot know the pipe's random name (it is only in the private run folder), and if it is
+# another account its pipe still fails the owner check; this same user could read the token anyway, as with the
+# Unix socket. A stale ``control.json`` names a pipe that ended with its supervisor, so opening it fails.
+#
+# Every operation is overlapped I/O with a deadline: a wait that times out cancels its own operation and waits for
+# that cancellation, on a raw handle no other thread uses (no C runtime descriptor, so none of its locks). One
+# instance serves one client at a time, as the Unix socket's single accept loop does.
+
+PIPE_PREFIX = '\\\\.\\pipe\\motet-'
+PIPE_ACCESS_DUPLEX = 0x00000003
+FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+FILE_FLAG_OVERLAPPED = 0x40000000
+PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+PIPE_BUFFER = 65536
+GENERIC_READ, GENERIC_WRITE = 0x80000000, 0x40000000
+OPEN_EXISTING = 3
+SECURITY_SQOS_PRESENT, SECURITY_IDENTIFICATION = 0x00100000, 0x00010000
+ERROR_FILE_NOT_FOUND, ERROR_BROKEN_PIPE, ERROR_PIPE_BUSY = 2, 109, 231
+ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_IO_PENDING = 232, 535, 997
+WAIT_TIMEOUT = 0x102
+CONTROL_SECONDS = 2.0            # every connect, read and write, as the Unix socket's settimeout(2)
+
+_PIPE_API = None
+
+
+def _pipe_api():
+    global _PIPE_API
+    if _PIPE_API is not None:
+        return _PIPE_API
+    import private_storage as ps
+    ctypes, w = _api()[:2]
+    SA = ps._win_api()[3]
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [('Internal', ctypes.c_size_t), ('InternalHigh', ctypes.c_size_t), ('Offset', w.DWORD),
+                    ('OffsetHigh', w.DWORD), ('hEvent', w.HANDLE)]
+
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    OV, D = ctypes.POINTER(Overlapped), ctypes.POINTER(w.DWORD)
+    for name, args, result in (
+            ('CreateNamedPipeW', [w.LPCWSTR, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD,
+                                  ctypes.POINTER(SA)], w.HANDLE),
+            ('ConnectNamedPipe', [w.HANDLE, OV], w.BOOL),
+            ('DisconnectNamedPipe', [w.HANDLE], w.BOOL),
+            ('CreateFileW', [w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE], w.HANDLE),
+            ('WaitNamedPipeW', [w.LPCWSTR, w.DWORD], w.BOOL),
+            ('GetNamedPipeServerProcessId', [w.HANDLE, ctypes.POINTER(w.ULONG)], w.BOOL),
+            ('CreateEventW', [w.LPVOID, w.BOOL, w.BOOL, w.LPCWSTR], w.HANDLE),
+            ('WaitForSingleObject', [w.HANDLE, w.DWORD], w.DWORD),
+            ('ReadFile', [w.HANDLE, w.LPVOID, w.DWORD, D, OV], w.BOOL),
+            ('WriteFile', [w.HANDLE, w.LPVOID, w.DWORD, D, OV], w.BOOL),
+            ('GetOverlappedResult', [w.HANDLE, OV, D, w.BOOL], w.BOOL),
+            ('CancelIoEx', [w.HANDLE, OV], w.BOOL),
+            ('CloseHandle', [w.HANDLE], w.BOOL)):
+        function = getattr(k, name)
+        function.argtypes, function.restype = args, result
+    _PIPE_API = (ctypes, w, k, Overlapped, ps)
+    return _PIPE_API
+
+
+def _pipe_error(message, code=None):
+    ctypes = _pipe_api()[0]
+    error = OSError(message)
+    error.winerror = ctypes.get_last_error() if code is None else code
+    return error
+
+
+def _milliseconds(seconds):
+    return max(0, min(0xFFFFFFFE, int(seconds * 1000)))
+
+
+class _Operation:
+    """One overlapped operation on ``handle`` with its own event, waited for with a deadline. A wait that times out
+    cancels the operation and waits for that cancellation (it completes at once), so no request outlives its
+    buffer."""
+
+    def __init__(self, handle):
+        ctypes, w, k, Overlapped, _ = _pipe_api()
+        self.handle = handle
+        self.event = k.CreateEventW(None, True, False, None)
+        if not self.event:
+            raise _pipe_error('event unavailable')
+        self.overlapped = Overlapped()
+        self.overlapped.hEvent = self.event
+        self.count = w.DWORD()
+
+    def cancel(self):
+        ctypes, w, k = _pipe_api()[:3]
+        k.CancelIoEx(self.handle, ctypes.byref(self.overlapped))
+        k.GetOverlappedResult(self.handle, ctypes.byref(self.overlapped), ctypes.byref(self.count), True)
+
+    def finish(self, started, code, seconds):
+        """Wait for the operation the call just ``started`` (its BOOL result and the error it set) for up to
+        ``seconds``: the byte count, or socket.timeout after cancelling it; Win32 errors as OSError with
+        ``winerror``."""
+        import socket
+        ctypes, w, k = _pipe_api()[:3]
+        if not started:
+            if code != ERROR_IO_PENDING:
+                raise _pipe_error('pipe operation failed', code)
+            if k.WaitForSingleObject(self.event, _milliseconds(seconds)) == WAIT_TIMEOUT:
+                self.cancel()
+                raise socket.timeout('pipe operation timed out')
+        if not k.GetOverlappedResult(self.handle, ctypes.byref(self.overlapped), ctypes.byref(self.count), False):
+            raise _pipe_error('pipe operation failed')
+        return self.count.value
+
+    def close(self):
+        event, self.event = self.event, None
+        if event:
+            _pipe_api()[2].CloseHandle(event)
+
+
+class PipeConnection:
+    """The part of a socket the line protocol uses (``settimeout``, ``recv``, ``sendall``, ``with``) over a pipe
+    handle with overlapped I/O; every call is bounded by the timeout set. The end of the stream is ``b''``."""
+
+    def __init__(self, handle, on_close=None):
+        self.handle, self.timeout, self.on_close = handle, CONTROL_SECONDS, on_close
+
+    def settimeout(self, seconds):
+        self.timeout = float(seconds)
+
+    def recv(self, size):
+        ctypes, w, k = _pipe_api()[:3]
+        size = max(1, size)
+        buffer = ctypes.create_string_buffer(size)
+        operation = _Operation(self.handle)
+        try:
+            started = k.ReadFile(self.handle, buffer, size, None, ctypes.byref(operation.overlapped))
+            code = ctypes.get_last_error()
+            try:
+                count = operation.finish(started, code, self.timeout)
+            except OSError as error:
+                if getattr(error, 'winerror', None) in (ERROR_BROKEN_PIPE, ERROR_NO_DATA):
+                    return b''
+                raise
+            return buffer.raw[:count]
+        finally:
+            operation.close()
+
+    def sendall(self, data):
+        import socket
+        import time
+        ctypes, w, k = _pipe_api()[:3]
+        view, deadline = memoryview(bytes(data)), time.monotonic() + self.timeout
+        while view:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout('pipe write timed out')
+            part = bytes(view[:PIPE_BUFFER])
+            chunk = ctypes.create_string_buffer(part, len(part))
+            operation = _Operation(self.handle)
+            try:
+                started = k.WriteFile(self.handle, chunk, len(part), None, ctypes.byref(operation.overlapped))
+                written = operation.finish(started, ctypes.get_last_error(), left)
+            finally:
+                operation.close()
+            if written <= 0:
+                raise _pipe_error('pipe write failed', 0)
+            view = view[written:]
+
+    def close(self):
+        on_close, self.on_close = self.on_close, None
+        if on_close is not None:
+            on_close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class PipeServer:
+    """The supervisor's end: one instance of a new pipe, serving one client at a time (``accept``)."""
+
+    def __init__(self, name=None):
+        import secrets
+        ctypes, w, k, _, ps = _pipe_api()
+        self.name = name or PIPE_PREFIX + secrets.token_hex(16)
+        self.handle, self.connect = None, None
+        with ps._CurrentUser() as user, ps._PrivateAttributes(user) as sa:
+            handle = k.CreateNamedPipeW(
+                self.name, PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                PIPE_REJECT_REMOTE_CLIENTS, 1, PIPE_BUFFER, PIPE_BUFFER, 0, ctypes.byref(sa))
+        if not handle or handle == w.HANDLE(-1).value:
+            raise _pipe_error('pipe unavailable')       # ERROR_ACCESS_DENIED: the name is held already
+        self.handle = handle
+
+    def accept(self, seconds):
+        """A connected client as a PipeConnection, or None if none connected within ``seconds`` (the wait for a
+        client stays pending for the next call)."""
+        import socket
+        ctypes, w, k = _pipe_api()[:3]
+        if self.connect is None:
+            operation = _Operation(self.handle)
+            started = k.ConnectNamedPipe(self.handle, ctypes.byref(operation.overlapped))
+            code = ctypes.get_last_error()
+            if started or code == ERROR_PIPE_CONNECTED:
+                operation.close()
+                return PipeConnection(self.handle, self._done)
+            if code == ERROR_NO_DATA:                      # a client connected and left already
+                operation.close()
+                k.DisconnectNamedPipe(self.handle)
+                return None
+            if code != ERROR_IO_PENDING:
+                operation.close()
+                raise _pipe_error('pipe connect failed', code)
+            self.connect = operation
+        if k.WaitForSingleObject(self.connect.event, _milliseconds(seconds)) == WAIT_TIMEOUT:
+            return None
+        operation, self.connect = self.connect, None
+        try:
+            operation.finish(True, 0, 0)
+        except (OSError, socket.timeout):
+            k.DisconnectNamedPipe(self.handle)
+            return None
+        finally:
+            operation.close()
+        return PipeConnection(self.handle, self._done)
+
+    def _done(self):
+        """After a reply: give the client up to two seconds to read it and close its end, then disconnect so the
+        instance can serve the next client. A disconnect discards anything unread (a socket close does not); the
+        wait is how the reply still reaches a client that is reading it."""
+        import socket
+        import time
+        connection = PipeConnection(self.handle)
+        deadline = time.monotonic() + CONTROL_SECONDS
+        try:
+            while time.monotonic() < deadline:
+                connection.settimeout(max(.001, deadline - time.monotonic()))
+                if not connection.recv(1):
+                    break
+        except (OSError, socket.timeout):
+            pass
+        _pipe_api()[2].DisconnectNamedPipe(self.handle)
+
+    def close(self):
+        ctypes, w, k = _pipe_api()[:3]
+        if self.connect is not None:
+            self.connect.cancel()
+            self.connect.close()
+            self.connect = None
+        handle, self.handle = self.handle, None
+        if handle:
+            k.CloseHandle(handle)
+
+
+def open_pipe(name, server_pid, seconds=CONTROL_SECONDS):
+    """The web server's end: open the pipe ``name`` within ``seconds`` and return a PipeConnection (each later read
+    or write bounded by CONTROL_SECONDS), only if its server process is ``server_pid`` and the pipe's owner and
+    access list are this user's private ones. Only a local pipe name of the supervisor's form is accepted, and the
+    server may only identify, never impersonate, the caller."""
+    import re
+    import socket
+    import time
+    if not isinstance(name, str) or not re.fullmatch(re.escape(PIPE_PREFIX) + '[0-9a-f]{32}', name):
+        raise _pipe_error('not a supervisor pipe name', 0)
+    if type(server_pid) is not int or not 0 < server_pid <= 0xFFFFFFFF:
+        raise _pipe_error('no supervisor process recorded', 0)
+    ctypes, w, k, _, ps = _pipe_api()
+    deadline = time.monotonic() + seconds
+    while True:
+        handle = k.CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING,
+                               FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, None)
+        if handle and handle != w.HANDLE(-1).value:
+            break
+        code = ctypes.get_last_error()
+        left = deadline - time.monotonic()
+        if code == ERROR_PIPE_BUSY and left > 0:
+            k.WaitNamedPipeW(name, max(1, _milliseconds(left)))
+            continue
+        if code == ERROR_PIPE_BUSY:
+            raise socket.timeout('the supervisor is busy')
+        if code == ERROR_FILE_NOT_FOUND:
+            raise FileNotFoundError(2, 'no supervisor pipe')
+        raise _pipe_error('supervisor pipe unavailable', code)
+    try:
+        pid = w.ULONG()
+        if not k.GetNamedPipeServerProcessId(handle, ctypes.byref(pid)):
+            raise _pipe_error('supervisor process unavailable')
+        if pid.value != server_pid:
+            raise _pipe_error('the pipe is not the recorded supervisor\'s', 0)
+        ps.windows_handle_security(handle)         # owned by this user; only this user and SYSTEM on its list
+    except BaseException:
+        k.CloseHandle(handle)
+        raise
+    return PipeConnection(handle, lambda: k.CloseHandle(handle))

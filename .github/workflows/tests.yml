@@ -100,6 +100,11 @@ jobs:
       - run: python tests/test_managed_windows_process.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # Managed Claude's control channel (step 8b.3): the serve loop's endpoint seam on every system, the pipe's
+      # record under the Windows simulation, and the named pipe itself on real Windows.
+      - run: python tests/test_managed_windows_control.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: node docs/fixtures/new-chat/managed-fixture.test.mjs
         if: ${{ !cancelled() }}
         timeout-minutes: 5
