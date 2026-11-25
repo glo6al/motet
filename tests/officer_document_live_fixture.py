@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import signal
 import socket
+import _socket
 import ssl
 import sys
 import tempfile
@@ -373,6 +374,12 @@ def main():
                 with self.active_lock:
                     self.active.discard(request)
 
+        def handle_error(self, request, address):
+            # On Windows a handler whose socket server_close closed ends in an error: that is the intended stop.
+            if os.name == 'nt' and self.closing:
+                return
+            super().handle_error(request, address)
+
         def server_close(self):
             # Unblock partial headers/bodies as well as the event stream, then
             # join every accepted handler before services or temp state close.
@@ -383,6 +390,16 @@ def main():
                         request.shutdown(socket.SHUT_RDWR)
                     except OSError:
                         pass
+                    if os.name == 'nt':
+                        # Windows shutdown does not wake a receive already blocked in the handler's thread (a
+                        # partial header), so the join below would wait forever. Closing the socket handle
+                        # cancels that receive. The C-level close is used because the handler's reader still
+                        # holds the Python socket open. Not done on POSIX, where shutdown wakes the receive and
+                        # closing a descriptor another thread is using could hand its number to a new file.
+                        try:
+                            _socket.socket.close(request)
+                        except OSError:
+                            pass
             super().server_close()
             with self.active_lock:
                 if self.active:
