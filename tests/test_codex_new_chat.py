@@ -493,6 +493,41 @@ class BuildTests(unittest.TestCase):
                 with patch.object(native.sys, 'platform', 'fictional-os'):
                     self.assertEqual(native._installed_build().code, 'unsupported_platform')
 
+    def test_qualified_build_is_named_exactly(self):
+        # Changing these values is a re-qualification, never a routine edit.
+        self.assertEqual((native.VERSION, native.BUILD), ('26.1103.60933', '25894'))
+        self.assertEqual(native.ADAPTER_VERSION, 'codex-new-chat-v2/26.1103.60933/25894')
+        self.assertEqual(native.ATTACHMENT_PIN[:2], ('26.1029.61003', '24614'))
+
+    @unittest.skipIf(os.name == 'nt', 'macOS build verification uses POSIX O_NOFOLLOW and executable modes.')
+    def test_file_sending_keeps_its_own_proven_build(self):
+        import codex_attachment_dispatch
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory).resolve() / 'Fictional.app'
+            resources = app / 'Contents/Resources'
+            resources.mkdir(parents=True)
+            (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+                'CFBundleIdentifier': 'com.openai.codex', 'CFBundleShortVersionString': native.VERSION,
+                'CFBundleVersion': native.BUILD}))
+            asar = resources / 'app.asar'
+            asar.write_bytes(b'fictional desktop build')
+            binary = resources / 'fictional-native-binary'
+            binary.write_bytes(b'fictional executable content')
+            binary.chmod(0o700)
+            digests = (hashlib.sha256(asar.read_bytes()).hexdigest(), hashlib.sha256(binary.read_bytes()).hexdigest())
+            queue = codex_attachment_dispatch.DesktopQueue(Path.home().resolve() / '.codex' / 'sessions')
+            with patch.object(native, 'APP', app), patch.object(native, 'BINARY', binary), \
+                    patch.object(native.sys, 'platform', 'darwin'), \
+                    patch.object(native, 'ASAR_SHA256', digests[0]), patch.object(native, 'BINARY_SHA256', digests[1]):
+                self.assertTrue(native._installed_build().available)
+                self.assertFalse(native._attachment_build().available)
+                self.assertEqual(native._attachment_build().version, 'codex-new-chat-v2/26.1029.61003/24614')
+                self.assertEqual(native._installed_build().version, native.ADAPTER_VERSION)
+                self.assertFalse(queue.ready())
+                with patch.object(native, 'ATTACHMENT_PIN', (native.VERSION, native.BUILD) + digests):
+                    self.assertTrue(native._attachment_build().available)
+                    self.assertTrue(queue.ready())
+
 
 # A real local Python child simulates JSONL transport and owned startup children.
 # Popen is patched only at the fixed native executable boundary.

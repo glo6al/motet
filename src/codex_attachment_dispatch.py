@@ -62,7 +62,7 @@ class DesktopQueue:
                 current = stamps()
                 if current != self._verified:
                     self._verified = None
-                    if not codex_new_chat._installed_build().available or current != stamps():
+                    if not codex_new_chat._attachment_build().available or current != stamps():
                         return False
                     self._verified = current
                 return True

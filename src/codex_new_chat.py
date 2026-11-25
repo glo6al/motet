@@ -29,10 +29,15 @@ from new_chat_types import Capability, FrozenFolder, NewChatError, OpenResult, V
 
 APP = Path('/Applications/ChatGPT.app')
 BINARY = APP / 'Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
-VERSION, BUILD = '26.1029.61003', '24614'
+VERSION, BUILD = '26.1103.60933', '25894'
 ADAPTER_VERSION = 'codex-new-chat-v2/' + VERSION + '/' + BUILD
-ASAR_SHA256 = '0c951258b7ab381ec601045ffb02159e53f424548dda18e6a4dcfd126557383b'
-BINARY_SHA256 = '508388df35319042107560d095b271a98a512f59a542848c908b23ed1bad4b44'
+ASAR_SHA256 = 'a77588b2dcfa9b394d722dd8c2c8b13d3a09bacd49c839cc715245742dba6048'
+BINARY_SHA256 = 'a636331ed87605efc4cf84028ac2884a75363f9d10ead63cffb57ea0016d486e'
+# Sending files to Codex was proven live on its own build and keeps that pin
+# until it is re-qualified; moving the New chat pin must not widen it.
+ATTACHMENT_PIN = ('26.1029.61003', '24614',
+                  '0c951258b7ab381ec601045ffb02159e53f424548dda18e6a4dcfd126557383b',
+                  '508388df35319042107560d095b271a98a512f59a542848c908b23ed1bad4b44')
 MAX_LINE, MAX_TOTAL, MAX_FRAMES = 1024 * 1024, 8 * 1024 * 1024, 512
 UUID = re.compile(codex_transcript.UUID + r'\Z')
 DEFAULTS_MESSAGE = 'Starting Codex chats is unavailable until native default settings are verified.'
@@ -84,21 +89,28 @@ def _regular(path, maximum):
         raise
 
 
-def _installed_build():
+def _attachment_build():
+    """The separately proven build that sending files to Codex still requires."""
+    return _installed_build(ATTACHMENT_PIN)
+
+
+def _installed_build(pin=None):
     """Only bundle metadata and executable bytes; no native config or credentials."""
+    version, build, asar_sha256, binary_sha256 = pin or (VERSION, BUILD, ASAR_SHA256, BINARY_SHA256)
+    adapter = 'codex-new-chat-v2/' + version + '/' + build  # Report the build this call checked.
     if sys.platform != 'darwin':
-        return Capability(False, 'unsupported_platform', 'Codex New chat currently requires macOS.', ADAPTER_VERSION)
+        return Capability(False, 'unsupported_platform', 'Codex New chat currently requires macOS.', adapter)
     try:
         source, _ = _regular(APP / 'Contents/Info.plist', 1024 * 1024)
         with source:
             info = plistlib.loads(source.read())
         if (info.get('CFBundleIdentifier') != 'com.openai.codex'
-                or info.get('CFBundleShortVersionString') != VERSION
-                or str(info.get('CFBundleVersion')) != BUILD):
+                or info.get('CFBundleShortVersionString') != version
+                or str(info.get('CFBundleVersion')) != build):
             raise ValueError()
         deadline = time.monotonic() + 8
-        for path, expected in ((APP / 'Contents/Resources/app.asar', ASAR_SHA256),
-                               (BINARY, BINARY_SHA256)):
+        for path, expected in ((APP / 'Contents/Resources/app.asar', asar_sha256),
+                               (BINARY, binary_sha256)):
             source, before = _regular(path, 1024 * 1024 * 1024)
             if path == BINARY and not before.st_mode & 0o111:
                 source.close()
@@ -117,9 +129,9 @@ def _installed_build():
                     != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
                     or digest.hexdigest() != expected):
                 raise ValueError()
-        return Capability(True, version=ADAPTER_VERSION)
+        return Capability(True, version=adapter)
     except (OSError, ValueError, plistlib.InvalidFileException):
-        return Capability(False, 'app_version_unsupported', 'This Codex build is not verified for New chat.', ADAPTER_VERSION)
+        return Capability(False, 'app_version_unsupported', 'This Codex build is not verified for New chat.', adapter)
 
 
 class StdioTransport:

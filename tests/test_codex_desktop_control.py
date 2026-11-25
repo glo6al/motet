@@ -284,6 +284,10 @@ class BuildGateTests(unittest.TestCase):
             self.info.write_bytes(plistlib.dumps(data))
             with self.assertRaises(Exception): control._verify_build()
 
+    def test_qualified_build_is_named_exactly(self):
+        # Changing these values is a re-qualification, never a routine edit.
+        self.assertEqual((control._VERSION, control._BUILD), ('26.1103.60933', '25894'))
+
     def test_platform_gate(self):
         with patch.object(control.sys, 'platform', 'linux'):
             with self.assertRaises(Exception): control._verify_build()
