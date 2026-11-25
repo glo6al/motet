@@ -605,3 +605,7 @@ class ClaudeAttachmentAdapterTests(unittest.TestCase):
         self.assertEqual(self.state(request)['outcome']['seq'], 2)
         self.assertEqual(self.emit(self.receipt(claim))['state'], 'answered')
         self.assertFalse(self.adapter.busy(self.entry['agent']))
+
+
+if __name__ == '__main__':
+    unittest.main()

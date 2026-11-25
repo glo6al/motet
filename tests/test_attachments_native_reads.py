@@ -62,7 +62,10 @@ def crash_server(root, pipe):
         service.close()
 
 
-@unittest.skipUnless(os.name == 'posix', 'Private attachment storage requires qualified POSIX primitives.')
+# The read stage of delivery to agent chats: off on Windows, where that delivery is not ported
+# (NATIVE_ATTACHMENT_DELIVERY_HOST), although the attachment store itself runs there.
+@unittest.skipUnless(os.name == 'posix', 'Delivery to agent chats, whose read stage this is, is off on Windows '
+                     '(not ported).')
 class NativeReadsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -547,3 +550,7 @@ class NativeReadsTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'Non-fixture connections'):
                 socket.create_connection(('fictional.invalid', 1), timeout=.1)
             self.assertEqual(server.outbound_blocked, 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
