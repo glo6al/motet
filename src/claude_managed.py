@@ -354,6 +354,8 @@ def client_request(run_dir, command, params):
         token = source.read(65).decode('ascii')
     if len(token) != 64 or any(c not in '0123456789abcdef' for c in token):
         _fail()
+    if ps.WIN:
+        return _windows_request(path, token, command, params)
     target = path / 'control.sock'
     st = os.lstat(target)
     if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
@@ -371,6 +373,7 @@ def client_request(run_dir, command, params):
             if not chunk or len(response) + len(chunk) > MAX_RESPONSE:
                 _fail()
             response.extend(chunk)
+        # These reply checks' Windows twin is _reply; a change here belongs there too.
         head, tail = bytes(response).split(b'\n', 1)
         if tail:
             _fail()
@@ -398,6 +401,58 @@ def _not_started_code(error):
     if isinstance(error, windows.NotStarted):
         return 'supervisor_not_started'
     return None
+
+
+def _windows_request(path, token, command, params):
+    """Windows ``client_request`` over the supervisor's named pipe: its name and process ID come from the private
+    ``control.json`` in the run folder; claude_managed_windows.open_pipe refuses a pipe whose server is not that
+    process or whose owner and access list are not this user's private ones, before the token is sent. The frame,
+    its limit, the reply's limits and its checks are client_request's."""
+    import claude_managed_windows as windows
+    control = path / 'control.json'
+    _private(control)
+    fd = ps.open_no_links(os.fspath(control), single_link=True, private=True)
+    try:
+        raw = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    if len(raw) > 4096:
+        _fail()
+    record = json.loads(raw.decode('ascii'))
+    if not isinstance(record, dict) or set(record) != {'pipe', 'pid'}:
+        _fail()
+    frame = json.dumps(dict(token=token, command=command, params=params), ensure_ascii=True).encode() + b'\n'
+    if len(frame) > MAX_FRAME:
+        _fail('invalid_request', 400)
+    with windows.open_pipe(record['pipe'], record['pid']) as connection:
+        connection.sendall(frame)
+        response = bytearray()
+        while b'\n' not in response:
+            chunk = connection.recv(min(8192, MAX_RESPONSE + 1 - len(response)))
+            if not chunk or len(response) + len(chunk) > MAX_RESPONSE:
+                _fail()
+            response.extend(chunk)
+    return _reply(response)
+
+
+def _reply(response):
+    """Windows only: the supervisor's reply line, checked exactly as client_request's POSIX path checks it (one
+    line, an object with ``ok``, provider error text never forwarded). A copy of that code, which POSIX keeps
+    inline; a change to either belongs in both."""
+    head, tail = bytes(response).split(b'\n', 1)
+    if tail:
+        _fail()
+    value = json.loads(head)
+    if not isinstance(value, dict) or type(value.get('ok')) is not bool:
+        _fail()
+    if not value['ok']:
+        code = value.get('error', {}).get('code')
+        if code in ('request_conflict', 'conflict', 'stale_permission'):
+            _fail('request_conflict')
+        _fail('managed_not_ready')
+    if set(value) != {'ok', 'value'}:
+        _fail()
+    return value['value']
 
 
 def spawn_runner(run_dir):

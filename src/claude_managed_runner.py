@@ -689,7 +689,8 @@ class Runner:
                 self.root_fd, self.manifest, self.token = _open_state(self.run_dir, writable=True)
                 # macOS sun_path includes its trailing NUL in 104 bytes. Refuse
                 # before claiming or starting a native process, not at bind time.
-                if len(os.fsencode(str(self.run_dir / 'control.sock'))) >= 104:
+                # Windows has no socket path (a named pipe; see serve).
+                if not ps.WIN and len(os.fsencode(str(self.run_dir / 'control.sock'))) >= 104:
                     _fail('unsafe_state')
                 self.lock_fd = _file(self.root_fd, 'run.lock', 0, flags=os.O_RDWR)
                 if ps.WIN:
@@ -1184,7 +1185,67 @@ class Runner:
                     setattr(self, name, None)
 
 
+CONTROL_FILE = 'control.json'        # Windows: the supervisor's pipe name and process ID, in the private run folder
+
+
+def _serve_loop(runner, endpoint):
+    """Windows (and the portable seam tests): the supervisor's loop over an endpoint (``accept(seconds)`` gives a
+    connection or None): step the native transport, stop after a recorded native exit, and answer one connection at
+    a time through ``exchange``. It is a copy of the POSIX loop in ``serve``, which keeps its own Unix socket code;
+    a change to either loop belongs in both."""
+    while not runner.stopping:
+        runner.step()
+        if _meta(runner.db, 'nativeExit') is not None:
+            break
+        connection = endpoint.accept(.05)
+        if connection is None:
+            continue
+        with connection:
+            runner.exchange(connection)
+    return 0
+
+
+def _record_endpoint(runner, name):
+    """Windows: write the pipe's name and this supervisor's process ID to the private run folder, after the pipe
+    exists, through the held folder (private from the start). Returns the file's identity, for its removal."""
+    fd = runner.root_fd.create(CONTROL_FILE)
+    try:
+        raw = _json({'pipe': name, 'pid': os.getpid()}).encode('ascii')
+        view = memoryview(raw)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        return ps.file_identity(fd)
+    finally:
+        os.close(fd)
+
+
+def _serve_windows(run_dir):
+    """Windows: ``serve`` over a named pipe (claude_managed_windows.PipeServer) in place of the Unix socket. The
+    record of its name is removed when the supervisor ends, if it is still the one written; a stale one names a
+    pipe that ended with its supervisor."""
+    import claude_managed_windows as windows
+    runner = Runner(run_dir)
+    endpoint = recorded = None
+    try:
+        runner.start()
+        endpoint = windows.PipeServer()
+        recorded = _record_endpoint(runner, endpoint.name)
+        return _serve_loop(runner, endpoint)
+    except (RunnerError, OSError, sqlite3.Error):
+        return 1
+    finally:
+        if endpoint is not None:
+            endpoint.close()
+        if recorded is not None:
+            with contextlib.suppress(OSError):
+                runner.root_fd.remove(CONTROL_FILE, lambda fd: ps.file_identity(fd)[:2] == recorded[:2])
+        runner.close()
+
+
 def serve(run_dir):
+    if ps.WIN:
+        return _serve_windows(run_dir)
     runner = Runner(run_dir)
     listener = None
     bound = None
@@ -1198,6 +1259,7 @@ def serve(run_dir):
         bound = os.lstat(path)
         listener.listen(8)
         listener.settimeout(.05)
+        # This loop's Windows twin is _serve_loop (over a named pipe); a change here belongs there too.
         while not runner.stopping:
             runner.step()
             if _meta(runner.db, 'nativeExit') is not None:

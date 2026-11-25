@@ -67,6 +67,15 @@ class SimulatedRunnerTests(Simulated, runner_tests.RunnerTests):
         for name in ('open_folder', 'try_lock', 'sqlite_companions_private', 'path_identity'):
             self.assertIn(name, self.calls)
 
+    @unittest.skip('The 104-byte limit is the Unix socket path\'s; Windows uses a named pipe (step 8b.3).')
+    def test_overlong_endpoint_path_rejected_before_native_launch_claim(self):
+        pass
+
+    @unittest.skip('Windows serves over a named pipe: tests/test_managed_windows_control.py checks its record and '
+                   'removal under the simulation, and the pipe itself on real Windows.')
+    def test_serve_exits_after_confirmed_native_exit_and_cleans_endpoint(self):
+        pass
+
     def test_a_folder_identity_from_os_stat_is_refused(self):
         info = self.project.stat()
         self.manifest['folder'].update(device=info.st_dev, inode=info.st_ino)
