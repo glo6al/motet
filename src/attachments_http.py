@@ -79,7 +79,8 @@ def handle_http(handler, service, owner_key, port, *, native=None,
     ``native_unavailable`` is the (code, words) requests for files sent to agent chats get while the store runs but
     this host cannot deliver them (``native`` is None there). ``native_refusal(destination_id)`` gives (code, words)
     when this host cannot deliver to that one chat (on Windows a Codex chat, or Git for Windows missing), else None;
-    it answers the selection, receipt and request reads that name a destination."""
+    it answers only a selection with nothing to show (no current or retained context), so receipts, status, history
+    and recovery of earlier sends stay readable, as where delivery runs."""
     handler.close_connection = True
     def headers(name):
         return handler.headers.get_all(name, [])
@@ -229,10 +230,6 @@ def handle_http(handler, service, owner_key, port, *, native=None,
         if (native is None and native_unavailable is not None
                 and (route == '/native/selection' or native_receipt or native_request or native_send or native_prepare)):
             return error(503, *native_unavailable)
-        if native_refusal is not None and (route == '/native/selection' or native_receipt or native_request):
-            refused = native_refusal(query.get('destinationId'))
-            if refused is not None:
-                return error(503, *refused)
         if native_request or native_send or native_prepare or native_receipt and native_receipt[1] == 'send_prepare':
             if native is None:
                 fail('attachments_disabled', 'Native agent attachments are unavailable.', 503)
@@ -255,7 +252,12 @@ def handle_http(handler, service, owner_key, port, *, native=None,
             with native.operation():
                 destination_id = query['destinationId']
                 if route == '/native/selection':
-                    return reply(200, native.native_selection(destination_id))
+                    selection = native.native_selection(destination_id)
+                    if selection.get('context') is None and native_refusal is not None:
+                        refused = native_refusal(destination_id)
+                        if refused is not None:
+                            return error(503, *refused)
+                    return reply(200, selection)
                 reads, _, _ = native.scoped_reads(destination_id, query['scopeId'])
                 if native_receipt:
                     return reply(200, reads.native_receipt(native_receipt[1], destination_id, query['scopeId'],

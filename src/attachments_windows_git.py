@@ -2,7 +2,9 @@
 
 macOS and Linux use /usr/bin/git, which must belong to root and not be writable by group or others. Windows has no
 such fixed place. Motet uses Git for Windows installed for all users, under Program Files, and runs its own program
-directly (``Git\\mingw64\\bin\\git.exe``; ``Git\\cmd\\git.exe`` only starts that one). Every folder from Program Files
+directly (``Git\\mingw64\\bin\\git.exe``, ``Git\\clangarm64\\bin\\git.exe`` on Windows on ARM, or
+``Git\\mingw32\\bin\\git.exe`` for the 32-bit build, also under Program Files (x86); ``Git\\cmd\\git.exe`` only starts
+that one). Every folder from Program Files
 down to it, and the program itself, must belong to the system (SYSTEM, Administrators or TrustedInstaller) and be
 changeable by nobody else (``unwritable(system_owned=True)``). Each is opened through the no-link walk, so a junction
 or link anywhere on the way is refused, and Windows loads git.exe's libraries from that checked folder first.
@@ -15,7 +17,10 @@ import os
 
 import private_storage as ps
 
-PROGRAM = ('Git', 'mingw64', 'bin', 'git.exe')
+# Git for Windows' own program for each build it ships: x64, ARM64 and 32-bit.
+PROGRAMS = (('Git', 'mingw64', 'bin', 'git.exe'), ('Git', 'clangarm64', 'bin', 'git.exe'),
+            ('Git', 'mingw32', 'bin', 'git.exe'))
+PROGRAM = PROGRAMS[0]
 WHY = {
     'attachments_git_missing': ('Sending files to Claude chats needs Git for Windows installed for all users (in '
                                 'Program Files). Ordinary messages still work.'),
@@ -35,9 +40,9 @@ class GitUnavailable(ValueError):
 
 
 def _roots():
-    """Program Files as Windows names it (the 64-bit one first, also from a 32-bit Python)."""
+    """Program Files as Windows names it (the 64-bit one first, also from a 32-bit Python), then the 32-bit one."""
     roots = []
-    for name in ('ProgramW6432', 'ProgramFiles'):
+    for name in ('ProgramW6432', 'ProgramFiles', 'ProgramFiles(x86)'):
         value = os.environ.get(name)
         if value and os.path.isabs(value) and value not in roots:
             roots.append(value)
@@ -74,15 +79,20 @@ def checked(executable):
 def find():
     """The checked git.exe of Git for Windows installed for all users, as a resolved absolute path."""
     for root in _roots():
-        candidate = os.path.join(root, *PROGRAM)
-        if os.path.isfile(candidate):
-            executable = os.path.realpath(candidate)
-            checked(executable)
-            return executable
+        for program in _programs():
+            candidate = os.path.join(root, *program)
+            if os.path.isfile(candidate):
+                executable = os.path.realpath(candidate)
+                checked(executable)
+                return executable
     local = os.environ.get('LOCALAPPDATA')
-    if local and os.path.isfile(os.path.join(local, 'Programs', *PROGRAM)):
+    if local and any(os.path.isfile(os.path.join(local, 'Programs', *program)) for program in _programs()):
         raise GitUnavailable('attachments_git_per_user')
     raise GitUnavailable('attachments_git_missing')
+
+
+def _programs():
+    return (PROGRAM,) + tuple(p for p in PROGRAMS if p != PROGRAM)
 
 
 def refusal():

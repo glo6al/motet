@@ -9,7 +9,7 @@ import stat
 import claude_mod
 import peer_lifecycle
 import private_storage as ps
-from attachments_materialize import (DirectoryIdentity, FileIdentity, Materializer, WorkspaceContext,
+from attachments_materialize import (DirectoryIdentity, FileIdentity, Materializer, WORKSPACE_REFUSALS, WorkspaceContext,
                                      WorkspaceDirectories, _windows_folder, _windows_refusal, copy_identity)
 from attachments_native_namespace import NamespaceError
 from attachments_native_reads import NativeAgentReadService
@@ -117,6 +117,24 @@ def _windows_folder_at(path, role):
         unavailable()
 
 
+def _windows_exclude(info):
+    """Windows: the Git exclude file, if there, must be one Motet may append to: one name, not a link, owned by this
+    user and changeable by nobody else (the rule the append applies), refused with plain words otherwise."""
+    try:
+        with ps.open_folder(info) as held:
+            try:
+                fd = held.open('exclude')
+            except FileNotFoundError:
+                return
+            try:
+                ps.unwritable(fd)
+            finally:
+                os.close(fd)
+    except OSError as error:
+        _windows_refusal(error, 'exclude')
+        unavailable()
+
+
 def _git_program():
     """The Git program and its identity. POSIX: /usr/bin/git resolved, a regular executable file owned by root that
     group and others cannot write, as before. Windows: Git for Windows installed for all users, with every folder
@@ -144,6 +162,8 @@ def _workspace(project):
     root_identity, git_identity, info_identity = (_folder(project), _folder(git, 'git'), _folder(info, 'git_info'))
     if os.path.lexists(os.path.join(git, 'commondir')):
         unavailable()
+    if ps.WIN:
+        _windows_exclude(info)
     executable, executable_identity = _git_program()
     workspace_id = digest({'project': project, 'root': asdict(root_identity)})
     identity = digest({'workspace': workspace_id, 'git': asdict(git_identity), 'info': asdict(info_identity),
@@ -296,9 +316,29 @@ class ClaudeAttachmentService:
         reads = NativeAgentReadService(self.store, selections=[selection] if selection is not None else [], _receipts=self.receipts)
         return reads, binding, enrollment
 
+    def _windows_workspace_refusal(self, destination_id):
+        """Windows: a connected Claude chat whose workspace Motet refuses gets the refusal's own words (a folder or file
+        owned by another account, one others can change, or one reached through a link or junction), not the bare
+        "unavailable". Asked only when the selection has nothing to show, so earlier sends kept for this chat stay
+        readable. POSIX keeps its answer: no context, and the page's generic words."""
+        if not isinstance(destination_id, str) or not destination_id.startswith('c:'):
+            return
+        item = self.room().get(destination_id)
+        if not claude_mod.ident(destination_id[2:]) or not claude_mod.eligible(destination_id, item):
+            return
+        try:
+            _workspace(item['cwd'])
+        except AttachmentError as error:
+            if error.code in WORKSPACE_REFUSALS:
+                raise
+        except (OSError, ValueError):
+            pass
+
     def native_selection(self, destination_id):
         reads, _, _ = self.scoped_reads(destination_id)
         result = reads.native_selection(destination_id)
+        if result['context'] is None and ps.WIN:
+            self._windows_workspace_refusal(destination_id)
         if result['context'] is not None:
             result['features']['send'] = True
             result['completionOnly'] = True

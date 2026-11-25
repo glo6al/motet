@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import uuid
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / 'src'))
@@ -26,7 +27,8 @@ import encodings.idna  # noqa: F401  (imported before the simulation, which rest
 import private_storage as ps
 import attachments_windows_git as wingit
 import attachments_claude_service as service
-from attachments_materialize import Materializer, WorkspaceDirectories, relative_path, resource_keys, copy_identity
+from attachments_materialize import (Materializer, WorkspaceDirectories, WORKSPACE_REFUSALS, relative_path,
+                                     resource_keys, copy_identity)
 import attachments_materialize as materialize
 from attachments_requests import RequestAuthority, CopyIntent
 from attachments_resources import ResourceLocks
@@ -34,6 +36,7 @@ from attachments_types import AttachmentError
 
 CONTENT = b'%PDF-1.4\nFictional orchard attachment.\n%%EOF'
 SYSTEM_GIT = '/usr/bin/git'
+OWNER_KEY = 'fictional-owner-key-for-delivery-tests'
 SIMULATED = (os.name != 'nt' and os.path.isfile(SYSTEM_GIT) and os.stat(SYSTEM_GIT).st_uid == 0
              and not os.stat(SYSTEM_GIT).st_mode & 0o022)
 
@@ -43,6 +46,9 @@ class DeliveryChecks:
         raise NotImplementedError
 
     def private_folder(self, path):
+        raise NotImplementedError
+
+    def open_to_others(self, path):
         raise NotImplementedError
 
     def setUp(self):
@@ -55,9 +61,10 @@ class DeliveryChecks:
             call()
         return raised.exception.code
 
-    def fake_git(self, folder):
-        """A git program this user made: a file at Git\\mingw64\\bin\\git.exe under ``folder`` (never run)."""
-        program = folder.joinpath(*wingit.PROGRAM)
+    def fake_git(self, folder, program=None):
+        """A git program this user made: a file at Git\\mingw64\\bin\\git.exe (or ``program``) under ``folder``
+        (never run)."""
+        program = folder.joinpath(*(program or wingit.PROGRAM))
         program.parent.mkdir(parents=True)
         program.write_bytes(b'fictional program')
         return program
@@ -81,6 +88,82 @@ class DeliveryChecks:
             with self.windows():
                 self.assertEqual(self.code(wingit.find), 'attachments_git_unsafe')
 
+    def test_the_arm64_and_32_bit_builds_are_found_and_checked_too(self):
+        for build in wingit.PROGRAMS[1:]:
+            with self.subTest(build=build[1]):
+                programs = self.base / ('programs-' + build[1])
+                self.private_folder(programs)
+                self.fake_git(programs, build)
+                local = self.base / ('local-' + build[1])
+                with mock.patch.object(wingit, '_roots', return_value=[str(programs)]):
+                    with self.windows():
+                        # Found, then refused only because this user made it (the check ran).
+                        self.assertEqual(self.code(wingit.find), 'attachments_git_unsafe')
+                self.fake_git(local / 'Programs', build)
+                with mock.patch.object(wingit, '_roots', return_value=[str(self.base / 'nothing-here')]), \
+                        mock.patch.dict(os.environ, {'LOCALAPPDATA': str(local)}):
+                    with self.windows():
+                        self.assertEqual(self.code(wingit.find), 'attachments_git_per_user')
+
+    def test_nothing_can_exist_or_be_made_under_the_hooks_path(self):
+        """The hooks path Git is given on Windows is a name under git.exe, a file, so no account can make the folder
+        Git would look for hooks in."""
+        programs = self.base / 'programs'
+        self.private_folder(programs)
+        program = str(self.fake_git(programs))
+        hooks = materialize.windows_hooks(program)
+        self.assertEqual(os.path.dirname(hooks), program)
+        self.assertNotIn('/dev/null', hooks.replace('\\', '/'))
+        self.assertFalse(os.path.lexists(hooks))
+        with self.assertRaises(OSError):
+            os.mkdir(hooks)
+        with self.assertRaises(OSError):
+            os.makedirs(os.path.join(hooks, 'pre-commit'))
+        self.assertFalse(os.path.lexists(hooks))
+
+    def selection_over_http(self, cwd):
+        """GET /native/selection for a connected, fictional Claude chat in ``cwd``, through the owner HTTP handler and
+        the Claude service's own selection (its reads give no context, as for a workspace Motet will not use)."""
+        import json
+        import attachments_http
+        destination = 'c:' + str(uuid.UUID(int=7))
+        service_ = object.__new__(service.ClaudeAttachmentService)
+        service_.room = lambda: {destination: {'runtime': 'Claude', 'cwd': cwd}}
+        service_.composition = mock.Mock()
+        service_.composition.claude_http_operation.return_value = nullcontext()
+        reads = mock.Mock()
+        reads.native_selection.return_value = {'context': None, 'features': {'send': False}}
+        service_.scoped_reads = mock.Mock(return_value=(reads, None, None))
+
+        class Headers(dict):
+            def get_all(self, name, default):
+                return self.get(name, default)
+
+        class Handler:
+            command = 'GET'
+            connection = mock.Mock()
+            path = '/api/attachments/native/selection?destinationId=' + destination
+            headers = Headers({'X-Live-Room-Key': [OWNER_KEY], 'Host': ['127.0.0.1:18801']})
+            sent = None
+
+            def send(self, code, body, kind=None, extra=()):
+                self.sent = code, json.loads(body)
+        handler = Handler()
+        attachments_http.handle_http(handler, mock.Mock(), OWNER_KEY, 18801, native=service_,
+                                     native_refusal=lambda destination_id: None)
+        return handler.sent
+
+    def test_a_refused_workspace_reaches_the_page_in_the_servers_words(self):
+        repo = self.base / 'orchard'
+        for folder in (repo, repo / '.git', repo / '.git' / 'info'):
+            self.private_folder(folder)
+        self.open_to_others(repo)
+        with self.windows():
+            status, body = self.selection_over_http(str(repo))
+        self.assertEqual(status, 409)
+        self.assertEqual(body['error'], {'code': 'workspace_unsafe', 'message': WORKSPACE_REFUSALS['workspace_unsafe'],
+                                         'retryable': False})
+
     def test_a_workspace_that_is_not_a_repository_is_refused(self):
         folder = self.base / 'notes'
         self.private_folder(folder)
@@ -101,8 +184,41 @@ class SimulatedWindowsDeliveryTests(DeliveryChecks, unittest.TestCase):
     def private_folder(self, path):
         os.mkdir(path, 0o700)
 
+    def open_to_others(self, path):
+        os.chmod(path, 0o777)
+
     def as_program_files(self):
         return mock.patch.multiple(wingit, PROGRAM=('bin', 'git'), _roots=mock.Mock(return_value=['/usr']))
+
+    def test_an_exclude_file_others_can_change_is_refused_at_selection_with_its_words(self):
+        """The Git exclude file Motet appends to is checked when the workspace is, so the chat's message box names it
+        before any send; an exclude file that is yours alone passes that check."""
+        repo = self.base / 'orchard'
+        for folder in (repo, repo / '.git', repo / '.git' / 'info'):
+            self.private_folder(folder)
+        exclude = repo / '.git' / 'info' / 'exclude'
+        exclude.write_bytes(b'# fictional exclude\n')
+        exclude.chmod(0o600)
+        with self.as_program_files(), self.windows():
+            self.assertEqual(service._workspace(str(repo)).root, str(repo))
+        exclude.chmod(0o666)
+        with self.as_program_files(), self.windows():
+            with self.assertRaises(AttachmentError) as raised:
+                service._workspace(str(repo))
+            status, body = self.selection_over_http(str(repo))
+        self.assertEqual(raised.exception.code, 'workspace_exclude_unsafe')
+        self.assertEqual((status, body['error']['code'], body['error']['message']),
+                         (409, 'workspace_exclude_unsafe', WORKSPACE_REFUSALS['workspace_exclude_unsafe']))
+
+    def test_posix_keeps_its_answer_for_a_refused_workspace(self):
+        """Outside the simulation the same chat gets POSIX's answer, unchanged: a selection with no context (the
+        page's generic words)."""
+        repo = self.base / 'orchard'
+        for folder in (repo, repo / '.git', repo / '.git' / 'info'):
+            self.private_folder(folder)
+        self.open_to_others(repo)
+        status, body = self.selection_over_http(str(repo))
+        self.assertEqual((status, body['context']), (200, None))
 
     def test_the_system_git_is_found_and_checked(self):
         with self.as_program_files(), self.windows():
@@ -138,7 +254,13 @@ class SimulatedWindowsDeliveryTests(DeliveryChecks, unittest.TestCase):
             materializer = Materializer(enabled=True, validate_authority=lambda *args: True,
                                         record_directory=lambda a, role, identity, lease: recorded.__setitem__(role, identity) or True,
                                         record_created=lambda *args: True, record_partial=lambda *args: True)
-            with self.as_program_files(), self.windows():
+            started = []
+            real_popen = subprocess.Popen
+
+            def recording(argv, *args, **kwargs):
+                started.append(list(argv))
+                return real_popen(argv, *args, **kwargs)
+            with self.as_program_files(), self.windows(), mock.patch.object(subprocess, 'Popen', recording):
                 identity = copy_identity(materialize._regular_fd(source_fd))
                 with resources.hold(resource_keys(context, authority, (spec,))) as lease:
                     materializer.ensure_exclusion(context, authority, (spec,), lease)
@@ -147,6 +269,15 @@ class SimulatedWindowsDeliveryTests(DeliveryChecks, unittest.TestCase):
                                                                     'request_identity': recorded['request']})
                     materializer.verify_copy(context, authority, spec, verified, lease, directories=directories)
             self.assertEqual((repo / spec.relative_path).read_bytes(), CONTENT)
+            # Git was run, and never with /dev/null as its hooks path: Git for Windows would look for hooks under
+            # <drive>:\\dev\\null, a folder any account may create. The hooks path is a name under git.exe instead.
+            self.assertTrue(started)
+            hooks = 'core.hooksPath=' + materialize.windows_hooks(context.git_executable)
+            for argv in started:
+                self.assertEqual(argv[0], context.git_executable)
+                self.assertIn(hooks, argv)
+                self.assertNotIn('core.hooksPath=/dev/null', argv)
+                self.assertEqual([item for item in argv if item.startswith('core.hooksPath=')], [hooks])
             self.assertIn(b'/.watch-attachments/' + authority.request_id.encode() + b'/',
                           (repo / '.git' / 'info' / 'exclude').read_bytes())
             with self.as_program_files(), self.windows():
@@ -169,6 +300,11 @@ class WindowsDeliveryTests(DeliveryChecks, unittest.TestCase):
 
     def private_folder(self, path):
         ps.make_private_folder(str(path))
+
+    def open_to_others(self, path):
+        """What a folder made directly under a drive inherits: Authenticated Users may modify it."""
+        subprocess.run(['icacls', str(path), '/grant', '*S-1-5-11:(OI)(CI)M'], check=True, capture_output=True,
+                       timeout=30)
 
     def test_git_for_windows_for_all_users_is_found_and_checked(self):
         program = wingit.find()

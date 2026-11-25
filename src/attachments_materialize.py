@@ -23,6 +23,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import os
+import re
 import selectors
 import secrets
 import stat
@@ -255,30 +256,43 @@ def _pread(fd, size, offset):
 # How a Windows refusal names the folder it is about (the roles of WorkspaceContext's three folders).
 FOLDER_NAMES = {'workspace': 'The selected workspace folder', 'git': "The selected workspace's .git folder",
                 'git_info': "The selected workspace's .git\\info folder",
-                'exclude': "The selected workspace's Git exclude file (.git\\info\\exclude)"}
+                'exclude': "The selected workspace's Git exclude file (.git\\info\\exclude)",
+                'git_file': 'A file Git reads in the selected workspace'}
+_FILES = ('exclude', 'git_file')
 
 
-def _windows_refusal(error, role, label=None):
-    """Plain words for a Windows refusal of a workspace or Git folder or file, naming which one (``label`` names
-    another file Git reads); None for any other."""
-    name = label or FOLDER_NAMES.get(role, FOLDER_NAMES['workspace'])
-    reason = getattr(error, 'reason', None)
-    if reason == 'access' and role in ('exclude', 'git_file'):
-        fail('workspace_unsafe', name + ' can be changed by other people using this computer, so files are not '
-             'copied into the workspace. Make it changeable by you alone, or choose another workspace.', 409)
+def _refusal_words(role, reason):
+    name = FOLDER_NAMES[role]
     if reason == 'access':
-        fail('workspace_unsafe', name + ' can be changed by other people using this computer, so files are not '
-             'copied into the workspace. A folder made directly under a drive (such as C:\\src) lets every '
-             'signed-in user change it, as a folder others can write to does on a Mac. Choose a folder inside your '
-             'user folder.', 409)
+        return name + (' can be changed by other people using this computer, so files are not copied into the '
+                       'workspace. ' + ('Make it changeable by you alone, or choose another workspace.' if role in _FILES
+                                        else 'A folder made directly under a drive (such as C:\\src) lets every signed-in '
+                                        'user change it, as a folder others can write to does on a Mac. Choose a folder '
+                                        'inside your user folder.'))
     if reason == 'owner':
-        fail('workspace_not_yours', name + ' belongs to another account (often Administrators, when it was made '
-             'from an administrator window), so files are not copied into the workspace. Take ownership of it, or '
-             'choose a folder you made.', 409)
-    if reason == 'link':
-        fail('workspace_linked', name + ' is reached through a link or junction, which Motet does not follow. '
-             "Choose the folder's real location.", 409)
-    return None
+        return name + (' belongs to another account (often Administrators, when it was made from an administrator '
+                       'window), so files are not copied into the workspace. Take ownership of it, or choose a '
+                       'folder you made.')
+    return name + (' is a link or junction, which Motet does not follow. Choose another workspace.' if role in _FILES
+                   else " is reached through a link or junction, which Motet does not follow. Choose the folder's "
+                   'real location.')
+
+
+_SUFFIXES = {'access': 'unsafe', 'owner': 'not_yours', 'link': 'linked'}
+# Windows: one fixed code and fixed words for each refused folder or file and each reason, so the page shows the
+# server's words as they are (src/web/native-agent-attachments-client.js repeats them; a test checks they match).
+WORKSPACE_REFUSALS = {('workspace_' + ('' if role == 'workspace' else role + '_') + suffix): _refusal_words(role, reason)
+                      for role in FOLDER_NAMES for reason, suffix in _SUFFIXES.items()}
+
+
+def _windows_refusal(error, role):
+    """Fail with the plain words for a Windows refusal of a workspace or Git folder or file, naming which one (the
+    codes in WORKSPACE_REFUSALS); return None for any other refusal."""
+    suffix = _SUFFIXES.get(getattr(error, 'reason', None))
+    if suffix is None or role not in FOLDER_NAMES:
+        return None
+    code = 'workspace_' + ('' if role == 'workspace' else role + '_') + suffix
+    fail(code, WORKSPACE_REFUSALS[code], 409)
 
 
 def _windows_folder(folder, *, private=False, role='workspace'):
@@ -412,6 +426,17 @@ def _windows_remove(parent, name, saved):
     if outcome not in ('removed', 'absent'):
         fail('cleanup_incomplete', 'The attachment copy could not be safely removed.', 409)
     return outcome
+
+
+# A configuration include or includeIf section header where Git can start a section: at the start of a line (after a
+# UTF-8 byte order mark, which Git skips) or right after another header on the same line, as in "[core] [include]".
+# Any name that is not a longer key (so "[include]", "[include ...", "[includeIf.gitdir:...]" all count) is refused.
+INCLUDE_HEADER = re.compile(rb'(?im)(?:^|\])\s*\[\s*include(?:if)?(?![a-z0-9-])')
+
+
+def windows_hooks(executable):
+    """Windows: the hooks path Git is given, a name under git.exe, below which nothing can exist (see _windows_git)."""
+    return os.path.join(executable, 'no-hooks')
 
 
 class Materializer:
@@ -643,7 +668,11 @@ class Materializer:
         inherited variables), its program re-checked first (owned by the system, changeable by nobody else, no link
         on the way). Windows' select works on sockets only, so two bounded reader threads drain stdout and stderr;
         output over a limit, any stderr, or the deadline ends the run, and the process is killed and reaped. Git for
-        Windows reads /dev/null as NUL, so the null configuration and hooks paths are the same as on POSIX."""
+        Windows maps only the exact name /dev/null to NUL when it opens a file, so that stays for the null
+        configuration and excludes file. Hooks are looked up as <hooksPath>\\<hook>, which /dev/null would turn into
+        <drive>:\\dev\\null\\<hook>, a folder any signed-in account may create. hooksPath is therefore a name under
+        git.exe itself: git.exe is a file, so nothing can exist below it, and only the system may replace it (its
+        owner and list are checked first). check-ignore and ls-files run no hooks; this keeps it that way."""
         import threading
         import attachments_windows_git
         exe = context.git_executable
@@ -651,7 +680,7 @@ class Materializer:
             attachments_windows_git.checked(exe)
         except attachments_windows_git.GitUnavailable:
             fail('exclusion_unavailable', 'The qualified Git executable changed.', 503)
-        argv = [exe, '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+        argv = [exe, '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=' + windows_hooks(exe),
                 '-c', 'core.excludesFile=/dev/null', '--git-dir=' + context.git_dir,
                 '--work-tree=' + context.root] + args
         limits = (stdout_limit, 1024)
@@ -659,7 +688,10 @@ class Materializer:
 
         def drain(stream, index):
             while True:
-                chunk = os.read(stream.fileno(), 4096)
+                try:
+                    chunk = os.read(stream.fileno(), 4096)
+                except (OSError, ValueError):     # the pipe closed under it: the run has already ended
+                    return
                 if not chunk:
                     return
                 output[index].extend(chunk)
@@ -692,16 +724,19 @@ class Materializer:
         except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
             fail('exclusion_unavailable', 'Effective Git exclusion could not be verified.', 503)
         finally:
+            # Reap first: the killed process's end of each pipe closes, so each reader sees the end and returns. Only
+            # then are our ends closed, so a reader never reads a descriptor number that may already be reused.
             closers = []
             if proc is not None:
-                closers.extend((lambda: self._reap_git(proc), proc.stdout.close, proc.stderr.close))
+                closers.append(lambda: self._reap_git(proc))
+            closers.append(lambda: [reader.join(5) for reader in readers])
+            if proc is not None:
+                closers.extend((proc.stdout.close, proc.stderr.close))
             if self._workspace_files is None:
                 for close in closers:
                     close()
             else:
                 _close_owned(closers)
-            for reader in readers:
-                reader.join(1)       # the pipes are closed, so a reader still running returns at once
 
     @staticmethod
     def _reap_git(proc):
@@ -715,7 +750,6 @@ class Materializer:
         The resolver must qualify configuration includes separately; this slice
         refuses them rather than scanning arbitrary additional local paths.
         """
-        import re
         paths = [os.path.join(context.git_dir, 'index'), os.path.join(context.git_dir, 'config'),
                  os.path.join(context.git_dir, 'config.worktree'),
                  os.path.join(os.path.dirname(context.exclude_parent), 'config'),
@@ -734,16 +768,13 @@ class Materializer:
                     try:
                         ps.unwritable(fd)
                     except ps.PrivateStorageError as error:
-                        base = os.path.basename(path)
-                        _windows_refusal(error, 'exclude' if base == 'exclude' else 'git_file',
-                                         None if base == 'exclude' else
-                                         'A file Git reads in the selected workspace (%s)' % os.path.relpath(path, context.root))
+                        _windows_refusal(error, 'exclude' if os.path.basename(path) == 'exclude' else 'git_file')
                         raise
                 value = _regular_fd(fd, private=False)
                 _same_entry(parent, os.path.basename(path), fd)
                 if os.path.basename(path).startswith('config'):
                     content = _bounded_read(fd, MAX_EXCLUDE)
-                    if re.search(rb'(?im)^\s*\[\s*include(?:if)?(?:\s|\])', content):
+                    if INCLUDE_HEADER.search(content[3:] if content.startswith(b'\xef\xbb\xbf') else content):
                         fail('exclusion_unavailable', 'This Git configuration is not qualified for attachments.', 503)
                 result.append((path, value))
             except FileNotFoundError:
@@ -764,7 +795,8 @@ class Materializer:
     def _prove_ignored(self, context, authority, copies):
         with self._context(context):
             before = self._git_inputs(context, authority)
-            deadline = time.monotonic() + 2
+            # Windows: up to six git.exe starts, each after the Git folder chain is checked again; 2 s as before on POSIX.
+            deadline = time.monotonic() + (15 if ps.WIN else 2)
             for spec in copies:
                 code, out = self._git(context, ['check-ignore', '-q', '--', spec.relative_path], deadline, stdout_limit=0)
                 if code != 0 or out:

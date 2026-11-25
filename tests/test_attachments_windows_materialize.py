@@ -28,7 +28,7 @@ import encodings.idna  # noqa: F401  (imported before the simulation, which rest
 import private_storage as ps
 import attachments_materialize as materialize
 from attachments_materialize import (Materializer, WorkspaceContext, FileIdentity, WorkspaceDirectories,
-                                     relative_path, resource_keys, copy_identity)
+                                     WORKSPACE_REFUSALS, relative_path, resource_keys, copy_identity)
 from attachments_requests import RequestAuthority, CopyIntent
 from attachments_resources import ResourceLocks
 from attachments_types import AttachmentError
@@ -217,7 +217,8 @@ class CopyChecks:
         self.owned_by_administrators(self.repo / '.git')
         with self.assertRaises(AttachmentError) as raised:
             self.copied()
-        self.assertEqual(raised.exception.code, 'workspace_not_yours')
+        self.assertEqual(raised.exception.code, 'workspace_git_not_yours')
+        self.assertEqual(str(raised.exception), WORKSPACE_REFUSALS['workspace_git_not_yours'])
         self.assertIn("The selected workspace's .git folder belongs to another account (often Administrators",
                       str(raised.exception))
         self.assertIn('Take ownership of it, or choose a folder you made.', str(raised.exception))
@@ -228,7 +229,8 @@ class CopyChecks:
         self.exclude_owned_by_administrators(exclude)
         with self.assertRaises(AttachmentError) as raised:
             self.copied()
-        self.assertEqual(raised.exception.code, 'workspace_not_yours')
+        self.assertEqual(raised.exception.code, 'workspace_exclude_not_yours')
+        self.assertEqual(str(raised.exception), WORKSPACE_REFUSALS['workspace_exclude_not_yours'])
         self.assertIn("The selected workspace's Git exclude file (.git\\info\\exclude) belongs to another account",
                       str(raised.exception))
 
