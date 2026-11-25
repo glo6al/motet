@@ -99,6 +99,9 @@ jobs:
       - run: python tests/test_new_chat_folder_chooser.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      - run: python tests/test_new_chat_folder_chooser_windows.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_new_chat_inventory.py
         if: ${{ !cancelled() }}
       - run: python tests/test_codex_new_chat.py

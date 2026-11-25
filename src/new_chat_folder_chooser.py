@@ -18,6 +18,7 @@ import uuid
 from new_chat_inventory import canonical_uuid
 from new_chat_types import NewChatError
 import new_chat_folder_chooser_native as native
+import new_chat_folder_chooser_windows as windows
 
 ENV, MAX_OUTPUT = native.ENV, native.LIMIT
 
@@ -190,10 +191,142 @@ class MacChooser:
             raise
 
 
+def read_lines(process, timeout, started, *, valid=windows.windows_path):
+    """read_frames for Windows, where a pipe cannot be selected: a thread reads it, and this waits on that thread
+    with the same deadline, size limit and frame rules."""
+    import queue
+    chunks, fd = queue.Queue(), process.stdout.fileno()
+
+    def pump():
+        try:
+            while True:
+                chunk = os.read(fd, 4096)
+                chunks.put(chunk)
+                if not chunk:
+                    return
+        except OSError:
+            chunks.put(b'')
+    threading.Thread(target=pump, daemon=True).start()
+    end, pending, total, terminal = time.monotonic() + timeout, bytearray(), 0, None
+    seen_start = False
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError()
+        try:
+            chunk = chunks.get(timeout=min(left, .1))
+        except queue.Empty:
+            continue
+        if not chunk:
+            if pending or terminal is None:
+                raise ValueError()
+            return terminal
+        total += len(chunk)
+        if total > MAX_OUTPUT:
+            raise ValueError()
+        pending.extend(chunk)
+        while b'\n' in pending:
+            line, _, rest = pending.partition(b'\n')
+            pending = bytearray(rest)
+            value = json.loads(line.decode('ascii', 'strict'))
+            if value == {'state': 'started'} and not seen_start and terminal is None:
+                seen_start = True
+                started()
+            elif terminal is None and value in ({'state': 'cancelled'}, {'state': 'failed'}):
+                terminal = value
+            elif (terminal is None and seen_start and type(value) is dict
+                  and set(value) == {'state', 'path'} and value['state'] == 'selected' and valid(value['path'])):
+                terminal = value
+            else:
+                raise ValueError()
+
+
+class WindowsOperation:
+    """One Windows folder window: its helper process, ended by TerminateProcess when cancelled. The dialog runs
+    inside that process, so the process having exited is the proof that the window is gone."""
+
+    def __init__(self, process, *, reader=read_lines):
+        self.process, self.reader = process, reader
+        self.lock, self.started = threading.RLock(), threading.Event()
+
+    @property
+    def window_started(self):
+        return self.started.is_set()
+
+    def exited(self):
+        with self.lock:
+            try:
+                return self.process.poll() is not None
+            except OSError:
+                return False
+
+    def cancel(self):
+        with self.lock:
+            if self.process.returncode is None:
+                with contextlib.suppress(OSError):
+                    self.process.kill()
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    self.process.wait(timeout=2)
+            return self.exited()
+
+    def result(self):
+        try:
+            value = self.reader(self.process, 125, self.started.set)
+            with self.lock:
+                self.process.wait(timeout=2)
+                if self.process.returncode != 0:
+                    raise ValueError('Folder chooser helper did not exit successfully.')
+            return value
+        finally:
+            self.cancel()
+            if self.exited() and self.process.stdout:
+                self.process.stdout.close()
+
+
+def windows_environment(source=os.environ):
+    """What the helper inherits: the folders Windows and the shell need, and a PATH of the system folders only."""
+    keep = ('SYSTEMROOT', 'WINDIR', 'SYSTEMDRIVE', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+            'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'COMMONPROGRAMFILES', 'TEMP', 'TMP',
+            'USERNAME', 'USERDOMAIN', 'COMPUTERNAME')
+    upper = {k.upper(): v for k, v in source.items()}
+    env = {k: upper[k] for k in keep if k in upper}
+    root = env.get('SYSTEMROOT', 'C:\\Windows')
+    env['PATH'] = root + '\\System32;' + root
+    return env
+
+
+class WindowsChooser:
+    """The Windows folder window: this server's Python, isolated (-I), runs new_chat_folder_chooser_windows.py with
+    one JSON argument. No shell and no console window; the folder hint is data in that argument."""
+    valid_path = staticmethod(windows.windows_path)
+
+    def __init__(self, root=None, popen=subprocess.Popen, reader=read_lines, env=None):
+        self.root, self.popen, self.reader = root, popen, reader
+        self.env = env if env is not None else windows_environment()
+
+    def open(self, initial_path=None, before_spawn=None):
+        if before_spawn:
+            before_spawn()
+        data = {'parent': os.getpid(), 'initial': initial_path or ''}
+        process = self.popen([sys.executable, '-I', str(Path(windows.__file__).resolve()), json.dumps(data, ensure_ascii=True)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             shell=False, env=self.env, close_fds=True,
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000))
+        return WindowsOperation(process, reader=self.reader)
+
+
+def host_chooser():
+    """The folder window for this system."""
+    return WindowsChooser if os.name == 'nt' else MacChooser
+
+
 class FolderChooser:
     def __init__(self, adapter, proof=None, *, clock=time.monotonic, maximum=128,
                  known_limit=65536, retention=150, schedule=True, timer_factory=None):
         self.adapter, self.proof = adapter, proof if proof is not None else LocalityProof()
+        # A folder as the adapter's window gives it: POSIX for the Mac window (and any adapter that says nothing),
+        # a drive or share path for the Windows one.
+        self.valid_path = getattr(adapter, 'valid_path', _path)
         self.clock, self.maximum, self.known_limit, self.retention = clock, maximum, known_limit, retention
         self.schedule, self.epoch = schedule, str(uuid.uuid4())
         self.timer_factory = timer_factory if timer_factory is not None else threading.Timer
@@ -296,7 +429,7 @@ class FolderChooser:
                 or data.keys() - {'requestId', 'epoch', 'gesture', 'initialPath'}
                 or not canonical_uuid(data['requestId']) or type(data['gesture']) is not dict
                 or set(data['gesture']) != {'trusted'} or type(data['gesture']['trusted']) is not bool
-                or 'initialPath' in data and not _path(data['initialPath'])):
+                or 'initialPath' in data and not self.valid_path(data['initialPath'])):
             _failure()
         with self.lock:
             guard()
@@ -422,7 +555,7 @@ class FolderChooser:
                 receipt = register({'path': row['path']})
                 folder = receipt.get('folder') if type(receipt) is dict else None
                 if (type(receipt) is not dict or receipt.get('schemaVersion') != 1 or type(folder) is not dict
-                        or folder.get('registered') is not True or not _path(folder.get('displayPath'))
+                        or folder.get('registered') is not True or not self.valid_path(folder.get('displayPath'))
                         or type(folder.get('label')) is not str or not folder['label'] or len(folder['label']) > 4096
                         or any(type(folder.get(key)) is not str or not re.fullmatch(r'[0-9a-f]{64}', folder[key]) for key in ('id', 'revision'))):
                     raise ValueError()
@@ -454,7 +587,7 @@ def trial(choose=None, validate=None, emit=print):
     try:
         if choose is None:
             with tempfile.TemporaryDirectory(prefix='motet-folder-trial-') as root:
-                value = MacChooser(root).open().result()
+                value = host_chooser()(root).open().result()
         else:
             value = choose()
         if value['state'] != 'selected':
