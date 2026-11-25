@@ -201,6 +201,31 @@ def copy_identity(value):
     return (value.device, value.inode, value.size, value.mtime_ns, value.ctime_ns)
 
 
+def source_identity(fd):
+    """The copy identity of an open source file, read the way ``Materializer.materialize`` reads it again before
+    copying. POSIX: ``fstat``, exactly as before. Windows: the handle's (``private_storage.file_identity``: 32-bit
+    volume serial, 64-bit file index, size, write and creation times), as ``_regular_fd`` reads it there. Python's
+    fstat would differ from 3.12 on: its st_dev is the 64-bit volume serial and st_ino may be a 128-bit id."""
+    if not ps.WIN:
+        return copy_identity(FileIdentity.of(os.fstat(fd)))
+    try:
+        return tuple(_id_ok(ps.file_identity(fd)))
+    except (OSError, AttachmentError):
+        fail('source_changed', 'The attachment source changed.', 409)
+
+
+def program_identity(executable):
+    """Windows: a FileIdentity for the checked git.exe from its handle (opened with no link on the way), so it is the
+    same under every Python; type and link count from fstat on that handle, uid 0 as fstat reports there."""
+    fd = ps.open_no_links(executable)
+    try:
+        st = os.fstat(fd)
+        device, inode, size, mtime_ns, ctime_ns = _id_ok(ps.file_identity(fd))
+        return FileIdentity(device, inode, st.st_mode, 0, st.st_nlink, size, mtime_ns, ctime_ns)
+    finally:
+        os.close(fd)
+
+
 def resource_keys(context, authority, copies=()):
     keys = {'workspace:' + context.workspace_fingerprint[:32], 'request:' + authority.request_id}
     for spec in copies:
@@ -434,6 +459,17 @@ def _windows_remove(parent, name, saved):
 INCLUDE_HEADER = re.compile(rb'(?im)(?:^|\])\s*\[\s*include(?:if)?(?![a-z0-9-])')
 
 
+def _program_identity_now(executable):
+    """The Git program's identity as the workspace recorded it: POSIX ``os.stat`` as before; Windows from its handle
+    (``program_identity``), or None when it cannot be read."""
+    if not ps.WIN:
+        return FileIdentity.of(os.stat(executable, follow_symlinks=False))
+    try:
+        return program_identity(executable)
+    except (OSError, AttachmentError):
+        return None
+
+
 def windows_hooks(executable):
     """Windows: the hooks path Git is given, a name under git.exe, below which nothing can exist (see _windows_git)."""
     return os.path.join(executable, 'no-hooks')
@@ -612,7 +648,7 @@ class Materializer:
         """Bounded fixed Git operations only; no shell, hooks, inherited Git env."""
         exe = context.git_executable
         if (not isinstance(exe, str) or not os.path.isabs(exe) or os.path.realpath(exe) != exe
-                or FileIdentity.of(os.stat(exe, follow_symlinks=False)) != context.git_executable_identity
+                or _program_identity_now(exe) != context.git_executable_identity
                 or not stat.S_ISREG(context.git_executable_identity.mode)):
             fail('exclusion_unavailable', 'The qualified Git executable changed.', 503)
         if ps.WIN:

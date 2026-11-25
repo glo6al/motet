@@ -10,7 +10,8 @@ import claude_mod
 import peer_lifecycle
 import private_storage as ps
 from attachments_materialize import (DirectoryIdentity, FileIdentity, Materializer, WORKSPACE_REFUSALS, WorkspaceContext,
-                                     WorkspaceDirectories, _windows_folder, _windows_refusal, copy_identity)
+                                     WorkspaceDirectories, _windows_folder, _windows_refusal, program_identity,
+                                     source_identity)
 from attachments_native_namespace import NamespaceError
 from attachments_native_reads import NativeAgentReadService
 from attachments_native_receipts import command_digest, draft_binding
@@ -145,10 +146,13 @@ def _git_program():
             executable = attachments_windows_git.find()
         except attachments_windows_git.GitUnavailable:
             unavailable()
-        st = os.stat(executable, follow_symlinks=False)
-        if not stat.S_ISREG(st.st_mode):
+        try:
+            identity = program_identity(executable)
+        except (OSError, AttachmentError):
             unavailable()
-        return executable, FileIdentity.of(st)
+        if not stat.S_ISREG(identity.mode):
+            unavailable()
+        return executable, identity
     executable = os.path.realpath(GIT)
     st = os.stat(executable, follow_symlinks=False)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 or not st.st_mode & 0o111:
@@ -464,7 +468,7 @@ class ClaudeAttachmentService:
                 self.materializer.ensure_exclusion(binding.context, authority, (copy,), lease)
                 with self.requests.source_handle(copy.id, lease) as fd:
                     item = self.materializer.materialize(binding.context, authority, copy, fd,
-                        copy_identity(FileIdentity.of(os.fstat(fd))), lease, directories=dirs)
+                        source_identity(fd), lease, directories=dirs)
                     self.requests.record_copy_result(item, lease)
                 saved.append(item)
         _, current, current_enrollment = self.target(destination_id, scope_id)
