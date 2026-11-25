@@ -23,6 +23,10 @@ import claude_managed_runner as runner
 import claude_managed_windows as windows
 
 WINDOWS = os.name == 'nt'
+LINES = ('import sys\n'
+         'for n in range(500):\n'
+         '    sys.stdout.write(\'{"n": %d}\\n\' % n)\n'
+         'sys.stdout.flush()\n')
 ECHO = ('import sys,json\n'
         'for raw in sys.stdin:\n'
         '    row=json.loads(raw)\n'
@@ -85,6 +89,20 @@ class ThreadedTransportTests(unittest.TestCase):
         with self.assertRaises(EOFError):
             transport.write({'value': 'after exit'})     # a write after exit is refused before writing
 
+    def test_every_frame_written_before_exit_is_read_then_eof_stays(self):
+        transport = self.transport(LINES)
+        transport.wait(timeout=10)                   # the child has exited before anything is read
+        seen = []
+        with self.assertRaises(EOFError):
+            while True:
+                value = transport.read(.1)
+                if value is not None:
+                    seen.append(value['n'])
+        self.assertEqual(seen, list(range(500)))
+        for _ in range(3):                           # once seen, the end is the answer every time
+            with self.assertRaises(EOFError):
+                transport.read(0)
+
     def test_partial_last_line_at_exit_is_eof(self):
         transport = self.transport('import sys; sys.stdout.write("{\\"type\\":"); sys.stdout.flush()')
         transport.wait(timeout=10)
@@ -95,8 +113,9 @@ class ThreadedTransportTests(unittest.TestCase):
     def test_line_over_one_mebibyte_is_refused(self):
         transport = self.transport('import sys; sys.stdout.write("x" * (1024 * 1024 + 2)); sys.stdout.flush(); '
                                    'import time; time.sleep(30)')
+        deadline = time.monotonic() + 10      # by time, not reads: Windows pipes may pass 4 KiB at a time
         with self.assertRaises(ValueError):
-            for _ in range(200):
+            while time.monotonic() < deadline:
                 transport.read(.1)
 
     def test_a_write_the_child_never_reads_times_out_and_refuses_the_next(self):
@@ -107,6 +126,19 @@ class ThreadedTransportTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 10)
         with self.assertRaises(TimeoutError):
             transport.write({'value': 'next'})      # the first is still blocked: frames never interleave
+
+    def test_close_leaves_a_pipe_whose_write_is_still_blocked(self):
+        transport = self.transport('import time; time.sleep(30)')
+        with self.assertRaises(TimeoutError):
+            transport.write({'value': 'x' * (runner.MAX_NATIVE_LINE - 64)})
+        started = time.monotonic()
+        self.assertFalse(transport.pipes.close(seconds=.2))       # the input pipe is left, not waited on
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(transport.process.stdin.closed)
+        transport.process.kill()
+        transport.process.wait(timeout=10)
+        self.assertTrue(transport.pipes.close(seconds=5))         # once the writer has returned, both close
+        self.assertTrue(transport.process.stdin.closed)
 
     def test_an_oversized_frame_is_refused_before_writing(self):
         transport = self.transport('import time; time.sleep(30)')
@@ -134,6 +166,12 @@ class StopDecisionTests(unittest.TestCase):
         code = windows.stop_tree(lambda: calls.append('close'), wait, lambda: calls.append('kill'), 3)
         self.assertEqual((code, calls), (1, ['close', ('wait', 3), 'kill', ('wait', 5)]))
 
+    def test_a_blocked_write_skips_closing_input_and_ends_the_job_at_once(self):
+        calls = []
+        code = windows.stop_tree(lambda: calls.append('close'), lambda seconds: calls.append(('wait', seconds)) or 9,
+                                 lambda: calls.append('kill'), 3, input_blocked=lambda: True)
+        self.assertEqual((code, calls), (9, ['kill', ('wait', 5)]))
+
     def test_an_unconfirmed_end_is_left_to_the_caller(self):
         def wait(seconds):
             raise subprocess.TimeoutExpired('fictional', seconds)
@@ -159,14 +197,16 @@ class StopDecisionTests(unittest.TestCase):
             self.assertEqual(transport.job.calls, ['terminate'])
         finally:
             transport.close()
-        self.assertEqual(transport.job.calls, ['terminate', 'close'])
+        # Closing ends the job first (before any pipe is touched), then closes its only handle.
+        self.assertEqual(transport.job.calls, ['terminate', 'terminate', 'close'])
 
 
 FAKE_CLAUDE = '''import subprocess, sys, time
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
 sys.stdout.write('{"grandchild": %d}\\n' % child.pid)
 sys.stdout.flush()
-sys.stdin.read()
+if sys.argv[1:] == ['read']:
+    sys.stdin.read()
 time.sleep(120)
 '''
 
@@ -207,8 +247,8 @@ class WindowsJobTests(unittest.TestCase):
         self.script = self.folder / 'fictional_claude.py'
         self.script.write_bytes(FAKE_CLAUDE.encode('utf-8'))
 
-    def start(self):
-        process, job = windows.start_in_job([sys.executable, '-u', str(self.script)], str(self.folder))
+    def start(self, *mode):
+        process, job = windows.start_in_job([sys.executable, '-u', str(self.script), *mode], str(self.folder))
         transport = runner.NativeTransport({})
         transport.process, transport.job = process, job
         transport.pipes = windows.ThreadedPipes(process)
@@ -224,17 +264,39 @@ class WindowsJobTests(unittest.TestCase):
         return transport, first['grandchild']
 
     def test_shutdown_ends_claude_and_everything_it_started(self):
-        transport, grandchild = self.start()
+        transport, grandchild = self.start('read')
         self.assertTrue(alive(grandchild))
+        started = time.monotonic()
         transport.terminate()
         code = transport.wait(timeout=3)              # input closed; the fake then sleeps, so the job is ended
-        self.assertIsNotNone(code)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual(code, windows.JOB_ENDED_EXIT)
+        self.assertTrue(transport.job.ended)
         self.assertTrue(gone(transport.process.pid))
         self.assertTrue(gone(grandchild))
 
-    def test_closing_the_job_handle_ends_the_tree(self):
-        transport, grandchild = self.start()
-        transport.close()                              # the supervisor's only job handle: kill on close
+    def test_shutdown_with_a_blocked_write_ends_the_job_at_once(self):
+        transport, grandchild = self.start()          # this fake never reads its input
+        with self.assertRaises(TimeoutError):
+            transport.write({'value': 'x' * (runner.MAX_NATIVE_LINE - 64)})
+        started = time.monotonic()
+        transport.terminate()
+        self.assertEqual(transport.wait(timeout=3), windows.JOB_ENDED_EXIT)
+        transport.close()
+        self.assertLess(time.monotonic() - started, 15)  # never waits on the blocked write, nor on the fake's 120 s
+        self.assertTrue(gone(grandchild))
+
+    def test_closing_ends_the_tree_without_waiting_for_claude(self):
+        transport, grandchild = self.start('read')
+        started = time.monotonic()
+        transport.close()                              # job ended first, then the pipes; the fake sleeps 120 s
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertTrue(gone(transport.process.pid))
+        self.assertTrue(gone(grandchild))
+
+    def test_closing_the_job_handle_alone_ends_the_tree(self):
+        transport, grandchild = self.start('read')
+        transport.job.close()                          # the only handle: kill on close
         self.assertTrue(gone(transport.process.pid))
         self.assertTrue(gone(grandchild))
 

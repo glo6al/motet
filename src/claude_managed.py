@@ -388,6 +388,12 @@ def client_request(run_dir, command, params):
 
 
 
+def _detach_refused(error):
+    """Whether ``error`` is Windows refusing to let the supervisor leave the server's job (nothing started)."""
+    import claude_managed_windows as windows
+    return isinstance(error, windows.DetachRefused)
+
+
 def spawn_runner(run_dir):
     """Start one detached supervisor after a manager's durable launch claim. Windows: detached from the console,
     its process group and the server's job (claude_managed_windows.spawn_detached), or refused."""
@@ -760,9 +766,16 @@ class ManagedClaude:
                     self._test.spawn(run_dir)
                 else:
                     spawn_runner(run_dir)
-            except Exception:
+            except Exception as error:
+                if ps.WIN and _detach_refused(error):
+                    # Windows: the supervisor was ended before it ran, so nothing started. Recorded as a run that
+                    # ended without a native receipt, and refused in plain words, also on replay.
+                    self._not_started(run_id)
+                    _fail('supervisor_detach_refused', 503)
                 self._uncertain(run_id)
                 _fail('launch_outcome_unknown')
+        elif ps.WIN and not row['occupied'] and row['state'] == 'exited' and not row['nativeReceipt']:
+            _fail('supervisor_detach_refused', 503)
         # Replays and a replacement web process inherit the original startup
         # deadline. Neither status nor a second launch_once extends the window.
         deadline = time.monotonic() + max(0, (row.get('startupExpiresAt') or 0) - time.time())
@@ -794,6 +807,13 @@ class ManagedClaude:
                 self._uncertain(run_id)
                 _fail('launch_outcome_unknown')
             time.sleep(min(.05, max(0, deadline - time.monotonic())))
+
+    def _not_started(self, run_id):
+        """Windows: the claimed launch started nothing (the supervisor was refused before it ran)."""
+        with self._registry() as db:
+            row = self._row(db, run_id)
+            row.update(state='exited', occupied=False)
+            self._save(db, row)
 
     def _uncertain(self, run_id):
         with self._registry() as db:

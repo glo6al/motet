@@ -9,26 +9,33 @@ its outcome becomes uncertain; it is never adopted.
 Windows differs in four ways:
 
 - The supervisor starts detached from the server's console and process group, and outside any job the server is
-  in (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB), so closing the server's window does
-  not end it. A job that forbids breaking away (some terminals and editors hold their programs in one) refuses the
-  start: ``breakaway_refusal`` says so in plain words before anything is claimed, and a start that is refused
-  anyway raises DetachRefused. Motet never starts a supervisor that would die with the console.
+  in (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB), suspended. Before its thread is
+  resumed, Windows is asked whether it is in any job at all (``IsProcessInJob``): one that still holds it (an
+  outer job in a nest that forbids breaking away) would end it with the console, so it is ended before it ran and
+  the start is refused (DetachRefused, in plain words). ``breakaway_refusal`` gives the same answer earlier, before
+  anything is claimed, where it can tell; the check on the started process is the one that decides.
 - Claude starts suspended and without a window, is put in a new job object that kills everything in it when the
   job's last handle closes (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE), and only then is its one thread resumed. Every
   program it starts (Bash-tool shells, node) is in that job. If any step fails, the suspended process is ended and
   nothing is resumed. So on Windows Claude ends with its supervisor, and leaves no orphans: the supervisor holds
   the job's only handle.
-- Shutdown closes Claude's input, waits as long as POSIX does, then ends the whole job (``stop_tree``).
+- Shutdown closes Claude's input, waits as long as POSIX does, then ends the whole job (``stop_tree``). A job
+  ended by Motet leaves the exit code JOB_ENDED_EXIT, never one Claude itself gives.
 - Windows can select sockets only, so the pipes are read and written by threads (``ThreadedPipes``), as the
-  dictation runtime does; the line limits, budgets and deadlines are the transport's, unchanged.
+  dictation runtime does; the line limits, budgets and deadlines are the transport's, unchanged. The C runtime
+  holds a descriptor's lock for a whole read, write or close, so a pipe is never closed while its thread may still
+  be blocked in it: the job is ended first (its processes' ends of the pipes then close, and the blocked thread
+  returns), the threads are waited for, and only then are the pipes closed.
 """
 import os
 import queue
 import subprocess
 import threading
+import time
 
 CHUNK = 65536
 DEPTH = 16                       # chunks queued at most (1 MiB): a reader that gets ahead waits
+FINISH_SECONDS = 2               # how long a pipe thread is waited for once the job is ended
 
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -36,6 +43,7 @@ CREATE_SUSPENDED = 0x00000004
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 CREATE_NO_WINDOW = 0x08000000
 ERROR_ACCESS_DENIED = 5
+JOB_ENDED_EXIT = 0x4D4F5445      # "MOTE": the exit code of every process in a job Motet ended
 
 JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
@@ -49,7 +57,7 @@ DETACH_REFUSED = ('Motet cannot start a Claude supervisor that outlives this win
 
 
 class DetachRefused(OSError):
-    """The supervisor could not leave the server's job, so it was not started."""
+    """The supervisor could not leave the server's job, so it was not started (it never ran)."""
 
 
 class JobError(OSError):
@@ -62,13 +70,14 @@ class JobError(OSError):
 class ThreadedPipes:
     """Blocking pipe I/O by threads. One reader thread reads Claude's output in chunks of at most CHUNK bytes into a
     queue of at most DEPTH chunks and marks the end of the stream (or a read error) once. Each write runs in its
-    own thread and must finish within the caller's deadline; a write still blocked refuses the next one, so frames
-    never interleave."""
+    own thread and must finish within the caller's deadline; a write still blocked refuses the next, so frames
+    never interleave. ``eof`` is set once the end of the stream has been read, and stays set."""
 
     def __init__(self, process):
         self.process = process
         self.chunks = queue.Queue(maxsize=DEPTH)
         self.closed = threading.Event()
+        self.eof = False
         self.writer = None
         self.reader = threading.Thread(target=self._read, name='managed-claude-reader', daemon=True)
         self.reader.start()
@@ -100,9 +109,27 @@ class ThreadedPipes:
         except queue.Empty:
             return b''
 
+    def final(self, seconds=FINISH_SECONDS):
+        """After the process exited with nothing queued: the next chunk or the end marker, waited for up to
+        ``seconds`` (the reader may still be passing on bytes it read before the exit). b'' if the reader is still
+        blocked then (a program outside the process still holds the pipe), which the caller takes as the end."""
+        deadline = time.monotonic() + seconds
+        while True:
+            chunk = self.get(.05)
+            if chunk != b'':
+                return chunk
+            if not self.reader.is_alive() and self.chunks.empty():
+                return None
+            if time.monotonic() >= deadline:
+                return b''
+
+    def writing(self):
+        """Whether an earlier write is still blocked in its thread."""
+        return self.writer is not None and self.writer.is_alive()
+
     def write(self, raw, seconds):
         """Write all of ``raw`` within ``seconds``, or raise TimeoutError; a pipe error is raised as it happened."""
-        if self.writer is not None and self.writer.is_alive():
+        if self.writing():
             raise TimeoutError()          # an earlier write is still blocked: never interleave frames
         done, failed = threading.Event(), []
 
@@ -126,21 +153,38 @@ class ThreadedPipes:
             error = failed[0]
             raise error if isinstance(error, OSError) else OSError(str(error))
 
-    def close(self):
+    def close(self, seconds=FINISH_SECONDS):
+        """Close the pipes without ever blocking on one a thread is still in. Call it once the process (on Windows,
+        its whole job) has ended, so the threads see the end of their pipes: each is waited for up to ``seconds``,
+        and a pipe whose thread is still blocked is left open rather than waited on. True if both were closed."""
         self.closed.set()
-        for stream in (self.process.stdin, self.process.stdout):
-            if stream:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
+        self.reader.join(seconds)
+        if self.writer is not None:
+            self.writer.join(seconds)
+        closed = True
+        for stream, thread in ((self.process.stdout, self.reader), (self.process.stdin, self.writer)):
+            if stream is None:
+                continue
+            if thread is not None and thread.is_alive():
+                closed = False            # still blocked in it: closing would wait for that call to end
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
+        return closed
 
 
-def stop_tree(close_input, wait, kill_tree, timeout):
+def stop_tree(close_input, wait, kill_tree, timeout, input_blocked=lambda: False):
     """Shutdown on Windows: close Claude's input (its end of stream-json input ends it), wait up to ``timeout``
     seconds as POSIX waits after SIGTERM, then end the whole job either way, so nothing Claude started stays
-    running. Returns Claude's exit code: its own if it ended in time, else the one after the job was ended.
-    ``wait`` raises subprocess.TimeoutExpired if even that cannot be confirmed (the caller records uncertainty)."""
+    running. If a write is still blocked in the input pipe, closing it would wait on that write, so the job is
+    ended at once instead. Returns Claude's exit code: its own if it ended in time, else JOB_ENDED_EXIT from ending
+    the job. ``wait`` raises subprocess.TimeoutExpired if even that cannot be confirmed (the caller records
+    uncertainty)."""
+    if input_blocked():
+        kill_tree()
+        return wait(5)
     close_input()
     try:
         code = wait(timeout)
@@ -152,7 +196,7 @@ def stop_tree(close_input, wait, kill_tree, timeout):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Win32: jobs, the suspended start and Toolhelp32. Loaded on first use, Windows only.
+# Win32: jobs, suspended starts and Toolhelp32. Loaded on first use, Windows only.
 
 _API = None
 
@@ -207,22 +251,33 @@ def _api():
     return _API
 
 
-def _failed(message):
+def _failed(message, code=None):
+    """A JobError carrying the Win32 error just set (or ``code`` where the failure is not a Win32 error)."""
     ctypes = _api()[0]
     error = JobError(message)
-    error.winerror = ctypes.get_last_error()
+    error.winerror = ctypes.get_last_error() if code is None else code
     return error
 
 
-def breakaway_refusal():
-    """None if a supervisor started now could leave the server's job (or the server is in none), else the plain
-    reason (DETACH_REFUSED). Asks Windows about this process's own job; changes nothing."""
-    ctypes, w, k, ExtendedLimits, _ = _api()
+def _in_any_job(process_handle):
+    """Whether the process is in any job (IsProcessInJob with no job named)."""
+    ctypes, w, k = _api()[:3]
     inside = w.BOOL()
-    if not k.IsProcessInJob(k.GetCurrentProcess(), None, ctypes.byref(inside)):
+    if not k.IsProcessInJob(process_handle, None, ctypes.byref(inside)):
+        raise _failed('job membership unavailable')
+    return bool(inside.value)
+
+
+def breakaway_refusal():
+    """None if a supervisor started now looks able to leave the server's job (or the server is in none), else the
+    plain reason (DETACH_REFUSED). It reads this process's immediate job only; an outer job in a nest can still
+    forbid it, which the check on the started supervisor (``spawn_detached``) catches. Changes nothing."""
+    ctypes, w, k, ExtendedLimits, _ = _api()
+    try:
+        if not _in_any_job(k.GetCurrentProcess()):
+            return None
+    except JobError:
         return DETACH_REFUSED
-    if not inside.value:
-        return None
     limits = ExtendedLimits()
     if not k.QueryInformationJobObject(None, JOB_EXTENDED_LIMITS, ctypes.byref(limits), ctypes.sizeof(limits), None):
         return DETACH_REFUSED
@@ -232,17 +287,54 @@ def breakaway_refusal():
     return DETACH_REFUSED
 
 
-def spawn_detached(argv):
-    """Start the supervisor detached from this console, process group and job. A job that refuses the breakaway
-    raises DetachRefused; nothing is started then."""
+def _end_suspended(process, reason):
+    """End a process that never ran (it is still suspended) and close its pipes. Returns ``reason`` with a note if
+    Windows did not confirm the end; a TimeoutExpired from the wait never replaces the original error."""
+    note = ''
     try:
-        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                close_fds=True,
-                                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
+        if not _api()[2].TerminateProcess(int(process._handle), JOB_ENDED_EXIT):
+            note = '; the suspended process could not be ended (it never ran)'
+        else:
+            try:
+                process.wait(5)
+            except subprocess.TimeoutExpired:
+                note = '; the end of the suspended process was not confirmed (it never ran)'
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    return reason + note
+
+
+def spawn_detached(argv):
+    """Start the supervisor detached from this console, process group and job, and resume it only if Windows says
+    it is in no job at all. Otherwise it is ended before it ran and DetachRefused is raised. A start Windows refuses
+    with access denied is DetachRefused when this process's job forbids breaking away; any other refusal (the
+    program itself could not be started) is raised as it is."""
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, close_fds=True,
+                                   creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                                                  | CREATE_BREAKAWAY_FROM_JOB | CREATE_SUSPENDED))
     except OSError as error:
-        if getattr(error, 'winerror', None) == ERROR_ACCESS_DENIED:
+        if getattr(error, 'winerror', None) == ERROR_ACCESS_DENIED and breakaway_refusal() is not None:
             raise DetachRefused(DETACH_REFUSED) from None
         raise
+    try:
+        if _in_any_job(int(process._handle)):
+            raise DetachRefused(_end_suspended(process, DETACH_REFUSED))
+        _resume_only_thread(process.pid)
+    except DetachRefused:
+        raise
+    except BaseException as error:
+        reason = _end_suspended(process, str(error) or 'the supervisor could not be resumed')
+        if not isinstance(error, Exception):
+            raise
+        raise JobError(reason) from error
+    return process
 
 
 class Job:
@@ -251,6 +343,7 @@ class Job:
     def __init__(self):
         ctypes, w, k, ExtendedLimits, _ = _api()
         self.handle = k.CreateJobObjectW(None, None)
+        self.ended = False
         if not self.handle:
             raise _failed('job object unavailable')
         limits = ExtendedLimits()
@@ -265,10 +358,12 @@ class Job:
         if not _api()[2].AssignProcessToJobObject(self.handle, process_handle):
             raise _failed('job assignment refused')
 
-    def terminate(self, code=1):
-        """End every process in the job (Claude and everything it started)."""
-        if self.handle and not _api()[2].TerminateJobObject(self.handle, code):
-            raise _failed('job could not be ended')
+    def terminate(self):
+        """End every process in the job (Claude and everything it started) with JOB_ENDED_EXIT."""
+        if self.handle:
+            if not _api()[2].TerminateJobObject(self.handle, JOB_ENDED_EXIT):
+                raise _failed('job could not be ended')
+            self.ended = True
 
     def close(self):
         """Close the job's handle: with KILL_ON_JOB_CLOSE, anything still in it ends."""
@@ -303,8 +398,10 @@ def _resume_only_thread(pid):
         raise _failed('thread unavailable')
     try:
         previous = k.ResumeThread(thread)
-        if previous == 0xFFFFFFFF or previous != 1:
+        if previous == 0xFFFFFFFF:
             raise _failed('thread could not be resumed')
+        if previous != 1:
+            raise _failed('the thread was not suspended once (count %d)' % previous, code=0)
     finally:
         k.CloseHandle(thread)
 
@@ -321,13 +418,15 @@ def start_in_job(args, cwd):
         job.assign(int(process._handle))
         _resume_only_thread(process.pid)
         return process, job
-    except BaseException:
+    except BaseException as error:
         try:
-            _api()[2].TerminateProcess(int(process._handle), 1)
-            process.wait(5)
+            reason = _end_suspended(process, str(error) or 'Claude could not be started in its job')
         finally:
-            for stream in (process.stdin, process.stdout):
-                stream.close()
             if job is not None:
                 job.close()
-        raise
+        if isinstance(error, JobError):
+            error.args = (reason,)
+            raise
+        if not isinstance(error, Exception):
+            raise                         # an interrupt stays an interrupt; the process was still ended
+        raise JobError(reason) from error

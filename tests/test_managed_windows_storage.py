@@ -83,6 +83,24 @@ class SimulatedManagerTests(Simulated, manager_tests.Fixture):
         self.folder = self.folder.__class__(**dict(self.folder.__dict__, **dict(zip(
             ('device', 'inode'), new_chat_inventory.folder_identity(str(self.project))))))
 
+    def test_a_refused_detach_records_that_nothing_started(self):
+        """A supervisor Windows would not let leave the server's job was ended before it ran: the run is recorded
+        as ended without a native receipt and refused in plain words, also on replay, never as uncertain."""
+        import dataclasses
+        import claude_managed_windows
+
+        def refused(path):
+            raise claude_managed_windows.DetachRefused(claude_managed_windows.DETACH_REFUSED)
+        self.manager._test = dataclasses.replace(self.dependencies, spawn=refused)
+        run_id = self.manager.reserve(self.folder, str(manager_tests.uuid.uuid4()))
+        for _ in range(2):
+            with self.assertRaises(claude_managed.ManagedError) as raised:
+                self.manager.launch_once(run_id, self.folder, lambda *_: None)
+            self.assertEqual(raised.exception.code, 'supervisor_detach_refused')
+        with self.manager._registry() as db:
+            row = self.manager._row(db, run_id)
+        self.assertEqual((row['state'], row['occupied'], row['nativeReceipt']), ('exited', False, False))
+
     @unittest.skip('Threads race the registry; the simulation lets only one thread use private_storage. Lock '
                    'contention on Windows is checked by the real Windows tests below.')
     def test_atomic_capacity_across_manager_instances(self):

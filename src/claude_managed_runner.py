@@ -499,7 +499,11 @@ class NativeTransport:
                 # Suspended, put in its own kill-on-close job, then resumed; refused if any step fails.
                 import claude_managed_windows as windows
                 self.process, self.job = windows.start_in_job(args, self.manifest['folder']['path'])
-                self.pipes = windows.ThreadedPipes(self.process)
+                try:
+                    self.pipes = windows.ThreadedPipes(self.process)
+                except BaseException:
+                    self.close()              # ends the job: nothing runs without its pipes
+                    raise
                 return
             self.process = subprocess.Popen(args, cwd=self.manifest['folder']['path'],
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -537,15 +541,20 @@ class NativeTransport:
                     continue
 
     def _threaded_fill(self, timeout):
-        """``read``'s fill from the reader thread: a chunk extends the buffer, the end of the stream is EOFError,
-        and an exited child with nothing waiting is EOFError, after one short look for bytes the reader had
-        already taken (a selector would still have reported those as readable)."""
+        """``read``'s fill from the reader thread: a chunk extends the buffer and the end of the stream is EOFError,
+        every time once seen, as a POSIX read of an ended pipe is. When the child has exited with nothing queued,
+        the reader is given up to two seconds to pass on what it already read and the end marker (a selector would
+        still report those bytes as readable); if it is still blocked then (a program outside the child holds the
+        pipe), that is the end too."""
+        if self.pipes.eof:
+            raise EOFError()
         chunk = self.pipes.get(timeout)
-        if not chunk and chunk is not None and self.poll() is not None:
-            chunk = self.pipes.get(.1)
-            if not chunk:
-                raise EOFError()
+        if chunk == b'' and self.poll() is not None:
+            chunk = self.pipes.final()
+            if chunk == b'':
+                chunk = None
         if chunk is None:
+            self.pipes.eof = True
             raise EOFError()
         self.buffer.extend(chunk)
 
@@ -586,7 +595,8 @@ class NativeTransport:
         if self.job is not None and self.stop_requested:
             import claude_managed_windows as windows
             return windows.stop_tree(self._close_input, lambda seconds: self.process.wait(timeout=seconds),
-                                     self.job.terminate, timeout)
+                                     self.job.terminate, timeout,
+                                     input_blocked=lambda: self.pipes is not None and self.pipes.writing())
         return self.process.wait(timeout=timeout)
 
     def _close_input(self):
@@ -596,11 +606,17 @@ class NativeTransport:
             pass
 
     def close(self):
-        if self.pipes is not None:
-            # Windows: closing the job's only handle ends anything still in it (Claude ends with its supervisor).
-            self.pipes.close()
+        if self.pipes is not None or self.job is not None:
+            # Windows: end the job first (Claude ends with its supervisor), so its ends of the pipes close and no
+            # pipe thread stays blocked; only then close the pipes, never one a thread is still in.
             if self.job is not None:
+                try:
+                    self.job.terminate()
+                except OSError:
+                    pass                  # closing its only handle below ends it all the same
                 self.job.close()
+            if self.pipes is not None:
+                self.pipes.close()
             return
         if self.selector:
             self.selector.close()
