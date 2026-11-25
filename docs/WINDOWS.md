@@ -182,7 +182,12 @@ py src\watch_tty.py --tail     # one line per event
 py src\watch_tty.py --once     # one line, e.g. "2 waiting · 3 working"
 ```
 
-`--tab` and `--split` are for iTerm2 on macOS; on Windows they say so and stop. If you used `$env:PORT`, set it in this window too.
+```powershell
+py src\watch_tty.py --tab      # Windows Terminal: the board in a new window, then one tab per agent
+py src\watch_tty.py --split    # the same in one tab: the board on top, each agent in a pane
+```
+
+`--tab` and `--split` run `wt.exe`, Windows Terminal's own command, and stop with a plain message if it is missing. They pass the port on to each tab for you. A tab or pane is titled with its agent's name and project, the bell rings when an agent starts waiting on you, and its tab shows a full progress ring in the warning state until it stops waiting (Windows Terminal cannot recolour a tab from inside it, so there is no amber tab or "2 waiting" badge as in iTerm2). Each new tab or pane hands the focus back to the board. They need Windows Terminal 1.11 or later (named windows came in 1.8, and the pane moves they use in 1.11). They refuse to start if the Motet folder or Python's path holds `;`, `%`, `"` or a control character, which Windows Terminal would treat as part of its own commands, or holds a space and ends in `\`. Not yet tried on a real PC. If you used `$env:PORT`, set it in this window too.
 
 ---
 
@@ -221,7 +226,6 @@ Motet **watches** on Windows: the live stage, risk flags, previews (with their s
 - **Dictation's speech engine.** The dictation helper, its private state, Motet's proxy and model setup now run on Windows, checked by automated tests but not yet on a real PC. The speech engine (`moonshine-voice` 0.1.6) has a Windows build only for 64-bit Intel and AMD PCs, and nobody has run it on Windows yet; Windows on ARM has none, so there the helper reports the engine as not installed and typing works as usual. See [local dictation on Windows](DICTATION.md#on-windows).
 - **Codex cloud agents** on the stage, which are found through the process list.
 - **Open in Antigravity.**
-- **iTerm2 terminal tabs.** iTerm2 is Mac only.
 
 Details on the rest:
 
@@ -287,7 +291,7 @@ Please tell us what happened, even if it was "everything worked". [Open an issue
 
 - [ ] Did Windows Firewall ask about `python.exe` when the server started?
 - [ ] Did **Unlock** open your browser, and did the stage fill with your agents?
-- [ ] Did each agent show the right project folder name? Cursor agents especially: we have not seen how Cursor names folders on Windows. Please paste the output of `dir "$env:USERPROFILE\.cursor\projects"`.
+- [ ] Did each agent show the right project folder name? Cursor agents especially: Motet reads a Cursor folder name such as `c-Users-demo-proj` as `C:\Users\demo\proj`, from names other people have posted, but has not seen it on a real PC. Projects on a network drive or share, and folder names with dots or spaces, are not named yet. Please paste the output of `dir "$env:USERPROFILE\.cursor\projects"`.
 - [ ] Is there a Claude desktop app sessions folder? Paste the output of:
   ```powershell
   dir "$env:APPDATA\Claude" ; dir "$env:APPDATA\Claude\claude-code-sessions" -ErrorAction SilentlyContinue
@@ -295,7 +299,7 @@ Please tell us what happened, even if it was "everything worked". [Open an issue
   ```
 - [ ] Did a page an agent wrote show as a rendered preview at its desk, with its styles and images? Which folder was it in (local disk, OneDrive, network, Dev Drive)?
 - [ ] After **Ctrl+C**, could you start the server again straight away, or did it say the port was busy, and for how long?
-- [ ] Did the terminal view draw properly in Windows Terminal?
+- [ ] Did the terminal view draw properly in Windows Terminal? Did `--tab` and `--split` open the board and one tab or pane per agent, and did a waiting agent's tab show the warning ring?
 - [ ] Did "Open in Claude" or "Open in Codex" at a desk open the app?
 
 **Security:** if you find a way for an agent, a page it wrote, or another program to reach something this guide or the README says it cannot (the key in `%USERPROFILE%\.live-room`, files outside a preview's folder, the port), please **do not post it publicly**. Report it privately through the repository's [security advisory page](https://github.com/glo6al/motet/security/advisories/new).

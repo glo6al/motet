@@ -335,6 +335,209 @@ def test_terminal_text():
     check('a question waits for its own answer', agent({'kind': 'ask', 'id': 'a1'}, {'kind': 'result', 'id': 'x'}).startswith('WAITING'))
 
 
+def wt_splits(arg):
+    """Windows Terminal's own command separator (AppCommandlineArgs.cpp, _commandDelimiterRegex): a ';' at the start
+    of an argument, or one after any character but a backslash, wherever it stands in the argument."""
+    import re
+    return re.search(r'(^;|[^\\];)', arg) is not None
+
+
+def wt_rejoined(run):
+    """How Windows Terminal joins a tab's command back into one line: an argument with a space in it is put in
+    quotes, and nothing else is escaped."""
+    return ' '.join('"%s"' % a if ' ' in a else a for a in run)
+
+
+def test_terminal_windows():
+    """watch_tty's Windows Terminal tabs and panes: the argument list handed to wt.exe, on every system. Nothing here
+    opens a window: wt.exe is never run, on CI or anywhere."""
+    import re
+    import subprocess
+    from unittest import mock
+    import watch_tty as w
+    saved = (w.HERE, w.PORT, sys.platform)
+    here = 'C:\\Users\\demo\\My Motet ü (copy) & co\\src'
+    py = 'C:\\Program Files\\Python 3.9\\python.exe'
+    window = 'motet-0123456789ab'
+
+    def cmd(*a):            # Python's own path, as a Windows one, only while the command is built
+        with mock.patch.object(sys, 'executable', py):
+            return w.wt_command(*a)
+    try:
+        w.HERE, w.PORT = here, 8801
+        run = [py, os.path.join(here, 'watch_tty.py'), '--port', '8801']
+        start = cmd(['--tabs', '--window', window], window, 'Motet')
+        check('wt: the board opens in a window of its own name',
+              start == ['-w', window, 'new-tab', '--title', 'Motet', '-d', here] + run + ['--tabs', '--window', window])
+        tab = cmd(['--agent', 'c:1234abcd-0000'], window, 'Motet c:1234abcd-0000')
+        check('wt: an agent tab in the board window, then the board has the focus again',
+              tab == ['-w', window, 'new-tab', '--title', 'Motet c:1234abcd-0000', '-d', here] + run
+              + ['--agent', 'c:1234abcd-0000', ';', 'focus-tab', '-t', '0'])
+        panes = [cmd(['--agent', 'c:1234abcd-0000', '--pane'], window, 'Motet c:1234abcd-0000', n) for n in range(1, 7)]
+        check('wt: the first pane takes the lower half of the board', panes[0][:10] == ['-w', window, 'focus-tab', '-t', '0', ';',
+              'move-focus', 'first', ';', 'split-pane'] and panes[0][10] == '-H')
+        check('wt: each later pane halves the largest earlier one, oldest first',
+              [p.count('nextInOrder') for p in panes] == [0, 1, 1, 2, 1, 2] and all('-H' not in p for p in panes[1:]))
+        check('wt: every pane hands the focus back to the board', all(p[-3:] == [';', 'move-focus', 'first'] for p in panes))
+        every = [start, tab] + panes
+        check('wt: a ; reaches wt.exe only as its own separator', all(not wt_splits(a) or a == ';' for c in every for a in c))
+        check('wt: spaces, brackets, & and non-ASCII in a path are kept as they are', here in start and py in start)
+        check('wt: the command Windows Terminal rebuilds holds every argument',
+              wt_rejoined(run) == '"%s" "%s" --port 8801' % (py, os.path.join(here, 'watch_tty.py')))
+        for bad in ('C:\\Users\\demo\\a;b\\src', 'C:\\Users\\demo\\100%PATH%\\src', 'C:\\Users\\demo\\"q"\\src',
+                    'C:\\Users\\demo\\tab\there', 'C:\\Users\\demo\\new\nline', 'C:\\Users\\demo\\esc\x1b]0;x\a',
+                    'C:\\Users\\demo\\ends with\\', 'src'):
+            w.HERE = bad
+            try:
+                cmd(['--tabs'], window, 'Motet')
+                refused = False
+            except ValueError:
+                refused = True
+            check('wt: refused, a folder of %r' % bad, refused)
+        w.HERE = here
+        for title in ('a;b', 'a\\;b', ';', '100%', '"q"', '-p', ''):
+            try:
+                cmd(['--tabs'], window, title)
+                refused = False
+            except ValueError:
+                refused = True
+            check('wt: refused, a title of %r' % title, refused)
+        check('wt: a quote that is not " is kept', cmd(['--tabs'], window, "Motet's")[4] == "Motet's")
+        check('wt: the waiting mark is fixed bytes', w.progress(1) == '\x1b]9;4;4;100\a' and w.progress(0) == '\x1b]9;4;0;0\a')
+        restore = w.vt_on()
+        check('the console mode is changed only on a Windows console, and can be put back',
+              restore is None if os.name != 'nt' else restore is None or callable(restore))
+        if restore:
+            restore()
+        check('wt: window names are ours only', w.WT_WINDOW_RX.match(window) and not w.WT_WINDOW_RX.match('motet-0123456789ab;x')
+              and not w.WT_WINDOW_RX.match('0') and not w.WT_WINDOW_RX.match('last'))
+
+        def exits(argv):
+            sys.argv = ['watch_tty.py'] + argv
+            try:
+                with mock.patch.object(sys, 'executable', py):
+                    w.main()
+            except SystemExit as e:
+                return str(e)
+            return ''
+        argv0 = sys.argv
+        try:
+            check('--port is checked before anything opens', exits(['--port', '80;1']) == '--port needs a port number'
+                  and exits(['--port']) == '--port needs a port number' and exits(['--port', '70000']) == '--port needs a port number')
+            check('--window is checked before anything opens', exits(['--tabs', '--window', 'motet-x']).startswith('--window needs'))
+            sys.platform = 'win32'
+            with mock.patch('shutil.which', return_value=None), mock.patch('subprocess.Popen') as popen:
+                said = exits(['--tab'])
+            check('wt: no wt.exe, a plain refusal and nothing run', said.startswith('Windows Terminal (wt.exe) was not found')
+                  and not popen.called)
+            wt = 'C:\\Users\\demo\\AppData\\Local\\Microsoft\\WindowsApps\\wt.EXE'
+            with mock.patch('shutil.which', return_value=wt), mock.patch('subprocess.Popen') as popen:
+                popen.return_value.wait.return_value = 0
+                said = exits(['--split', '--port', '8801'])
+            args, kw = popen.call_args
+            check('wt: --split runs wt.exe with an argument list and no shell',
+                  said == '0' and args[0][0] == wt and args[0][1:3] == ['-w', args[0][2]] and w.WT_WINDOW_RX.match(args[0][2])
+                  and args[0][3:] == ['new-tab', '--title', 'Motet', '-d', here] + run + ['--panes', '--window', args[0][2]]
+                  and not kw.get('shell'))
+            w.HERE = 'C:\\Users\\demo\\a;b'
+            with mock.patch('shutil.which', return_value=wt), mock.patch('subprocess.Popen') as popen:
+                said = exits(['--tab'])
+            check('wt: a path with ; is refused in plain words, and nothing run',
+                  said.startswith('Windows Terminal cannot be handed this path') and not popen.called)
+        finally:
+            sys.argv = argv0
+            sys.platform = saved[2]
+        if os.name == 'nt':
+            # Real Windows: the argument list survives the trip through one command line, as wt.exe reads it
+            # (CommandLineToArgvW), and the tab's command Windows Terminal rebuilds reads back as it was sent.
+            import ctypes
+            from ctypes import wintypes
+            parse = ctypes.WinDLL('shell32').CommandLineToArgvW
+            parse.argtypes, parse.restype = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)], ctypes.POINTER(wintypes.LPWSTR)
+            free = ctypes.WinDLL('kernel32').LocalFree
+            free.argtypes, free.restype = [ctypes.c_void_p], ctypes.c_void_p
+
+            def argv_of(line):
+                n = ctypes.c_int()
+                p = parse(line, ctypes.byref(n))
+                try:
+                    return [p[i] for i in range(n.value)]
+                finally:
+                    free(ctypes.cast(p, ctypes.c_void_p))
+            exe = 'C:\\Users\\demo\\AppData\\Local\\Microsoft\\WindowsApps\\wt.EXE'
+            check('Windows: wt.exe reads back every argument it was handed',
+                  all(argv_of(subprocess.list2cmdline([exe] + c)) == [exe] + c for c in every))
+            check('Windows: the rebuilt tab command reads back as sent', argv_of(wt_rejoined(run)) == run)
+            print('note: wt.exe on PATH:', bool(__import__('shutil').which('wt.exe')), '(never run by this test)')
+    finally:
+        w.HERE, w.PORT = saved[:2]
+
+
+def test_cursor_folder_names():
+    """Cursor's ~/.cursor/projects/<name> folder back to the workspace path: on POSIX as before, and the Windows form
+    (drive letter, lower-cased, then the path with '\\' as '-'), here with a stand-in drive and on Windows with a
+    real one. Nothing outside the tree that a name unfolds to is listed or opened."""
+    saved = (server.WIN, server.cursor_drive)
+    tmp = tempfile.TemporaryDirectory()
+    root = os.path.realpath(tmp.name)
+    try:
+        for d in ('DeepSeek-TUI-desktop', os.path.join('two', 'parts'), 'two-parts-x', os.path.join('amb', 'b'), 'amb-b'):
+            os.makedirs(os.path.join(root, d))
+        with open(os.path.join(root, 'a-file'), 'wb') as f:
+            f.write(b'')
+        if not server.WIN:
+            check('cursor: a POSIX transcript path names its folder',
+                  server.CURSOR_SLUG.search('/home/demo/.cursor/projects/home-demo-site/agent-transcripts/x/x.jsonl').group(1) == 'home-demo-site'
+                  and server.aid_of('/home/demo/.cursor/projects/home-demo-site/agent-transcripts/ab/ab.jsonl') == 'k:ab')
+            check('cursor: on POSIX a backslash is part of a name, not a separator',
+                  not server.CURSOR_IN.search('/home/demo/x\\.cursor\\projects\\a\\b.jsonl')
+                  and not server.CURSOR_SLUG.search('/home/demo/x\\.cursor\\projects\\a\\b.jsonl'))
+            slug = root.strip('/').replace('/', '-')
+            server.CURSOR_CWD.clear()
+            check('cursor: a POSIX folder unfolds as before', server.cursor_cwd(slug + '-DeepSeek-TUI-desktop') == os.path.join(root, 'DeepSeek-TUI-desktop'))
+            check('cursor: one hyphenated reading, one folder', server.cursor_cwd(slug + '-two-parts') == os.path.join(root, 'two', 'parts'))
+            check('cursor: two readings, no folder', server.cursor_cwd(slug + '-amb-b') == '')
+            check('cursor: a file is not a folder', server.cursor_cwd(slug + '-a-file') == '')
+            check('cursor: .. in a name is never followed', server.cursor_cwd(slug + '-..-..-etc') == '')
+            check('cursor: POSIX compares case as it is', server.cursor_cwd(slug + '-deepseek-tui-desktop') == '')
+        else:
+            check('cursor: a Windows transcript path names its folder, with either separator',
+                  server.CURSOR_SLUG.search('C:\\Users\\demo\\.cursor\\projects\\c-Users-demo-site\\agent-transcripts\\x\\x.jsonl').group(1) == 'c-Users-demo-site'
+                  and server.CURSOR_SLUG.search('C:\\Users\\demo/.cursor/projects\\c-Users-demo-site\\agent-transcripts\\x\\x.jsonl').group(1) == 'c-Users-demo-site'
+                  and server.aid_of('C:\\Users\\demo\\.cursor\\projects\\c-x\\agent-transcripts\\ab\\ab.jsonl') == 'k:ab')
+        # The Windows rules, with a stand-in for drive F: (any system)
+        server.WIN = True
+        server.cursor_drive = lambda letter: root + os.sep if letter in 'fF' else ''
+        server.CURSOR_CWD.clear()
+        want = os.path.join(root + os.sep, 'DeepSeek-TUI-desktop')
+        check('cursor on Windows: f-DeepSeek-TUI-desktop is F:\\DeepSeek-TUI-desktop', server.cursor_cwd('f-DeepSeek-TUI-desktop') == want)
+        check('cursor on Windows: an upper-case drive letter too', server.cursor_cwd('F-DeepSeek-TUI-desktop') == want)
+        check('cursor on Windows: folder names without case, the path as it is on disk', server.cursor_cwd('f-deepseek-tui-desktop') == want)
+        check('cursor on Windows: one hyphenated reading, one folder', server.cursor_cwd('f-two-parts') == os.path.join(root + os.sep, 'two', 'parts'))
+        check('cursor on Windows: two readings, no folder', server.cursor_cwd('f-amb-b') == '')
+        check('cursor on Windows: a drive that is not a fixed disk is not listed', server.cursor_cwd('z-DeepSeek-TUI-desktop') == '')
+        check('cursor on Windows: a name without a drive letter is not guessed', server.cursor_cwd('DeepSeek-TUI-desktop') == '')
+        check('cursor on Windows: .. in a name is never followed', server.cursor_cwd('f-..-DeepSeek-TUI-desktop') == '')
+        check('cursor on Windows: a drive and colon in a name are not a path', server.cursor_cwd('f-C:-Windows') == '' and server.cursor_cwd('f:') == '')
+        server.WIN, server.cursor_drive = saved
+        if server.WIN:
+            # Real Windows: the temporary folder's own drive, through GetDriveTypeW
+            drive, rest = os.path.splitdrive(root)
+            server.CURSOR_CWD.clear()
+            check('Windows: the fixed drive holding the temporary folder is listed', server.cursor_drive(drive[0]) == drive.upper() + '\\')
+            slug = drive[0].lower() + '-' + rest.strip('\\').replace('\\', '-') + '-DeepSeek-TUI-desktop'
+            got = server.cursor_cwd(slug)
+            check('Windows: a real Cursor-style name unfolds to its folder', os.path.normcase(got) == os.path.normcase(os.path.join(root, 'DeepSeek-TUI-desktop')))
+            server.CURSOR_CWD.clear()
+            check('Windows: and with the folder names in other case', os.path.normcase(server.cursor_cwd(slug.upper())) == os.path.normcase(got))
+            free = next((c for c in 'QRSTUVWXYZ' if not os.path.exists(c + ':\\')), '')
+            check('Windows: a drive letter with no drive is not listed', not free or server.cursor_drive(free) == '')
+    finally:
+        server.WIN, server.cursor_drive = saved
+        server.CURSOR_CWD.clear()
+        tmp.cleanup()
+
+
 def test_platform():
     """Runs on every system (CI: Ubuntu, macOS, Windows): the key, previews with a link in the way or in place of the
     granted folder (on Windows a junction, walked by handle), nothing granted on Windows before Python 3.12, and the
@@ -1720,6 +1923,8 @@ if __name__ == '__main__':
     test_plain_words()
     test_cursor_transcript()
     test_terminal_text()
+    test_terminal_windows()
+    test_cursor_folder_names()
     test_platform()
     test_cloud_exec()
     test_active_log()
