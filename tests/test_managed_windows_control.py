@@ -310,11 +310,27 @@ class WindowsPipeTests(unittest.TestCase):
                 reply.extend(chunk)
         self.assertEqual(bytes(reply), b'{"fictional": true}\n')
 
-    def test_a_second_server_with_the_same_name_is_refused(self):
+    def test_the_supervisors_pipe_has_one_instance_only(self):
+        """A second instance of the supervisor's own pipe is refused: it allows one instance, so Windows answers
+        ERROR_PIPE_BUSY before the first-instance flag is consulted. (The flag itself is proved below.)"""
         server, _ = self.server()
         with self.assertRaises(OSError) as raised:
             windows.PipeServer(server.name)
-        self.assertEqual(raised.exception.winerror, 5)          # ERROR_ACCESS_DENIED: first instance only
+        self.assertEqual(raised.exception.winerror, 231)        # ERROR_PIPE_BUSY: one instance only
+
+    def test_a_name_someone_else_holds_first_is_refused(self):
+        """Anti-squatting: another program creates the name first, with unlimited instances and default security;
+        the supervisor's pipe on that name is refused by FILE_FLAG_FIRST_PIPE_INSTANCE (ERROR_ACCESS_DENIED)."""
+        import secrets
+        ctypes, w, kernel = windows._pipe_api()[:3]
+        name = windows.PIPE_PREFIX + secrets.token_hex(16)
+        squatter = kernel.CreateNamedPipeW(name, windows.PIPE_ACCESS_DUPLEX, 0, 255,       # PIPE_UNLIMITED_INSTANCES
+                                           windows.PIPE_BUFFER, windows.PIPE_BUFFER, 0, None)
+        self.assertTrue(squatter and squatter != w.HANDLE(-1).value, ctypes.get_last_error())
+        self.addCleanup(kernel.CloseHandle, squatter)
+        with self.assertRaises(OSError) as raised:
+            windows.PipeServer(name)
+        self.assertEqual(raised.exception.winerror, 5)          # ERROR_ACCESS_DENIED: the name was held first
 
     def test_a_client_refuses_a_pipe_whose_server_is_another_process(self):
         server, _ = self.server()
