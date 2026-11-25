@@ -166,7 +166,9 @@ class InventoryTests(unittest.TestCase):
             return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_dev=device, st_ino=inode)
 
         windows = SimpleNamespace(path=WindowsPaths(), stat=directory, fspath=os.fspath)
+        # On Windows the recorded identity comes from a folder handle; here it is the fixture's, as from stat.
         with patch('new_chat_inventory.os', windows), \
+                patch('new_chat_inventory._handle_identity', lambda path: identities[path]), \
                 patch('new_chat_inventory.sys', SimpleNamespace(platform='win32')), \
                 patch('new_chat_inventory.PurePath', PureWindowsPath), \
                 patch('new_chat_inventory.Path') as paths:

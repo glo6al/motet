@@ -2,12 +2,18 @@
 
 Construction and observation never launch a native process. Production readiness
 is deliberately separate from the feature gate and has no environment override.
+
+Storage. POSIX: every folder and file is checked on its descriptor (this user's, no group or other bits, one name,
+no link), created 0700 or 0600, and the host and registry locks are blocking ``flock``. Windows (step 8b.1; the
+feature stays refused there until 8b.5): the same folders and files through private_storage, checked on their
+handles and created private from the start; SQLite's own companion files follow private_storage's companion rule;
+folders are flushed through a held handle; and the locks are private_storage's byte lock on the same files, the lock
+the attachment namespace fence takes on ``managed-claude.lock``, waited for up to LOCK_SECONDS.
 """
 from __future__ import annotations
 
 import contextlib
 from dataclasses import asdict, dataclass
-import fcntl
 import hashlib
 import json
 import math
@@ -26,6 +32,7 @@ import uuid
 from xml.parsers.expat import ExpatError
 
 from new_chat_inventory import canonical_uuid, validate_folder
+import private_storage as ps
 from new_chat_types import (Capability, ExecutionResult, FrozenFolder, NewChatError, VerifiedIdentity,
                             MANAGED_PERMISSION_TIMEOUT_SECONDS)
 
@@ -38,6 +45,7 @@ MAX_FRAME = 256 * 1024
 MAX_RESPONSE = 8 * 1024 * 1024
 MAX_RUNS = 4096
 MAX_MESSAGES = 8192
+LOCK_SECONDS = 10         # Windows: how long a host or registry lock is waited for (POSIX flock waits without end)
 TEXT_RETENTION = 7 * 86400
 STARTUP_TIMEOUT = 15
 PERMISSION_TIMEOUT_SECONDS = MANAGED_PERMISSION_TIMEOUT_SECONDS
@@ -79,6 +87,36 @@ def _readiness_json_object(pairs):
     return value
 
 
+def _windows_readiness(state_dir):
+    """Windows: the readiness record through private_storage. The state folder and the record are held through the
+    no-link walk and checked private on their handles; a held folder and an open file cannot be renamed, so the
+    record is the same file throughout, and its handle identity (with size and times) is compared before and
+    after the read."""
+    try:
+        state_dir = Path(state_dir)
+        directory = state_dir.parent.resolve(strict=True) / state_dir.name
+        with ps.open_folder(str(directory), private=True) as folder:
+            fd = folder.open(READINESS_FILENAME, single_link=True, private=True)
+            try:
+                before = ps.file_identity(fd)
+                if not 1 <= before[2] <= 1024:
+                    return False
+                raw = os.read(fd, 1025)
+                if len(raw) != before[2]:
+                    return False
+                record = json.loads(raw.decode('utf-8'), object_pairs_hook=_readiness_json_object)
+                if type(record) is not dict or type(record.get('schemaVersion')) is not int:
+                    return False
+                if record != local_configuration_identity():
+                    return False
+                return ps.file_identity(fd) == before
+            finally:
+                os.close(fd)
+    except (OSError, ValueError, TypeError, RuntimeError, ManagedError,
+            ExpatError, plistlib.InvalidFileException, subprocess.SubprocessError):
+        return False
+
+
 def _readiness_file_identity(st):
     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
@@ -87,6 +125,8 @@ def load_configuration_readiness(state_dir, *, enabled=False, demo=False):
     """Read the local qualification once at startup. Missing or unsafe records fail closed."""
     if enabled is not True or demo is not False or sys.platform != 'darwin':
         return False
+    if ps.WIN:
+        return _windows_readiness(state_dir)
     parent_fd = fd = None
     try:
         state_dir = Path(state_dir)
@@ -172,6 +212,16 @@ def _private(path, directory=False):
     path = os.fspath(path)
     if os.path.realpath(path) != path:
         _fail()
+    if ps.WIN:
+        # The name itself (not a link) checked on its handle: this user's, an access list naming only this user and
+        # SYSTEM (and Administrators on folders), a folder or a file with one name. Missing raises as POSIX does.
+        try:
+            ps.check_private(path, directory=directory, single_link=not directory)
+        except ps.PrivateStorageError as error:
+            if error.reason == 'missing':
+                raise FileNotFoundError(path) from None
+            _fail()
+        return None
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     if directory:
         flags |= os.O_DIRECTORY
@@ -193,11 +243,88 @@ def _present(path):
 
 
 def _write_private(path, data):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    if ps.WIN:
+        fd = ps.create_private_file(os.fspath(path))     # private from the start; an existing name raises
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.setmode(fd, os.O_BINARY)
+    else:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'wb') as stream:
         stream.write(data)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _mkdir_private(path):
+    """POSIX: ``mkdir(0o700)``, as before. Windows: a folder private from the start (an existing name raises)."""
+    if ps.WIN:
+        ps.make_private_folder(os.fspath(path))
+    else:
+        path.mkdir(mode=0o700, parents=False)
+
+
+def _sync_folder(path):
+    """Flush a folder's entries. POSIX: ``fsync`` on its descriptor, as before. Windows: through a held handle that
+    can write (FlushFileBuffers needs one), opened with no link on the way."""
+    if ps.WIN:
+        with ps.open_folder(os.fspath(path), private=True, writable=True) as folder:
+            folder.sync()
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _lock(path):
+    """Hold the exclusive lock on the private lock file at ``path`` and return its descriptor. POSIX: blocking
+    ``flock``, as before. Windows: private_storage's byte lock (the one the attachment namespace fence takes on the
+    host lock) on a descriptor opened through the no-link walk, retried until LOCK_SECONDS pass."""
+    if not ps.WIN:
+        import fcntl
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+    with ps.open_folder(os.fspath(path.parent), private=True) as folder:
+        fd = folder.open(path.name, single_link=True, private=True)
+    try:
+        deadline = time.monotonic() + LOCK_SECONDS
+        while not ps.try_lock(fd):
+            if time.monotonic() >= deadline:
+                _fail()
+            time.sleep(.005)
+    except BaseException:
+        ps.close_lock(fd)
+        raise
+    return fd
+
+
+def _unlock(fd):
+    """Release a lock from ``_lock``: POSIX closes it, as before; Windows releases the byte lock, then closes."""
+    if ps.WIN:
+        ps.close_lock(fd)
+    else:
+        os.close(fd)
+
+
+def _companions_private(path):
+    """SQLite's journal, -wal and -shm beside ``path``. POSIX: each that exists is a private file, as before.
+    Windows: private_storage's companion rule (SQLite creates them by name: owner this user, Administrators or
+    SYSTEM, the folder's private list), checked on their handles."""
+    if ps.WIN:
+        if not ps.sqlite_companions_private(os.fspath(path)):
+            _fail()
+        return
+    for suffix in ('-journal', '-wal', '-shm'):
+        side = Path(str(path) + suffix)
+        if _present(side):
+            _private(side)
 
 
 def _text(text):
@@ -217,7 +344,8 @@ def client_request(run_dir, command, params):
     for name in ('manifest.json', 'token', 'run.lock'):
         _private(path / name)
     token_path = path / 'token'
-    fd = os.open(token_path, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = (ps.open_no_links(os.fspath(token_path), single_link=True, private=True) if ps.WIN
+          else os.open(token_path, os.O_RDONLY | os.O_NOFOLLOW))
     with os.fdopen(fd, 'rb') as source:
         token = source.read(65).decode('ascii')
     if len(token) != 64 or any(c not in '0123456789abcdef' for c in token):
@@ -387,8 +515,7 @@ class ManagedClaude:
                         pass
                 if _present(host_lock):
                     _private(host_lock)
-                    hostfd = os.open(host_lock, os.O_RDONLY | os.O_NOFOLLOW)
-                    fcntl.flock(hostfd, fcntl.LOCK_EX)
+                    hostfd = _lock(host_lock)
                 elif _present(self.root) or _present(self.expected):
                     _fail()
                 if discovery is not None and discovery.detected():
@@ -405,7 +532,7 @@ class ManagedClaude:
                     if namespace is not None and creation is None:
                         _fail('managed_unavailable', 503)
                     try:
-                        self.root.mkdir(mode=0o700, parents=False)
+                        _mkdir_private(self.root)
                     except FileExistsError:
                         pass
                 _private(self.root, True)
@@ -418,8 +545,7 @@ class ManagedClaude:
                     except FileExistsError:
                         pass
                 _private(lock_path)
-                lockfd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
-                fcntl.flock(lockfd, fcntl.LOCK_EX)
+                lockfd = _lock(lock_path)
                 path, marker = self.root / 'registry.sqlite3', self.root / 'registry.expected'
                 witnessed = discovery is not None and namespace is discovery
                 endpoint = path.as_uri() + '?mode=rw' if witnessed else path
@@ -439,19 +565,12 @@ class ManagedClaude:
                         _write_private(self.expected, b'1\n')
                     except FileExistsError:
                         _private(self.expected)
-                    fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
-                    try:
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
+                    _sync_folder(self.root)
                     if namespace is not None:
                         namespace.finish_create(db, hostfd, creation)
                 _private(path)
                 _private(marker)
-                for suffix in ('-journal', '-wal', '-shm'):
-                    side = Path(str(path) + suffix)
-                    if _present(side):
-                        _private(side)
+                _companions_private(path)
                 if db is None:
                     db = sqlite3.connect(endpoint, timeout=5, **options)
                 db.execute('PRAGMA synchronous=FULL')
@@ -519,9 +638,9 @@ class ManagedClaude:
                 if db is not None:
                     db.close()
                 if lockfd is not None:
-                    os.close(lockfd)
+                    _unlock(lockfd)
                 if hostfd is not None:
-                    os.close(hostfd)
+                    _unlock(hostfd)
 
     @staticmethod
     def _row(db, run_id):
@@ -614,18 +733,14 @@ class ManagedClaude:
         if not claimed:
             try:
                 run_dir = self.root / run_id
-                run_dir.mkdir(mode=0o700)
+                _mkdir_private(run_dir)
                 manifest = {key: row[key] for key in ('runId', 'nativeId', 'incarnation', 'folder', 'createdAt')}
                 manifest.update(schemaVersion=1, executable=executable,
                                 profile=self._test.profile if self._test else 'normal')
                 _write_private(run_dir / 'manifest.json', json.dumps(manifest).encode())
                 _write_private(run_dir / 'token', secrets.token_hex(32).encode())
                 _write_private(run_dir / 'run.lock', b'')
-                fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
+                _sync_folder(run_dir)
                 validate_folder(folder)
                 self._executable()
                 if self._test:

@@ -19,7 +19,8 @@ import threading
 import time
 import uuid
 
-from new_chat_inventory import KnownFolderInventory, canonical_uuid, public_folder, validate_folder
+from new_chat_inventory import KnownFolderInventory, canonical_uuid, folder_identity, public_folder, validate_folder
+import private_storage as ps
 from new_chat_types import (Capability, FrozenFolder, NewChatError, OpenResult, VerifiedIdentity, ExecutionResult,
                             MANAGED_PERMISSION_TIMEOUT_SECONDS)
 
@@ -116,7 +117,31 @@ class NewChatService:
             self._dispose()
             raise
 
+    def _windows_storage(self):
+        """Windows: the same private folder and files through private_storage. The folders are made private from the
+        start (no link or junction on the way, each checked on its handle), the writer lock and the journal are
+        private files with one name, and the writer lock is private_storage's byte lock, taken without waiting."""
+        with ps.open_folder(str(self.root.parent.parent), writable=True) as home:
+            try:
+                home.mkdir(self.root.parent.name)
+            except FileExistsError:
+                pass
+            with home.folder(self.root.parent.name, private=True, writable=True) as state:
+                try:
+                    state.mkdir(self.root.name)
+                except FileExistsError:
+                    pass
+                with state.folder(self.root.name, private=True, writable=True) as folder:
+                    self._file_lock = folder.open_or_create('writer.lock')
+                    if not ps.try_lock(self._file_lock):
+                        raise BlockingIOError('New chat is already open in another Motet.')
+                    os.close(folder.open_or_create('journal.sqlite'))
+
     def _storage(self):
+        if ps.WIN:
+            self._windows_storage()
+            self._database()
+            return
         import fcntl
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         meta = self.root.lstat()
@@ -135,6 +160,9 @@ class NewChatService:
         fcntl.flock(self._file_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fd = private_file(self.root / 'journal.sqlite')
         os.close(fd)
+        self._database()
+
+    def _database(self):
         self.db = sqlite3.connect(self.root / 'journal.sqlite', check_same_thread=False, timeout=2)
         self.db.execute('PRAGMA synchronous=FULL')
         self.db.execute('PRAGMA secure_delete=ON')
@@ -159,7 +187,10 @@ class NewChatService:
             self.db.close()
             self.db = None
         if self._file_lock is not None:
-            os.close(self._file_lock)
+            if ps.WIN:
+                ps.close_lock(self._file_lock)       # Windows may keep a byte lock a while after a close
+            else:
+                os.close(self._file_lock)
             self._file_lock = None
 
     def _now(self):
@@ -664,6 +695,14 @@ class NewChatService:
         if (not stat.S_ISREG(source.st_mode) or source.st_nlink != 1
                 or (source.st_dev, source.st_ino) != (value.source_device, value.source_inode)):
             _error('identity_unavailable', MESSAGES['identity_unavailable'])
+        if ps.WIN:
+            # The same checks; the folder identity is the handle's, as the inventory records it.
+            if not stat.S_ISDIR(os.stat(value.cwd, follow_symlinks=False).st_mode):
+                _error('identity_unavailable', MESSAGES['identity_unavailable'])
+            device, inode = folder_identity(value.cwd)
+            if value.folder_device and value.folder_device != device or value.folder_inode and value.folder_inode != inode:
+                _error('identity_unavailable', MESSAGES['identity_unavailable'])
+            return value
         directory = os.stat(value.cwd, follow_symlinks=False)
         if (not stat.S_ISDIR(directory.st_mode)
                 or value.folder_device and value.folder_device != directory.st_dev

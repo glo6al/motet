@@ -2,9 +2,15 @@
 
 Importing this module has no effects. The web process never adopts a PID or
 restarts a native child: only this original supervisor can record its exit.
+
+Private state. POSIX: the run folder is opened from "/" without following a link and every file in it is opened
+relative to it and checked on its descriptor (this user's, no group or other bits, one name), and ``run.lock`` is
+``flock``, as before. Windows (step 8b.1; the feature stays refused there until 8b.5): the run folder is held through
+private_storage's no-link walk and checked private on its handle, its files are opened or created private through
+that held folder, SQLite's companion files follow private_storage's companion rule, and ``run.lock`` is
+private_storage's byte lock. The folder identity is read from a handle there, as New chat's inventory records it.
 """
 import contextlib
-import fcntl
 import hashlib
 import hmac
 import json
@@ -22,6 +28,7 @@ import time
 import uuid
 
 from new_chat_types import MANAGED_PERMISSION_TIMEOUT_SECONDS as PERMISSION_SECONDS
+import private_storage as ps
 
 PINNED_VERSION = '2.1.323'
 PINNED_SHA256 = '5432918d904a9b6afef7bb79d20df24d76052eabc1f41bceb84091d21f8889a7'
@@ -100,9 +107,12 @@ def _private(info, directory=False):
         _fail('unsafe_state')
 
 
-def _directory(path):
-    """Reject symlinks in every path component, including non-private parents."""
+def _directory(path, writable=False):
+    """Reject symlinks in every path component, including non-private parents. Windows: the private run folder held
+    through private_storage's walk (``writable`` lets files be created through it)."""
     path = os.path.abspath(os.fspath(path))
+    if ps.WIN:
+        return ps.open_folder(path, private=True, writable=writable)
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
     try:
         for component in path.split('/'):
@@ -117,7 +127,31 @@ def _directory(path):
         raise
 
 
+def _close(handle):
+    """Close the run folder or a file from ``_directory`` / ``_file``: a held folder on Windows, else a descriptor."""
+    if handle is not None and not isinstance(handle, int):
+        handle.close()
+    elif handle is not None:
+        os.close(handle)
+
+
+def _windows_file(root, name, maximum, flags):
+    """Windows ``_file``: through the held run folder. ``O_CREAT`` (always with ``O_EXCL`` here) makes a new private
+    file and an existing name raises FileExistsError; otherwise the file is opened read-only, private with one name
+    (a missing one raises FileNotFoundError). A read-only descriptor serves the byte lock as well."""
+    fd = root.create(name) if flags & os.O_CREAT else root.open(name, single_link=True, private=True)
+    try:
+        if os.fstat(fd).st_size > maximum:
+            _fail('unsafe_state')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _file(root_fd, name, maximum, *, flags=os.O_RDONLY):
+    if ps.WIN:
+        return _windows_file(root_fd, name, maximum, flags)
     fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=root_fd)
     try:
         info = os.fstat(fd)
@@ -136,6 +170,12 @@ def _folder(folder):
         if (not isinstance(path, str) or not os.path.isabs(path) or os.path.realpath(path) != path
                 or type(folder['device']) is not int or type(folder['inode']) is not int):
             raise ValueError()
+        if ps.WIN:
+            # The handle's identity through the no-link walk, as New chat's inventory records it.
+            with ps.open_folder(path) as held:
+                if tuple(held.identity()[:2]) != (folder['device'], folder['inode']):
+                    raise ValueError()
+            return
         info = os.lstat(path)
         if (not stat.S_ISDIR(info.st_mode)
                 or (info.st_dev, info.st_ino) != (folder['device'], folder['inode'])):
@@ -164,10 +204,10 @@ def _manifest(raw):
     return data
 
 
-def _open_state(run_dir):
+def _open_state(run_dir, writable=False):
     root_fd = None
     try:
-        root_fd = _directory(run_dir)
+        root_fd = _directory(run_dir, writable)
         fd = _file(root_fd, 'manifest.json', 16384)
         try:
             manifest = _manifest(os.read(fd, 16385))
@@ -182,16 +222,21 @@ def _open_state(run_dir):
             _fail('unsafe_state')
         return root_fd, manifest, token
     except RunnerError:
-        if root_fd is not None:
-            os.close(root_fd)
+        _close(root_fd)
         raise
     except (OSError, ValueError, TypeError, UnicodeError):
-        if root_fd is not None:
-            os.close(root_fd)
+        _close(root_fd)
         _fail('unsafe_state')
 
 
 def _validate_db(root_fd):
+    if ps.WIN:
+        # The ledger itself is ours (created private); SQLite makes its companions by name, so they follow
+        # private_storage's companion rule, checked through the held run folder.
+        os.close(_file(root_fd, 'ledger.sqlite3', 64 * 1024 * 1024))
+        if not ps.sqlite_companions_private(os.path.join(root_fd.path, 'ledger.sqlite3'), folder=root_fd):
+            _fail('unsafe_state')
+        return
     for name in ('ledger.sqlite3', 'ledger.sqlite3-journal', 'ledger.sqlite3-wal', 'ledger.sqlite3-shm'):
         try:
             fd = _file(root_fd, name, 64 * 1024 * 1024)
@@ -305,8 +350,7 @@ def read_snapshot(run_dir):
     finally:
         if db is not None:
             db.close()
-        if root_fd is not None:
-            os.close(root_fd)
+        _close(root_fd)
 
 
 def read_message(run_dir, request_id):
@@ -335,8 +379,7 @@ def read_message(run_dir, request_id):
     finally:
         if db is not None:
             db.close()
-        if root_fd is not None:
-            os.close(root_fd)
+        _close(root_fd)
 
 
 def read_decision(run_dir, permission_id, request_id, decision):
@@ -376,8 +419,7 @@ def read_decision(run_dir, permission_id, request_id, decision):
     finally:
         if db is not None:
             db.close()
-        if root_fd is not None:
-            os.close(root_fd)
+        _close(root_fd)
 
 
 class NativeTransport:
@@ -561,16 +603,21 @@ class Runner:
             if self.started:
                 _fail('already_running')
             try:
-                self.root_fd, self.manifest, self.token = _open_state(self.run_dir)
+                self.root_fd, self.manifest, self.token = _open_state(self.run_dir, writable=True)
                 # macOS sun_path includes its trailing NUL in 104 bytes. Refuse
                 # before claiming or starting a native process, not at bind time.
                 if len(os.fsencode(str(self.run_dir / 'control.sock'))) >= 104:
                     _fail('unsafe_state')
                 self.lock_fd = _file(self.root_fd, 'run.lock', 0, flags=os.O_RDWR)
-                try:
-                    fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    _fail('already_running')
+                if ps.WIN:
+                    if not ps.try_lock(self.lock_fd):
+                        _fail('already_running')
+                else:
+                    import fcntl
+                    try:
+                        fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        _fail('already_running')
                 self._db_open()
                 identity = {k: self.manifest[k] for k in ('runId', 'nativeId', 'incarnation')}
                 old_identity = _meta(self.db, 'identity')
@@ -1047,7 +1094,10 @@ class Runner:
             for name in ('lock_fd', 'root_fd'):
                 fd = getattr(self, name)
                 if fd is not None:
-                    os.close(fd)
+                    if ps.WIN and name == 'lock_fd':
+                        ps.close_lock(fd)     # Windows may keep a byte lock a while after a close
+                    else:
+                        _close(fd)
                     setattr(self, name, None)
 
 
