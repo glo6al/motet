@@ -207,6 +207,20 @@ def test_shell():
                 'cmd /c "rd /s /q build"', 'cmd.exe /C rd /s /q build', 'powershell -Command "Remove-Item x -Recurse"',
                 'powershell.exe -NoProfile -ExecutionPolicy Bypass -c "Remove-Item x -Recurse"', 'pwsh -c ri x -r'):
         check('windows delete: ' + cmd, server.risk(cmd) == 'delete')
+    for cmd in ('Get-ChildItem *.log | Remove-Item', 'gci -Recurse -Filter *.tmp | ri -Force', 'ls build | rm',
+                'Get-ChildItem x | Where-Object { $_.Length -gt 0 } | Remove-Item -Force',
+                'powershell -Command "Get-ChildItem *.log | Remove-Item"',
+                'powershell -Command "& { Remove-Item x -Recurse }"', "powershell -c '& {Remove-Item x -Recurse}'",
+                'pwsh -Command "& { ri x -r }"', 'powershell -Command { Remove-Item x -Recurse }', '{ rm -rf x; }',
+                'powershell Remove-Item x -Recurse', 'powershell.exe Remove-Item -Recurse -Force .\\build',
+                'powershell -NoProfile Remove-Item x -Recurse', 'powershell -ExecutionPolicy Bypass Remove-Item x -Recurse',
+                'POWERSHELL "Remove-Item x -Recurse"'):
+        check('windows delete (follow-up): ' + cmd, server.risk(cmd) == 'delete')
+    check('bare powershell is followed', server.risk('powershell git push origin main') == 'push')
+    for cmd in ('Get-ChildItem *.log | Select-Object Name', 'Get-Content x || Remove-Item y', 'echo a | findstr rm',
+                'powershell -File cleanup.ps1', 'powershell -NoProfile Get-Process', 'pwsh Remove-Item x -Recurse',
+                'powershell -Command "& { Get-Process }"', 'powershell -EncodedCommand ZQBjAGgAbwA='):
+        check('not a delete (follow-up): ' + cmd, server.risk(cmd) == '')
     check('windows send', server.risk('Send-MailMessage -To a@example.com -Subject hi') == 'send')
     check('cmd /c is followed', server.risk('cmd /c "git push origin main"') == 'push')
     check('powershell -Command is followed', server.risk('powershell -Command "git push origin main"') == 'push')
