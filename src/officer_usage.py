@@ -19,7 +19,7 @@ import uuid
 
 MAX_BYTES = 5 * 1024 * 1024
 RETENTION_DAYS = 90
-PRICING_PATH = Path(__file__).resolve().parents[1] / 'motet' / 'PRICING.json'
+PRICING_PATH = Path(__file__).resolve().parents[1] / 'config' / 'PRICING.json'
 PRICE_SOURCE = 'https://platform.claude.com/docs/en/about-claude/pricing'
 MODEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z')
 KEY_SHAPE = re.compile(r'sk-ant-[A-Za-z0-9_-]{20,}')

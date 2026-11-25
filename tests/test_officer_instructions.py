@@ -189,6 +189,22 @@ class SkillInstructionsTests(InstructionFixture):
         self.write_skill(body='')
         self.assertEqual(instructions.load_instructions().skills, ())
 
+    def test_self_templates_are_shipped_but_not_read_yet(self):
+        real = Path(instructions.__file__).resolve().parents[1] / 'motet'
+        with patch.object(instructions, '_OFFICER_DIR', real):
+            bundle = instructions.load_instructions()
+        live = (real / 'VOCABULARY.md').read_text(encoding='utf-8') + (real / 'INSTRUCTIONS.md').read_text(encoding='utf-8')
+        self.assertEqual(bundle.system, live + instructions.CORE_AUTHORITY)
+        templates = ['SOUL.md', 'RULES.md', 'IDENTITY.md', 'VOCABULARY.next.md', 'ASKING_MOTET.md']
+        templates += ['skills/' + name + '.md' for name in (
+            'morning-brief', 'project-sweep', 'end-of-day', 'kick-off', 'next-step', 'review-loop', 'ready-for-yes',
+            'close-out', 'unstick-an-agent', 'something-went-wrong', 'helping-an-agent', 'waiting-on-you', 'wake-and-deliver')]
+        for name in templates:
+            with self.subTest(template=name):
+                self.assertTrue((real / name).is_file())
+                self.assertNotIn(tuple(name.split('/')), instructions._FIXED_FILES)
+        self.assertEqual(len(bundle.skills), 5)
+
     def test_unknown_skill_and_model_paths_never_open_files(self):
         bundle = instructions.load_instructions()
         with patch.object(instructions.os, 'open', side_effect=AssertionError('No tool-time file reads')):

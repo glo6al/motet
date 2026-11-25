@@ -57,7 +57,7 @@ def registry(supplied=True):
 class RequestBudgetTests(unittest.TestCase):
     def setUp(self):
         self.now = 10
-        self.pricing = json.loads((Path(__file__).resolve().parents[1] / 'motet/PRICING.json').read_text())
+        self.pricing = json.loads((Path(__file__).resolve().parents[1] / 'config/PRICING.json').read_text())
         self.billing = {'service_tier': 'standard', 'inference_geo': 'global', 'speed': 'standard', 'extras': False}
 
     def budget(self, **kwargs):

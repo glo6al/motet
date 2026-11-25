@@ -43,7 +43,7 @@ def _digest(value):
 
 def load_pricing_snapshot():
     """Read the checked-in test snapshot. Never fetch or claim fresh pricing."""
-    return json.loads((_SRC.parent / 'motet' / 'PRICING.json').read_text())
+    return json.loads((_SRC.parent / 'config' / 'PRICING.json').read_text())
 
 
 def synthetic_bound(body, tokens=100000):
