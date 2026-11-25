@@ -69,6 +69,10 @@ class JobError(OSError):
     """Claude could not be started inside its own job; it was ended before it ran."""
 
 
+class AlreadyRunning(JobError):
+    """The process's thread was not suspended when it was to be resumed: it may already have run. Never NotStarted."""
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Threads in place of selectors on pipes.
 
@@ -333,7 +337,9 @@ def spawn_detached(argv):
                                    creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
                                                   | CREATE_BREAKAWAY_FROM_JOB | CREATE_SUSPENDED))
     except OSError as error:
-        if _server_in_a_job():
+        # Access denied while this process is in a job (or that cannot be checked) is the job refusing the
+        # breakaway; any other failure (a missing or unreadable program, say) is a plain start failure.
+        if getattr(error, 'winerror', None) == ERROR_ACCESS_DENIED and _server_in_a_job():
             raise DetachRefused(DETACH_REFUSED) from error
         raise NotStarted(NOT_STARTED) from error
     try:
@@ -342,6 +348,10 @@ def spawn_detached(argv):
         _resume_only_thread(process.pid)
     except NotStarted:
         raise
+    except AlreadyRunning as error:
+        # It may have run: ended anyway, and never reported as not started (the launch stays unknown).
+        _api()[2].TerminateProcess(int(process._handle), JOB_ENDED_EXIT)
+        raise JobError('the supervisor was already running when it was to be resumed; it was ended') from error
     except BaseException as error:
         reason = _end_suspended(process, NOT_STARTED)
         if not isinstance(error, Exception):
@@ -413,6 +423,8 @@ def _resume_only_thread(pid):
         previous = k.ResumeThread(thread)
         if previous == 0xFFFFFFFF:
             raise _failed('thread could not be resumed')
+        if previous == 0:
+            raise AlreadyRunning('the process was already running')
         if previous != 1:
             raise _failed('the thread was not suspended once (count %d)' % previous, code=0)
     finally:

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import claude_managed_runner as runner
@@ -199,6 +200,85 @@ class StopDecisionTests(unittest.TestCase):
             transport.close()
         # Closing ends the job first (before any pipe is touched), then closes its only handle.
         self.assertEqual(transport.job.calls, ['terminate', 'terminate', 'close'])
+
+
+class FakeKernel:
+    """Win32 calls answered in Python, for the decisions around them (portable)."""
+
+    def __init__(self, resume=1, owner=9):
+        self.resume, self.owner, self.ended = resume, owner, []
+
+    def CreateToolhelp32Snapshot(self, flags, pid):
+        return 1
+
+    def Thread32First(self, snapshot, entry):
+        entry._obj.th32OwnerProcessID, entry._obj.th32ThreadID = self.owner, 7
+        return 1
+
+    def Thread32Next(self, snapshot, entry):
+        return 0
+
+    def OpenThread(self, access, inherit, thread):
+        return 2
+
+    def ResumeThread(self, thread):
+        return self.resume
+
+    def CloseHandle(self, handle):
+        return 1
+
+    def TerminateProcess(self, handle, code):
+        self.ended.append((handle, code))
+        return 1
+
+
+class FakeWin32Tests(unittest.TestCase):
+    def setUp(self):
+        import ctypes
+
+        class ThreadEntry(ctypes.Structure):
+            _fields_ = [('dwSize', ctypes.c_uint32), ('cntUsage', ctypes.c_uint32), ('th32ThreadID', ctypes.c_uint32),
+                        ('th32OwnerProcessID', ctypes.c_uint32), ('tpBasePri', ctypes.c_int32),
+                        ('tpDeltaPri', ctypes.c_int32), ('dwFlags', ctypes.c_uint32)]
+        self.kernel = FakeKernel()
+        fake = (ctypes, type('W', (), {'HANDLE': ctypes.c_void_p}), self.kernel, None, ThreadEntry)
+        patcher = mock.patch.object(windows, '_api', return_value=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def popen(self, **kwargs):
+        process = mock.Mock(pid=9, _handle=5, stdin=None, stdout=None, stderr=None)
+        return mock.patch.object(windows.subprocess, 'Popen', return_value=process, **kwargs)
+
+    def test_a_thread_that_was_already_running_may_have_run(self):
+        self.kernel.resume = 0
+        with self.assertRaises(windows.AlreadyRunning) as raised:
+            windows._resume_only_thread(9)
+        self.assertNotIsInstance(raised.exception, windows.NotStarted)
+        self.kernel.resume = 1
+        windows._resume_only_thread(9)                        # suspended once: resumed
+
+    def test_a_supervisor_that_may_have_run_is_never_reported_not_started(self):
+        self.kernel.resume = 0
+        with self.popen(), mock.patch.object(windows, '_in_any_job', return_value=False):
+            with self.assertRaises(windows.JobError) as raised:
+                windows.spawn_detached(['fictional-python', 'fictional-runner'])
+        self.assertNotIsInstance(raised.exception, windows.NotStarted)
+        self.assertEqual(self.kernel.ended, [(5, windows.JOB_ENDED_EXIT)])   # ended anyway
+
+    def test_only_access_denied_in_a_job_is_a_refused_detach(self):
+        def refused(code):
+            error = OSError('fictional start failure')
+            error.winerror = code
+            return error
+        for code, in_job, expected in ((5, True, windows.DetachRefused), (2, True, windows.NotStarted),
+                                       (5, False, windows.NotStarted), (2, False, windows.NotStarted)):
+            with self.subTest(winerror=code, in_job=in_job):
+                with self.popen(side_effect=refused(code)), \
+                        mock.patch.object(windows, '_server_in_a_job', return_value=in_job):
+                    with self.assertRaises(windows.NotStarted) as raised:
+                        windows.spawn_detached(['fictional-python', 'fictional-runner'])
+                self.assertIs(type(raised.exception), expected)
 
 
 FAKE_CLAUDE = '''import subprocess, sys, time

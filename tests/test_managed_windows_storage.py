@@ -119,6 +119,28 @@ class SimulatedManagerTests(Simulated, manager_tests.Fixture):
             self.manager._save(db, row)
         self.assertIsNone(self.manager._recorded_not_started(run_id, row))
 
+    def test_an_unrecorded_reason_still_ends_the_run_with_plain_words(self):
+        import dataclasses
+        import claude_managed_windows
+
+        def refused(path):
+            raise claude_managed_windows.DetachRefused(claude_managed_windows.DETACH_REFUSED)
+        self.manager._test = dataclasses.replace(self.dependencies, spawn=refused)
+        run_id = self.manager.reserve(self.folder, str(manager_tests.uuid.uuid4()))
+        write = claude_managed._write_private
+
+        def full_for_the_reason(path, data):
+            if path.name == claude_managed.ManagedClaude.NOT_STARTED_FILE:
+                raise OSError('fictional full disk')
+            return write(path, data)
+        with mock.patch.object(claude_managed, '_write_private', full_for_the_reason):
+            with self.assertRaises(claude_managed.ManagedError) as raised:
+                self.manager.launch_once(run_id, self.folder, lambda *_: None)
+        self.assertEqual(raised.exception.code, 'supervisor_not_started')
+        with self.manager._registry() as db:
+            row = self.manager._row(db, run_id)
+        self.assertEqual((row['state'], row['occupied']), ('exited', False))
+
     def test_a_waiter_sees_another_callers_not_started_record_at_once(self):
         import dataclasses
         run_id = self.manager.reserve(self.folder, str(manager_tests.uuid.uuid4()))

@@ -783,8 +783,7 @@ class ManagedClaude:
                 if code is not None:
                     # Windows: the supervisor never ran, so nothing started. The run ends without a native receipt,
                     # its reason is kept in its folder, and the plain refusal is the answer, also on replay.
-                    self._not_started(run_id, code)
-                    _fail(code, 503)
+                    _fail(self._not_started(run_id, code), 503)
                 self._uncertain(run_id)
                 _fail('launch_outcome_unknown')
         elif ps.WIN:
@@ -829,27 +828,33 @@ class ManagedClaude:
                 _fail('launch_outcome_unknown')
             time.sleep(min(.05, max(0, deadline - time.monotonic())))
 
-    NOT_STARTED = 'not-started'
+    NOT_STARTED_FILE = 'not-started'
 
     def _not_started(self, run_id, code):
         """Windows: the claimed launch started nothing (the supervisor never ran). Its reason is written to the run
-        folder (a private file read only for this), then the run ends without a native receipt, releasing its
-        slot."""
+        folder (a private file read only for this) and flushed, then the run ends without a native receipt,
+        releasing its slot; it ends either way, since nothing started. Returns the code to answer with: ``code``
+        if it was recorded, else the plainer supervisor_not_started."""
+        recorded = True
         try:
-            _write_private(self.root / run_id / self.NOT_STARTED, code.encode('ascii'))
+            _write_private(self.root / run_id / self.NOT_STARTED_FILE, code.encode('ascii'))
+            _sync_folder(self.root / run_id)
         except FileExistsError:
             pass
+        except (OSError, ManagedError):
+            recorded = False
         with self._registry() as db:
             row = self._row(db, run_id)
             row.update(state='exited', occupied=False)
             self._save(db, row)
+        return code if recorded else 'supervisor_not_started'
 
     def _recorded_not_started(self, run_id, row):
         """Windows: the reason recorded by ``_not_started`` for a run that ended without a native receipt, else None
         (a Claude that started and exited before its identity was proved has no such record)."""
         if row['occupied'] or row['state'] != 'exited' or row['nativeReceipt'] or not row['launchClaimed']:
             return None
-        path = self.root / run_id / self.NOT_STARTED
+        path = self.root / run_id / self.NOT_STARTED_FILE
         try:
             _private(path)
             fd = ps.open_no_links(os.fspath(path), single_link=True, private=True)
