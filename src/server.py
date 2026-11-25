@@ -6716,8 +6716,8 @@ def start_new_chat():
             adapters['claude_code'] = ClaudeAdapter(CLAUDE_MANAGED)
         chooser = None
         if NEW_CHAT_ENABLED and os.environ.get('WATCH_DEMO') != '1':
-            from new_chat_folder_chooser import FolderChooser, MacChooser
-            chooser = FolderChooser(MacChooser(os.path.join(HOME, '.live-room', 'new-chat')))
+            from new_chat_folder_chooser import FolderChooser, host_chooser
+            chooser = FolderChooser(host_chooser()(os.path.join(HOME, '.live-room', 'new-chat')))
         return NewChatService(os.path.join(HOME, '.live-room'), adapters,
                               new_chat_inventory, enabled=NEW_CHAT_ENABLED,
                               demo=os.environ.get('WATCH_DEMO') == '1', folder_chooser=chooser)

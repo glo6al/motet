@@ -18,6 +18,7 @@ import uuid
 from new_chat_inventory import canonical_uuid
 from new_chat_types import NewChatError
 import new_chat_folder_chooser_native as native
+import new_chat_folder_chooser_windows as windows
 
 ENV, MAX_OUTPUT = native.ENV, native.LIMIT
 
@@ -190,10 +191,196 @@ class MacChooser:
             raise
 
 
+def read_lines(process, timeout, started, *, valid=windows.windows_path, pumps=None):
+    """read_frames for Windows, where a pipe cannot be selected: a thread reads it, and this waits on that thread
+    with the same deadline, size limit and frame rules. The thread reads through the file object, never a bare
+    descriptor: once the pipe is closed it fails, so it can never read a descriptor number reused after a timeout."""
+    import queue
+    chunks, stream = queue.Queue(), process.stdout
+
+    def pump():
+        try:
+            while True:
+                chunk = stream.read1(4096)
+                chunks.put(chunk)
+                if not chunk:
+                    return
+        except (OSError, ValueError):
+            chunks.put(b'')
+    thread = threading.Thread(target=pump, daemon=True)
+    if pumps is not None:
+        pumps.append(thread)        # the operation joins it after the helper is ended, before closing the pipe
+    thread.start()
+    end, pending, total, terminal = time.monotonic() + timeout, bytearray(), 0, None
+    seen_start = False
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError()
+        try:
+            chunk = chunks.get(timeout=min(left, .1))
+        except queue.Empty:
+            continue
+        if not chunk:
+            if pending or terminal is None:
+                raise ValueError()
+            return terminal
+        total += len(chunk)
+        if total > MAX_OUTPUT:
+            raise ValueError()
+        pending.extend(chunk)
+        while b'\n' in pending:
+            line, _, rest = pending.partition(b'\n')
+            pending = bytearray(rest)
+            value = json.loads(line.decode('ascii', 'strict'))
+            if value == {'state': 'started'} and not seen_start and terminal is None:
+                seen_start = True
+                started()
+            elif terminal is None and value in ({'state': 'cancelled'}, {'state': 'failed'}):
+                terminal = value
+            elif (terminal is None and seen_start and type(value) is dict
+                  and set(value) == {'state', 'path'} and value['state'] == 'selected' and valid(value['path'])):
+                terminal = value
+            else:
+                raise ValueError()
+
+
+class WindowsOperation:
+    """One Windows folder window: its helper process, ended by TerminateProcess when cancelled. The dialog runs
+    inside that process, so the process having exited is the proof that the window is gone."""
+
+    def __init__(self, process, *, reader=read_lines):
+        self.process, self.reader, self.pumps = process, reader, []
+        self.lock, self.started = threading.RLock(), threading.Event()
+
+    @property
+    def window_started(self):
+        return self.started.is_set()
+
+    def exited(self):
+        with self.lock:
+            try:
+                return self.process.poll() is not None
+            except OSError:
+                return False
+
+    def cancel(self):
+        with self.lock:
+            if self.process.returncode is None:
+                with contextlib.suppress(OSError):
+                    self.process.kill()
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    self.process.wait(timeout=2)
+            return self.exited()
+
+    def result(self):
+        try:
+            value = self.reader(self.process, 125, self.started.set, pumps=self.pumps)
+            with self.lock:
+                self.process.wait(timeout=2)
+                if self.process.returncode != 0:
+                    raise ValueError('Folder chooser helper did not exit successfully.')
+            return value
+        finally:
+            self.cancel()
+            if self.exited() and self.process.stdout:
+                for pump in self.pumps:     # the ended helper closed its end, so the reading thread finishes
+                    pump.join(2)
+                if not any(pump.is_alive() for pump in self.pumps):
+                    self.process.stdout.close()
+
+
+def windows_environment(source=os.environ):
+    """What the helper inherits: the folders Windows and the shell need, and a PATH of the system folders only."""
+    keep = ('SYSTEMROOT', 'WINDIR', 'SYSTEMDRIVE', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+            'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'COMMONPROGRAMFILES', 'TEMP', 'TMP',
+            'USERNAME', 'USERDOMAIN', 'COMPUTERNAME')
+    upper = {k.upper(): v for k, v in source.items()}
+    env = {k: upper[k] for k in keep if k in upper}
+    root = env.get('SYSTEMROOT', 'C:\\Windows')
+    env['PATH'] = root + '\\System32;' + root
+    return env
+
+
+def server_handle():
+    """An inheritable handle to this process (SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION only), for the helper
+    to recognise and watch the server by, and a function that closes this process's copy."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.GetCurrentProcess.argtypes, k.GetCurrentProcess.restype = [], wintypes.HANDLE
+    k.DuplicateHandle.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.HANDLE),
+                                  wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.DuplicateHandle.restype = wintypes.BOOL
+    k.CloseHandle.argtypes, k.CloseHandle.restype = [wintypes.HANDLE], wintypes.BOOL
+    me, out = k.GetCurrentProcess(), wintypes.HANDLE()
+    if not k.DuplicateHandle(me, me, me, ctypes.byref(out), 0x00100000 | 0x1000, True, 0):
+        raise OSError(ctypes.get_last_error(), 'The server could not hand its own process handle to the folder window.')
+    return out.value, lambda: k.CloseHandle(out.value)
+
+
+def allow_foreground(pid):
+    """Let the helper bring its window in front (AllowSetForegroundWindow). Windows grants this only while the
+    server may itself take the foreground, so the window can still open behind the browser; then it flashes in the
+    taskbar."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL('user32')
+        u.AllowSetForegroundWindow.argtypes, u.AllowSetForegroundWindow.restype = [wintypes.DWORD], wintypes.BOOL
+        return bool(u.AllowSetForegroundWindow(pid))
+    except (AttributeError, OSError):
+        return False
+
+
+def _startup(handles):
+    info = subprocess.STARTUPINFO() if hasattr(subprocess, 'STARTUPINFO') else type('STARTUPINFO', (), {})()
+    info.lpAttributeList = {'handle_list': list(handles)}
+    return info
+
+
+class WindowsChooser:
+    """The Windows folder window: this server's Python, isolated (-I), runs new_chat_folder_chooser_windows.py with
+    one JSON argument. No shell and no console window; the folder hint is data in that argument. The helper
+    inherits one handle besides its standard ones: a handle to this server, by which it recognises and watches it."""
+    valid_path = staticmethod(windows.windows_path)
+
+    def __init__(self, root=None, popen=subprocess.Popen, reader=read_lines, env=None, handle=server_handle,
+                 foreground=allow_foreground):
+        self.root, self.popen, self.reader, self.handle, self.foreground = root, popen, reader, handle, foreground
+        self.env = env if env is not None else windows_environment()
+
+    def open(self, initial_path=None, before_spawn=None):
+        if before_spawn:
+            before_spawn()
+        server, close = self.handle()
+        try:
+            data = {'parent': os.getpid(), 'server': server, 'initial': initial_path or ''}
+            system = os.path.join(self.env.get('SYSTEMROOT') or 'C:\\Windows', 'System32')
+            process = self.popen([sys.executable, '-I', str(Path(windows.__file__).resolve()), json.dumps(data, ensure_ascii=True)],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 shell=False, env=self.env, close_fds=True, startupinfo=_startup([server]),
+                                 cwd=system,     # a DLL loaded by bare name is never looked for in the server's folder
+                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000))
+        finally:
+            close()
+        self.foreground(process.pid)
+        return WindowsOperation(process, reader=self.reader)
+
+
+def host_chooser():
+    """The folder window for this system."""
+    return WindowsChooser if os.name == 'nt' else MacChooser
+
+
 class FolderChooser:
     def __init__(self, adapter, proof=None, *, clock=time.monotonic, maximum=128,
                  known_limit=65536, retention=150, schedule=True, timer_factory=None):
         self.adapter, self.proof = adapter, proof if proof is not None else LocalityProof()
+        # A folder as the adapter's window gives it: a drive path for the Windows window, and POSIX for the Mac one
+        # and for any other adapter (a stand-in that merely has some valid_path attribute does not switch it).
+        windows_window = getattr(type(adapter), 'valid_path', None) is windows.windows_path
+        self.valid_path = windows.windows_path if windows_window else _path
         self.clock, self.maximum, self.known_limit, self.retention = clock, maximum, known_limit, retention
         self.schedule, self.epoch = schedule, str(uuid.uuid4())
         self.timer_factory = timer_factory if timer_factory is not None else threading.Timer
@@ -296,7 +483,7 @@ class FolderChooser:
                 or data.keys() - {'requestId', 'epoch', 'gesture', 'initialPath'}
                 or not canonical_uuid(data['requestId']) or type(data['gesture']) is not dict
                 or set(data['gesture']) != {'trusted'} or type(data['gesture']['trusted']) is not bool
-                or 'initialPath' in data and not _path(data['initialPath'])):
+                or 'initialPath' in data and not self.valid_path(data['initialPath'])):
             _failure()
         with self.lock:
             guard()
@@ -422,7 +609,7 @@ class FolderChooser:
                 receipt = register({'path': row['path']})
                 folder = receipt.get('folder') if type(receipt) is dict else None
                 if (type(receipt) is not dict or receipt.get('schemaVersion') != 1 or type(folder) is not dict
-                        or folder.get('registered') is not True or not _path(folder.get('displayPath'))
+                        or folder.get('registered') is not True or not self.valid_path(folder.get('displayPath'))
                         or type(folder.get('label')) is not str or not folder['label'] or len(folder['label']) > 4096
                         or any(type(folder.get(key)) is not str or not re.fullmatch(r'[0-9a-f]{64}', folder[key]) for key in ('id', 'revision'))):
                     raise ValueError()
@@ -454,7 +641,7 @@ def trial(choose=None, validate=None, emit=print):
     try:
         if choose is None:
             with tempfile.TemporaryDirectory(prefix='motet-folder-trial-') as root:
-                value = MacChooser(root).open().result()
+                value = host_chooser()(root).open().result()
         else:
             value = choose()
         if value['state'] != 'selected':
