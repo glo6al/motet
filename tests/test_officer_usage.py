@@ -251,6 +251,16 @@ class UsageTests(unittest.TestCase):
         self.assertIsNone(total['estimated_usd'])
         self.assertIsNone(total['rates_date'])
 
+    def test_pricing_is_read_from_config_and_a_missing_file_stays_unknown(self):
+        repo = Path(usage.__file__).resolve().parents[1]
+        self.assertEqual(usage.PRICING_PATH, repo / 'config' / 'PRICING.json')
+        self.assertFalse((repo / 'motet' / 'PRICING.json').exists())
+        self.assertEqual(usage._pricing()['models'], json.loads(usage.PRICING_PATH.read_text())['models'])
+        for path in (Path(self.tmp.name) / 'config' / 'PRICING.json', Path(self.tmp.name) / 'absent' / 'PRICING.json'):
+            (Path(self.tmp.name) / 'config').mkdir(exist_ok=True)
+            with self.subTest(path=path), patch.object(usage, 'PRICING_PATH', path):
+                self.assertIsNone(usage._pricing())
+
     def test_malformed_rate_snapshot_fails_closed(self):
         # Keep public test pricing outside the private ledger directory, whose
         # platform-specific permissions must be established by the real loader.

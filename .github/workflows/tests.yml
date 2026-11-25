@@ -166,6 +166,10 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_officer_usage.py
         if: ${{ !cancelled() }}
+      # Motet's self folder and its version history, against a temporary home only.
+      - run: python tests/test_motet_self.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_officer_accounting.py
         if: ${{ !cancelled() }}
       - run: python tests/test_anthropic_reporting.py

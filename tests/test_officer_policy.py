@@ -35,7 +35,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.load_policy(), policy.ModelPolicy('claude-haiku-5-5', 'claude-sonnet-5-5'))
         self.path.write_bytes(POLICY.replace('\n', '\r\n').encode())
         self.assertEqual(policy.load_policy().summary, 'claude-sonnet-5-5')
-        with patch.object(policy, 'POLICY_PATH', Path(policy.__file__).resolve().parents[1] / 'motet/MODEL_POLICY.md'):
+        with patch.object(policy, 'POLICY_PATH', Path(policy.__file__).resolve().parents[1] / 'config/MODEL_POLICY.md'):
             self.assertEqual(policy.load_policy().qa, 'claude-haiku-5-5')
 
     def test_invalid_missing_or_unreadable_policy_fails_fixed_without_echo(self):
@@ -63,6 +63,23 @@ class PolicyTests(unittest.TestCase):
         if hasattr(os, 'mkfifo'):
             os.mkfifo(self.path)
             with self.assertRaises(ValueError): policy.load_policy()
+
+    def test_policy_is_read_from_config_and_a_missing_file_fails_as_before(self):
+        repo = Path(policy.__file__).resolve().parents[1]
+        self.patcher.stop()
+        try:
+            self.assertEqual(policy.POLICY_PATH, repo / 'config' / 'MODEL_POLICY.md')
+            self.assertFalse((repo / 'motet' / 'MODEL_POLICY.md').exists())
+            self.assertEqual(policy.load_policy().qa, 'claude-haiku-5-5')
+        finally:
+            self.patcher.start()
+        error = '^' + policy.POLICY_ERROR.replace('.', r'\.') + '$'
+        config = Path(self.tmp.name) / 'config'
+        for path in (config / 'MODEL_POLICY.md', Path(self.tmp.name) / 'absent' / 'MODEL_POLICY.md'):
+            config.mkdir(exist_ok=True)
+            with self.subTest(path=path), patch.object(policy, 'POLICY_PATH', path):
+                with self.assertRaisesRegex(ValueError, error):
+                    policy.load_policy()
 
 
 class RoutingPolicyTests(unittest.TestCase):

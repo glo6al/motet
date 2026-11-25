@@ -8,6 +8,37 @@ Motet's voice and working methods live in [`motet/INSTRUCTIONS.md`](../motet/INS
 
 Only a short skill menu is sent initially. The read-only `load_skill` tool returns a selected card; it adds no stage actions or authority. Loading a card uses the existing request allowance and may add an API round. Tools, permission boundaries, redaction, dispatch, and request limits remain in Python. Missing or invalid core files use the complete built-in instructions; an unavailable card is omitted. A new skill file alone cannot add a tool or enable messaging.
 
+### Templates for Motet's self
+
+The `motet/` folder also holds the agreed templates for Motet's self, the files a future agent core will read in place of today's instructions. They are templates only: Motet does not read them yet, and nothing in Motet writes to `motet/`. `motet/INSTRUCTIONS.md` and `motet/VOCABULARY.md` stay the live instructions until the agent core switches over.
+
+- `motet/SOUL.md`: Motet's persona, the values and habits it tries to hold to.
+- `motet/RULES.md`: what Motet may do on its own, what it must ask the owner first, and what needs the owner's own yes.
+- `motet/IDENTITY.md`: who Motet is, its job, each cycle, and how it knows things.
+- `motet/VOCABULARY.next.md`: the agreed next version of `motet/VOCABULARY.md`. It replaces that file when the agent core switches over.
+- `motet/ASKING_MOTET.md`: the short block every project's agent instruction files will carry about asking Motet for help.
+- Thirteen new skills in `motet/skills/`, one for each point where work can stall: `morning-brief.md`, `project-sweep.md`, `end-of-day.md`, `kick-off.md`, `next-step.md`, `review-loop.md`, `ready-for-yes.md`, `close-out.md`, `unstick-an-agent.md`, `something-went-wrong.md`, `helping-an-agent.md`, `waiting-on-you.md` and `wake-and-deliver.md`. Only the five cards above are loaded today.
+
+The templates say "the owner" and use fictional agents such as Ada, Bram and Cleo. An owner's own copies, which may use their name, live outside the repository, in `~/.live-room/motet-self/`.
+
+### The self folder and its history
+
+`scripts/motet_self.py` is the owner's command for that folder. Motet does not read it yet, and nothing in Motet's server, tools or engines can write it.
+
+    python scripts/motet_self.py init --from FOLDER    create the folder, private, from your prepared copies (each becomes version 1); refuses an existing folder
+    python scripts/motet_self.py scan                  record every file you edited directly since its last version
+    python scripts/motet_self.py history [FILE]        list the versions of one file, or of every file
+    python scripts/motet_self.py show FILE VERSION     print one version
+    python scripts/motet_self.py restore FILE VERSION  make an earlier version current again, recorded as "restored from vN"
+
+`init --from` takes your prepared copies of the self files, never the repository's `motet/` templates: a folder that holds `INSTRUCTIONS.md` or `VOCABULARY.next.md` is refused.
+
+The folder, its files and its history are private from the start, with the same owner and permission checks as the rest of `~/.live-room` (the access list on Windows); anything that is not private is refused, never repaired. Every saved version is kept in `motet-self/.history/<file>/v000001.json` and so on, one record per version with who changed it, when and why. Each record holds the sha256 of the record before it, and `latest.json` beside them names the newest record, so a record that goes missing or is changed by hand is noticed: every command then refuses rather than guess. Records are never changed or removed. Each save is all or nothing: the new record is staged first, the file is replaced by rename, and a save that stopped partway is settled at the next change, so an interrupted save leaves the previous version in place. Server code that lists history later will use `src/motet_self_history.py`, which only reads; the writer, `src/motet_self.py`, is used by the owner's command alone.
+
+If a command refuses because a file's history does not match its latest-version marker, nothing was changed. To recover, restore that file's `.history/<file>/` folder from a backup (for example Time Machine), or ask for help. Never edit the records by hand. If a command says the pending record (`.history/.pending.json`) is damaged, a link or a folder, move it aside by hand and run the command again.
+
+Motet's model policy and price list are settings, not part of its self: they live in `config/MODEL_POLICY.md` and `config/PRICING.json`. Motet reads them but never writes them.
+
 The golden questions in `tests/fixtures/officer/golden_questions.json` use the existing fictional demo fleet. Run `python tests/test_officer_evals.py` for offline evidence checks. These do not prove model behavior, and the browser's demo answers remain scripted. The optional `scripts/eval_officer.py` runner lists cases without making requests; its explicit live mode uses the configured Motet API key and bills that API account. It tests fictional evidence only, without changing the saved model or sending agent messages.
 
 ## Motet evidence and follow-ups
@@ -34,7 +65,7 @@ The default policy uses these non-monetary limits and does not promise a dollar 
 
 Ask Motet how much it has used or spent. Motet records its own API attempts locally in `~/.live-room/officer-usage.sqlite3`, including the intent check and each answer round. It retains ninety days of model names, token counters, request stage and completion status, within a bounded store. It does not save prompts, answers, project names, file paths, credentials or provider response bodies in this ledger. This accounting is separate from Motet memory and begins with the updated server; it does not reconstruct past bills.
 
-Token counts come from API responses. Dollar amounts are **estimates**, using dated public rates in `motet/PRICING.json`, rather than a bill or account balance. Unsupported pricing, missing usage, timeouts, or incomplete tracking remain unknown; they are never counted as free. The estimate covers recognized standard global requests only, without account-specific discounts, credits or taxes. Set `OFFICER_USAGE=0` when launching Motet to stop recording new usage. Use `python scripts/officer_usage.py --help` for local inspection and deletion. Fleet-wide agent costs remain a longer-term item: a context-window counter alone cannot establish spend.
+Token counts come from API responses. Dollar amounts are **estimates**, using dated public rates in `config/PRICING.json`, rather than a bill or account balance. Unsupported pricing, missing usage, timeouts, or incomplete tracking remain unknown; they are never counted as free. The estimate covers recognized standard global requests only, without account-specific discounts, credits or taxes. Set `OFFICER_USAGE=0` when launching Motet to stop recording new usage. Use `python scripts/officer_usage.py --help` for local inspection and deletion. Fleet-wide agent costs remain a longer-term item: a context-window counter alone cannot establish spend.
 
 ## Anthropic-reported usage and cost
 

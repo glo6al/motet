@@ -6,7 +6,7 @@ import stat
 from dataclasses import dataclass
 
 AUTOMATIC = '@automatic'
-POLICY_PATH = Path(__file__).resolve().parents[1] / 'motet' / 'MODEL_POLICY.md'
+POLICY_PATH = Path(__file__).resolve().parents[1] / 'config' / 'MODEL_POLICY.md'
 MAX_POLICY_BYTES = 4096
 _MODEL_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z')
 _KEY_SHAPE = re.compile(rb'sk-ant-[A-Za-z0-9_-]{20,}')
