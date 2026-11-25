@@ -5,9 +5,11 @@ until 8b.5).
 On every system: the SMBIOS parser (fixture tables), the Windows host fingerprint, the build pin by architecture,
 the refused locations, and the bounded hash. Under the Windows simulation on macOS and Linux: finding the build
 where the installer keeps it and refusing a link, a second name or the wrong bytes, and the supervisor keeping the
-hashed handle open until Claude has started. On real Windows only: the SMBIOS call, a read-only-sharing handle that
-stops writers, hashing through it, a junction refused, and a process started while that handle is held. No Claude
-is started.
+hashed handle open until Claude has started, and an availability check that hashes again only when the file
+changed. With fakes everywhere: a started program that is not the checked file is ended before it runs. On real
+Windows only: the SMBIOS call, this user's SID and the whole identity, a read-only-sharing handle that stops
+writers, hashing through it, a junction refused, and a process started while that handle is held, and refused when
+it was not started from the checked file. No Claude is started.
 
 Run: python tests/test_managed_windows_identity.py
 """
@@ -16,10 +18,12 @@ import hashlib
 import os
 from pathlib import Path
 import plistlib
+import re
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import uuid
@@ -123,6 +127,16 @@ class PinAndLocationTests(unittest.TestCase):
         self.assertEqual(windows.native_architecture(lambda: 0x8664), 'x64')
         self.assertEqual(windows.native_architecture(lambda: 0xAA64), 'arm64')      # also under x64 Python
         self.assertIsNone(windows.native_architecture(lambda: 0x014C))             # 32-bit Windows: none
+
+    def test_windows_without_iswow64process2_asks_getnativesysteminfo(self):
+        older = lambda code: (lambda: None, lambda: code)                       # noqa: E731
+        self.assertEqual(windows.native_architecture(*older(9)), 'x64')          # PROCESSOR_ARCHITECTURE_AMD64
+        self.assertEqual(windows.native_architecture(*older(12)), 'arm64')       # PROCESSOR_ARCHITECTURE_ARM64
+        self.assertIsNone(windows.native_architecture(*older(0)))                # 32-bit Intel: none
+        self.assertIsNone(windows.native_architecture(*older(5)))                # 32-bit ARM: none
+        asked = []
+        self.assertEqual(windows.native_architecture(lambda: 0xAA64, lambda: asked.append(1) or 9), 'arm64')
+        self.assertEqual(asked, [])                                              # only where the call is missing
         self.assertEqual(windows.windows_pin('x64'), (
             '5064e6e0572dca86257363ca04d48653eef20ef27f1bd04b504ed7199ed3fd13', 367634080))
         self.assertEqual(windows.windows_pin('arm64')[0],
@@ -161,6 +175,55 @@ class PinAndLocationTests(unittest.TestCase):
 
 class FakeProcess:
     pid = 4242
+
+
+class StartedImageTests(unittest.TestCase):
+    """start_in_job's check of the program the suspended process was started from, with every Win32 step faked."""
+
+    def start(self, started_from):
+        events = []
+
+        class Popen:
+            pid, _handle = 4242, 77
+            stdin = stdout = stderr = None
+
+            def __init__(self, args, **options):
+                events.append(('created', options['creationflags'] & windows.CREATE_SUSPENDED))
+
+        class Job:
+            def assign(self, handle):
+                events.append(('assigned', handle))
+
+            def close(self):
+                events.append('job closed')
+
+        def image_of(handle):
+            events.append(('identified', handle))
+            return started_from
+
+        def ended(process, reason):
+            events.append(('ended', reason))
+            return reason
+        with mock.patch.object(windows.subprocess, 'Popen', Popen), mock.patch.object(windows, 'Job', Job), \
+                mock.patch.object(windows, '_resume_only_thread', lambda pid: events.append(('resumed', pid))), \
+                mock.patch.object(windows, '_end_suspended', ended):
+            try:
+                windows.start_in_job(['claude'], 'C:\\fictional', image=(0x2A5E5E1D, 99), image_of=image_of)
+            except windows.JobError as error:
+                events.append(('refused', str(error)))
+        return events
+
+    def test_the_checked_file_is_resumed(self):
+        self.assertEqual(self.start((0x2A5E5E1D, 99)), [
+            ('created', windows.CREATE_SUSPENDED), ('assigned', 77), ('identified', 77), ('resumed', 4242)])
+
+    def test_another_file_is_ended_and_never_resumed(self):
+        for other in ((0x2A5E5E1D, 100), (0x11111111, 99)):          # another index, or another volume
+            with self.subTest(other=other):
+                events = self.start(other)
+                reason = 'the started program is not the checked Claude Code'
+                self.assertEqual(events, [('created', windows.CREATE_SUSPENDED), ('assigned', 77), ('identified', 77),
+                                          ('ended', reason), 'job closed', ('refused', reason)])
 
 
 @unittest.skipUnless(SIMULATED, 'simulates Windows on macOS and Linux')
@@ -219,6 +282,74 @@ class SimulatedExecutableTests(unittest.TestCase):
         self.versions.symlink_to(elsewhere, target_is_directory=True)
         self.assert_refused()
 
+    def counting_hashes(self):
+        hashed, real = [], windows.hash_open_file
+
+        def counting(fd, seconds, *args, **options):
+            hashed.append(seconds)
+            return real(fd, seconds, *args, **options)
+        patcher = mock.patch.object(windows, 'hash_open_file', counting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return hashed
+
+    def available(self, manager):
+        with mock.patch.object(windows, 'breakaway_refusal', return_value=None):
+            capability = manager.preflight()
+        return capability.available, capability.code
+
+    def test_a_second_availability_check_does_not_read_the_file_again(self):
+        path = self.install()
+        hashed, manager = self.counting_hashes(), self.manager()
+        self.assertEqual(self.available(manager), (True, ''))
+        self.assertEqual(self.available(manager), (True, ''))
+        manager._executable()
+        self.assertEqual(hashed, [60])                               # once, with Windows' own bound
+        info = os.stat(str(path))
+        os.utime(str(path), ns=(info.st_atime_ns, info.st_mtime_ns + 10**9))   # a new last-write time
+        self.assertEqual(self.available(manager), (True, ''))
+        self.assertEqual(len(hashed), 2)
+        self.assertEqual(self.available(manager), (True, ''))
+        self.assertEqual(len(hashed), 2)
+
+    def test_a_changed_or_replaced_file_never_reuses_an_earlier_check(self):
+        path = self.install()
+        hashed, manager = self.counting_hashes(), self.manager()
+        self.assertEqual(self.available(manager), (True, ''))
+        info = os.stat(str(path))
+        with open(str(path), 'ab') as grown:                         # another size: refused, and forgotten
+            grown.write(b'!')
+        self.assertEqual(self.available(manager), (False, 'app_version_unsupported'))
+        self.assertIsNone(manager._windows_verified)
+        path.write_bytes(self.content)                                # the right bytes again: hashed again
+        os.utime(str(path), ns=(info.st_atime_ns, info.st_mtime_ns))  # even with the old last-write time
+        self.assertEqual(self.available(manager), (True, ''))
+        self.assertEqual(len(hashed), 2)
+        copy = self.versions / 'copy'
+        copy.write_bytes(self.content)
+        copy.chmod(0o700)
+        os.utime(str(copy), ns=(info.st_atime_ns, info.st_mtime_ns))
+        os.replace(str(copy), str(path))                              # another file, same bytes and times
+        self.assertEqual(self.available(manager), (True, ''))
+        self.assertEqual(len(hashed), 3)
+        path.write_bytes(b'fictional other build!')                   # same size, other bytes
+        self.assertEqual(self.available(manager), (False, 'app_version_unsupported'))
+        self.assertEqual(len(hashed), 4)
+
+    def test_an_earlier_check_counts_only_for_the_same_path_and_pin(self):
+        path = str(self.install())
+        hashed = self.counting_hashes()
+        verified = windows.verify_pinned(path, self.pin)
+        self.assertEqual(verified[:2], (path, self.pin))
+        self.assertEqual(windows.verify_pinned(path, self.pin, verified), verified)
+        self.assertEqual(len(hashed), 1)
+        other = str(self.install('2.1.323.exe'))
+        windows.verify_pinned(other, self.pin, verified)
+        self.assertEqual(len(hashed), 2)
+        with self.assertRaises(ValueError):                           # another pin: hashed, and refused
+            windows.verify_pinned(path, ('0' * 64, self.pin[1]), verified)
+        self.assertEqual(len(hashed), 3)
+
     def test_the_supervisor_keeps_the_hashed_handle_until_claude_has_started(self):
         exe = str(self.install())
         project = self.home / 'project'
@@ -236,8 +367,9 @@ class SimulatedExecutableTests(unittest.TestCase):
             events.append('hashed')
             return fd
 
-        def start_in_job(args, cwd):
+        def start_in_job(args, cwd, image=None):
             os.fstat(opened[0])                           # still open: the file cannot be replaced meanwhile
+            self.assertEqual(image, tuple(ps.file_identity(opened[0])[:2]))     # the hashed file, to compare
             events.append(('started', args[0], cwd))
             return FakeProcess(), mock.Mock()
         with mock.patch.object(windows, 'open_pinned', open_pinned), \
@@ -291,6 +423,23 @@ class WindowsExecutableTests(unittest.TestCase):
         machine = windows.system_uuid()
         self.assertNotIn(machine.int, (0, (1 << 128) - 1))
         self.assertIn(windows.native_architecture(), ('x64', 'arm64'))
+        # The older answer agrees where it can see the truth (not under x64 emulation on ARM64).
+        if windows._native_machine() == 0x8664:
+            self.assertEqual(windows.native_architecture(lambda: None), 'x64')
+
+    def test_this_users_identity_is_read_for_real_and_is_stable(self):
+        sid = windows.user_sid()
+        self.assertRegex(sid, r'^S-1-\d+(-\d+)+$')
+        self.assertEqual(windows.user_sid(), sid)
+        first, second = claude_managed.local_configuration_identity(), claude_managed.local_configuration_identity()
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), {'schemaVersion', 'hostFingerprint', 'profile', 'executableVersion',
+                                      'executableSha256'})
+        self.assertTrue(re.fullmatch('[0-9a-f]{64}', first['hostFingerprint']))
+        self.assertEqual(first['hostFingerprint'], windows.host_fingerprint(windows.system_uuid(), sid))
+        self.assertEqual((first['schemaVersion'], first['profile'], first['executableVersion']),
+                         (1, 'normal', '2.1.323'))
+        self.assertEqual(first['executableSha256'], windows.windows_pin()[0])
 
     def test_a_handle_that_shares_reading_only_stops_writers(self):
         fd = ps.open_no_links(str(self.path), single_link=True, deny_writers=True)
@@ -327,7 +476,9 @@ class WindowsExecutableTests(unittest.TestCase):
     def test_a_program_starts_while_its_file_is_held_for_reading_only(self):
         fd = ps.open_no_links(os.path.realpath(sys.executable), deny_writers=True)
         try:
-            process, job = windows.start_in_job([sys.executable, '-c', 'pass'], str(self.base))
+            image = tuple(ps.file_identity(fd)[:2])
+            self.assertEqual(windows.process_image_identity(windows._api()[2].GetCurrentProcess()), image)
+            process, job = windows.start_in_job([sys.executable, '-c', 'pass'], str(self.base), image=image)
             try:
                 self.assertEqual(process.wait(timeout=60), 0)
             finally:
@@ -336,6 +487,19 @@ class WindowsExecutableTests(unittest.TestCase):
                     stream.close()
         finally:
             os.close(fd)
+
+    def test_a_program_started_from_another_file_never_runs(self):
+        fd = ps.open_no_links(str(self.path), single_link=True, deny_writers=True)
+        try:
+            checked = tuple(ps.file_identity(fd)[:2])            # the fictional build, not Python
+            with self.assertRaises(windows.JobError) as raised:
+                windows.start_in_job([sys.executable, '-c', 'open("ran.txt", "w").close()'], str(self.base),
+                                     image=checked)
+            self.assertIn('not the checked Claude Code', str(raised.exception))
+        finally:
+            os.close(fd)
+        time.sleep(1)
+        self.assertFalse((self.base / 'ran.txt').exists())       # ended while still suspended
 
 
 if __name__ == '__main__':
