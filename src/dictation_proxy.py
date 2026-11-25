@@ -15,6 +15,7 @@ import stat
 import threading
 import time
 import urllib.parse
+import private_storage as ps
 from dictation_auth import AuthenticationError, BusyError, REQUEST_CAPACITY, request_headers, wire_json
 
 PROTOCOL = 1
@@ -107,8 +108,35 @@ def _json(raw):
                       parse_constant=_constant, parse_float=_float, parse_int=_int)
 
 
+def _read_helper_key_windows(home):
+    """Windows: the same read through private_storage's no-link walk. The resolved home is held, then
+    .live-room, dictation and the credential are each opened by handle inside the folder above (no link or
+    junction followed), each checked private on its handle; held folders cannot be renamed while open, so no name
+    re-check is needed afterwards. Never creates or repairs state."""
+    if not ps.folder_walk_available():
+        raise ValueError()
+    anchor = Path(home).resolve(strict=True)
+    prefix = b'X-Dictation-Key: '
+    expected = len(prefix) + 64 + 1
+    with ps.open_folder(str(anchor)) as held, held.folder('.live-room', private=True) as live, \
+            live.folder('dictation', private=True) as state:
+        credential = state.open('header', single_link=True, private=True)
+        try:
+            if os.fstat(credential).st_size != expected:
+                raise ValueError()
+            raw = os.read(credential, expected + 1)
+        finally:
+            os.close(credential)
+    if (len(raw) != expected or not raw.startswith(prefix) or not raw.endswith(b'\n')
+            or not re.fullmatch(b'[0-9a-f]{64}', raw[len(prefix):-1])):
+        raise ValueError()
+    return raw[len(prefix):-1].decode('ascii')
+
+
 def _read_helper_key(home):
     """Read through held directory descriptors; never create or repair state."""
+    if ps.WIN:
+        return _read_helper_key_windows(home)
     if os.name != 'posix':
         raise ValueError()
     descriptors = []

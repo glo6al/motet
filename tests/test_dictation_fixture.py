@@ -19,6 +19,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'src'))
+import private_storage
+# The helper's private state: POSIX protections, or on Windows private_storage's folder walk.
+PRIVATE_STATE = os.name == 'posix' or private_storage.folder_walk_available()
 spec = importlib.util.spec_from_file_location('dictation_fixture', ROOT / 'docs/fixtures/dictation/serve.py')
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
@@ -247,7 +250,7 @@ console.log('motion diagnostic gate, geometry, lifecycle and bounds passed');
         self.assertTrue(any(e['kind'] == 'turn_end' and e['agent'] == fixture.DESKS['ended'][0] for e in events))
         self.assertTrue(all(e['boot'] == 'dictation-fixture' for e in events))
 
-    @unittest.skipUnless(os.name == 'posix', 'Private helper state requires POSIX')
+    @unittest.skipUnless(PRIVATE_STATE, 'Private helper state requires POSIX or the Windows folder walk')
     def test_review_http_variants_keep_all_product_actions_refused(self):
         with tempfile.TemporaryDirectory() as home:
             process = subprocess.Popen([sys.executable, '-u', str(ROOT / 'docs/fixtures/dictation/serve.py'),
@@ -266,7 +269,7 @@ console.log('motion diagnostic gate, geometry, lifecycle and bounds passed');
             reader = threading.Thread(target=read_lines, daemon=True)
             reader.start()
             try:
-                first = lines.get(timeout=10)
+                first = lines.get(timeout=60 if os.name == 'nt' else 10)
                 self.assertIsInstance(first, str, 'Fixture output could not be decoded as UTF-8')
                 port = int(re.search(r'127\.0\.0\.1:(\d+)', first).group(1))
                 def request(path, method='GET', body=None):
@@ -337,7 +340,7 @@ console.log('motion diagnostic gate, geometry, lifecycle and bounds passed');
         with self.assertRaises(RuntimeError):
             fixture.review_page(broken, True, 'claude', 'a03-one')
 
-    @unittest.skipUnless(os.name == 'posix', 'Private helper state requires POSIX')
+    @unittest.skipUnless(PRIVATE_STATE, 'Private helper state requires POSIX or the Windows folder walk')
     def test_real_helper_and_proxy_with_synthetic_runtime(self):
         from dictation_proxy import DictationProxy
         with tempfile.TemporaryDirectory() as home:

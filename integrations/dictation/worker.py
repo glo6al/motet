@@ -218,7 +218,8 @@ def main():
     parser.add_argument('--model', type=Path, required=True)
     args = parser.parse_args()
     # A dedicated descriptor keeps native stdout away from the JSON protocol.
-    protocol = os.fdopen(os.dup(sys.stdout.fileno()), 'w', encoding='utf-8', buffering=1)
+    # newline='\n': one LF per frame on every system (Windows text mode would otherwise write CRLF).
+    protocol = os.fdopen(os.dup(sys.stdout.fileno()), 'w', encoding='utf-8', buffering=1, newline='\n')
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
 
     def respond(value):

@@ -57,6 +57,11 @@ class AssetsTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
         os.chmod(str(self.root), 0o700)
+        if os.name == 'nt':
+            # Real Windows: a folder private to this user (an elevated runner's plain folders belong to
+            # Administrators, which the model checks refuse).
+            self.root = self.root / 'private'
+            assets._storage().make_private_folder(str(self.root))
         self.model = self.root / 'model'
         self.data = {'adapter.ort': b'first-model-file', 'encoder.ort': b'second-model-file'}
         self.info = {
@@ -73,8 +78,19 @@ class AssetsTests(unittest.TestCase):
         self.temp.cleanup()
 
     def write(self, name, data):
-        self.model.mkdir(mode=0o700, exist_ok=True)
         target = self.model / name
+        if os.name == 'nt':
+            # Real Windows: the folder and files private to this user from the start, written in binary.
+            ps = assets._storage()
+            if not self.model.exists():
+                ps.make_private_folder(str(self.model))
+            if target.exists():
+                target.unlink()
+            fd = assets._binary(ps.create_private_file(str(target)))
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+            return target
+        self.model.mkdir(mode=0o700, exist_ok=True)
         target.write_bytes(data)
         os.chmod(str(target), 0o600)
         return target
@@ -91,7 +107,7 @@ class AssetsTests(unittest.TestCase):
         source = self.write(item['filename'], self.data[item['filename']])
         handle, metadata = assets._open_read(source)
         with mock.patch.object(assets, '_open_read', return_value=(handle, metadata)), \
-                mock.patch.object(assets.os, 'open', side_effect=OSError('fixture refusal')):
+                mock.patch.object(assets, '_create', side_effect=OSError('fixture refusal')):
             with self.assertRaises(OSError):
                 assets._copy_verified(source, item, self.root / 'refused')
         self.assertTrue(handle.closed)
@@ -279,7 +295,12 @@ class AssetsTests(unittest.TestCase):
         self.assert_error('unsafe_model_path', lambda: assets.download_model(
             self.model, self.info['bytes'], opener=Opener(self.data)))
         self.model.unlink()
-        self.model.mkdir(mode=0o700)
+        if os.name == 'nt':
+            # Private from the start, so the lock-link step below reaches the lock (an elevated runner's plain
+            # folder belongs to Administrators and would be refused first).
+            assets._storage().make_private_folder(str(self.model))
+        else:
+            self.model.mkdir(mode=0o700)
         file = outside / 'adapter.ort'
         file.write_bytes(self.data['adapter.ort'])
         os.chmod(str(file), 0o600)
@@ -291,7 +312,7 @@ class AssetsTests(unittest.TestCase):
             self.model, self.info['bytes'], opener=Opener(self.data)))
         self.assertEqual(file.read_bytes(), self.data['adapter.ort'])
 
-    @unittest.skipUnless(os.name == 'posix', 'POSIX hardlink handling')
+    @unittest.skipUnless(hasattr(os, 'link'), 'Hard link support required')
     def test_hardlinked_model_files_are_rejected(self):
         target = self.write('adapter.ort', self.data['adapter.ort'])
         os.link(str(target), str(self.root / 'other-link'))

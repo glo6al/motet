@@ -52,6 +52,11 @@ jobs:
       - run: python tests/test_dictation_proxy.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # Dictation's private state, proxy read, model setup and helper stop on Windows: simulated on macOS and Linux,
+      # against real access lists on Windows. No microphone, runtime or model download.
+      - run: python tests/test_dictation_windows.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - name: Check dictation routes and nonce delivery over real local HTTP
         if: ${{ !cancelled() }}
         timeout-minutes: 5
