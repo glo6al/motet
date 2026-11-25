@@ -17,6 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TTY = sys.stdout.isatty()                           # bells and escape codes only for a person, never into a pipe
 ITERM = TTY and os.environ.get('TERM_PROGRAM') == 'iTerm.app'
 WT = TTY and bool(os.environ.get('WT_SESSION'))     # Windows Terminal names every session it starts
+# WSL passes WT_SESSION on to Linux, where Windows Terminal still draws: only its ring and titles are used there.
 WT_WINDOW_RX = re.compile(r'motet-[0-9a-f]{12}\Z')  # the name of the window a --tab or --split board opens in
 # What wt.exe must never be handed in a value: ';' separates its own commands wherever it stands (a '\;' escape keeps
 # the backslash, so it cannot carry a path); '%' is expanded from the environment in a tab's command; '"' is not
@@ -275,15 +276,24 @@ def progress(on):           # Windows Terminal's own marker on a tab (and the ta
 
 
 def vt_on():
-    """Windows: ask the console to act on escape codes rather than print them. Windows Terminal usually does already."""
+    """Windows: ask the console to act on escape codes rather than print them (Windows Terminal usually does already).
+    Returns what puts the console's mode back as it was, or None when nothing was changed."""
     try:
         import ctypes
-        k = ctypes.windll.kernel32
-        h, mode = k.GetStdHandle(-11), ctypes.c_uint32()
-        if k.GetConsoleMode(h, ctypes.byref(mode)):
-            k.SetConsoleMode(h, mode.value | 0x0004)        # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        from ctypes import wintypes
+        k = ctypes.WinDLL('kernel32')               # its own copy, so these types bind no other code's calls
+        k.GetStdHandle.argtypes, k.GetStdHandle.restype = [wintypes.DWORD], wintypes.HANDLE
+        k.GetConsoleMode.argtypes, k.GetConsoleMode.restype = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL
+        k.SetConsoleMode.argtypes, k.SetConsoleMode.restype = [wintypes.HANDLE, wintypes.DWORD], wintypes.BOOL
+        h, mode = k.GetStdHandle(0xFFFFFFF5), wintypes.DWORD()          # STD_OUTPUT_HANDLE, (DWORD)-11
+        if not h or not k.GetConsoleMode(h, ctypes.byref(mode)) or mode.value & 0x0004:
+            return None
+        was = mode.value
+        if k.SetConsoleMode(h, was | 0x0004):          # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            return lambda: k.SetConsoleMode(h, was)
     except (AttributeError, OSError):
         pass
+    return None
 
 
 def current(agents, window):
@@ -399,8 +409,7 @@ def main():
 
 if __name__ == '__main__':
     sys.stdout.reconfigure(errors='replace')        # a character the terminal cannot encode is shown as ?, never a crash
-    if TTY and sys.platform == 'win32':
-        vt_on()
+    restore = vt_on() if TTY and sys.platform == 'win32' else None
     try:
         for tries in range(20):     # the server frees a closed window's connection within seconds: wait for one, a minute at most
             try:
@@ -425,3 +434,5 @@ if __name__ == '__main__':
         if 'progress' in TOUCHED:
             sys.stdout.write(progress(False))
         sys.stdout.flush()
+        if restore:                 # after the codes above, which need it
+            restore()

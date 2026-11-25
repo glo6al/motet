@@ -2707,7 +2707,7 @@ def cursor_cwd(slug):
             path = os.path.join(so_far, name) if so_far else os.path.join('/', name)
             if not tail and os.path.isdir(path):
                 hits.append(path)
-            elif tail.startswith('-') and os.path.isdir(path):
+            elif tail.startswith('-') and os.path.isdir(path):      # follows the user's own folder links, as before
                 walk(path, tail[1:])
     if WIN:
         m = re.fullmatch(r'([A-Za-z])-(.+)', slug)

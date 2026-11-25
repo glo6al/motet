@@ -355,21 +355,25 @@ def test_terminal_windows():
     import subprocess
     from unittest import mock
     import watch_tty as w
-    saved = (w.HERE, sys.executable, w.PORT, sys.platform)
+    saved = (w.HERE, w.PORT, sys.platform)
     here = 'C:\\Users\\demo\\My Motet ü (copy) & co\\src'
     py = 'C:\\Program Files\\Python 3.9\\python.exe'
     window = 'motet-0123456789ab'
+
+    def cmd(*a):            # Python's own path, as a Windows one, only while the command is built
+        with mock.patch.object(sys, 'executable', py):
+            return w.wt_command(*a)
     try:
-        w.HERE, sys.executable, w.PORT = here, py, 8801
+        w.HERE, w.PORT = here, 8801
         run = [py, os.path.join(here, 'watch_tty.py'), '--port', '8801']
-        start = w.wt_command(['--tabs', '--window', window], window, 'Motet')
+        start = cmd(['--tabs', '--window', window], window, 'Motet')
         check('wt: the board opens in a window of its own name',
               start == ['-w', window, 'new-tab', '--title', 'Motet', '-d', here] + run + ['--tabs', '--window', window])
-        tab = w.wt_command(['--agent', 'c:1234abcd-0000'], window, 'Motet c:1234abcd-0000')
+        tab = cmd(['--agent', 'c:1234abcd-0000'], window, 'Motet c:1234abcd-0000')
         check('wt: an agent tab in the board window, then the board has the focus again',
               tab == ['-w', window, 'new-tab', '--title', 'Motet c:1234abcd-0000', '-d', here] + run
               + ['--agent', 'c:1234abcd-0000', ';', 'focus-tab', '-t', '0'])
-        panes = [w.wt_command(['--agent', 'c:1234abcd-0000', '--pane'], window, 'Motet c:1234abcd-0000', n) for n in range(1, 7)]
+        panes = [cmd(['--agent', 'c:1234abcd-0000', '--pane'], window, 'Motet c:1234abcd-0000', n) for n in range(1, 7)]
         check('wt: the first pane takes the lower half of the board', panes[0][:10] == ['-w', window, 'focus-tab', '-t', '0', ';',
               'move-focus', 'first', ';', 'split-pane'] and panes[0][10] == '-H')
         check('wt: each later pane halves the largest earlier one, oldest first',
@@ -385,7 +389,7 @@ def test_terminal_windows():
                     'C:\\Users\\demo\\ends with\\', 'src'):
             w.HERE = bad
             try:
-                w.wt_command(['--tabs'], window, 'Motet')
+                cmd(['--tabs'], window, 'Motet')
                 refused = False
             except ValueError:
                 refused = True
@@ -393,20 +397,26 @@ def test_terminal_windows():
         w.HERE = here
         for title in ('a;b', 'a\\;b', ';', '100%', '"q"', '-p', ''):
             try:
-                w.wt_command(['--tabs'], window, title)
+                cmd(['--tabs'], window, title)
                 refused = False
             except ValueError:
                 refused = True
             check('wt: refused, a title of %r' % title, refused)
-        check('wt: a quote that is not " is kept', w.wt_command(['--tabs'], window, "Motet's")[4] == "Motet's")
+        check('wt: a quote that is not " is kept', cmd(['--tabs'], window, "Motet's")[4] == "Motet's")
         check('wt: the waiting mark is fixed bytes', w.progress(1) == '\x1b]9;4;4;100\a' and w.progress(0) == '\x1b]9;4;0;0\a')
+        restore = w.vt_on()
+        check('the console mode is changed only on a Windows console, and can be put back',
+              restore is None if os.name != 'nt' else restore is None or callable(restore))
+        if restore:
+            restore()
         check('wt: window names are ours only', w.WT_WINDOW_RX.match(window) and not w.WT_WINDOW_RX.match('motet-0123456789ab;x')
               and not w.WT_WINDOW_RX.match('0') and not w.WT_WINDOW_RX.match('last'))
 
         def exits(argv):
             sys.argv = ['watch_tty.py'] + argv
             try:
-                w.main()
+                with mock.patch.object(sys, 'executable', py):
+                    w.main()
             except SystemExit as e:
                 return str(e)
             return ''
@@ -436,14 +446,16 @@ def test_terminal_windows():
                   said.startswith('Windows Terminal cannot be handed this path') and not popen.called)
         finally:
             sys.argv = argv0
-            sys.platform = saved[3]
+            sys.platform = saved[2]
         if os.name == 'nt':
             # Real Windows: the argument list survives the trip through one command line, as wt.exe reads it
             # (CommandLineToArgvW), and the tab's command Windows Terminal rebuilds reads back as it was sent.
             import ctypes
             from ctypes import wintypes
-            parse = ctypes.windll.shell32.CommandLineToArgvW
+            parse = ctypes.WinDLL('shell32').CommandLineToArgvW
             parse.argtypes, parse.restype = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)], ctypes.POINTER(wintypes.LPWSTR)
+            free = ctypes.WinDLL('kernel32').LocalFree
+            free.argtypes, free.restype = [ctypes.c_void_p], ctypes.c_void_p
 
             def argv_of(line):
                 n = ctypes.c_int()
@@ -451,14 +463,14 @@ def test_terminal_windows():
                 try:
                     return [p[i] for i in range(n.value)]
                 finally:
-                    ctypes.windll.kernel32.LocalFree(p)
+                    free(ctypes.cast(p, ctypes.c_void_p))
             exe = 'C:\\Users\\demo\\AppData\\Local\\Microsoft\\WindowsApps\\wt.EXE'
             check('Windows: wt.exe reads back every argument it was handed',
                   all(argv_of(subprocess.list2cmdline([exe] + c)) == [exe] + c for c in every))
             check('Windows: the rebuilt tab command reads back as sent', argv_of(wt_rejoined(run)) == run)
             print('note: wt.exe on PATH:', bool(__import__('shutil').which('wt.exe')), '(never run by this test)')
     finally:
-        w.HERE, sys.executable, w.PORT = saved[:3]
+        w.HERE, w.PORT = saved[:2]
 
 
 def test_cursor_folder_names():
