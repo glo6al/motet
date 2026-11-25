@@ -53,10 +53,15 @@ TH32CS_SNAPTHREAD = 0x00000004
 THREAD_SUSPEND_RESUME = 0x0002
 
 DETACH_REFUSED = ('Motet cannot start a Claude supervisor that outlives this window: the program Motet runs in '
-                  'does not let it leave its job. Start Motet from an ordinary terminal or a shortcut.')
+                  'does not let it leave its job. Try starting Motet from an ordinary terminal window or a shortcut.')
+NOT_STARTED = 'Motet could not start the Claude supervisor. Nothing was started.'
 
 
-class DetachRefused(OSError):
+class NotStarted(OSError):
+    """The supervisor was not started, or was ended before it ran: nothing started."""
+
+
+class DetachRefused(NotStarted):
     """The supervisor could not leave the server's job, so it was not started (it never ran)."""
 
 
@@ -309,31 +314,39 @@ def _end_suspended(process, reason):
     return reason + note
 
 
+def _server_in_a_job():
+    try:
+        return _in_any_job(_api()[2].GetCurrentProcess())
+    except JobError:
+        return True                   # unknown: take the stricter answer
+
+
 def spawn_detached(argv):
     """Start the supervisor detached from this console, process group and job, and resume it only if Windows says
-    it is in no job at all. Otherwise it is ended before it ran and DetachRefused is raised. A start Windows refuses
-    with access denied is DetachRefused when this process's job forbids breaking away; any other refusal (the
-    program itself could not be started) is raised as it is."""
+    it is in no job at all. Every way it does not run is NotStarted, so a caller records that nothing started:
+    DetachRefused when it is still held by a job (it is ended before it ran) or when Windows refuses the start while
+    this process is in a job; NotStarted when Windows refuses the start otherwise (the program itself could not be
+    started) or the suspended supervisor cannot be resumed (it is ended first)."""
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, close_fds=True,
                                    creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
                                                   | CREATE_BREAKAWAY_FROM_JOB | CREATE_SUSPENDED))
     except OSError as error:
-        if getattr(error, 'winerror', None) == ERROR_ACCESS_DENIED and breakaway_refusal() is not None:
-            raise DetachRefused(DETACH_REFUSED) from None
-        raise
+        if _server_in_a_job():
+            raise DetachRefused(DETACH_REFUSED) from error
+        raise NotStarted(NOT_STARTED) from error
     try:
         if _in_any_job(int(process._handle)):
             raise DetachRefused(_end_suspended(process, DETACH_REFUSED))
         _resume_only_thread(process.pid)
-    except DetachRefused:
+    except NotStarted:
         raise
     except BaseException as error:
-        reason = _end_suspended(process, str(error) or 'the supervisor could not be resumed')
+        reason = _end_suspended(process, NOT_STARTED)
         if not isinstance(error, Exception):
             raise
-        raise JobError(reason) from error
+        raise NotStarted(reason) from error
     return process
 
 

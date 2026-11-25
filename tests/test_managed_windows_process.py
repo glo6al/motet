@@ -23,8 +23,8 @@ import claude_managed_runner as runner
 import claude_managed_windows as windows
 
 WINDOWS = os.name == 'nt'
-LINES = ('import sys\n'
-         'for n in range(500):\n'
+LINES = ('import sys\n'         # about 3.3 KB: under the 4 KiB a Windows pipe holds before a writer waits
+         'for n in range(300):\n'
          '    sys.stdout.write(\'{"n": %d}\\n\' % n)\n'
          'sys.stdout.flush()\n')
 ECHO = ('import sys,json\n'
@@ -98,7 +98,7 @@ class ThreadedTransportTests(unittest.TestCase):
                 value = transport.read(.1)
                 if value is not None:
                     seen.append(value['n'])
-        self.assertEqual(seen, list(range(500)))
+        self.assertEqual(seen, list(range(300)))
         for _ in range(3):                           # once seen, the end is the answer every time
             with self.assertRaises(EOFError):
                 transport.read(0)
@@ -318,12 +318,26 @@ class WindowsJobTests(unittest.TestCase):
         refusal = windows.breakaway_refusal()
         argv = [sys.executable, '-c', 'import sys; sys.exit(7)']
         if refusal is None:
-            process = windows.spawn_detached(argv)
+            try:
+                process = windows.spawn_detached(argv)
+            except windows.DetachRefused:
+                return                # an outer job forbids it, which only the started supervisor shows
             self.assertEqual(process.wait(timeout=30), 7)
         else:
             self.assertEqual(refusal, windows.DETACH_REFUSED)
             with self.assertRaises(windows.DetachRefused):
                 windows.spawn_detached(argv)
+
+    def test_a_supervisor_still_in_a_job_never_runs(self):
+        original = windows._in_any_job
+        windows._in_any_job = lambda handle: True
+        try:
+            with self.assertRaises(windows.DetachRefused):
+                windows.spawn_detached([sys.executable, '-c', 'open(%r, "w").close()' % str(self.folder / 'ran.txt')])
+        finally:
+            windows._in_any_job = original
+        time.sleep(.5)
+        self.assertFalse((self.folder / 'ran.txt').exists())
 
 
 if __name__ == '__main__':

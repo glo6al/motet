@@ -83,6 +83,64 @@ class SimulatedManagerTests(Simulated, manager_tests.Fixture):
         self.folder = self.folder.__class__(**dict(self.folder.__dict__, **dict(zip(
             ('device', 'inode'), new_chat_inventory.folder_identity(str(self.project))))))
 
+    def test_refusals_before_reservation_never_hold_a_slot(self):
+        refused = mock.patch.object(claude_managed.ManagedClaude, '_breakaway_refusal',
+                                    return_value='fictional refusal')
+        with refused:
+            for _ in range(5):
+                with self.assertRaises(claude_managed.ManagedError) as raised:
+                    self.manager.reserve(self.folder, str(manager_tests.uuid.uuid4()))
+                self.assertEqual(raised.exception.code, 'supervisor_detach_refused')
+        self.assertTrue(self.manager.reserve(self.folder, str(manager_tests.uuid.uuid4())))
+        with self.manager._registry() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM runs').fetchone()[0], 1)
+
+    def test_a_supervisor_that_could_not_start_is_not_started_not_uncertain(self):
+        import dataclasses
+        import claude_managed_windows
+
+        def failed(path):
+            raise claude_managed_windows.NotStarted(claude_managed_windows.NOT_STARTED)
+        self.manager._test = dataclasses.replace(self.dependencies, spawn=failed)
+        run_id = self.manager.reserve(self.folder, str(manager_tests.uuid.uuid4()))
+        for _ in range(2):
+            with self.assertRaises(claude_managed.ManagedError) as raised:
+                self.manager.launch_once(run_id, self.folder, lambda *_: None)
+            self.assertEqual(raised.exception.code, 'supervisor_not_started')
+
+    def test_an_early_exit_without_a_record_is_not_called_a_refused_detach(self):
+        """Claude started and exited before its identity was proved: the run ends without a native receipt, but
+        nothing recorded it as not started, so a replay is not told the detach was refused."""
+        run_id = self.manager.reserve(self.folder, str(manager_tests.uuid.uuid4()))
+        self.manager.launch_once(run_id, self.folder, lambda *_: None)
+        with self.manager._registry() as db:
+            row = self.manager._row(db, run_id)
+            row.update(state='exited', occupied=False, nativeReceipt=False)
+            self.manager._save(db, row)
+        self.assertIsNone(self.manager._recorded_not_started(run_id, row))
+
+    def test_a_waiter_sees_another_callers_not_started_record_at_once(self):
+        import dataclasses
+        run_id = self.manager.reserve(self.folder, str(manager_tests.uuid.uuid4()))
+        request, first = self.request, []
+
+        def recorded_first(path, command, params):
+            if command == 'status' and not first:
+                first.append(path.name)
+                self.manager._not_started(path.name, 'supervisor_detach_refused')   # another caller, first
+                raise OSError('no supervisor')
+            return request(path, command, params)
+        self.manager._test = dataclasses.replace(self.dependencies, spawn=lambda path: None,
+                                                 request=recorded_first, launch_timeout=15)
+        started = time.monotonic()
+        with self.assertRaises(claude_managed.ManagedError) as raised:
+            self.manager.launch_once(run_id, self.folder, lambda *_: None)
+        self.assertEqual(raised.exception.code, 'supervisor_detach_refused')
+        self.assertLess(time.monotonic() - started, 5)
+        with self.manager._registry() as db:              # still valid, still not started
+            row = self.manager._row(db, run_id)
+        self.assertEqual((row['state'], row['occupied']), ('exited', False))
+
     def test_a_refused_detach_records_that_nothing_started(self):
         """A supervisor Windows would not let leave the server's job was ended before it ran: the run is recorded
         as ended without a native receipt and refused in plain words, also on replay, never as uncertain."""
@@ -135,6 +193,10 @@ class SimulatedReadinessTests(Simulated, manager_tests.ConfigurationReadinessTes
         patcher = mock.patch.object(claude_managed, 'local_configuration_identity', mac_identity)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Win32 job queries have no simulated answer: the server is taken as free to start a supervisor.
+        breakaway = mock.patch.object(claude_managed.ManagedClaude, '_breakaway_refusal', return_value=None)
+        breakaway.start()
+        self.addCleanup(breakaway.stop)
         super().setUp()
 
     @unittest.skip('POSIX ownership by uid; on Windows an untrusted record is one whose owner or access list is '

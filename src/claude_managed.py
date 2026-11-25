@@ -198,8 +198,9 @@ def _fail(code='managed_unavailable', status=409):
         'launch_outcome_unknown': 'The launch outcome is unknown. It will not be repeated.',
         'managed_not_ready': 'This managed Claude session is not ready for new messages.',
         'supervisor_detach_refused': ('Motet cannot start a Claude supervisor that outlives this window: the program '
-                                      'Motet runs in does not let it leave its job. Start Motet from an ordinary '
-                                      'terminal or a shortcut.'),
+                                      'Motet runs in does not let it leave its job. Try starting Motet from an '
+                                      'ordinary terminal window or a shortcut.'),
+        'supervisor_not_started': 'Motet could not start the Claude supervisor. Nothing was started.',
     }
     raise ManagedError(status, code, messages.get(code, messages['managed_unavailable']))
 
@@ -388,10 +389,15 @@ def client_request(run_dir, command, params):
 
 
 
-def _detach_refused(error):
-    """Whether ``error`` is Windows refusing to let the supervisor leave the server's job (nothing started)."""
+def _not_started_code(error):
+    """Windows: the plain refusal for a supervisor start that started nothing (claude_managed_windows.NotStarted),
+    else None (an outcome that may have started something stays uncertain)."""
     import claude_managed_windows as windows
-    return isinstance(error, windows.DetachRefused)
+    if isinstance(error, windows.DetachRefused):
+        return 'supervisor_detach_refused'
+    if isinstance(error, windows.NotStarted):
+        return 'supervisor_not_started'
+    return None
 
 
 def spawn_runner(run_dir):
@@ -442,6 +448,14 @@ class ManagedClaude:
         self.closed = False
         # No state creation, provider access, socket calls, or process work here.
 
+    def _breakaway_refusal(self):
+        """Windows: the plain reason a supervisor started now could not leave the server's job, else None (fixture
+        managers never start a real supervisor, so they have none)."""
+        if self._test:
+            return None
+        import claude_managed_windows as windows
+        return windows.breakaway_refusal()
+
     def _active(self):
         if not self.enabled or self.demo or self.closed:
             _fail('managed_disabled', 503)
@@ -483,6 +497,9 @@ class ManagedClaude:
                 _fail('configuration_unverified', 503)
             if not self._test and sys.platform != 'darwin':
                 _fail('app_version_unsupported', 503)
+            if ps.WIN and self._breakaway_refusal() is not None:
+                # Before any reservation: a supervisor that could not leave the server's job would end with it.
+                _fail('supervisor_detach_refused', 503)
             self._executable()
             with self._registry() as db:
                 if db is not None and db.execute('SELECT count(*) FROM runs WHERE occupied=1').fetchone()[0] >= 4:
@@ -734,11 +751,6 @@ class ManagedClaude:
         executable = self._executable()
         if not self.configuration_ready:
             _fail('configuration_unverified', 503)
-        if ps.WIN and not self._test:
-            # Before any claim: a supervisor that could not leave the server's job would end with its window.
-            import claude_managed_windows as windows
-            if windows.breakaway_refusal() is not None:
-                _fail('supervisor_detach_refused', 503)
         with self._registry() as db:
             row = self._row(db, run_id)
             if row['folder'] != asdict(folder):
@@ -767,15 +779,18 @@ class ManagedClaude:
                 else:
                     spawn_runner(run_dir)
             except Exception as error:
-                if ps.WIN and _detach_refused(error):
-                    # Windows: the supervisor was ended before it ran, so nothing started. Recorded as a run that
-                    # ended without a native receipt, and refused in plain words, also on replay.
-                    self._not_started(run_id)
-                    _fail('supervisor_detach_refused', 503)
+                code = _not_started_code(error) if ps.WIN else None
+                if code is not None:
+                    # Windows: the supervisor never ran, so nothing started. The run ends without a native receipt,
+                    # its reason is kept in its folder, and the plain refusal is the answer, also on replay.
+                    self._not_started(run_id, code)
+                    _fail(code, 503)
                 self._uncertain(run_id)
                 _fail('launch_outcome_unknown')
-        elif ps.WIN and not row['occupied'] and row['state'] == 'exited' and not row['nativeReceipt']:
-            _fail('supervisor_detach_refused', 503)
+        elif ps.WIN:
+            code = self._recorded_not_started(run_id, row)
+            if code is not None:
+                _fail(code, 503)
         # Replays and a replacement web process inherit the original startup
         # deadline. Neither status nor a second launch_once extends the window.
         deadline = time.monotonic() + max(0, (row.get('startupExpiresAt') or 0) - time.time())
@@ -803,21 +818,56 @@ class ManagedClaude:
                         self._save(db, current)
                     record_native_receipt(row['nativeId'], folder.path)
                     return row['nativeId']
+            if ps.WIN:
+                # A launch that another caller recorded as not started is that refusal here too, at once.
+                with self._registry() as db:
+                    code = self._recorded_not_started(run_id, self._row(db, run_id))
+                if code is not None:
+                    _fail(code, 503)
             if time.monotonic() >= deadline:
                 self._uncertain(run_id)
                 _fail('launch_outcome_unknown')
             time.sleep(min(.05, max(0, deadline - time.monotonic())))
 
-    def _not_started(self, run_id):
-        """Windows: the claimed launch started nothing (the supervisor was refused before it ran)."""
+    NOT_STARTED = 'not-started'
+
+    def _not_started(self, run_id, code):
+        """Windows: the claimed launch started nothing (the supervisor never ran). Its reason is written to the run
+        folder (a private file read only for this), then the run ends without a native receipt, releasing its
+        slot."""
+        try:
+            _write_private(self.root / run_id / self.NOT_STARTED, code.encode('ascii'))
+        except FileExistsError:
+            pass
         with self._registry() as db:
             row = self._row(db, run_id)
             row.update(state='exited', occupied=False)
             self._save(db, row)
 
+    def _recorded_not_started(self, run_id, row):
+        """Windows: the reason recorded by ``_not_started`` for a run that ended without a native receipt, else None
+        (a Claude that started and exited before its identity was proved has no such record)."""
+        if row['occupied'] or row['state'] != 'exited' or row['nativeReceipt'] or not row['launchClaimed']:
+            return None
+        path = self.root / run_id / self.NOT_STARTED
+        try:
+            _private(path)
+            fd = ps.open_no_links(os.fspath(path), single_link=True, private=True)
+            try:
+                code = os.read(fd, 64).decode('ascii')
+            finally:
+                os.close(fd)
+        except (OSError, ManagedError, UnicodeError):
+            return None
+        return code if code in ('supervisor_detach_refused', 'supervisor_not_started') else None
+
     def _uncertain(self, run_id):
         with self._registry() as db:
             row = self._row(db, run_id)
+            if not row['occupied'] and row['state'] == 'exited':
+                # A released slot records a confirmed end (an exit, or on Windows a launch that started nothing).
+                # Uncertainty never reopens it: an unoccupied row must stay 'exited' for the registry to be valid.
+                return
             row['state'] = 'uncertain'
             self._save(db, row)
 

@@ -501,8 +501,10 @@ class NativeTransport:
                 self.process, self.job = windows.start_in_job(args, self.manifest['folder']['path'])
                 try:
                     self.pipes = windows.ThreadedPipes(self.process)
-                except BaseException:
+                except BaseException as error:
                     self.close()              # ends the job: nothing runs without its pipes
+                    if isinstance(error, Exception) and not isinstance(error, (OSError, ValueError)):
+                        raise OSError('pipe threads unavailable') from error    # a thread that would not start
                     raise
                 return
             self.process = subprocess.Popen(args, cwd=self.manifest['folder']['path'],
