@@ -172,9 +172,12 @@ class DeliveryChecks:
         folder = self.base / 'private'
         self.private_folder(folder)
         source = folder / 'source'
-        source.write_bytes(CONTENT)
-        if os.name != 'nt':
-            source.chmod(0o600)
+        # Made private for this user from the start: an ordinary write on the elevated runner belongs to Administrators.
+        written = ps.create_private_file(str(source))
+        try:
+            os.write(written, CONTENT)
+        finally:
+            os.close(written)
         with self.windows():
             fd = ps.open_no_links(str(source), single_link=True, private=True)
             try:
