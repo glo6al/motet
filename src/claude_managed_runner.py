@@ -1189,9 +1189,10 @@ CONTROL_FILE = 'control.json'        # Windows: the supervisor's pipe name and p
 
 
 def _serve_loop(runner, endpoint):
-    """The supervisor's loop over an endpoint (``accept(seconds)`` gives a connection or None): step the native
-    transport, stop after a recorded native exit, and answer one connection at a time through ``exchange``. The
-    POSIX loop in ``serve`` is the same over its Unix socket."""
+    """Windows (and the portable seam tests): the supervisor's loop over an endpoint (``accept(seconds)`` gives a
+    connection or None): step the native transport, stop after a recorded native exit, and answer one connection at
+    a time through ``exchange``. It is a copy of the POSIX loop in ``serve``, which keeps its own Unix socket code;
+    a change to either loop belongs in both."""
     while not runner.stopping:
         runner.step()
         if _meta(runner.db, 'nativeExit') is not None:
@@ -1258,6 +1259,7 @@ def serve(run_dir):
         bound = os.lstat(path)
         listener.listen(8)
         listener.settimeout(.05)
+        # This loop's Windows twin is _serve_loop (over a named pipe); a change here belongs there too.
         while not runner.stopping:
             runner.step()
             if _meta(runner.db, 'nativeExit') is not None:

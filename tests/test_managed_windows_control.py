@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import socket
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -36,11 +37,57 @@ WINDOWS = os.name == 'nt'
 
 
 def fixture(case):
-    """The runner suite's run folder, manifest, token and fake transport, for ``case``."""
+    """The runner suite's run folder, manifest, token and fake transport, for ``case`` (POSIX files and stat
+    identities: for the simulated tests, which adjust the identity themselves)."""
     base = runner_tests.RunnerTests('test_identity_claim_and_status_precede_first_input')
     base.setUp()
     case.addCleanup(base.tearDown)
     return base
+
+
+class RunFolder:
+    """A supervisor's run folder made the way each system needs it: folders and files private from the start
+    through private_storage (an elevated Windows runner's plain ones belong to Administrators), and the project
+    folder's identity as the runner reads it (os.stat on POSIX; a handle opened by path on Windows)."""
+
+    def __init__(self, case):
+        temporary = tempfile.TemporaryDirectory(prefix='managed-control-')
+        case.addCleanup(temporary.cleanup)
+        base = Path(temporary.name).resolve()
+        self.run, self.project = base / 'run', base / 'fictional-project'
+        for folder in (self.run, self.project):
+            ps.make_private_folder(str(folder))
+        if ps.WIN:
+            device, inode = ps.path_identity(str(self.project))
+        else:
+            info = os.stat(str(self.project))
+            device, inode = info.st_dev, info.st_ino
+        self.token = 'a' * 64
+        self.manifest = {
+            'schemaVersion': 1, 'runId': runner_tests.uid(), 'nativeId': runner_tests.uid(),
+            'incarnation': runner_tests.uid(),
+            'folder': {'id': 'fictional', 'revision': 'one', 'label': 'Fictional orchard',
+                       'path': str(self.project), 'device': device, 'inode': inode},
+            'executable': {'path': os.path.abspath(os.sep + os.path.join('fictional', 'claude')),
+                           'version': runner_module.PINNED_VERSION, 'sha256': runner_module.PINNED_SHA256},
+            'profile': 'restricted_test', 'createdAt': 1000}
+        for name, data in (('manifest.json', json.dumps(self.manifest).encode()), ('token', self.token.encode()),
+                           ('run.lock', b'')):
+            fd = ps.create_private_file(str(self.run / name))
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+        self.runners = []
+        case.addCleanup(lambda: [runner.close() for runner in self.runners])
+
+    def runner(self):
+        self.transport = runner_tests.FakeTransport(self.manifest, self.run)
+        runner = runner_module.Runner(self.run, transport_factory=lambda manifest: self.transport,
+                                      clock=runner_tests.FakeClock(), wall=runner_tests.FakeClock())
+        self.runners.append(runner)
+        runner.start()
+        return runner
 
 
 class Client(threading.Thread):
@@ -85,7 +132,7 @@ class ServeLoopTests(unittest.TestCase):
     """The protocol through the endpoint seam, one connection at a time, as the supervisor serves it."""
 
     def setUp(self):
-        self.base = fixture(self)
+        self.base = RunFolder(self)
 
     def frame(self, token=None, command='status', params=None):
         return (json.dumps({'token': token or self.base.token, 'command': command, 'params': params or {}})
@@ -265,8 +312,9 @@ class WindowsPipeTests(unittest.TestCase):
 
     def test_a_second_server_with_the_same_name_is_refused(self):
         server, _ = self.server()
-        with self.assertRaises(OSError):
+        with self.assertRaises(OSError) as raised:
             windows.PipeServer(server.name)
+        self.assertEqual(raised.exception.winerror, 5)          # ERROR_ACCESS_DENIED: first instance only
 
     def test_a_client_refuses_a_pipe_whose_server_is_another_process(self):
         server, _ = self.server()
@@ -311,6 +359,40 @@ class WindowsPipeTests(unittest.TestCase):
         with self.assertRaises(socket.timeout):
             connection.sendall(b'x' * (4 * windows.PIPE_BUFFER))
         self.assertLess(time.monotonic() - started, 10)
+
+    def test_the_web_server_and_supervisor_talk_end_to_end_with_a_client_waiting(self):
+        """The supervisor's own loop over a real pipe, the web server's own client_request, and a second client
+        that arrives while the first is connected (busy, then WaitNamedPipe within its deadline)."""
+        folder = RunFolder(self)
+        runner = folder.runner()
+        server = windows.PipeServer()
+        recorded = runner_module._record_endpoint(runner, server.name)
+        loop = threading.Thread(target=runner_module._serve_loop, args=(runner, server), daemon=True)
+        loop.start()
+
+        def stop():
+            runner.stopping = True
+            loop.join(30)
+            server.close()
+            runner.root_fd.remove(runner_module.CONTROL_FILE, lambda fd: ps.file_identity(fd)[:2] == recorded[:2])
+        self.addCleanup(stop)
+        self.assertEqual(claude_managed.client_request(folder.run, 'status', {})['runId'], folder.manifest['runId'])
+        first = windows.open_pipe(server.name, os.getpid())         # connected: the one instance is taken
+        waiting = []
+        second = threading.Thread(target=lambda: waiting.append(
+            claude_managed.client_request(folder.run, 'status', {})), daemon=True)
+        second.start()
+        time.sleep(.3)
+        with first:
+            first.sendall((json.dumps({'token': folder.token, 'command': 'status', 'params': {}}) + '\n').encode())
+            reply = bytearray()
+            while b'\n' not in reply:
+                chunk = first.recv(65536)
+                self.assertTrue(chunk)
+                reply.extend(chunk)
+        self.assertTrue(json.loads(bytes(reply))['ok'])
+        second.join(10)
+        self.assertEqual([value['runId'] for value in waiting], [folder.manifest['runId']])
 
     def test_an_accept_with_no_client_returns_in_time(self):
         server = windows.PipeServer()

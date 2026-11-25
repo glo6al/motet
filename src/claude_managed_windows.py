@@ -466,19 +466,26 @@ def start_in_job(args, cwd):
 #
 # The supervisor creates one pipe instance with a random name (``\\.\pipe\motet-`` and 32 random hex digits),
 # FILE_FLAG_FIRST_PIPE_INSTANCE (if anything already holds that name, creating it fails: no squatting) and
-# PIPE_REJECT_REMOTE_CLIENTS, under private_storage's protected this-user/SYSTEM security descriptor. Only after the
-# pipe exists does it write the name and its own process ID to ``control.json`` in its private run folder. The web
-# server reads that file through private_storage and opens the pipe with identification-only impersonation. It
-# talks only if the pipe's server process is the recorded supervisor (GetNamedPipeServerProcessId) and the pipe's
-# owner and access list are this user's private ones (read back from the opened handle); only then is the token
-# sent. A pipe another account made fails the owner check. A process that later receives the supervisor's
-# recorded process ID cannot know the pipe's random name (it is only in the private run folder), and if it is
-# another account its pipe still fails the owner check; this same user could read the token anyway, as with the
-# Unix socket. A stale ``control.json`` names a pipe that ended with its supervisor, so opening it fails.
+# PIPE_REJECT_REMOTE_CLIENTS, under private_storage's protected this-user/SYSTEM security descriptor (explicit owner;
+# Everyone and anonymous get nothing). Only after the pipe exists does it write the name and its own process ID to
+# ``control.json`` in its private run folder. The web server reads that file through private_storage and opens the
+# pipe with identification-only impersonation. It talks only if the pipe's server process is the recorded
+# supervisor (GetNamedPipeServerProcessId) and the pipe's owner and access list are this user's private ones (read
+# back from the opened handle); only then is the token sent.
 #
-# Every operation is overlapped I/O with a deadline: a wait that times out cancels its own operation and waits for
-# that cancellation, on a raw handle no other thread uses (no C runtime descriptor, so none of its locks). One
-# instance serves one client at a time, as the Unix socket's single accept loop does.
+# The name is not a secret: any local user can list \\.\pipe\*. What refuses a foreign pipe is the owner and list
+# check (a pipe another account made, under any name or process ID, is not owned by this user) together with the
+# process check (a pipe this same user's other process made is not served by the recorded supervisor; this same
+# user could read the token from the run folder anyway, as with the Unix socket). A stale ``control.json`` names a
+# pipe that ended with its supervisor, so opening it fails; if another process of this user later serves that name
+# under the recorded process ID, that user could have read the token anyway.
+#
+# Every operation is overlapped I/O with a deadline on a raw handle no other thread uses (no C runtime descriptor,
+# so none of its locks). An operation's buffer, OVERLAPPED and event are freed only once Windows has confirmed the
+# operation is over: a wait that ends any way but completion cancels it and waits for that cancellation, and an
+# exception (an interrupt, say) does the same on the way out. If even that cannot be confirmed, they are kept for
+# the life of the process rather than freed under a pending operation. One instance serves one client at a time, as
+# the Unix socket's single accept loop does.
 
 PIPE_PREFIX = '\\\\.\\pipe\\motet-'
 PIPE_ACCESS_DUPLEX = 0x00000003
@@ -490,9 +497,12 @@ GENERIC_READ, GENERIC_WRITE = 0x80000000, 0x40000000
 OPEN_EXISTING = 3
 SECURITY_SQOS_PRESENT, SECURITY_IDENTIFICATION = 0x00100000, 0x00010000
 ERROR_FILE_NOT_FOUND, ERROR_BROKEN_PIPE, ERROR_PIPE_BUSY = 2, 109, 231
-ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_IO_PENDING = 232, 535, 997
-WAIT_TIMEOUT = 0x102
+ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, ERROR_PIPE_CONNECTED, ERROR_IO_PENDING = 232, 233, 535, 997
+ERROR_NOT_FOUND = 1168
+ENDED = (ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED)   # the other end is gone: the end of stream
+WAIT_OBJECT_0, WAIT_TIMEOUT = 0, 0x102
 CONTROL_SECONDS = 2.0            # every connect, read and write, as the Unix socket's settimeout(2)
+_KEPT = []                       # operations whose end Windows never confirmed: never freed
 
 _PIPE_API = None
 
@@ -544,13 +554,13 @@ def _milliseconds(seconds):
 
 
 class _Operation:
-    """One overlapped operation on ``handle`` with its own event, waited for with a deadline. A wait that times out
-    cancels the operation and waits for that cancellation (it completes at once), so no request outlives its
-    buffer."""
+    """One overlapped operation on ``handle``: its event, OVERLAPPED and data buffer (``buffer``), kept together
+    until Windows has confirmed the operation is over. ``pending`` is set before the call that starts it, so any
+    exit, an exception included, cancels and confirms it before anything is freed (``close``)."""
 
-    def __init__(self, handle):
+    def __init__(self, handle, buffer=None):
         ctypes, w, k, Overlapped, _ = _pipe_api()
-        self.handle = handle
+        self.handle, self.buffer, self.pending = handle, buffer, False
         self.event = k.CreateEventW(None, True, False, None)
         if not self.event:
             raise _pipe_error('event unavailable')
@@ -558,28 +568,56 @@ class _Operation:
         self.overlapped.hEvent = self.event
         self.count = w.DWORD()
 
-    def cancel(self):
-        ctypes, w, k = _pipe_api()[:3]
-        k.CancelIoEx(self.handle, ctypes.byref(self.overlapped))
-        k.GetOverlappedResult(self.handle, ctypes.byref(self.overlapped), ctypes.byref(self.count), True)
+    def started(self, result, code):
+        """Record what the call that should have started the operation returned (its BOOL and the error it set). A
+        call that failed with anything but ERROR_IO_PENDING started nothing; returns that error, else None."""
+        if not result and code != ERROR_IO_PENDING:
+            self.pending = False
+            return code
+        return None
 
-    def finish(self, started, code, seconds):
-        """Wait for the operation the call just ``started`` (its BOOL result and the error it set) for up to
-        ``seconds``: the byte count, or socket.timeout after cancelling it; Win32 errors as OSError with
-        ``winerror``."""
+    def cancel(self):
+        """Cancel the operation if it is still running and wait until Windows says it is over. True when its end is
+        confirmed (CancelIoEx finds nothing to cancel only when nothing is running)."""
+        ctypes, w, k = _pipe_api()[:3]
+        if not self.pending:
+            return True
+        if k.CancelIoEx(self.handle, ctypes.byref(self.overlapped)) or ctypes.get_last_error() != ERROR_NOT_FOUND:
+            # Running, or unknown: wait for its end, bounded, through its own event.
+            if k.WaitForSingleObject(self.event, 5000) != WAIT_OBJECT_0:
+                return False
+        self.pending = False
+        return True
+
+    def finish(self, result, code, seconds):
+        """Wait for the operation the call just started for up to ``seconds``: the byte count, or socket.timeout
+        once it is cancelled and over; Win32 errors as OSError with ``winerror``."""
         import socket
         ctypes, w, k = _pipe_api()[:3]
-        if not started:
-            if code != ERROR_IO_PENDING:
-                raise _pipe_error('pipe operation failed', code)
-            if k.WaitForSingleObject(self.event, _milliseconds(seconds)) == WAIT_TIMEOUT:
-                self.cancel()
-                raise socket.timeout('pipe operation timed out')
-        if not k.GetOverlappedResult(self.handle, ctypes.byref(self.overlapped), ctypes.byref(self.count), False):
-            raise _pipe_error('pipe operation failed')
+        failed = self.started(result, code)
+        if failed is not None:
+            raise _pipe_error('pipe operation failed', failed)
+        waited = k.WaitForSingleObject(self.event, _milliseconds(seconds))
+        if waited != WAIT_OBJECT_0:                     # timed out, or the wait itself failed
+            failure = None if waited == WAIT_TIMEOUT else _pipe_error('pipe wait failed')
+            if not self.cancel():
+                raise _pipe_error('pipe operation could not be ended', 0)
+            if failure is not None:
+                raise failure
+            raise socket.timeout('pipe operation timed out')
+        ok = k.GetOverlappedResult(self.handle, ctypes.byref(self.overlapped), ctypes.byref(self.count), False)
+        error = None if ok else _pipe_error('pipe operation failed')
+        self.pending = False
+        if error is not None:
+            raise error
         return self.count.value
 
     def close(self):
+        """Free the event (and with it the OVERLAPPED and buffer) only once the operation is confirmed over; one
+        Windows never confirms is kept for the life of the process instead."""
+        if not self.cancel():
+            _KEPT.append(self)
+            return
         event, self.event = self.event, None
         if event:
             _pipe_api()[2].CloseHandle(event)
@@ -587,7 +625,8 @@ class _Operation:
 
 class PipeConnection:
     """The part of a socket the line protocol uses (``settimeout``, ``recv``, ``sendall``, ``with``) over a pipe
-    handle with overlapped I/O; every call is bounded by the timeout set. The end of the stream is ``b''``."""
+    handle with overlapped I/O; every call is bounded by the timeout set. The end of the stream (the other end
+    closed or disconnected) is ``b''``, as from a socket."""
 
     def __init__(self, handle, on_close=None):
         self.handle, self.timeout, self.on_close = handle, CONTROL_SECONDS, on_close
@@ -598,18 +637,18 @@ class PipeConnection:
     def recv(self, size):
         ctypes, w, k = _pipe_api()[:3]
         size = max(1, size)
-        buffer = ctypes.create_string_buffer(size)
-        operation = _Operation(self.handle)
+        operation = _Operation(self.handle, ctypes.create_string_buffer(size))
         try:
-            started = k.ReadFile(self.handle, buffer, size, None, ctypes.byref(operation.overlapped))
+            operation.pending = True
+            result = k.ReadFile(self.handle, operation.buffer, size, None, ctypes.byref(operation.overlapped))
             code = ctypes.get_last_error()
             try:
-                count = operation.finish(started, code, self.timeout)
+                count = operation.finish(result, code, self.timeout)
             except OSError as error:
-                if getattr(error, 'winerror', None) in (ERROR_BROKEN_PIPE, ERROR_NO_DATA):
+                if getattr(error, 'winerror', None) in ENDED:
                     return b''
                 raise
-            return buffer.raw[:count]
+            return operation.buffer.raw[:count]
         finally:
             operation.close()
 
@@ -623,11 +662,12 @@ class PipeConnection:
             if left <= 0:
                 raise socket.timeout('pipe write timed out')
             part = bytes(view[:PIPE_BUFFER])
-            chunk = ctypes.create_string_buffer(part, len(part))
-            operation = _Operation(self.handle)
+            operation = _Operation(self.handle, ctypes.create_string_buffer(part, len(part)))
             try:
-                started = k.WriteFile(self.handle, chunk, len(part), None, ctypes.byref(operation.overlapped))
-                written = operation.finish(started, ctypes.get_last_error(), left)
+                operation.pending = True
+                result = k.WriteFile(self.handle, operation.buffer, len(part), None,
+                                     ctypes.byref(operation.overlapped))
+                written = operation.finish(result, ctypes.get_last_error(), left)
             finally:
                 operation.close()
             if written <= 0:
@@ -648,7 +688,10 @@ class PipeConnection:
 
 
 class PipeServer:
-    """The supervisor's end: one instance of a new pipe, serving one client at a time (``accept``)."""
+    """The supervisor's end: one instance of a new pipe, serving one client at a time (``accept``). One instance
+    is enough: a reading client closes as soon as it has its reply, so the next is served at once, and a client
+    that arrives meanwhile waits for the instance within its own deadline, as a Unix socket's queued client waits
+    within its receive timeout."""
 
     def __init__(self, name=None):
         import secrets
@@ -666,31 +709,37 @@ class PipeServer:
     def accept(self, seconds):
         """A connected client as a PipeConnection, or None if none connected within ``seconds`` (the wait for a
         client stays pending for the next call)."""
-        import socket
         ctypes, w, k = _pipe_api()[:3]
         if self.connect is None:
             operation = _Operation(self.handle)
-            started = k.ConnectNamedPipe(self.handle, ctypes.byref(operation.overlapped))
+            operation.pending = True
+            result = k.ConnectNamedPipe(self.handle, ctypes.byref(operation.overlapped))
             code = ctypes.get_last_error()
-            if started or code == ERROR_PIPE_CONNECTED:
+            if result or code in (ERROR_PIPE_CONNECTED, ERROR_NO_DATA):
+                operation.pending = False                   # nothing outstanding: connected already
                 operation.close()
+                if code == ERROR_NO_DATA and not result:    # a client connected and left already
+                    k.DisconnectNamedPipe(self.handle)
+                    return None
                 return PipeConnection(self.handle, self._done)
-            if code == ERROR_NO_DATA:                      # a client connected and left already
+            failed = operation.started(result, code)
+            if failed is not None:
                 operation.close()
-                k.DisconnectNamedPipe(self.handle)
-                return None
-            if code != ERROR_IO_PENDING:
-                operation.close()
-                raise _pipe_error('pipe connect failed', code)
+                raise _pipe_error('pipe connect failed', failed)
             self.connect = operation
-        if k.WaitForSingleObject(self.connect.event, _milliseconds(seconds)) == WAIT_TIMEOUT:
+        waited = k.WaitForSingleObject(self.connect.event, _milliseconds(seconds))
+        if waited == WAIT_TIMEOUT:
             return None
         operation, self.connect = self.connect, None
         try:
-            operation.finish(True, 0, 0)
-        except (OSError, socket.timeout):
-            k.DisconnectNamedPipe(self.handle)
-            return None
+            if waited != WAIT_OBJECT_0:
+                raise _pipe_error('pipe wait failed')
+            ok = k.GetOverlappedResult(self.handle, ctypes.byref(operation.overlapped), ctypes.byref(operation.count),
+                                       False)
+            operation.pending = False
+            if not ok:
+                k.DisconnectNamedPipe(self.handle)
+                return None
         finally:
             operation.close()
         return PipeConnection(self.handle, self._done)
@@ -698,7 +747,7 @@ class PipeServer:
     def _done(self):
         """After a reply: give the client up to two seconds to read it and close its end, then disconnect so the
         instance can serve the next client. A disconnect discards anything unread (a socket close does not); the
-        wait is how the reply still reaches a client that is reading it."""
+        wait is how the reply still reaches a client that is reading it. A reading client closes at once."""
         import socket
         import time
         connection = PipeConnection(self.handle)
@@ -715,8 +764,7 @@ class PipeServer:
     def close(self):
         ctypes, w, k = _pipe_api()[:3]
         if self.connect is not None:
-            self.connect.cancel()
-            self.connect.close()
+            self.connect.close()                    # cancels the pending wait for a client and confirms it
             self.connect = None
         handle, self.handle = self.handle, None
         if handle:
@@ -724,10 +772,10 @@ class PipeServer:
 
 
 def open_pipe(name, server_pid, seconds=CONTROL_SECONDS):
-    """The web server's end: open the pipe ``name`` within ``seconds`` and return a PipeConnection (each later read
-    or write bounded by CONTROL_SECONDS), only if its server process is ``server_pid`` and the pipe's owner and
-    access list are this user's private ones. Only a local pipe name of the supervisor's form is accepted, and the
-    server may only identify, never impersonate, the caller."""
+    """The web server's end: open the pipe ``name`` within ``seconds`` (waiting for a busy instance within that
+    time) and return a PipeConnection (each later read or write bounded by CONTROL_SECONDS), only if its server
+    process is ``server_pid`` and the pipe's owner and access list are this user's private ones. Only a local pipe
+    name of the supervisor's form is accepted, and the server may only identify, never impersonate, the caller."""
     import re
     import socket
     import time

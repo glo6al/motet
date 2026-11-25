@@ -373,6 +373,7 @@ def client_request(run_dir, command, params):
             if not chunk or len(response) + len(chunk) > MAX_RESPONSE:
                 _fail()
             response.extend(chunk)
+        # These reply checks' Windows twin is _reply; a change here belongs there too.
         head, tail = bytes(response).split(b'\n', 1)
         if tail:
             _fail()
@@ -435,8 +436,9 @@ def _windows_request(path, token, command, params):
 
 
 def _reply(response):
-    """The supervisor's reply line, checked as client_request checks it: one line, an object with ``ok``, provider
-    error text never forwarded."""
+    """Windows only: the supervisor's reply line, checked exactly as client_request's POSIX path checks it (one
+    line, an object with ``ok``, provider error text never forwarded). A copy of that code, which POSIX keeps
+    inline; a change to either belongs in both."""
     head, tail = bytes(response).split(b'\n', 1)
     if tail:
         _fail()
