@@ -521,6 +521,8 @@ class BuildTests(unittest.TestCase):
                     patch.object(native, 'ASAR_SHA256', digests[0]), patch.object(native, 'BINARY_SHA256', digests[1]):
                 self.assertTrue(native._installed_build().available)
                 self.assertFalse(native._attachment_build().available)
+                self.assertEqual(native._attachment_build().version, 'codex-new-chat-v2/26.1029.61003/24614')
+                self.assertEqual(native._installed_build().version, native.ADAPTER_VERSION)
                 self.assertFalse(queue.ready())
                 with patch.object(native, 'ATTACHMENT_PIN', (native.VERSION, native.BUILD) + digests):
                     self.assertTrue(native._attachment_build().available)

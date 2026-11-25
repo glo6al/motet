@@ -97,8 +97,9 @@ def _attachment_build():
 def _installed_build(pin=None):
     """Only bundle metadata and executable bytes; no native config or credentials."""
     version, build, asar_sha256, binary_sha256 = pin or (VERSION, BUILD, ASAR_SHA256, BINARY_SHA256)
+    adapter = 'codex-new-chat-v2/' + version + '/' + build  # Report the build this call checked.
     if sys.platform != 'darwin':
-        return Capability(False, 'unsupported_platform', 'Codex New chat currently requires macOS.', ADAPTER_VERSION)
+        return Capability(False, 'unsupported_platform', 'Codex New chat currently requires macOS.', adapter)
     try:
         source, _ = _regular(APP / 'Contents/Info.plist', 1024 * 1024)
         with source:
@@ -128,9 +129,9 @@ def _installed_build(pin=None):
                     != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
                     or digest.hexdigest() != expected):
                 raise ValueError()
-        return Capability(True, version=ADAPTER_VERSION)
+        return Capability(True, version=adapter)
     except (OSError, ValueError, plistlib.InvalidFileException):
-        return Capability(False, 'app_version_unsupported', 'This Codex build is not verified for New chat.', ADAPTER_VERSION)
+        return Capability(False, 'app_version_unsupported', 'This Codex build is not verified for New chat.', adapter)
 
 
 class StdioTransport:
