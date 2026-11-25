@@ -46,14 +46,21 @@ def uid():
     return str(uuid.uuid4())
 
 
+GIT_REFUSED = None
+
+
 def _git_program():
-    """The Git the product uses: /usr/bin/git on POSIX; on Windows Git for Windows installed for all users."""
+    """The Git the product uses: /usr/bin/git on POSIX; on Windows Git for Windows installed for all users. On
+    Windows a refusal is kept with what the lookup saw, so the tests fail with it instead of skipping."""
+    global GIT_REFUSED
     if os.name != 'nt':
         return '/usr/bin/git' if os.path.exists('/usr/bin/git') else None
     import attachments_windows_git
     try:
         return attachments_windows_git.find()
-    except attachments_windows_git.GitUnavailable:
+    except attachments_windows_git.GitUnavailable as error:
+        from windows_git_diagnosis import diagnosis
+        GIT_REFUSED = 'Git for Windows was not accepted (%s).\n%s' % (error.code, diagnosis())
         return None
 
 
@@ -68,9 +75,16 @@ def _git_environment(home):
     return attachments_windows_git.environment(GIT)
 
 
-@unittest.skipUnless(GIT and (os.name == 'posix' or ps.folder_walk_available()),
+@unittest.skipUnless((GIT or GIT_REFUSED) and (os.name == 'posix' or ps.folder_walk_available()),
                      'Requires the Git Motet uses (/usr/bin/git, or Git for Windows installed for all users) and private storage.')
 class ClaudeAttachmentIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if GIT_REFUSED is not None:
+            # Windows CI has Git for Windows installed for all users: not accepting it is a failure, not a skip.
+            raise AssertionError(GIT_REFUSED)
+
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)

@@ -2,12 +2,14 @@
 
 macOS and Linux use /usr/bin/git, which must belong to root and not be writable by group or others. Windows has no
 such fixed place. Motet uses Git for Windows installed for all users, under Program Files, and runs its own program
-directly (``Git\\mingw64\\bin\\git.exe``, ``Git\\clangarm64\\bin\\git.exe`` on Windows on ARM, or
-``Git\\mingw32\\bin\\git.exe`` for the 32-bit build, also under Program Files (x86); ``Git\\cmd\\git.exe`` only starts
-that one). Every folder from Program Files
-down to it, and the program itself, must belong to the system (SYSTEM, Administrators or TrustedInstaller) and be
-changeable by nobody else (``unwritable(system_owned=True)``). Each is opened through the no-link walk, so a junction
-or link anywhere on the way is refused, and Windows loads git.exe's libraries from that checked folder first.
+directly: ``Git\\ucrt64\\bin\\git.exe`` on x64 since Git for Windows 2.56 (its release notes: "/mingw64/bin/git.exe
+does not exist anymore, /ucrt64/bin/git.exe takes its role"), ``Git\\mingw64\\bin\\git.exe`` on x64 before that,
+``Git\\clangarm64\\bin\\git.exe`` on Windows on ARM, or ``Git\\mingw32\\bin\\git.exe`` for the older 32-bit build,
+also under Program Files (x86). ``Git\\cmd\\git.exe`` is not used: it only starts one of those, as a second process
+whose program Motet would not have checked. Every folder from Program Files down to it, and the program itself,
+must belong to the system (SYSTEM, Administrators or TrustedInstaller) and be changeable by nobody else
+(``unwritable(system_owned=True)``). Each is opened through the no-link walk, so a junction or link anywhere on the way
+is refused, and Windows loads git.exe's libraries from that checked folder first.
 
 A Git installed only for this account (under %LOCALAPPDATA%) is refused: any program the user runs could change it,
 and Motet would then run that changed program with access to the workspace. The refusals carry fixed words the page
@@ -17,9 +19,10 @@ import os
 
 import private_storage as ps
 
-# Git for Windows' own program for each build it ships: x64, ARM64 and 32-bit.
-PROGRAMS = (('Git', 'mingw64', 'bin', 'git.exe'), ('Git', 'clangarm64', 'bin', 'git.exe'),
-            ('Git', 'mingw32', 'bin', 'git.exe'))
+# Git for Windows' own program for each build it has shipped: x64 (UCRT64 since 2.56, MINGW64 before), ARM64 and
+# 32-bit. One install holds one of them; the first found is used and checked.
+PROGRAMS = (('Git', 'ucrt64', 'bin', 'git.exe'), ('Git', 'mingw64', 'bin', 'git.exe'),
+            ('Git', 'clangarm64', 'bin', 'git.exe'), ('Git', 'mingw32', 'bin', 'git.exe'))
 PROGRAM = PROGRAMS[0]
 WHY = {
     'attachments_git_missing': ('Sending files to Claude chats needs Git for Windows installed for all users (in '
@@ -76,17 +79,25 @@ def checked(executable):
         raise GitUnavailable('attachments_git_unsafe') from None
 
 
+def candidates():
+    """Where Git for Windows' program is looked for, in order: each Program Files root with each build's place."""
+    return [os.path.join(root, *program) for root in _roots() for program in _programs()]
+
+
+def per_user_candidates():
+    """Where a Git installed only for this account would be (refused, but named as such)."""
+    local = os.environ.get('LOCALAPPDATA')
+    return [os.path.join(local, 'Programs', *program) for program in _programs()] if local else []
+
+
 def find():
     """The checked git.exe of Git for Windows installed for all users, as a resolved absolute path."""
-    for root in _roots():
-        for program in _programs():
-            candidate = os.path.join(root, *program)
-            if os.path.isfile(candidate):
-                executable = os.path.realpath(candidate)
-                checked(executable)
-                return executable
-    local = os.environ.get('LOCALAPPDATA')
-    if local and any(os.path.isfile(os.path.join(local, 'Programs', *program)) for program in _programs()):
+    for candidate in candidates():
+        if os.path.isfile(candidate):
+            executable = os.path.realpath(candidate)
+            checked(executable)
+            return executable
+    if any(os.path.isfile(candidate) for candidate in per_user_candidates()):
         raise GitUnavailable('attachments_git_per_user')
     raise GitUnavailable('attachments_git_missing')
 
