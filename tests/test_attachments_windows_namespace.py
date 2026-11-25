@@ -219,10 +219,15 @@ class FenceChecks(FenceBase):
         holder = self.held_elsewhere(self.state / namespace.HOST)
         with self.windows():
             started = time.monotonic()
-            with self.assertRaises(NamespaceError):
+            with self.assertRaises(NamespaceError) as raised:
                 with fence.host_fence():
                     pass
             self.assertLess(time.monotonic() - started, 5)     # it gives up after a short retry, not a long wait
+            self.assertEqual((raised.exception.code, raised.exception.reason), ('managed_unavailable', 'busy'))
+            # Its own words, which say a later start can clear it: not the copied-records reason.
+            with self.assertRaises(messaging.MessagingStorageUnavailable) as refused:
+                messaging.MessagingStore(str(self.state), str(self.sessions)).close()
+            self.assertEqual(str(refused.exception), messaging.RETAINED_STATE_BUSY)
         self.assert_refused(fence)
         self.released(holder)
         self.assertIsNotNone(self.opens_within()._attachment_guard)
@@ -232,6 +237,11 @@ class FenceChecks(FenceBase):
         raw = (self.state / namespace.ANCHOR).read_bytes()
         self.not_private(self.state / namespace.ANCHOR, raw)
         self.assert_refused(fence)
+        # A record the walk refuses is a storage refusal, not records from elsewhere: it keeps the storage reason.
+        with self.windows():
+            with self.assertRaises(NamespaceError) as raised:
+                messaging.MessagingStore(str(self.state), str(self.sessions)).close()
+        self.assertIsNone(raised.exception.reason)
         self.make_private(self.state / namespace.ANCHOR, raw)
         self.assertIsNotNone(self.open_store()._attachment_guard)
 

@@ -131,4 +131,4 @@ async function ownerStartupChecks({causals=true}={}) {
   console.log('ok fixture startup diagnostics and listener cleanup');
 }
 
-module.exports={ownerFixture,waitForOwnerReady,ownerStartupChecks,PYTHON,stopFixture,WINDOWS,STARTUP_MS};
+module.exports={ownerFixture,waitForOwnerReady,ownerStartupChecks,CLEANUP_MS,PYTHON,scrub,stopFixture,WINDOWS,STARTUP_MS};

@@ -46,6 +46,8 @@ RETAINED_STATE_UNAVAILABLE = ('Agent messaging cannot start here: its state fold
                               'records that this system cannot check safely yet.')
 RETAINED_STATE_FOREIGN = ('Agent messaging cannot start here: its state folder holds attachment records made by Motet '
                           'on another computer or in another folder, and they cannot be used here.')
+RETAINED_STATE_BUSY = ('Agent messaging could not start: another program was using its attachment records. '
+                       'Restart Motet to try again.')
 STATE_FOLDER_REFUSED = 'Messaging state directory must be private and owned by you.'
 LOCK_REFUSED = 'Messaging lock must be a private regular file.'
 DATABASE_REFUSED = 'Messaging database must be a private regular file.'
@@ -142,18 +144,24 @@ def codex_records_checkable():
 
 @contextmanager
 def foreign_records_refused():
-    """Windows: a refusal from the attachment namespace fence becomes RETAINED_STATE_FOREIGN, a reason shown as it
-    is. Nothing on Windows makes these records yet (only delivery to agent chats installs them, and it is off there),
-    so any that exist were made by Motet on another computer or in another folder, and the identities they record
-    belong there. Revisit once that delivery is ported. POSIX keeps its own refusal (the generic storage reason)."""
+    """Windows: the attachment namespace fence's refusals that have their own words, shown as they are. Records
+    whose identities or nonce do not match this folder's files (made by Motet on another computer or in another
+    folder) give RETAINED_STATE_FOREIGN; another holder keeping the fence's lock past its short wait gives
+    RETAINED_STATE_BUSY, which a later start can clear. Any other refusal (a record the walk refused for its access
+    list or a sharing violation, or a malformed one) passes on and gets the storage reason. POSIX keeps its own
+    refusal (the storage reason for all of them)."""
     if not private_storage.WIN:
         yield
         return
     from attachments_native_namespace import NamespaceError
     try:
         yield
-    except NamespaceError:
-        raise MessagingStorageUnavailable(RETAINED_STATE_FOREIGN) from None
+    except NamespaceError as error:
+        if error.reason == 'foreign':
+            raise MessagingStorageUnavailable(RETAINED_STATE_FOREIGN) from None
+        if error.reason == 'busy':
+            raise MessagingStorageUnavailable(RETAINED_STATE_BUSY) from None
+        raise
 
 
 def private_state_folder(state_dir):

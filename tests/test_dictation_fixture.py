@@ -39,7 +39,11 @@ def _node_check_output(value, check):
     return '\n'.join(lines)[-2048:] or '<empty>'
 
 
-def _run_node_check(check, bootstrap, *, label, marker, timeout=10):
+# Windows runners can take far longer to start Node (one 10 s limit ran out there with no output at all).
+NODE_CHECK_TIMEOUT = 60 if os.name == 'nt' else 10
+
+
+def _run_node_check(check, bootstrap, *, label, marker, timeout=NODE_CHECK_TIMEOUT):
     # A closed file removes the synchronous stdin read's dependency on pipe EOF.
     with tempfile.TemporaryDirectory(prefix='motet-node-check-') as directory:
         path = Path(directory) / 'bootstrap.js'
@@ -97,7 +101,7 @@ class FixtureTests(unittest.TestCase):
                                 'The original Node check must be invoked exactly once')
                 self.assertEqual(run.call_args.kwargs,
                                  {'stdin': subprocess.DEVNULL, 'text': True, 'encoding': 'utf-8',
-                                  'capture_output': True, 'timeout': 10})
+                                  'capture_output': True, 'timeout': NODE_CHECK_TIMEOUT})
                 self.assertFalse(paths[0].parent.exists(), 'Timed-out bootstrap directory must be removed')
                 self.assertTrue(isinstance(failure, AssertionError), 'Raw subprocess timeout escaped')
                 self.assertTrue(failure.__suppress_context__, 'Inline argv exception must not be chained')
@@ -106,7 +110,7 @@ class FixtureTests(unittest.TestCase):
                 self.assertFalse(check in rendered, 'Rendered failure leaked the inline source')
                 self.assertFalse('subprocess.TimeoutExpired' in rendered,
                                  'Rendered failure leaked the raw subprocess exception')
-                self.assertIn('2.500s (limit 10s)', message)
+                self.assertIn('2.500s (limit %ss)' % NODE_CHECK_TIMEOUT, message)
                 self.assertIn('completion marker: ' + reached, message)
                 self.assertIn('args: node -e <inline check>', message)
                 self.assertLess(len(message), 4600)
@@ -129,7 +133,7 @@ class FixtureTests(unittest.TestCase):
                     paths.append(Path(argv[4]))
                     self.assertTrue(paths[-1].read_bytes() == bootstrap.encode('utf-8'))
                     self.assertEqual(kwargs, {'stdin': subprocess.DEVNULL, 'text': True,
-                                             'encoding': 'utf-8', 'capture_output': True, 'timeout': 10})
+                                             'encoding': 'utf-8', 'capture_output': True, 'timeout': NODE_CHECK_TIMEOUT})
                     return subprocess.CompletedProcess(argv, code, 'signal',
                                                        'failure at ' + str(paths[-1]) + '\n' +
                                                        json.dumps(str(paths[-1]))[1:-1] + '\n' +
