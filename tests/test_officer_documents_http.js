@@ -104,6 +104,14 @@ const ready = new Promise((resolve,reject) => {
     assert.equal((await metadata()).fakeProviderCalls,0);
     s = await client.send('What does the fictional file say?',{keptFiles:s.files.filter(f=>f.available)});
     assert.equal(s.error,null,JSON.stringify(s.error));
+    // The ask returns only after the fixture has recorded the question's outcome, and send reloads after it, so no
+    // answer here means the question ended without one. Say how it ended (it is not waited for: it will not change).
+    if(s.answers.length!==1){
+      const asked=s.requests.find(r=>r.requestId===s.lastSend?.requestId)||s.requests[s.requests.length-1];
+      assert.fail('No answer was recorded: '+JSON.stringify({answers:s.answers.length,request:asked&&{state:asked.state,
+        failure:asked.failure,officerDelivery:asked.officerDelivery,answerId:asked.answerId},uncertain:s.uncertain,
+        fakeProviderCalls:(await metadata()).fakeProviderCalls,fixtureErrors:errors.slice(-2000)}));
+    }
     assert.equal(s.answers[0].state,'available');
     assert.deepEqual(s.answers[0].priorAnswerWindow,{policy:'recent_available_8',includedCount:0,omittedOlder:false});
     assert(Number.isFinite(s.answers[0].answeredAt));
