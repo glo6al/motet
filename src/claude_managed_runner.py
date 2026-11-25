@@ -187,6 +187,21 @@ def _folder(folder):
         _fail('folder_changed')
 
 
+def _windows_pin():
+    """Windows: the (SHA-256, size) of the build pinned for this machine's architecture, or None."""
+    import claude_managed_windows as windows
+    return windows.windows_pin()
+
+
+def _pinned_sha256():
+    """The pinned build's SHA-256: the Mac's (PINNED_SHA256) on POSIX, as before; on Windows the build for this
+    machine's architecture."""
+    if not ps.WIN:
+        return PINNED_SHA256
+    pin = _windows_pin()
+    return pin[0] if pin else None
+
+
 def _manifest(raw):
     data = _load(raw)
     keys = {'schemaVersion', 'runId', 'nativeId', 'incarnation', 'folder', 'executable', 'profile', 'createdAt'}
@@ -201,7 +216,7 @@ def _manifest(raw):
         _fail('unsafe_state')
     executable = data['executable']
     if (not isinstance(executable['path'], str) or not os.path.isabs(executable['path'])
-            or executable['sha256'] != PINNED_SHA256 or executable['version'] != PINNED_VERSION):
+            or executable['sha256'] != _pinned_sha256() or executable['version'] != PINNED_VERSION):
         _fail('unsupported_build')
     _folder(data['folder'])
     return data
@@ -456,10 +471,46 @@ class NativeTransport:
     def pid(self):
         return self.process.pid if self.process else None
 
+    def _args(self, exe):
+        args = [exe, '--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
+                '--verbose', '--await-claim', '--session-id', self.manifest['nativeId'],
+                '--permission-mode', 'default', '--permission-prompt-tool', 'stdio',
+                '--replay-user-messages', '--include-partial-messages']
+        if self.manifest['profile'] == 'restricted_test':
+            args += ['--safe-mode', '--strict-mcp-config', '--tools', 'Write,Read']
+        return args
+
+    def _windows_start(self, exe):
+        """Windows: open the pinned build through the no-link walk sharing reading only, hash it through that
+        handle, and keep the handle open until Claude has been started from the same file in its kill-on-close
+        job, so it cannot be replaced in between; the handle is closed in every path."""
+        import claude_managed_windows as windows
+        fd = None
+        try:
+            fd = windows.open_pinned(exe, _windows_pin())
+            _folder(self.manifest['folder'])
+            self.process, self.job = windows.start_in_job(self._args(exe), self.manifest['folder']['path'])
+            try:
+                self.pipes = windows.ThreadedPipes(self.process)
+            except BaseException as error:
+                self.close()              # ends the job: nothing runs without its pipes
+                if isinstance(error, Exception) and not isinstance(error, (OSError, ValueError)):
+                    raise OSError('pipe threads unavailable') from error    # a thread that would not start
+                raise
+        except RunnerError:
+            raise
+        except (OSError, ValueError):
+            _fail('unsupported_build')
+        finally:
+            if fd is not None:
+                os.close(fd)
+
     def start(self):
         if sys.platform != 'darwin':
             _fail('unsupported_build')
         exe = self.manifest['executable']['path']
+        if ps.WIN:
+            return self._windows_start(exe)
         fd = None
         try:
             if os.path.realpath(exe) != exe:
@@ -484,29 +535,12 @@ class NativeTransport:
                     or digest.hexdigest() != PINNED_SHA256):
                 raise ValueError()
             _folder(self.manifest['folder'])
-            args = [exe, '--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
-                    '--verbose', '--await-claim', '--session-id', self.manifest['nativeId'],
-                    '--permission-mode', 'default', '--permission-prompt-tool', 'stdio',
-                    '--replay-user-messages', '--include-partial-messages']
-            if self.manifest['profile'] == 'restricted_test':
-                args += ['--safe-mode', '--strict-mcp-config', '--tools', 'Write,Read']
+            args = self._args(exe)
             # Check the path again after hashing. No shell, inherited stdin or stderr.
             path_info = os.lstat(exe)
             if (path_info.st_dev, path_info.st_ino, path_info.st_mtime_ns, path_info.st_ctime_ns) != (
                     after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns):
                 raise ValueError()
-            if ps.WIN:
-                # Suspended, put in its own kill-on-close job, then resumed; refused if any step fails.
-                import claude_managed_windows as windows
-                self.process, self.job = windows.start_in_job(args, self.manifest['folder']['path'])
-                try:
-                    self.pipes = windows.ThreadedPipes(self.process)
-                except BaseException as error:
-                    self.close()              # ends the job: nothing runs without its pipes
-                    if isinstance(error, Exception) and not isinstance(error, (OSError, ValueError)):
-                        raise OSError('pipe threads unavailable') from error    # a thread that would not start
-                    raise
-                return
             self.process = subprocess.Popen(args, cwd=self.manifest['folder']['path'],
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)

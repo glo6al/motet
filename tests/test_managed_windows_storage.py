@@ -39,12 +39,15 @@ REAL_WINDOWS = os.name == 'nt' and ps.folder_walk_available()
 
 
 class Simulated:
-    """Enter the Windows simulation before the suite's own setUp, for the whole test."""
+    """Enter the Windows simulation before the suite's own setUp, for the whole test. The machine reads as x64
+    (its architecture is a Win32 answer the simulation has no model for), so the pinned build is the x64 one."""
 
     def setUp(self):
         from windows_simulation import simulated_windows
+        import claude_managed_windows
         stack = ExitStack()
         self.calls = stack.enter_context(simulated_windows())
+        stack.enter_context(mock.patch.object(claude_managed_windows, 'native_architecture', return_value='x64'))
         self.addCleanup(stack.close)
         super().setUp()
 
@@ -60,6 +63,7 @@ class SimulatedRunnerTests(Simulated, runner_tests.RunnerTests):
         with ps.open_folder(str(self.project)) as held:
             device, inode = held.identity()[:2]
         self.manifest['folder'].update(device=device, inode=inode)
+        self.manifest['executable']['sha256'] = claude_managed_runner._pinned_sha256()     # the Windows x64 pin
         self.write('manifest.json', json.dumps(self.manifest))
 
     def test_the_windows_branches_are_the_ones_used(self):
@@ -212,14 +216,15 @@ class SimulatedManagerTests(Simulated, manager_tests.Fixture):
 
 @unittest.skipUnless(SIMULATED, 'simulates Windows on macOS and Linux')
 class SimulatedReadinessTests(Simulated, manager_tests.ConfigurationReadinessTests):
-    """The readiness record read through the walk and checked on its handle. The machine and user identity in the
-    record is still the Mac's (ioreg and the uid; Windows' is step 8b.4), so it is computed with the real uid."""
+    """The readiness record read through the walk and checked on its handle. These tests vary the Mac's hardware
+    answer (ioreg) to change the record, so the identity is computed the Mac's way (with the real uid); Windows'
+    own identity (SMBIOS UUID and SID) is tested in tests/test_managed_windows_identity.py."""
 
     def setUp(self):
         real, getuid = claude_managed.local_configuration_identity, os.getuid
 
         def mac_identity():
-            with mock.patch.object(os, 'getuid', getuid):
+            with mock.patch.object(os, 'getuid', getuid), mock.patch.object(claude_managed.ps, 'WIN', False):
                 return real()
         patcher = mock.patch.object(claude_managed, 'local_configuration_identity', mac_identity)
         patcher.start()
@@ -229,6 +234,11 @@ class SimulatedReadinessTests(Simulated, manager_tests.ConfigurationReadinessTes
         breakaway.start()
         self.addCleanup(breakaway.stop)
         super().setUp()
+
+    @unittest.skip('It pins the Mac build by patching PINNED_SHA256; the Windows build pin and location are '
+                   'tested in tests/test_managed_windows_identity.py.')
+    def test_server_factory_honors_record_and_keeps_owner_fence_without_it(self):
+        pass
 
     @unittest.skip('POSIX ownership by uid; on Windows an untrusted record is one whose owner or access list is '
                    'not private, as the real Windows tests check.')

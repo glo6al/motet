@@ -1105,15 +1105,17 @@ def _win_open_root(root, private=False, listing=False, writable=False):
     return handle
 
 
-def _win_open_checked(parent, name, directory, subject, single_link=False, private=False, listing=False, writable=False):
+def _win_open_checked(parent, name, directory, subject, single_link=False, private=False, listing=False, writable=False,
+                      deny_writers=False):
     """Open the child ``name`` of the held folder ``parent`` and check it. A folder is held (data access, no delete
-    sharing); a file shares everything, since its handle is what is read. A missing name (or one being removed, still
-    open elsewhere) raises FileNotFoundError; the wrong type ``not_regular``; any other failed open
-    PrivateStorageError('open')."""
+    sharing); a file shares everything, since its handle is what is read, or with ``deny_writers`` reading only, so
+    nobody can write, rename or delete it while the handle is open. A missing name (or one being removed, still open
+    elsewhere) raises FileNotFoundError; the wrong type ``not_regular``; any other failed open (a writer already
+    holding it, with ``deny_writers``) PrivateStorageError('open')."""
     if directory:   # held: no delete sharing, which briefly blocks other programs renaming or deleting it
         access, share = _hold_access(listing, writable), _SHARE_READ | _SHARE_WRITE
     else:
-        access, share = _GENERIC_READ, _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE
+        access, share = _GENERIC_READ, (_SHARE_READ if deny_writers else _SHARE_READ | _SHARE_WRITE | _SHARE_DELETE)
     try:
         handle = _win_child(parent, name, access, share, directory)
     except OSError as e:
@@ -1189,17 +1191,20 @@ class NoLinkFolder:
             raise _refuse('unavailable', 'folder')
         return _win_list(self._handles[-1])
 
-    def open(self, name, directory=False, single_link=False, private=False, subject=None):
+    def open(self, name, directory=False, single_link=False, private=False, subject=None, deny_writers=False):
         """A read-only descriptor for the child ``name``: a regular file (with one name only, if ``single_link``),
         or with ``directory`` a folder. ``private`` also requires this user as owner and a private mode or access
-        list. A missing child raises FileNotFoundError; on POSIX a link raises the system's own OSError (ELOOP)."""
+        list. ``deny_writers`` (Windows only; POSIX has no sharing modes and opens as before): the file is shared
+        for reading only while the descriptor is open. A missing child raises FileNotFoundError; on POSIX a link
+        raises the system's own OSError (ELOOP)."""
         subject = subject or ('folder' if directory else 'file')
         self._held()
         if not _plain_name(name, self._windows):
             raise _refuse('unavailable', subject)
         if self._windows:
             # Binary, so a read returns the bytes as they are (no CRLF change, no stop at Ctrl-Z).
-            return _win_fd(_win_open_checked(self._handles[-1], name, directory, subject, single_link, private),
+            return _win_fd(_win_open_checked(self._handles[-1], name, directory, subject, single_link, private,
+                                             deny_writers=deny_writers),
                            os.O_RDONLY | getattr(os, 'O_BINARY', 0))
         flags = os.O_RDONLY | os.O_NOFOLLOW | _CLOEXEC | (os.O_DIRECTORY if directory else os.O_NONBLOCK)
         fd = os.open(name, flags, dir_fd=self._fd)      # non-blocking: a pipe cannot hang the open
@@ -1572,13 +1577,15 @@ def anchored(path):
     return module.join(module.realpath(module.dirname(path)), module.basename(path))
 
 
-def open_no_links(path, directory=False, single_link=False, private=False):
+def open_no_links(path, directory=False, single_link=False, private=False, deny_writers=False):
     """A read-only descriptor for ``path`` with no link followed anywhere in it; the caller closes it.
 
     A regular file by default (``single_link`` refuses a second name), or with ``directory`` the folder itself (on
     Windows that descriptor holds the folder and serves ``os.fstat``; to open its children use ``open_folder``).
-    ``private`` also checks the opened file or folder's owner, and mode or access list. A missing name raises
-    FileNotFoundError and refusals raise PrivateStorageError; on POSIX a link raises the system's own OSError."""
+    ``private`` also checks the opened file or folder's owner, and mode or access list. ``deny_writers`` (a file, on
+    Windows) shares it for reading only while the descriptor is open (see ``NoLinkFolder.open``). A missing name
+    raises FileNotFoundError and refusals raise PrivateStorageError; on POSIX a link raises the system's own
+    OSError."""
     path = _absolute(path)
     if directory:
         folder = open_folder(path, private)
@@ -1590,6 +1597,8 @@ def open_no_links(path, directory=False, single_link=False, private=False):
         return fd
     parent, name = _path_module().split(path)
     with open_folder(parent) as folder:
+        if deny_writers:
+            return folder.open(name, single_link=single_link, private=private, deny_writers=True)
         return folder.open(name, single_link=single_link, private=private)
 
 
