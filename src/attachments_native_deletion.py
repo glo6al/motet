@@ -45,7 +45,8 @@ FULL, PARTIAL, NEVER, UNRESOLVED = range(1, 5)
 NATIVE = 2
 PIECES = {PENDING: 'pending', REMOVED: 'removed', CHANGED: 'changed', UNKNOWN: 'unknown'}
 REASONS = (None, 'source_in_use', 'identity_changed', 'removal_unconfirmed', 'workspace_unavailable',
-           'workspace_unverified')
+           'workspace_unverified', 'copy_in_use')
+COPY_IN_USE = 6
 _LAUNCHER = object()
 
 
@@ -1093,7 +1094,7 @@ class NativeDeletion:
                     'busy': (UNKNOWN, 1)}.get(result, (UNKNOWN, 3))
         except AttachmentError as error:
             if error.code == 'cleanup_busy':
-                return UNKNOWN, 1       # Windows: the copy is open in another program; retried later, as a busy source
+                return UNKNOWN, COPY_IN_USE     # Windows: the copy is open in another program; retried later
             return (CHANGED, 2) if error.code == 'copy_changed' else (UNKNOWN, 3)
         except OSError:
             return UNKNOWN, 3

@@ -11,6 +11,7 @@ change it, a copy held open by another program, and the resource lock held by an
 Run: python tests/test_attachments_windows_materialize.py
 """
 from contextlib import contextmanager, nullcontext
+import dataclasses
 import hashlib
 import os
 from pathlib import Path
@@ -208,8 +209,28 @@ class CopyChecks:
             with self.assertRaises(AttachmentError) as raised:
                 self.context_for(self.repo)
         self.assertEqual(raised.exception.code, 'workspace_unsafe')
-        self.assertIn('Other people using this computer can change the selected workspace folder', str(raised.exception))
+        self.assertIn('The selected workspace folder can be changed by other people using this computer',
+                      str(raised.exception))
         self.assertIn('as a folder others can write to does on a Mac', str(raised.exception))
+
+    def test_a_git_folder_owned_by_another_account_is_named_in_plain_words(self):
+        self.owned_by_administrators(self.repo / '.git')
+        with self.assertRaises(AttachmentError) as raised:
+            self.copied()
+        self.assertEqual(raised.exception.code, 'workspace_not_yours')
+        self.assertIn("The selected workspace's .git folder belongs to another account (often Administrators",
+                      str(raised.exception))
+        self.assertIn('Take ownership of it, or choose a folder you made.', str(raised.exception))
+
+    def test_a_workspace_reached_through_a_link_is_named_in_plain_words(self):
+        link = self.base / 'orchard-link'
+        self.workspace_link(link, self.repo)
+        self.context = dataclasses.replace(self.context, root=str(link))
+        with self.assertRaises(AttachmentError) as raised:
+            self.copied()
+        self.assertEqual(raised.exception.code, 'workspace_linked')
+        self.assertIn('The selected workspace folder is reached through a link or junction, which Motet does not '
+                      "follow. Choose the folder's real location.", str(raised.exception))
 
     def test_a_copy_held_open_elsewhere_is_left_and_retried_later(self):
         verified = self.copied()
@@ -266,6 +287,32 @@ class SimulatedWindowsCopyTests(CopyChecks, unittest.TestCase):
         with mock.patch.object(ps.NoLinkFolder, 'remove', lambda self, name, expect: 'busy'):
             yield
 
+    def workspace_link(self, link, target):
+        """A symbolic link stands in for the junction; the walk's refusal of it is given in Windows' words (the POSIX
+        walk reports its own error, ELOOP or ENOTDIR)."""
+        os.symlink(target, link, target_is_directory=True)
+        real = Materializer._windows_directory
+
+        def directory(materializer, path, writable):
+            if path == str(link):
+                raise ps.PrivateStorageError('a junction on the way', 'link', 'folder')
+            return real(materializer, path, writable)
+        patcher = mock.patch.object(Materializer, '_windows_directory', directory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def owned_by_administrators(self, path):
+        """POSIX cannot give the folder away without root, so the held folder's check answers as Windows would."""
+        real = ps.NoLinkFolder.unwritable
+
+        def unwritable(folder, system_owned=False):
+            if folder.path == str(path):
+                raise ps.PrivateStorageError('folder owned elsewhere', 'owner', 'folder')
+            return real(folder, system_owned)
+        patcher = mock.patch.object(ps.NoLinkFolder, 'unwritable', unwritable)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_windows_identities_are_read_from_handles(self):
         from windows_simulation import SERIAL
         self.copied()
@@ -305,6 +352,40 @@ class WindowsCopyTests(CopyChecks, unittest.TestCase):
         only), as an editor or scanner may hold it."""
         with open(path, 'rb'):
             yield
+
+    def workspace_link(self, link, target):
+        junction(link, target)
+
+    def owned_by_administrators(self, path):
+        """As a repository cloned from an administrator window is."""
+        subprocess.run(['icacls', str(path), '/setowner', '*S-1-5-32-544'], check=True, capture_output=True,
+                       timeout=30)
+
+    @contextmanager
+    def held_exclusively(self, path):
+        """Another program with the copy open sharing nothing (CreateFileW with share mode 0), as some viewers do."""
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)      # GENERIC_READ, OPEN_EXISTING
+        if not handle or handle == wintypes.HANDLE(-1).value:
+            raise OSError(ctypes.get_last_error(), 'could not hold the copy')
+        try:
+            yield
+        finally:
+            kernel.CloseHandle(handle)
+
+    def test_a_copy_held_with_no_sharing_is_left_and_retried_later(self):
+        verified = self.copied()
+        copy = self.repo / self.spec.relative_path
+        with self.held_exclusively(copy):
+            self.assertEqual(self.code(lambda: self.remove(verified)), 'cleanup_busy')
+            self.assertTrue(copy.exists())
+        self.assertEqual(self.remove(verified).result, 'removed')
 
 
 if __name__ == '__main__':

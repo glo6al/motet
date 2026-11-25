@@ -252,18 +252,38 @@ def _pread(fd, size, offset):
     return os.read(fd, size)
 
 
-def _windows_folder(folder, *, private=False):
+# How a Windows refusal names the folder it is about (the roles of WorkspaceContext's three folders).
+FOLDER_NAMES = {'workspace': 'The selected workspace folder', 'git': "The selected workspace's .git folder",
+                'git_info': "The selected workspace's .git\\info folder"}
+
+
+def _windows_refusal(error, role):
+    """Plain words for a Windows refusal of a workspace or Git folder, naming which one; None for any other."""
+    name = FOLDER_NAMES.get(role, FOLDER_NAMES['workspace'])
+    reason = getattr(error, 'reason', None)
+    if reason == 'access':
+        fail('workspace_unsafe', name + ' can be changed by other people using this computer, so files are not '
+             'copied into the workspace. A folder made directly under a drive (such as C:\\src) lets every '
+             'signed-in user change it, as a folder others can write to does on a Mac. Choose a folder inside your '
+             'user folder.', 409)
+    if reason == 'owner':
+        fail('workspace_not_yours', name + ' belongs to another account (often Administrators, when it was made '
+             'from an administrator window), so files are not copied into the workspace. Take ownership of it, or '
+             'choose a folder you made.', 409)
+    if reason == 'link':
+        fail('workspace_linked', name + ' is reached through a link or junction, which Motet does not follow. '
+             "Choose the folder's real location.", 409)
+    return None
+
+
+def _windows_folder(folder, *, private=False, role='workspace'):
     """DirectoryIdentity for a held Windows folder: private (attachment folders) or changeable by nobody but its
     owner (the workspace and Git folders), with an identity within the store's range."""
     try:
         if not private:
             folder.unwritable()
     except ps.PrivateStorageError as error:
-        if error.reason == 'access':
-            fail('workspace_unsafe', 'Other people using this computer can change the selected workspace folder, so '
-                 'files are not copied into it. A folder made directly under a drive (such as C:\\src) lets every '
-                 'signed-in user change it, as a folder others can write to does on a Mac. Choose a folder inside '
-                 'your user folder.', 409)
+        _windows_refusal(error, role)
         fail('folder_changed', 'The selected workspace identity changed.', 409)
     try:
         return DirectoryIdentity(*_id_ok(folder.identity())[:2])
@@ -271,12 +291,12 @@ def _windows_folder(folder, *, private=False):
         fail('folder_changed', 'The selected workspace identity changed.', 409)
 
 
-def _folder_identity(handle, *, private=False):
+def _folder_identity(handle, *, private=False, role='workspace'):
     """DirectoryIdentity of an open folder: a descriptor on POSIX (exactly ``DirectoryIdentity.of(os.fstat(fd))``),
-    a held folder on Windows."""
+    a held folder on Windows (``role`` names it in a refusal)."""
     if isinstance(handle, int):
         return DirectoryIdentity.of(os.fstat(handle))
-    return _windows_folder(handle, private=private)
+    return _windows_folder(handle, private=private, role=role)
 
 
 def _sync_folder(handle):
@@ -367,10 +387,11 @@ def _verify_cleanup_file(fd, saved):
 
 
 def _windows_remove(parent, name, saved):
-    """Windows: remove the copy ``name`` through the held folder, only if it is still the recorded copy. The remove
-    opens it sharing only reading, so nobody writes it between this check and the deletion (POSIX checks, then
-    unlinks by name). Another program holding it open (a scanner, an editor) is 'busy': it is left in place and the
-    cleanup is retried later."""
+    """Windows: remove the copy ``name`` through the held folder, only if it is still the recorded copy, and return
+    'removed' or 'absent' (no such name). The remove opens it sharing only reading and checks it on that handle, so
+    nobody writes it between the check and the deletion (POSIX checks, then unlinks by name). Another program
+    holding it open, with or without sharing (a scanner, an editor), is 'busy': it is left in place and the cleanup
+    is retried later."""
     def expect(fd):
         try:
             _verify_cleanup_file(fd, saved)
@@ -383,8 +404,9 @@ def _windows_remove(parent, name, saved):
              'again later.', 409)
     if outcome == 'changed':
         fail('copy_changed', 'The attachment copy was changed and was left alone.', 409)
-    if outcome != 'removed':
+    if outcome not in ('removed', 'absent'):
         fail('cleanup_incomplete', 'The attachment copy could not be safely removed.', 409)
+    return outcome
 
 
 class Materializer:
@@ -523,30 +545,35 @@ class Materializer:
         fds = []
         # The workspace is where the attachment folder is made, and the exclude file's folder where it is appended
         # (Windows asks for that access on those holds only).
-        bindings = [(context.root, context.root_identity, True)]
+        bindings = [(context.root, context.root_identity, True, 'workspace')]
         if not workspace_only:
-            bindings.extend(((context.git_dir, context.git_identity, False),
-                             (context.exclude_parent, context.exclude_parent_identity, True)))
+            bindings.extend(((context.git_dir, context.git_identity, False, 'git'),
+                             (context.exclude_parent, context.exclude_parent_identity, True, 'git_info')))
+        role = 'workspace'
         try:
             try:
-                for path, expected, writable in bindings:
+                for path, expected, writable, role in bindings:
                     fd = self._windows_directory(path, writable) if ps.WIN else self._workspace_directory(path)
                     fds.append(fd)
-                    if _folder_identity(fd) != expected:
+                    if _folder_identity(fd, role=role) != expected:
                         fail('folder_changed', 'The selected workspace changed.', 409)
-            except OSError:
+            except OSError as error:
+                if ps.WIN:
+                    _windows_refusal(error, role)        # a link or junction on the way, in plain words
                 fail('folder_changed', 'The selected workspace changed.', 409)
             yield fds
             # Native readers follow paths, not our still-open renamed directory.
             try:
-                for path, expected, _ in bindings:
+                for path, expected, _, role in bindings:
                     fd = self._workspace_directory(path)
                     try:
-                        if _folder_identity(fd) != expected:
+                        if _folder_identity(fd, role=role) != expected:
                             fail('folder_changed', 'The selected workspace changed.', 409)
                     finally:
                         _close_all((fd,))
-            except OSError:
+            except OSError as error:
+                if ps.WIN:
+                    _windows_refusal(error, role)
                 fail('folder_changed', 'The selected workspace changed.', 409)
         finally:
             _close_all(reversed(fds))
@@ -688,8 +715,8 @@ class Materializer:
                     # (open_append's rule), made private if missing. A byte lock on it would be mandatory and stop
                     # Git reading it, so writers are serialised by this workspace's private resource lock instead,
                     # held by the lease through this whole update.
-                    fd, created = parent.open_append('exclude', create=True)
                     lease.require(['workspace:' + context.workspace_fingerprint[:32]])
+                    fd, created = parent.open_append('exclude', create=True)
                     _regular_fd(fd, private=False)
                 else:
                     try:
@@ -990,6 +1017,14 @@ class Materializer:
             with self._context(context, workspace_only=True) as roots:
                 with self._directories(roots[0], authority, directories, lease, create=False) as (parent, _):
                     name = spec.relative_path.rsplit('/', 1)[1]
+                    if not isinstance(parent, int):
+                        # Windows: no separate open first. An editor or viewer holding the copy without sharing
+                        # would refuse it, and the remove checks the copy on the very handle it deletes through.
+                        self.checkpoint('cleanup_before_unlink')
+                        self._authorize(context, authority, lease, 'cleanup', (spec,))
+                        outcome = _windows_remove(parent, name, saved)
+                        _sync_folder(parent)
+                        return CopyCleanup(spec.id, spec.copy_generation, spec.lease_id, outcome, True)
                     try:
                         fd = _open_file(parent, name)
                     except FileNotFoundError:
@@ -1008,16 +1043,10 @@ class Materializer:
                         self._authorize(context, authority, lease, 'cleanup', (spec,))
                         _verify_cleanup_file(fd, saved)
                         _same_entry(parent, name, fd)
-                        if isinstance(parent, int):
-                            os.unlink(name, dir_fd=parent)
-                        else:
-                            _close_all((fd,))
-                            fd = None
-                            _windows_remove(parent, name, saved)
+                        os.unlink(name, dir_fd=parent)
                         _sync_folder(parent)
                     finally:
-                        if fd is not None:
-                            _close_all((fd,))
+                        _close_all((fd,))
                     return CopyCleanup(spec.id, spec.copy_generation, spec.lease_id, 'removed', True)
         except AttachmentError:
             raise
