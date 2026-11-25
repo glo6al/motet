@@ -280,6 +280,8 @@ class ProbeV2Tests(unittest.TestCase):
         self.assertEqual(probe.sid_label('S-1-1-0', ME), 'Everyone (S-1-1-0)')
         self.assertEqual(probe.sid_label('S-1-5-21-1111111111-2222222222-3333333333-1002', ME),
                          'another account (S-1-5-21-...-1002)')
+        self.assertEqual(probe.sid_label('S-1-5-21-1111111111-2222222222-3333333333-513', ME), 'a domain group (S-1-5-21-...-513)')
+        self.assertEqual(probe.sid_label('S-1-5-21-1111111111-2222222222-3333333333-500', ME), 'a built-in account (S-1-5-21-...-500)')
         self.assertEqual(probe.sid_label('S-1-15-2-123-456-789-1-2-3-4', ME), 'an app package (S-1-15-2-...)')
         self.assertEqual(probe.sid_label('S-1-5-5-0-12345', ME), 'this logon session (S-1-5-5-...)')
         for bad in (b'', b'\x02\x01' + b'\0' * 10, b'\x01\x05' + b'\0' * 8):
@@ -346,28 +348,31 @@ class ProbeV2Tests(unittest.TestCase):
         with patch.object(probe, 'appx_rows', side_effect=RuntimeError('error: powershell exit 1')):
             self.assertEqual(probe.check_openai_packages(), ['OpenAI packages: error: powershell exit 1'])
 
-    def test_codex_pipe_section(self):
+    def test_codex_pipe_is_only_looked_for_in_the_listing(self):
+        note = '  (only the name was looked for in the pipe list; the probe never opens or connects to a pipe)'
         self.assertEqual(probe.check_codex_pipe(['codex-app-tools-1', 'other']),
-                         ["codex-ipc (the Codex app's control pipe): not found"])
-        image = r'C:\Program Files\WindowsApps\OpenAI.Codex_26.1.2.0_x64__fict0pub1d\app\ChatGPT.exe'
-        facts = {'pid': 4242, 'owner': ME, 'aces': [(0, 0, 0x1F01FF, ME), (0, 0, 0x120089, 'S-1-1-0')]}
-        with patch.object(probe, 'pipe_facts', return_value=facts) as opened, patch.object(probe, 'my_sid', return_value=ME), \
-                patch.object(probe, 'process_facts', return_value={'image': image, 'family': 'OpenAI.Codex_fict0pub1d', 'owner': ME}):
-            lines = probe.check_codex_pipe(['Codex-IPC'])
-        opened.assert_called_once_with('\\\\.\\pipe\\codex-ipc')
-        self.assertEqual(lines, ["codex-ipc (the Codex app's control pipe): found",
-                                 '  opened for its attributes only; nothing was read or sent',
-                                 '  served by process 4242', '  that process: ' + image,
-                                 '  its package: OpenAI.Codex_fict0pub1d; it runs as: you',
-                                 '  owner: you', '  allow you: full control (0x1f01ff)',
-                                 '  allow Everyone (S-1-1-0): read (0x120089)'])
+                         ["codex-ipc (the Codex app's control pipe): not found", note])
+
+        class Kernel:
+            def __getattr__(self, name):
+                raise AssertionError('the probe called %s' % name)
+
+        def no_open(*a, **k):
+            raise AssertionError('the probe opened %r' % (a[:1],))
+        with patch.object(probe, 'win', return_value=(None, None, Kernel(), Kernel())) as api, \
+                patch('builtins.open', no_open), patch('os.open', no_open), \
+                patch.object(probe, 'list_dir', return_value=(['Codex-IPC', 'other'], '')):
+            lines = probe.check_codex_pipe()
+            self.assertEqual(lines, ["codex-ipc (the Codex app's control pipe): found", note])
+            api.assert_not_called()
         for line in lines:
             self.assertEqual(probe.redact(line, CTX), line, 'redaction leaves the facts readable')
-        self.assertEqual(probe.pipe_lines({'error': 'all instances busy'}, ME), ['  could not open it to look: all instances busy'])
-        self.assertEqual(probe.pipe_lines({'security_error': 'error 5'}, ME)[1:],
-                         ['  server process: not reported', '  permissions: error 5'])
-        self.assertIn('that process: cannot be opened (error 5)',
-                      '\n'.join(probe.pipe_lines({'pid': 7}, ME, {'error': 'cannot be opened (error 5)'})))
+        for name in ('pipe_facts', 'pipe_lines', 'handle_security'):
+            self.assertFalse(hasattr(probe, name), name)
+        with open(SCRIPT, encoding='utf-8') as f:
+            src = f.read()
+        self.assertNotIn('CreateFileW', src)
+        self.assertNotIn('GetNamedPipeServerProcessId', src)
 
     def test_processes_section(self):
         app = r'C:\Program Files\WindowsApps\OpenAI.Codex_26.1.2.0_x64__fict0pub1d\app\ChatGPT.exe'
@@ -408,6 +413,8 @@ class ProbeV2Tests(unittest.TestCase):
                 '  allow, with a condition Users (S-1-5-32-545): read, execute (0x1200a9)',
                 '  allow TrustedInstaller (S-1-5-80-...): full control (0x1f01ff)',
                 '  signature: valid; signer: Fictional Signer, LLC',
+                '  (a file inside an app package usually has no signature of its own, since the package is signed as a '
+                'whole, so "not signed (no signature of its own)" is expected here)',
                 '%USERPROFILE%\\.codex\\app-server-control: not found'])
             for line in lines[1:]:
                 self.assertEqual(probe.redact(line, CTX), line, 'redaction leaves the facts readable')
@@ -434,7 +441,7 @@ class ProbeV2Tests(unittest.TestCase):
         self.assertIn('read this output before posting', probe.FINAL_LINE)
 
 
-@unittest.skipUnless(os.name == 'nt', 'reads real Windows tokens, processes, pipes and files')
+@unittest.skipUnless(os.name == 'nt', 'reads real Windows tokens, processes, the pipe list and files')
 class RealWindowsProbeV2(unittest.TestCase):
     def test_own_process_and_token(self):
         mine = probe.my_sid()
@@ -446,18 +453,9 @@ class RealWindowsProbeV2(unittest.TestCase):
         name = os.path.basename(facts['image'])
         self.assertIn(os.getpid(), [pid for pid, _ in probe.processes_named([name])])
 
-    def test_a_pipe_of_our_own(self):
-        from multiprocessing.connection import Listener
-        address = '\\\\.\\pipe\\motet-probe-test-%d' % os.getpid()
-        listener = Listener(address, family='AF_PIPE')
-        try:
-            facts = probe.pipe_facts(address)
-            self.assertEqual(facts.get('pid'), os.getpid(), facts)
-            self.assertIsInstance(facts.get('aces'), list)
-            self.assertTrue(probe.pipe_lines(facts, probe.my_sid(), probe.process_facts(facts['pid'])))
-        finally:
-            listener.close()
-        self.assertIn('error', probe.pipe_facts(address))
+    def test_the_real_pipe_listing_is_read_without_opening(self):
+        lines = probe.check_codex_pipe()
+        self.assertTrue(lines[0].startswith("codex-ipc (the Codex app's control pipe): "), lines)
 
     def test_file_permissions_and_signature_are_read(self):
         owner, aces = probe.path_security(sys.executable)

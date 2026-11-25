@@ -3,10 +3,10 @@
 
 Run:  py scripts\\windows_probe.py
 
-It reads the registry, folder listings, a few small settings files, app package manifests, file and
-pipe permissions, and `--version` / `--help` output from command-line tools. It opens the Codex app's
-control pipe (if there is one) only to ask who serves it, reading and sending nothing. It writes no
-files, opens no network connection, starts no app window, sends no message and changes nothing. The output is redacted (your profile path,
+It reads the registry, folder listings, a few small settings files, app package manifests, file
+permissions, and `--version` / `--help` output from command-line tools. It never opens or connects to any
+named pipe: for the Codex app's control pipe it only checks that the name is listed. It writes no files,
+opens no network connection, starts no app window, sends no message and changes nothing. The output is redacted (your profile path,
 user name, computer name, e-mail addresses and key-like strings) but READ IT before posting.
 """
 
@@ -779,6 +779,11 @@ def sid_label(sid, mine=''):
         return '%s (%s)' % (WELL_KNOWN_SIDS[sid], sid if len(sid) < 24 else '-'.join(sid.split('-')[:4]) + '-...')
     parts = sid.split('-')
     if sid.startswith('S-1-5-21-') and len(parts) >= 5:
+        rid = int(parts[-1]) if parts[-1].isdigit() else 0
+        if 500 <= rid <= 503:
+            return 'a built-in account (S-1-5-21-...-%s)' % parts[-1]
+        if rid < 1000:
+            return 'a domain group (S-1-5-21-...-%s)' % parts[-1]
         return 'another account (S-1-5-21-...-%s)' % parts[-1]
     if sid.startswith('S-1-5-5-'):
         return 'this logon session (S-1-5-5-...)'
@@ -857,9 +862,7 @@ def win():
     from ctypes import wintypes as w
     k, a = ctypes.WinDLL('kernel32', use_last_error=True), ctypes.WinDLL('advapi32', use_last_error=True)
     H, D, P = w.HANDLE, w.DWORD, ctypes.c_void_p
-    k.CreateFileW.argtypes, k.CreateFileW.restype = [w.LPCWSTR, D, D, P, D, D, H], H
     k.CloseHandle.argtypes, k.CloseHandle.restype = [H], w.BOOL
-    k.GetNamedPipeServerProcessId.argtypes, k.GetNamedPipeServerProcessId.restype = [H, ctypes.POINTER(w.ULONG)], w.BOOL
     k.OpenProcess.argtypes, k.OpenProcess.restype = [D, w.BOOL, D], H
     k.QueryFullProcessImageNameW.argtypes = [H, D, w.LPWSTR, ctypes.POINTER(D)]
     k.QueryFullProcessImageNameW.restype = w.BOOL
@@ -870,9 +873,6 @@ def win():
     a.GetTokenInformation.argtypes = [H, ctypes.c_int, P, D, ctypes.POINTER(D)]
     a.GetTokenInformation.restype = w.BOOL
     a.GetLengthSid.argtypes, a.GetLengthSid.restype = [P], D
-    a.GetSecurityInfo.argtypes = [H, ctypes.c_int, D, ctypes.POINTER(P), ctypes.POINTER(P), ctypes.POINTER(P),
-                                  ctypes.POINTER(P), ctypes.POINTER(P)]
-    a.GetSecurityInfo.restype = D
     a.GetNamedSecurityInfoW.argtypes = [w.LPCWSTR, ctypes.c_int, D, ctypes.POINTER(P), ctypes.POINTER(P),
                                         ctypes.POINTER(P), ctypes.POINTER(P), ctypes.POINTER(P)]
     a.GetNamedSecurityInfoW.restype = D
@@ -891,7 +891,7 @@ def _sid_at(ptr):
 
 
 def _security(get):
-    """(owner SID, ACEs or None) through GetSecurityInfo or GetNamedSecurityInfoW (`get` fills the pointers)."""
+    """(owner SID, ACEs or None) through GetNamedSecurityInfoW (`get` fills the pointers)."""
     ctypes, _, k, _ = win()
     owner, dacl, sd = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
     err = get(ctypes.byref(owner), ctypes.byref(dacl), ctypes.byref(sd))
@@ -908,11 +908,6 @@ def _security(get):
 
 
 OWNER_AND_DACL = 0x1 | 0x4                          # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
-
-
-def handle_security(handle):
-    _, _, _, a = win()
-    return _security(lambda o, d, s: a.GetSecurityInfo(handle, 6, OWNER_AND_DACL, o, None, d, None, s))  # SE_KERNEL_OBJECT
 
 
 def path_security(path):
@@ -991,28 +986,6 @@ def processes_named(names):
     finally:
         k.CloseHandle(snap)
     return found
-
-
-def pipe_facts(name):
-    """Open a named pipe for its attributes and permissions only (no reading or writing, nothing sent), with the
-    server not allowed to act as us (SECURITY_SQOS_PRESENT, anonymous level), and say who serves it."""
-    ctypes, w, k, _ = win()
-    handle = k.CreateFileW(name, 0x80 | 0x20000, 0x3, None, 3, 0x00100000, None)  # FILE_READ_ATTRIBUTES|READ_CONTROL, OPEN_EXISTING
-    if handle in (None, w.HANDLE(-1).value):
-        err = ctypes.get_last_error()
-        return {'error': {231: 'all instances busy', 5: 'access denied', 2: 'gone'}.get(err, 'error %d' % err)}
-    try:
-        facts = {}
-        pid = w.ULONG()
-        if k.GetNamedPipeServerProcessId(handle, ctypes.byref(pid)):
-            facts['pid'] = pid.value
-        try:
-            facts['owner'], facts['aces'] = handle_security(handle)
-        except OSError as e:
-            facts['security_error'] = str(e)
-        return facts
-    finally:
-        k.CloseHandle(handle)
 
 
 def signature(path):
@@ -1162,39 +1135,16 @@ def check_app_processes():
     return process_lines([(name, process_facts(pid)) for pid, name in found[:80]], mine)
 
 
-def pipe_lines(facts, mine, image_facts=None):
-    if 'error' in facts:
-        return ['  could not open it to look: %s' % facts['error']]
-    lines = ['  opened for its attributes only; nothing was read or sent']
-    if 'pid' in facts:
-        lines.append('  served by process %d' % facts['pid'])
-        f = image_facts or {}
-        if f.get('error'):
-            lines.append('  that process: %s' % f['error'])
-        else:
-            lines.append('  that process: %s' % (f.get('image') or '(image path not readable)'))
-            lines.append('  its package: %s; it runs as: %s' % (f.get('family') or 'unknown',
-                                                                 sid_label(f['owner'], mine) if f.get('owner') else 'unknown'))
-    else:
-        lines.append('  server process: not reported')
-    if 'security_error' in facts:
-        lines.append('  permissions: %s' % facts['security_error'])
-    elif 'aces' in facts:
-        lines.extend(acl_lines(facts.get('owner'), facts['aces'], mine))
-    return lines
-
-
 def check_codex_pipe(names=None):
+    """Whether codex-ipc is in the pipe listing. The pipe is never opened: opening a pipe is a client connection
+    the Codex app would accept and answer, so the probe only reads the listing's names."""
     if names is None:
         names, why = list_dir('\\\\.\\pipe\\\\')
         if names is None:
             return ['codex-ipc: %s' % why]
-    if 'codex-ipc' not in [n.lower() for n in names]:
-        return ['codex-ipc (the Codex app\'s control pipe): not found']
-    lines = ['codex-ipc (the Codex app\'s control pipe): found']
-    facts = pipe_facts('\\\\.\\pipe\\codex-ipc')
-    mine = my_sid()
-    return lines + pipe_lines(facts, mine, process_facts(facts['pid']) if 'pid' in facts else None)
+    found = 'codex-ipc' in [n.lower() for n in names]
+    return ['codex-ipc (the Codex app\'s control pipe): %s' % ('found' if found else 'not found'),
+            '  (only the name was looked for in the pipe list; the probe never opens or connects to a pipe)']
 
 
 def check_codex_cli_file():
@@ -1219,6 +1169,8 @@ def check_codex_cli_file():
         try:
             status, signer = signature(path)
             lines.append('  signature: %s; signer: %s' % (status, signer or 'unknown'))
+            lines.append('  (a file inside an app package usually has no signature of its own, since the package is '
+                         'signed as a whole, so "not signed (no signature of its own)" is expected here)')
         except Exception as e:
             lines.append('  signature: unknown (%s)' % type(e).__name__)
     if not any_cli:
@@ -1244,9 +1196,8 @@ SECTIONS = [
     ('13. Codex bundled command-line tool', check_codex_cli_file),
 ]
 
-NEW_SECTIONS_NOTE = ('New in this version: section 4 also says whether the Codex app\'s control pipe (codex-ipc) exists, '
-                     'which program answers it and who may open it (the probe opens it without reading or sending '
-                     'anything). Section 11 lists the OpenAI app packages and what their manifests declare, section 12 '
+NEW_SECTIONS_NOTE = ('New in this version: section 4 also says whether the Codex app\'s control pipe (codex-ipc) is '
+                     'listed (the probe never opens or connects to it). Section 11 lists the OpenAI app packages and what their manifests declare, section 12 '
                      'which file and package each ChatGPT or Codex process runs from, and section 13 who may open '
                      'Codex\'s bundled codex.exe and who signed it (it is not run). "you" means your own account.')
 FINAL_LINE = 'Please read this output before posting it, and remove anything you would rather not share.'
