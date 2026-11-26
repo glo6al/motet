@@ -423,7 +423,9 @@ class ClaudeMod:
             grant = self.db.execute('SELECT peer_receive FROM claude_mod_grants WHERE active=1').fetchone()
             authorized = bool(grant)
             entries = [self.get(r[0]) for r in self.db.execute('SELECT id FROM claude_mod_enrollments WHERE active=1 AND grant_id IS NOT NULL AND generation IS NOT NULL')]
+            # A receipt-only connection reports earlier outcomes; it does not count as a receiving chat.
             connected = sum(1 for e in entries if not self.store.worker_failed and e['last_seen'] > time.time() - LEASE
+                            and not e['receipt_only']
                             and self.db.execute('SELECT 1 FROM claude_mod_grants WHERE id=? AND active=1', (e['grant_id'],)).fetchone()
                             and not self.room_veto(e['agent'], e['project']) and
                             (agents is None or e['agent'] not in agents or eligible(e['agent'], agents[e['agent']])
@@ -639,7 +641,8 @@ class ClaudeMod:
             self.maintain()
             row = self.db.execute('SELECT id FROM claude_mod_enrollments WHERE agent=? AND active=1', (agent,)).fetchone()
             entry = self.get(row[0]) if row else None
-            ready = bool(entry and entry['generation'] and entry['last_seen'] > time.time() - LEASE and not self.store.worker_failed)
+            ready = bool(entry and entry['generation'] and entry['last_seen'] > time.time() - LEASE and not self.store.worker_failed
+                         and not entry['receipt_only'])          # receipts only: no new work is admitted
             if entry and self.room_veto(agent, entry['project']):
                 ready = False
             if item is not None and entry and (not eligible(agent, item) or not within_project(item.get('cwd'), entry['project'])):
@@ -650,6 +653,7 @@ class ClaudeMod:
         """Transaction-owned facts only: no lock, filesystem, maintenance or commit."""
         if (not entry or not entry['active'] or not entry['grant_id'] or entry['peer_protocol'] != 1
                 or not entry['generation'] or entry['last_seen'] <= time.time() - LEASE or self.store.worker_failed
+                or entry['receipt_only']
                 or self.room_veto(entry['agent'], entry['project'])):
             return False
         grant = self.db.execute('SELECT peer_receive FROM claude_mod_grants WHERE id=? AND active=1',
@@ -668,7 +672,7 @@ class ClaudeMod:
     def any_ready(self):
         with self.store.lock, self.db:
             self.maintain()
-            return not self.store.worker_failed and bool(self.db.execute('SELECT 1 FROM claude_mod_enrollments WHERE active=1 AND generation IS NOT NULL AND last_seen>?', (time.time()-LEASE,)).fetchone())
+            return not self.store.worker_failed and bool(self.db.execute('SELECT 1 FROM claude_mod_enrollments WHERE active=1 AND generation IS NOT NULL AND receipt_only=0 AND last_seen>?', (time.time()-LEASE,)).fetchone())
 
     @staticmethod
     def _claim_folder(entry, item, reported, observed):
@@ -776,7 +780,7 @@ class ClaudeMod:
         if (not entry or entry['project'] != item['cwd'] or not ident(entry['grant_id'])
                 or not ident(entry['client_id']) or not ident(entry['generation'])
                 or entry['lifecycle_protocol'] != 2 or entry['last_seen'] <= time.time() - LEASE
-                or self.room_veto(agent, entry['project'])):
+                or entry['receipt_only'] or self.room_veto(agent, entry['project'])):
             return None
         grant = self.db.execute('SELECT 1 FROM main.claude_mod_grants WHERE id=? AND active=1',
                                 (entry['grant_id'],)).fetchone()

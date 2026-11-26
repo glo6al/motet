@@ -1073,6 +1073,45 @@ class ClaudePeerBackendTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT receipt_only FROM claude_mod_enrollments WHERE agent=? AND active=1',
                                                (self.aid,)).fetchone()[0], 0)
 
+    def test_a_receipt_only_connection_admits_no_new_work(self):
+        # The stage still shows the earlier folder, so only the receipt-only flag tells this chat apart.
+        inside = self.subfolder_enrollment()
+        child = lambda accept=True: self.http('/claude-mod/poll', dict(
+            generation=self.generation, native_id=self.sid, project=str(inside), accept=accept,
+            client_id=self.body['client_id']), token=self.token)
+        _, owner = self.request('Fictional owner question before the upgrade')
+        claim = child()[1]['claim']
+        self.assertEqual(claim['request_id'], owner['request_id'])
+        seq = self.current_seq()
+        status, value = self.register_at(str(inside), seq + 1, receipt_only=True)
+        self.assertEqual(status, 200, value)
+        self.token, self.generation = value['token'], value['generation']
+        item = server.AGENTS[self.aid]
+        rows = len(self.store._rows())
+        self.assertFalse(self.store.mods.capability(self.aid, item)[0])
+        self.assertFalse(self.store.mods.peer_capability(self.aid, item)[0])
+        self.assertIsNone(self.store.mods.attachment_entry(self.aid, item))
+        self.assertEqual(self.store.mods.setup_status(dict(server.AGENTS))['connected_chats'], 0)
+        self.assertFalse(self.store.mods.any_ready())
+        self.assertEqual(self.target()['capability'], 'unavailable')
+        question = dict(agent=self.aid, question='Fictional question for a receipt-only chat', request_id=uid())
+        self.assertEqual(self.http('/agent-message', question, owner=True)[0], 503)
+        with self.assertRaises(peer_bridge.PeerError):
+            self.send('Fictional peer question for a receipt-only chat')
+        self.assertEqual(len(self.store._rows()), rows)                       # no new pending work
+        # Its receipts still go through.
+        answered = dict(generation=self.generation, native_id=self.sid, client_id=self.body['client_id'],
+                        request_id=claim['request_id'], attempt_id=claim['attempt_id'], kind='answered',
+                        turn_id='fictional-turn', answer='WATCH_REPLY ' + claim['request_id'] + '\nFictional reply.')
+        self.assertEqual(self.http('/claude-mod/event', answered, token=self.token)[0], 200)
+        # The move to the project folder clears the flag and admission resumes.
+        server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=self.project)
+        status, value = self.register_at(self.project, seq + 2)
+        self.assertEqual(status, 200, value)
+        self.assertTrue(self.store.mods.capability(self.aid, server.AGENTS[self.aid])[0])
+        self.assertTrue(self.store.mods.peer_capability(self.aid, server.AGENTS[self.aid])[0])
+        self.assertEqual(self.store.mods.setup_status(dict(server.AGENTS))['connected_chats'], 1)
+
     def test_derived_move_waits_for_receipts_reported_from_the_earlier_folder(self):
         self.derived_receipts_then_move(expired=False)
 

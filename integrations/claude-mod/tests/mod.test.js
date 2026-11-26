@@ -1056,17 +1056,39 @@ test('opt-out excludes a new supervisor throughout its deferred preference write
   }finally{hold=false;gate.release();await disconnect;}
 });
 
-test('identity rejection catch discards lifecycle-invalidated lookups without rejecting the timer',async()=>{
-  const gate=latch();let inCatch=false;
+test('identity rejection catch discards lifecycle-invalidated attempts without rejecting the timer',async()=>{
+  // The refusal belongs to the attempt; a lifecycle change while it is in flight discards it without a lookup.
+  const gate=latch();
   const h=await harness({startup:sdk,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:(url,body)=>{
-    if(url.endsWith('/register')){inCatch=true;return responseJSON({error_code:'identity_rejected'},403);}return globalFetch(url,body);
+    if(url.endsWith('/register'))return gate.hold().then(()=>responseJSON({error_code:'identity_rejected'},403));return globalFetch(url,body);
   }});
-  h.$.session.id=async()=>inCatch?gate.hold():NATIVE;
   const pending=h.tick();
   try{
-    await bounded(gate.entered,'identity rejection lookup');await h.call('session.end',{reason:'resume',sessionId:NATIVE});inCatch=false;gate.release(NATIVE);await pending;
+    await bounded(gate.entered,'registration in flight');await h.call('session.end',{reason:'resume',sessionId:NATIVE});gate.release();await pending;
     h.setSurfaces([]);await h.tick();assert.equal(registrations(h).length,1);assert.equal((await status(h)).connected,false);
-  }finally{inCatch=false;gate.release(NATIVE);await pending;}
+  }finally{gate.release();await pending;}
+});
+
+test('a refusal is remembered for the folder the attempt was made from, not one reached while it was in flight',async()=>{
+  // Registration starts in folder A; the host moves to B before the terminal refusal for A comes back.
+  let first=true,now=100000;
+  const h=await harness({startup:sdk,claimed:false,root:'/fictional/project',storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>{
+      if(!url.endsWith('/register'))return globalFetch(url,body);
+      if(first){first=false;h.setCwd('/fictional/project');return responseJSON({error_code:'identity_rejected'},409);}
+      return body.project==='/fictional/project'&&h.$.session.cwd&&globalFetch(url,body);
+    }});
+  h.setCwd('/fictional/project/src');
+  await h.tick();assert.equal(registrations(h).length,1);
+  for(let i=0;i<4&&registrations(h).length<2;i++){now+=120000;h.setNow(now);await h.tick();}
+  assert.equal(registrations(h).length,2,'B gets its own first attempt');
+  // Staying in a refused folder still makes no extra attempts.
+  let refusals=0;
+  const a=await harness({startup:sdk,claimed:false,root:'/fictional/project',storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>url.endsWith('/register')?(refusals++,responseJSON({error_code:'identity_rejected'},409)):globalFetch(url,body)});
+  a.setCwd('/fictional/project/src');
+  for(let i=0;i<5;i++){now+=120000;a.setNow(now);await a.tick();}
+  assert.equal(refusals,1);
 });
 
 test('a refused registration is remembered for the folder it happened in, and a move retries',async()=>{

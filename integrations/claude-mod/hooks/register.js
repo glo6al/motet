@@ -689,7 +689,7 @@ async function readSurfaces($, state, eligibilityEpoch) {
 async function supervisor($, state) {
   if (state.supervising || state.connecting || state.networkBusy || state.flushing || state.disconnecting) return;
   state.supervising = true;
-  let now = 0, eligibilityEpoch = state.eligibilityEpoch;
+  let now = 0, eligibilityEpoch = state.eligibilityEpoch, attempt = null;
   try {
     now = await $.clock.now();
     const id = await $.session.id(), project = await sessionProject($);
@@ -763,6 +763,9 @@ async function supervisor($, state) {
         state.receiptOnly = earlier !== null;
         state.receiptKey = earlier === null ? null : receiptContext('derived', earlier, config.grant_id);
         if (state.data && state.data.project !== (earlier ?? project)) {state.data = null; state.key = null;}
+        // The place this attempt is made from, taken before any network call: a refusal is remembered for it only.
+        attempt = await refusalKey($,state,id,project,config);
+        checkEligibility(state,eligibilityEpoch);
         await connectDerived($,state,id,earlier ?? project,config,eligibilityEpoch);
       } else {
         const stored = state.data ?? await $.store.get(legacyKey(id));
@@ -787,12 +790,9 @@ async function supervisor($, state) {
     if (state.eligibilityEpoch !== eligibilityEpoch) return;
     stop(state);
     if (error.status === 403 && state.config) state.rejectedGrant = configurationId(state.config);
-    if (error.code === 'identity_rejected') {
-      const id = await $.session.id().catch(()=>null), project = await sessionProject($).catch(()=>null);
-      const key = await refusalKey($,state,id,project,state.config);
-      if (state.eligibilityEpoch !== eligibilityEpoch) return;
-      state.rejectedIdentity = key;
-    }
+    // Never re-read the folder here: the chat may have moved while the request was in flight, and the refusal
+    // belongs to the folder the attempt was made from.
+    if (error.code === 'identity_rejected' && attempt !== null) state.rejectedIdentity = attempt;
     if (error.code === 'receipt_context_missing' && state.receiptOnly) {
       // Motet holds no connection for that earlier folder any more. Stop asking for it; its records stay stored
       // for recovery, and the chat moves to its project folder on the next attempt.
