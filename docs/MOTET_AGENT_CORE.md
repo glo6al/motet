@@ -316,16 +316,9 @@ How a press reaches the agent depends on the kind of question:
 | A plan approval (Claude `ExitPlanMode`) | Treated as the agent's own prompt: "Open desk" only (a proposed reading) |
 | A permission prompt, in either app | "Open desk" only, always |
 
-**Answer buttons on typed questions (not decided yet).** `AskUserQuestion` is the most reliable "waiting on you"
-signal, and the design draws answer buttons on question items. Under the rule above, a typed question shows only
-"Open desk", so the owner would see far fewer buttons than drawn. The options:
-
-1. **Buttons only where they work** (recommended): plain-text questions get buttons; typed questions and plan
-   approvals show "Open desk", and the screens mark which is which. A typed question shows its choices as plain words
-   ("It is a choice box in her chat: arm64, x86, or both"), with what Motet would pick, so the owner can decide on
-   Next up and only goes to the desk to press it. The choices are text, never buttons.
-2. **Find a route first:** investigate, before step 2, whether Motet can answer an open `AskUserQuestion` itself.
-3. **No answer buttons in version 1:** every question opens the agent's desk.
+**Answer buttons on typed questions.** Plain-text questions get answer buttons; a typed question (an app's
+multiple-choice form) and a plan approval show "Open desk". The screens may show a form's choices as plain words, never
+as buttons. A short investigation into answering forms safely comes first, and may extend this rule.
 
 #### Authority and provenance
 
@@ -764,25 +757,23 @@ of this step's testing.
 
 **Before step 2 or later:**
 
-5. Answer buttons on typed questions: buttons only where they work, find a route first, or no buttons in version 1.
-   Interim: a typed question shows "Open desk".
-6. Fix chats as the way Motet writes code, with their limits (part 4). Before step 4. Interim: Motet sends fix requests
+5. Fix chats as the way Motet writes code, with their limits (part 4). Before step 4. Interim: Motet sends fix requests
    to the agent that owns the work and starts no fix chat.
-7. What happens after the second unanswered "Keep, change, or drop?". A proposed reading, not yet confirmed: Motet
+6. What happens after the second unanswered "Keep, change, or drop?". A proposed reading, not yet confirmed: Motet
    stops asking and puts the item on the weekly tidy list. Builders implement the proposed readings until they are
    confirmed.
-8. The daily cap's unit and number, for example 60 thinking cycles a day and 12 an hour after a shadow week.
-9. While the owner is away, should only the right-away wake-ups reach their phone?
-10. What interrupts the owner: a notification, or only Next up? A provisional investigation suggests generic notices
+7. The daily cap's unit and number, for example 60 thinking cycles a day and 12 an hour after a shadow week.
+8. While the owner is away, should only the right-away wake-ups reach their phone?
+9. What interrupts the owner: a notification, or only Next up? A provisional investigation suggests generic notices
     ("Motet needs your attention") that open a private, authenticated phone view with its own revocable credential.
-11. Should an agent's "can't reach" or "needs the owner" request interrupt the owner at once, or wait in Next up?
-12. Whether a subscription may run as an engine for people other than its owner (matters only for the shipped
+10. Should an agent's "can't reach" or "needs the owner" request interrupt the owner at once, or wait in Next up?
+11. Whether a subscription may run as an engine for people other than its owner (matters only for the shipped
     template).
 
 **Still open in the design:**
 
-13. How a proposal shows that its evidence has since gone, for example a log that expired.
-14. How goals and promises appear in Memory's search ("what did we decide yesterday?").
-15. How Motet stops one of the owner's own Claude Desktop or Codex chats, if at all (part 9).
-16. Windows and Linux: the carry-off check for backups, and any equivalent of the side door.
-17. Whether housekeeping may ever remove a Memory entry before its set time runs out.
+12. How a proposal shows that its evidence has since gone, for example a log that expired.
+13. How goals and promises appear in Memory's search ("what did we decide yesterday?").
+14. How Motet stops one of the owner's own Claude Desktop or Codex chats, if at all (part 9).
+15. Windows and Linux: the carry-off check for backups, and any equivalent of the side door.
+16. Whether housekeeping may ever remove a Memory entry before its set time runs out.
