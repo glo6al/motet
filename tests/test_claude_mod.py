@@ -82,18 +82,39 @@ class WithinProjectTests(unittest.TestCase):
         self.assertFalse(mod.folder_inside(outside_alias, self.project))
 
     def test_checks_under_the_lock_never_touch_the_disk(self):
-        caller, real = threading.current_thread(), os.path.realpath
-        def guarded(path):
-            if threading.current_thread() is caller:
-                raise AssertionError('resolved on the calling thread')
-            return real(path)
+        # Any disk access on the calling thread fails the test. The resolver is held, so "not resolved yet" is
+        # the real state when it is checked, however fast the runner is.
+        caller, real_path, real_dir = threading.current_thread(), os.path.realpath, os.path.isdir
+        def guarded(real):
+            def call(path):
+                if threading.current_thread() is caller:
+                    raise AssertionError('the disk was read on the calling thread')
+                return real(path)
+            return call
+        gate = threading.Event(); self.addCleanup(gate.set)
+        def held(cwd, root):
+            gate.wait(10)
+            return mod.folder_inside(cwd, root)
+        resolver = mod.FolderResolver(resolve=held)
         fresh = os.path.join(self.inside, 'fresh-' + uid()); os.mkdir(fresh)
-        with patch.object(mod.PATH, 'realpath', side_effect=guarded):
+        with patch.object(mod, 'RESOLVER', resolver), \
+                patch.object(mod.PATH, 'realpath', side_effect=guarded(real_path)), \
+                patch.object(mod.PATH, 'isdir', side_effect=guarded(real_dir)):
             for cwd in (self.project, self.project + '-sibling', self.elsewhere, fresh):
                 mod.within_project(cwd, self.project)
-            self.assertFalse(mod.within_project(fresh, self.project))      # not resolved yet: outside
-            self.assertTrue(mod.RESOLVER.settle())
-            self.assertTrue(mod.within_project(fresh, self.project))
+            self.assertFalse(mod.within_project(fresh, self.project))      # held, so not resolved yet: outside
+            gate.set()
+            self.assertTrue(resolver.settle())
+            self.assertTrue(mod.within_project(fresh, self.project))      # resolved off the calling thread
+
+    def test_a_bare_slash_is_not_a_windows_project_simulated(self):
+        # On Windows '/' alone names no drive, so it is never a canonical project; a drive root is.
+        import ntpath
+        with patch.object(sys, 'platform', 'win32'), patch.object(mod, 'PATH', ntpath), \
+                patch.object(ntpath, 'realpath', side_effect=ntpath.normpath):
+            self.assertFalse(mod.project('/'))
+            self.assertTrue(mod.project('D:\\'))
+            self.assertTrue(mod.project('D:\\Work\\Project'))
 
     def hanging_resolver(self, stuck):
         gate, entered = threading.Event(), threading.Event()

@@ -927,14 +927,15 @@ class ClaudePeerBackendTests(unittest.TestCase):
         self.assertEqual(self.peer_row(sent['request_id'])['request_id'], claim['request_id'])
 
     def test_wider_project_needs_the_recorded_launch_folder(self):
-        # The transcript's first cwd is the project. A plugin naming '/' or a parent folder is refused, both when
-        # pairing and when registering, even though that folder holds the chat's working folder.
+        # The transcript's first cwd is the project. A plugin naming the filesystem root ('/', or the drive root on
+        # Windows) or a parent folder is refused, both when pairing and when registering, even though that folder
+        # holds the chat's working folder.
         inside = Path(self.project, 'archive'); inside.mkdir()
         server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=str(inside))
         self.target()
         status, pair = self.http('/claude-mod-pair', {'agent': self.aid}, owner=True)
         self.assertEqual(status, 200, pair)
-        for wider in ('/', os.path.dirname(self.project)):
+        for wider in (self.filesystem_root(), os.path.dirname(self.project)):
             body = {'code': pair['pair_code'], 'native_id': self.sid, 'project': wider}
             self.assertEqual(self.http('/claude-mod/enroll', body)[0], 403, wider)
         status, enrollment = self.http('/claude-mod/enroll', {'code': pair['pair_code'], 'native_id': self.sid,
@@ -947,13 +948,18 @@ class ClaudePeerBackendTests(unittest.TestCase):
         status, setup = self.http('/claude-mod-setup', {'peer_receive': True}, owner=True)
         status, self.grant = self.http('/claude-mod/setup', {'code': setup['pair_code']})
         self.assertEqual(status, 200, self.grant)
-        for wider in ('/', os.path.dirname(self.project)):
+        for wider in (self.filesystem_root(), os.path.dirname(self.project)):
             status, value, _ = self.register_global(self.grant, project=wider)
             self.assertEqual((status, value.get('error_code')), (409, 'not_observed'), wider)
         status, value, _ = self.register_global(self.grant)
         self.assertEqual(status, 200, value)
         projects = {row[0] for row in self.store.db.execute('SELECT project FROM claude_mod_enrollments WHERE active=1')}
         self.assertEqual(projects, {self.project})
+
+    def filesystem_root(self):
+        # The widest canonical folder on this platform: '/' on macOS and Linux, the project's drive root on Windows,
+        # where '/' alone is not an absolute folder (Motet refuses it as an invalid identity before any proof).
+        return Path(self.project).anchor
 
     def subfolder_enrollment(self):
         # An enrollment made before plugin 0.6.3 while the chat sat in a subfolder names that subfolder.
@@ -1286,7 +1292,7 @@ class ClaudePeerBackendTests(unittest.TestCase):
         with patch.object(self.store.shared, 'metadata_target',
                           side_effect=peer_bridge.PeerError(409, 'Fictional missing metadata.')):
             self.assertEqual(connect(self.project)[0], 409)
-        for wider in ('/', os.path.dirname(self.project)):
+        for wider in (self.filesystem_root(), os.path.dirname(self.project)):
             self.assertEqual(connect(wider)[0], 409, wider)
         self.assertEqual(facts(), before)
         status, value = connect(self.project)
@@ -1326,7 +1332,7 @@ class ClaudePeerBackendTests(unittest.TestCase):
         deeper = Path(inside, 'deeper'); deeper.mkdir()
         self.move_enrollment(deeper)
         server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=str(deeper))
-        for wider in (str(inside), '/'):
+        for wider in (str(inside), self.filesystem_root()):
             status, value = self.reregister(wider)
             self.assertEqual(status, 409, (wider, value))
             self.assertEqual(self.active_projects(), [str(deeper)])
