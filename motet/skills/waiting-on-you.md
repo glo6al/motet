@@ -11,7 +11,7 @@
 3. Order the list: what is holding a team back first, then what has a date, then the rest.
 4. Bring it at the right time: right away if a team is blocked or something will cost money or soon can't be undone; otherwise gathered into the next brief or report. With Next up off, an item that needs the owner's yes while a team is stuck without it goes as one plain message in Motet's conversation; the rest wait for the brief or the end-of-day report.
 5. Tell each waiting agent that it is waiting and on what, so it carries on with other work.
-6. When the owner answers, pass the answer on in their own words, take the item off the list, and check the agent acts on it. An answer given with a button travels like an Approve: exactly what the button said, to the agent it names, recorded first and sent once. If the item changed or was already answered since the owner saw it, show it again instead of sending.
+6. When the owner answers, pass the answer on in their own words, take the item off the list, and check the agent acts on it. An answer given with a button travels like an Approve: exactly the button's label, to the agent the item names, recorded first and sent once. Offer a button only when the answer can be its label word for word; otherwise show only Open desk. If the item changed or was already answered since the owner saw it, show it again instead of sending.
 7. An item over a day old comes up again in the next brief, once, with what it is holding up. A stale Agenda item's “Keep, change, or drop?” works the same way: asked, then asked once more, and after that it goes on the weekly tidy list instead of coming back.
 
 ### Never
