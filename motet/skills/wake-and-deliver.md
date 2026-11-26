@@ -20,7 +20,7 @@
 - Wake a chat for anything except a message another agent already sent and the bridge refused.
 - Word it as if the owner wrote it, or add an instruction or approval the sender didn't give.
 - Deliver the same message twice, wake the same chat again for it, or send it under a new record around the bridge's guard.
-- Wake a chat the owner explicitly stopped or archived, or one outside Motet's agent list.
+- Wake a chat the owner explicitly stopped or archived, one ended by Stop, one Motet stopped before the owner said to carry on, or one outside Motet's agent list.
 - Start a fresh chat, or use any route around the bridge, to get a message through. A delivery failure gets a root-cause fix.
 
 ### For example
