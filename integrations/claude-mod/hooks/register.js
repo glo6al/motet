@@ -13,6 +13,107 @@ const configurationId = value => value ? JSON.stringify([value.grant_id,value.gr
 const validConflictIds = value => value === undefined ||
   Array.isArray(value) && value.every(id => typeof id === 'string' && UUID.test(id));
 
+// Containment by the host's own path rules, from the platform the host reports ($.session.info()), never guessed
+// from how a path is spelled. POSIX (macOS, Linux, WSL) separates on '/' only, so '\' is an ordinary character and
+// '/project\outside' or '/\share\project\outside' is a sibling. Windows separates on both slashes and needs a drive
+// (C:\) or share (\\server\share) path; case is compared exactly, which is stricter. An unknown platform accepts
+// the project folder itself only. '.', '..' and device or long-path prefixes (\\?\, \\.\) are refused.
+const WINDOWS_PATH = /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/?.][^\\/]*[\\/][^\\/]+)/;
+
+async function pathRules($) {
+  try {
+    const platform = typeof $.session.info === 'function' ? (await $.session.info())?.platform : undefined;
+    return platform === 'windows' ? 'windows' : ['macos', 'linux', 'wsl'].includes(platform) ? 'posix' : 'unknown';
+  } catch { return 'unknown'; }
+}
+
+function insideFolder(path, root, rules) {
+  if (typeof path !== 'string' || typeof root !== 'string' || !root || path.includes('\0') || root.includes('\0')) return false;
+  if (path === root) return true;
+  let sep;
+  if (rules === 'posix') {
+    if (!root.startsWith('/') || !path.startsWith('/')) return false;
+    sep = '/';
+  } else if (rules === 'windows') {
+    if (!WINDOWS_PATH.test(root) || !WINDOWS_PATH.test(path)) return false;
+    sep = '\\'; path = path.replace(/\//g, sep); root = root.replace(/\//g, sep);
+    if (path === root) return true;
+  } else return false;
+  if (path.split(sep).some(part => part === '.' || part === '..')) return false;
+  return path.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+
+// The chat's stable project folder. `$.session.cwd()` follows a shell `cd` into a subfolder, which would make the
+// same chat look like another project; `$.session.root()` does not. The root counts only while the current folder
+// is the root or inside it by name; otherwise there is no project (null), which matches no enrollment, so a chat
+// that left its project stops. A host without `root()`, or one whose `root()` fails, keeps the stricter `cwd()`
+// comparison.
+// Receipts still to report, judged over every record of one connection context at once: an event counts unless
+// some record acknowledges it or Motet refused it for good (MAX_RECEIPT_REJECTIONS times) in any record, the new
+// receipt-only record included. A context with any keeps its earlier folder until they are reported or refused.
+async function pendingReceipts(records) {
+  const acknowledged = Object.assign({}, ...records.map(record => record?.acknowledged || {}));
+  const refused = new Map();
+  for (const record of records) for (const request of Object.values(record?.requests || {}))
+    for (const [hash, rejection] of Object.entries(request?.rejections || {}))
+      refused.set(hash, Math.max(refused.get(hash) ?? 0, rejection?.count ?? 0));
+  for (const record of records) for (const request of Object.values(record?.requests || {})) {
+    for (const value of Array.isArray(request?.events) ? request.events : []) {
+      const hash = await fingerprint(canonicalReceipt(value));
+      if (acknowledged[hash] || acknowledged[await fingerprint(value)]) continue;
+      if ((refused.get(hash) ?? 0) >= MAX_RECEIPT_REJECTIONS) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+const receiptContext = (mode, project, grant) => JSON.stringify([mode, project, grant ?? null]);
+
+// An automatic connection made by an earlier plugin from a folder inside this project, whose retained outcomes are
+// not all reported yet: its folder, so the plugin reconnects there for receipts only before moving. A context Motet
+// no longer holds (receipt_context_missing) is given up for this runtime; its records stay for recovery.
+async function earlierReceipts($, state, id, project, config) {
+  const keys = await $.store.keys();
+  if (!Array.isArray(keys) || keys.length > 4096) return null;
+  const rules = await pathRules($), contexts = new Map();
+  const add = record => {
+    if (!record || record.mode !== 'derived' || record.native_id !== id || record.grant_id !== config.grant_id ||
+        record.project === project || !insideFolder(record.project, project, rules) ||
+        state.abandonedReceipts.has(receiptContext('derived', record.project, config.grant_id))) return;
+    const scope = JSON.stringify([record.project, record.enrollment_id]);
+    if (!contexts.has(scope)) contexts.set(scope, []);
+    contexts.get(scope).push(record);
+  };
+  for (const key of keys) {
+    if (typeof key !== 'string' || ![shardPrefix(id), legacyShardPrefix(id)].some(prefix => key.startsWith(prefix))) continue;
+    add(await $.store.get(key));
+  }
+  if (state.receiptOnly) add(state.data);              // the live receipt-only record, possibly newer than storage
+  for (const records of contexts.values()) if (await pendingReceipts(records)) return records[0].project;
+  return null;
+}
+
+// A refused registration is not tried again from the same place, so a refusal that repeats cannot storm Motet.
+// The place is the chat's actual folder, not only its project: Motet judges the folder the chat is in, so after a
+// move (back to the project folder, say) the chat registers again.
+async function refusalKey($, state, id, project, config) {
+  const cwd = await $.session.cwd().catch(()=>null);
+  return JSON.stringify([id, project, cwd, state.folderProtocol, configurationId(config)]);
+}
+
+async function sessionProject($) {
+  if (typeof $.session.root === 'function') {
+    let root = null;
+    try { root = await $.session.root(); } catch { /* fall back to the stricter current folder */ }
+    if (typeof root === 'string' && root) {
+      const cwd = await $.session.cwd();
+      return insideFolder(cwd, root, await pathRules($)) ? root : null;
+    }
+  }
+  return $.session.cwd();
+}
+
 function trimHistory(state, data) {
   const requests = Object.values(data.requests);
   // Held proof keeps its own space within the byte cap, independently of history.
@@ -404,17 +505,26 @@ async function submitNotice($,state,request,envelope,epoch) {
   finally{state.submitting=false;if(state.flight===request){state.flight=null;state.envelope=null;}}
 }
 
+// A claim may run only in the folder it was granted for: the folder this chat reported in the poll that carried
+// the claim (Motet resolved it, links included, before granting), or, with an older Motet that does not check
+// folders, the project folder itself.
+async function claimFolderHolds($, state, granted) {
+  if (await sessionProject($) !== state.data.project) return false;
+  const cwd = await $.session.cwd();
+  return state.folderProtocol === 1 && typeof granted === 'string' ? cwd === granted : cwd === state.data.project;
+}
+
 async function failRequest($, state, request) {
   try {if(request.kind==='peer_reply_notice')await noticeEvent($,state,request,'unknown');else await event($,state,request,'unknown');} catch { /* Server claim remains attempted. */ }
 }
 
-async function submit($, state, request, envelope, epoch) {
+async function submit($, state, request, envelope, epoch, granted = null) {
   try {
     const id = await $.session.id(), now = await $.clock.now();
-    if (!state.connected || state.epoch !== epoch || id !== state.data.native_id || await $.session.cwd() !== state.data.project) {await failRequest($,state,request); return;}
+    if (!state.connected || state.epoch !== epoch || id !== state.data.native_id || !await claimFolderHolds($,state,granted)) {await failRequest($,state,request); return;}
     if (now / 1000 >= request.expires_at) {await event($,state,request,'dropped'); return;}
     await save($,state,()=>{request.attempted = true; request.phase = 'pending';});
-    if (!state.connected || state.epoch !== epoch || await $.session.id() !== state.data.native_id || await $.session.cwd() !== state.data.project) {await failRequest($,state,request); return;}
+    if (!state.connected || state.epoch !== epoch || await $.session.id() !== state.data.native_id || !await claimFolderHolds($,state,granted)) {await failRequest($,state,request); return;}
     state.envelope = envelope;
     const result = await $.prompt.submit({text:envelope,asUser:false});
     if (typeof result?.drop === 'string') {
@@ -433,7 +543,9 @@ async function submit($, state, request, envelope, epoch) {
 
 async function poll($, state) {
   const epoch = state.epoch;
-  const response = await post($,state,'poll',{...identityBody(state),project:state.data.project,accept:!state.flight && !state.submitting});
+  const folder = state.folderProtocol === 1 ? await $.session.cwd() : null;
+  const response = await post($,state,'poll',{...identityBody(state),project:state.data.project,
+    ...(typeof folder === 'string' ? {cwd:folder} : {}),accept:!state.receiptOnly && !state.flight && !state.submitting});
   if (!sessionResponse({...response,heartbeat_interval_ms:2000,lease_seconds:12},state.data.native_id) || response.generation !== state.generation) throw Error('Invalid Motet poll identity.');
   if (!state.connected || state.epoch !== epoch) return;
   const turns = response.recoverable_turns;
@@ -464,13 +576,14 @@ async function poll($, state) {
   state.flight = request;
   await save($,state,data=>{data.requests[request.request_id] = request;});
   state.submitting = true;
-  submit($,state,request,claim.envelope,epoch).catch(()=>{});
+  // The granted folder travels with this one submission and nowhere else, so nothing accumulates per claim.
+  submit($,state,request,claim.envelope,epoch,typeof folder === 'string' ? folder : null).catch(()=>{});
 }
 
 async function activate($, state, response, eligibilityEpoch) {
   checkEligibility(state,eligibilityEpoch);
   if (!sessionResponse(response,state.data.native_id)) throw Error('Invalid Motet connection identity.');
-  if (await $.session.id() !== state.data.native_id || await $.session.cwd() !== state.data.project) throw Error('Native conversation changed.');
+  if (await $.session.id() !== state.data.native_id || !state.receiptOnly && await sessionProject($) !== state.data.project) throw Error('Native conversation changed.');
   checkEligibility(state,eligibilityEpoch);
   state.generation = response.generation;
   // Only this current derived connection can negotiate peer input. Saved receipts and
@@ -479,6 +592,9 @@ async function activate($, state, response, eligibilityEpoch) {
   state.noticeData=null;state.noticeKey=null;
   state.peerProtocol = state.data.mode === 'derived' && response.peer_protocol === 1 ? 1 : 0;
   state.peerEnvelopeLimit = state.data.mode === 'derived' && response.peer_envelope_limit === 100000 ? 100000 : 4000;
+  // Folder protocol 1: polls report this chat's current folder, which Motet resolves before a claim in a subfolder.
+  // Without it (an older Motet) only the project folder itself may receive.
+  state.folderProtocol = response.folder_protocol === 1 ? 1 : 0;
   state.lifecycleProtocol = state.data.mode === 'derived' && response.lifecycle_protocol === 2 ? 2 : 0;
   await save($,state,data=>{checkEligibility(state,eligibilityEpoch); data.active = true; data.generation = response.generation; data.peer_protocol = state.peerProtocol;});
   checkEligibility(state,eligibilityEpoch);
@@ -501,7 +617,7 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
     // Reserve before I/O, including while not connected: lost commits never reuse a tuple's episode.
     if(!Number.isSafeInteger(state.sequence+1))throw Error('Motet connection sequence exhausted.');
     const sequence=++state.sequence;
-    const body={native_id:id,project,client_id:state.clientId,connection_seq:sequence,peer_protocol:1,...notices?{reply_notice_protocol:1}:{},...lifecycle?{lifecycle_protocol:2}:{},...largePeer?{peer_envelope_limit:100000}:{}};
+    const body={native_id:id,project,client_id:state.clientId,connection_seq:sequence,...state.receiptOnly?{receipt_only:true}:{},peer_protocol:1,...notices?{reply_notice_protocol:1}:{},...lifecycle?{lifecycle_protocol:2}:{},...largePeer?{peer_envelope_limit:100000}:{}};
     const response=await post($,state,'register',body,{port:config.port,token:config.grant});
     checkEligibility(state,eligibilityEpoch);
     if(!sessionResponse(response,id)||response.grant_id!==config.grant_id||!UUID.test(response.enrollment_id)||
@@ -513,7 +629,7 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
   }
   let response=await registration();
   if(response.supported_reply_notice_protocol===1 || response.supported_lifecycle_protocol===2 || response.supported_peer_envelope_limit===100000)response=await registration(response.supported_reply_notice_protocol===1,response.supported_lifecycle_protocol===2,response.supported_peer_envelope_limit===100000);
-  if (await $.session.id() !== id || await $.session.cwd() !== project) throw Error('Native conversation changed.');
+  if (await $.session.id() !== id || !state.receiptOnly && await sessionProject($) !== project) throw Error('Native conversation changed.');
   checkEligibility(state,eligibilityEpoch);
   const same = state.data?.mode === 'derived' && state.data.native_id === id && state.data.project === project &&
     state.data.grant_id === config.grant_id && state.data.enrollment_id === response.enrollment_id;
@@ -573,10 +689,10 @@ async function readSurfaces($, state, eligibilityEpoch) {
 async function supervisor($, state) {
   if (state.supervising || state.connecting || state.networkBusy || state.flushing || state.disconnecting) return;
   state.supervising = true;
-  let now = 0, eligibilityEpoch = state.eligibilityEpoch;
+  let now = 0, eligibilityEpoch = state.eligibilityEpoch, attempt = null;
   try {
     now = await $.clock.now();
-    const id = await $.session.id(), project = await $.session.cwd();
+    const id = await $.session.id(), project = await sessionProject($);
     checkEligibility(state,eligibilityEpoch);
     if (state.desktopBinding && (state.desktopBinding.native_id !== id || state.desktopBinding.project !== project)) {
       // Refresh only at our synchronous invalidation, never after awaited cleanup.
@@ -587,7 +703,7 @@ async function supervisor($, state) {
     const config = globalConfiguration(raw) ? raw : null;
     const preference = UUID.test(id) ? await $.store.get(preferenceKey(id)) : null;
     checkEligibility(state,eligibilityEpoch);
-    const changed = state.data && (id !== state.data.native_id || project !== state.data.project ||
+    const changed = state.data && (id !== state.data.native_id || project !== state.data.project && !state.receiptOnly ||
       (state.data.mode === 'derived' && configurationId(config) !== configurationId(state.config)));
     if (changed || preference?.disconnected === true || !UUID.test(id)) {
       if (preference?.disconnected === true || !UUID.test(id)) eligibilityEpoch = invalidateEligibility(state);
@@ -601,16 +717,28 @@ async function supervisor($, state) {
       if (preference?.disconnected === true || !UUID.test(id)) return;
     }
     const surfaces = await readSurfaces($,state,eligibilityEpoch);
-    const currentId = await $.session.id(), currentProject = await $.session.cwd();
+    const currentId = await $.session.id(), currentProject = await sessionProject($);
     checkEligibility(state,eligibilityEpoch);
     if (currentId !== id || currentProject !== project) {
       invalidateEligibility(state);
       suspend($,state);
       return;
     }
+    if (project === null) return;                     // outside its own project: nothing connects until it returns
     if (surfaces === null) return;
     if (surfaces.includes('desktop') && UUID.test(id)) state.desktopBinding = {native_id:id,project};
     if (!state.interactive && !(state.desktopBinding?.native_id === id && state.desktopBinding.project === project)) return;
+    if (state.connected && state.receiptOnly && !state.flushing && !state.recovering &&
+        (state.data.mode === 'derived' ? await earlierReceipts($,state,id,project,state.config) !== state.data.project
+                                       : !await pendingReceipts([state.data]))) {
+      // Every outcome from the earlier folder is reported: leave that context and connect in the project folder.
+      const data = state.data;
+      suspend($,state);
+      state.receiptOnly = false; state.receiptKey = null; state.retryAt = 0; state.failures = 0;
+      if (data.mode === 'derived') {state.data = null; state.key = null;}
+      else state.data = {...data, project};
+      return;
+    }
     if (now < state.retryAt) return;
     if (!state.connected) {
       if (state.submitting) return;
@@ -618,16 +746,33 @@ async function supervisor($, state) {
         const manual = await $.store.get(legacyKey(id));
         checkEligibility(state,eligibilityEpoch);
         if (manual?.native_id === id && manual.project === project && manual.active) {state.data = manual; state.key = legacyKey(id);}
+        // A manual pairing made from a subfolder before 0.6.3 names that subfolder. Offer the project root on the
+        // same manual connection; Motet moves it only after proving the root is this chat's launch folder, and it
+        // stays a manual (owner-only) connection. Nothing is saved until Motet accepts.
+        else if (manual?.native_id === id && manual.active && typeof project === 'string' && insideFolder(manual.project, project, await pathRules($))) {
+          state.receiptKey = receiptContext('manual', manual.project);
+          state.receiptOnly = !state.abandonedReceipts.has(state.receiptKey) && await pendingReceipts([manual]);
+          state.data = state.receiptOnly ? manual : {...manual, project}; state.key = legacyKey(id);
+        }
       }
       if (state.data?.mode === 'derived' || (!state.data && config)) {
-        if (!config || state.rejectedGrant === configurationId(config) || state.rejectedIdentity === JSON.stringify([id,project,configurationId(config)])) return;
-        await connectDerived($,state,id,project,config,eligibilityEpoch);
+        if (!config || state.rejectedGrant === configurationId(config) || state.rejectedIdentity === await refusalKey($,state,id,project,config)) return;
+        // Report an earlier folder's retained outcomes first (receipts only, no claims); then move.
+        const earlier = await earlierReceipts($,state,id,project,config);
+        checkEligibility(state,eligibilityEpoch);
+        state.receiptOnly = earlier !== null;
+        state.receiptKey = earlier === null ? null : receiptContext('derived', earlier, config.grant_id);
+        if (state.data && state.data.project !== (earlier ?? project)) {state.data = null; state.key = null;}
+        // The place this attempt is made from, taken before any network call: a refusal is remembered for it only.
+        attempt = await refusalKey($,state,id,project,config);
+        checkEligibility(state,eligibilityEpoch);
+        await connectDerived($,state,id,earlier ?? project,config,eligibilityEpoch);
       } else {
         const stored = state.data ?? await $.store.get(legacyKey(id));
         checkEligibility(state,eligibilityEpoch);
-        if (!stored || stored.native_id !== id || stored.project !== project || !stored.active) return;
+        if (!stored || stored.native_id !== id || stored.project !== project && !state.receiptOnly || !stored.active) return;
         state.key = legacyKey(id); state.data = stored;
-        const response = await post($,state,'connect',{native_id:id,project});
+        const response = await post($,state,'connect',{native_id:id,project:stored.project,...state.receiptOnly?{receipt_only:true}:{}});
         checkEligibility(state,eligibilityEpoch);
         await activate($,state,response,eligibilityEpoch);
       }
@@ -645,10 +790,21 @@ async function supervisor($, state) {
     if (state.eligibilityEpoch !== eligibilityEpoch) return;
     stop(state);
     if (error.status === 403 && state.config) state.rejectedGrant = configurationId(state.config);
-    if (error.code === 'identity_rejected') {
-      const id = await $.session.id().catch(()=>null), project = await $.session.cwd().catch(()=>null);
-      if (state.eligibilityEpoch !== eligibilityEpoch) return;
-      state.rejectedIdentity = JSON.stringify([id,project,configurationId(state.config)]);
+    // Never re-read the folder here: the chat may have moved while the request was in flight, and the refusal
+    // belongs to the folder the attempt was made from.
+    if (error.code === 'identity_rejected' && attempt !== null) state.rejectedIdentity = attempt;
+    if (error.code === 'receipt_context_missing' && state.receiptOnly) {
+      // Motet holds no connection for that earlier folder any more. Stop asking for it; its records stay stored
+      // for recovery, and the chat moves to its project folder on the next attempt.
+      if (state.receiptKey) state.abandonedReceipts.add(state.receiptKey);
+      state.receiptOnly = false; state.receiptKey = null;
+      if (state.data?.mode === 'derived') {state.data = null; state.key = null;}
+      else if (state.data) {
+        const project = await sessionProject($).catch(()=>null);
+        if (state.eligibilityEpoch !== eligibilityEpoch) return;
+        state.data = typeof project === 'string' ? {...state.data, project} : null;
+        if (!state.data) state.key = null;
+      }
     }
     state.error = error.message === 'Motet recovery data limit.' ? 'Motet recovery data limit reached; automatic claims stopped.' :
       'Motet connection interrupted; existing attempts are never resubmitted.';
@@ -681,7 +837,7 @@ async function retryHeldReceipts($, state, id) {
   }
   state.connecting = true;
   try {
-    if (await $.session.id() !== data.native_id || await $.session.cwd() !== data.project ||
+    if (await $.session.id() !== data.native_id || await sessionProject($) !== data.project ||
         state.data !== data || state.epoch !== epoch) return {text:'Open the original Motet conversation and check /watch-status.'};
     if (data.mode === 'derived') await recover($,state);
     if (state.data !== data || state.epoch !== epoch) return {text:'Open the original Motet conversation and check /watch-status.'};
@@ -735,7 +891,7 @@ async function completeRecoveredTurns($, state) {
 
 export function register(on) {
   const state = {clientId:crypto.randomUUID(),sequence:-1,data:null,key:null,config:null,generation:null,connected:false,epoch:0,eligibilityEpoch:0,desktopBinding:null,disconnecting:0,
-    timer:null,peerProtocol:0,lifecycleProtocol:0,bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
+    timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
     rejectedGrant:'',rejectedIdentity:'',startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
@@ -785,8 +941,9 @@ export function register(on) {
     state.connecting = true;
     invalidateEligibility(state);
     try {
-      const id = await $.session.id(), project = await $.session.cwd();
+      const id = await $.session.id(), project = await sessionProject($);
       if (!UUID.test(id)) throw Error('Native identity unavailable.');
+      if (project === null) return {text:'This chat is working outside its project folder. Return to the project folder and try again.'};
       const pair = e.args.trim() ? pairing(e.args) : null;
       if (e.args.trim() && !pair) return {text:'Use the exact port:code command from Motet.'};
       if (e.command === 'watch-setup') {
@@ -797,7 +954,7 @@ export function register(on) {
         state.rejectedGrant = ''; state.rejectedIdentity = '';
         await $.store.set(preferenceKey(id),{version:1,disconnected:false});
         suspend($,state);
-        state.data = null; state.key = null; state.config = config;
+        state.data = null; state.key = null; state.config = config; state.receiptOnly = false;
         state.flight = null; state.envelope = null; state.bound.clear();
         state.retryAt = 0; state.failures = 0;
         return {text:'Motet automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
@@ -816,13 +973,21 @@ export function register(on) {
         return {text:'Motet connected to this existing chat. ' + LIMITATION};
       }
       if (state.data?.mode !== 'derived') {
-        state.data = await $.store.get(legacyKey(id)); state.key = state.data ? legacyKey(id) : null;
-        if (state.data?.native_id === id && state.data.project === project) {
-          state.data.active = true;
-          await activate($,state,await post($,state,'connect',{native_id:id,project}));
-          return {text:'Motet connected to this existing chat. ' + LIMITATION};
+        const stored = await $.store.get(legacyKey(id));
+        // An owner-requested reconnect of this chat's manual pairing, including one an earlier plugin made from a
+        // subfolder: it offers the project folder on the same manual credential, and Motet moves it only to the
+        // proven launch folder. It stays manual; nothing is saved unless Motet accepts.
+        if (stored?.native_id === id && (stored.project === project || insideFolder(stored.project, project, await pathRules($)))) {
+          state.receiptKey = receiptContext('manual', stored.project);
+          state.receiptOnly = stored.project !== project && !state.abandonedReceipts.has(state.receiptKey) &&
+            await pendingReceipts([stored]);
+          state.key = legacyKey(id); state.data = {...stored, project:state.receiptOnly ? stored.project : project, active:true};
+          await activate($,state,await post($,state,'connect',{native_id:id,project:state.data.project,...state.receiptOnly?{receipt_only:true}:{}}));
+          return {text:state.receiptOnly ? 'Motet reconnected this chat to report its earlier replies; it then moves to this project folder. ' + LIMITATION :
+            'Motet connected to this existing chat. ' + LIMITATION};
         }
         state.data = null; state.key = null;
+        if (stored?.native_id === id) return {text:"This chat's manual Motet pairing is for a folder outside this project, so it was not reconnected. Pair this chat again from Motet."};
       }
       return {text:'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
     } catch {stop(state); return {text:'Motet connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.'};}
@@ -841,7 +1006,7 @@ export function register(on) {
       const request = state.flight, data = state.data, eligibility = state.eligibilityEpoch;
       if (request && data && request.kind!=='peer_reply_notice' && !request.turn_id && e.agentId === undefined &&
           turnIdentifier(e.turnId) && matchingPrompt(e.text,state.envelope) &&
-          await $.session.id() === data.native_id && await $.session.cwd() === data.project &&
+          await $.session.id() === data.native_id && await sessionProject($) === data.project &&
           state.data === data && state.flight === request && state.eligibilityEpoch === eligibility && !request.turn_id) {
         request.turn_id = e.turnId;
         state.bound.set(e.turnId,{request,native_id:state.data.native_id,project:state.data.project,enrollment_id:state.data.enrollment_id});
@@ -854,7 +1019,7 @@ export function register(on) {
     try {
       if (e.agentId !== undefined || !turnIdentifier(e.turnId)) return next(e);
       const bound = state.bound.get(e.turnId), request = bound?.request, data=state.data, eligibility=state.eligibilityEpoch;
-      const native=await $.session.id(), project=await $.session.cwd();
+      const native=await $.session.id(), project=await sessionProject($);
       if (state.eligibilityEpoch!==eligibility) return next(e);
       if (request && !request.execution_completed && data && state.data === data && data.requests[request.request_id] === request &&
           bound.native_id === state.data.native_id && bound.project === state.data.project && bound.enrollment_id === state.data.enrollment_id &&

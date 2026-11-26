@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {register} from '../hooks/register.js';
-import {matchingPrompt, matchingAnswer, pairing, validClaim, validNoticeClaim, replyNoticeText, lifecycleReceipt, receiptRecord} from '../hooks/protocol.js';
+import {MAX_RECEIPT_REJECTIONS, matchingPrompt, matchingAnswer, pairing, validClaim, validNoticeClaim, replyNoticeText, lifecycleReceipt, receiptRecord} from '../hooks/protocol.js';
 
 const NATIVE='11111111-1111-4111-8111-111111111111', GENERATION='22222222-2222-4222-8222-222222222222';
 const REQUEST='33333333-3333-4333-8333-333333333333', ATTEMPT='44444444-4444-4444-8444-444444444444';
@@ -33,14 +33,14 @@ function observationBus(summary=()=> ''){
   return {wait,notify(){for(const check of [...listeners])check();},get pending(){return listeners.size;}};
 }
 
-async function harness({storage=new Map(), claimed=true, submit, fetch, nativeId=NATIVE, project='/fictional/project', storeSet, startup={surface:'desktop',isInteractive:true}, surfaces=['desktop'], surfaceRead}={}) {
+async function harness({storage=new Map(), claimed=true, submit, fetch, nativeId=NATIVE, project='/fictional/project', storeSet, startup={surface:'desktop',isInteractive:true}, surfaces=['desktop'], surfaceRead, root, platform='macos', folderProtocol=true}={}) {
   const hooks=new Map(),timers=[],calls=[],submissions=[],settlements=[],passed=[],stores=[];
   const bus=observationBus(()=>JSON.stringify({calls:calls.length,submissions:submissions.length,stores:stores.length}));
   let failIdentity=false,failSurfaces=false,roster=surfaces;
-  let native=nativeId,cwd=project,now=100000,failStore=false,generation=GENERATION;
+  let native=nativeId,cwd=project,now=100000,failStore=false,generation=GENERATION,rootDir=root;
   const claim={request_id:REQUEST,attempt_id:ATTEMPT,native_id:nativeId,generation:GENERATION,envelope:ENVELOPE,expires_at:1000};
-  const response=()=>({version:1,native_id:native,generation,heartbeat_interval_ms:2000,lease_seconds:12});
-  const $={session:{id:async()=>{if(failIdentity)throw Error('identity unavailable');return native;},cwd:async()=>cwd,surfaces:async()=>{if(failSurfaces)throw Error('private surface read failure /fictional/private');return surfaceRead?surfaceRead():roster;}},command:{register:async()=>{}},
+  const response=()=>({version:1,native_id:native,generation,heartbeat_interval_ms:2000,lease_seconds:12,...(folderProtocol?{folder_protocol:1}:{})});
+  const $={session:{id:async()=>{if(failIdentity)throw Error('identity unavailable');return native;},cwd:async()=>cwd,...(root===undefined?{}:{root:async()=>{if(rootDir instanceof Error)throw rootDir;return rootDir;}}),...(platform===null?{}:{info:async()=>({platform})}),surfaces:async()=>{if(failSurfaces)throw Error('private surface read failure /fictional/private');return surfaceRead?surfaceRead():roster;}},command:{register:async()=>{}},
     store:{get:async key=>storage.has(key)?copy(storage.get(key)):undefined,keys:async()=>[...storage.keys()],
       set:async(key,value)=>{if(failStore)throw Error('disk');if(storeSet)await storeSet(key,copy(value));storage.set(key,copy(value));stores.push({key,value:copy(value)});bus.notify();}},
     clock:{now:async()=>now,every:(delay,fn)=>{const timer={delay,fn,cancelled:false,cancel(){this.cancelled=true;}};timers.push(timer);return timer;}},
@@ -101,7 +101,7 @@ async function harness({storage=new Map(), claimed=true, submit, fetch, nativeId
     waitSettlement:(count=1)=>bus.wait(()=>settlements.length>=count&&settlements[count-1],'native settlement '+count),
     get pendingObservers(){return bus.pending;},
     enroll:()=>command('watch-connect','8793:fictional_pair_code_1234'),
-    setNative(value){native=value;},setCwd(value){cwd=value;},setNow(value){now=value;},
+    setNative(value){native=value;},setCwd(value){cwd=value;},setRoot(value){rootDir=value;},setNow(value){now=value;},
     setSurfaces(value){roster=value;},failSurfaces(value){failSurfaces=value;},
     failIdentity(value){failIdentity=value;},failStore(value){failStore=value;},setGeneration(value){generation=value;},
     events:()=>calls.filter(c=>c.url.endsWith('/event')).map(c=>c.body)};
@@ -246,6 +246,145 @@ test('identity/project change and disconnect stop future claims without claiming
   }
   const h=await harness();await h.enroll();assert.match((await h.command('watch-disconnect')).text,/does not cancel|does not cancel|Disconnect does not cancel/);
   await h.tick();assert.equal(h.submissions.length,0);
+});
+
+test('a shell cd inside the project keeps the same chat; a moved project root still stops claims',async()=>{
+  // The host's root() is the chat's stable project; cwd() follows a shell cd into a subfolder.
+  const h=await harness({root:'/fictional/project'});
+  h.setCwd('/fictional/project/archive/notes');
+  await h.enroll();await h.tick();await h.waitSubmission();
+  assert.equal(h.calls.find(c=>c.url.endsWith('/enroll')).body.project,'/fictional/project');
+  await h.call('turn.start',{text:ENVELOPE,turnId:'parent'});
+  h.setCwd('/fictional/project/src');
+  await h.call('turn.complete',{turnId:'parent',answer:ANSWER,isAborted:false,reason:'answer'});
+  await h.waitForEvent('answered');
+  assert.equal(h.events().at(-1).answer,ANSWER);
+  for(const change of [h=>h.setRoot('/fictional/other'),h=>h.setRoot('/fictional/project-sibling')]){
+    const moved=await harness({root:'/fictional/project'});await moved.enroll();change(moved);await moved.tick();
+    assert.equal(moved.submissions.length,0);
+    await moved.waitCall('/disconnect',()=>true,{settled:true});
+  }
+});
+
+test('a current folder outside the project root stops claims even when root() is unchanged',async()=>{
+  for(const outside of ['/fictional/elsewhere','/fictional/project-sibling','/fictional/project/../elsewhere']){
+    const h=await harness({root:'/fictional/project'});await h.enroll();h.setCwd(outside);await h.tick();
+    assert.equal(h.submissions.length,0,outside);
+    await h.waitCall('/disconnect',()=>true,{settled:true});
+  }
+});
+
+test('folder containment follows the root platform: a POSIX backslash name is a sibling',async()=>{
+  // On POSIX '\' is an ordinary character: '/fictional/project\outside' is a sibling, so nothing is submitted.
+  for(const outside of ['/fictional/project\\outside','/fictional/project\\..\\elsewhere']){
+    const h=await harness({root:'/fictional/project'});await h.enroll();h.setCwd(outside);await h.tick();
+    assert.equal(h.submissions.length,0,outside);
+    await h.waitCall('/disconnect',()=>true,{settled:true});
+  }
+});
+
+test('Windows drive and share roots keep their inside folders and refuse siblings',async()=>{
+  const cases=[
+    ['C:\\Work\\Project',['C:\\Work\\Project\\src','C:/Work/Project/src','C:\\Work\\Project\\a b\\c'],
+      ['C:\\Work\\Project2','C:\\Work\\Project-sibling','D:\\Work\\Project\\src','C:\\Work\\Project\\..\\Other',
+       'c:\\work\\project\\src','\\\\?\\C:\\Work\\Project\\src','/Work/Project/src']],
+    ['\\\\server\\share\\Project',['\\\\server\\share\\Project\\src','//server/share/Project/src'],
+      ['\\\\server\\share\\Project2','\\\\server\\other\\Project\\src','\\\\.\\server\\share\\Project\\src','C:\\Project\\src']],
+  ];
+  for(const [root,inside,outside] of cases){
+    for(const cwd of inside){
+      const h=await harness({root,project:root,platform:'windows'});h.setCwd(cwd);await h.enroll();await h.tick();await h.waitSubmission();
+      assert.equal(h.calls.find(c=>c.url.endsWith('/enroll')).body.project,root,cwd);
+    }
+    for(const cwd of outside){
+      const h=await harness({root,project:root,platform:'windows'});await h.enroll();h.setCwd(cwd);await h.tick();
+      assert.equal(h.submissions.length,0,cwd);
+      await h.waitCall('/disconnect',()=>true,{settled:true});
+    }
+  }
+});
+
+test('a manual pairing made from a subfolder reconnects with its project root on the same manual credential',async()=>{
+  const old=await harness({project:'/fictional/project/sub'});await old.enroll();
+  const key=[...old.storage.keys()].find(k=>k.startsWith('watch-owner-v1:'));
+  assert.equal(old.storage.get(key).project,'/fictional/project/sub');
+  const reload=await harness({storage:old.storage,root:'/fictional/project',project:'/fictional/project/sub'});
+  await reload.tick();
+  const connect=await reload.waitCall('/connect');
+  assert.equal(connect.body.project,'/fictional/project');
+  assert(!reload.calls.some(c=>c.url.endsWith('/register')),'a manual pairing never turns into automatic registration');
+  await reload.wait(()=>reload.storage.get(key).project==='/fictional/project','manual record moved');
+  // A refused move saves nothing: the stored manual record keeps its subfolder.
+  const refused=await harness({root:'/fictional/project',project:'/fictional/project/sub',
+    fetch:(url)=>url.endsWith('/connect')?{ok:false,status:409,headers:{},text:JSON.stringify({error:'The enrolled Claude project does not match.'})}:null});
+  await refused.enroll();
+  const refusedKey=[...refused.storage.keys()].find(k=>k.startsWith('watch-owner-v1:'));
+  refused.storage.set(refusedKey,{...refused.storage.get(refusedKey),project:'/fictional/project/sub',generation:null});
+  const again=await harness({storage:refused.storage,root:'/fictional/project',project:'/fictional/project/sub',
+    fetch:(url)=>url.endsWith('/connect')?{ok:false,status:409,headers:{},text:JSON.stringify({error:'The enrolled Claude project does not match.'})}:null});
+  await again.tick();await again.waitCall('/connect',()=>true,{settled:true});
+  assert.equal(again.storage.get(refusedKey).project,'/fictional/project/sub');
+  assert.equal(again.submissions.length,0);
+});
+
+test('path rules come from the host platform, never from how the root is spelled',async()=>{
+  // On macOS a root spelled '/\fictional\share\project' is an ordinary POSIX folder; '\outside' makes a sibling.
+  const root='/\\fictional\\share\\project';
+  const h=await harness({root,project:root});await h.enroll();h.setCwd(root+'\\outside');await h.tick();
+  assert.equal(h.submissions.length,0);
+  await h.waitCall('/disconnect',()=>true,{settled:true});
+  // An unknown platform accepts the project folder itself only.
+  const unknown=await harness({root:'/fictional/project',platform:'unknown'});await unknown.enroll();
+  unknown.setCwd('/fictional/project/src');await unknown.tick();
+  assert.equal(unknown.submissions.length,0);
+  const none=await harness({root:'/fictional/project',platform:null});await none.enroll();await none.tick();await none.waitSubmission();
+});
+
+test('a poll reports the current folder and the claim runs only in that same folder',async()=>{
+  const h=await harness({root:'/fictional/project'});h.setCwd('/fictional/project/src');
+  await h.enroll();await h.tick();await h.waitSubmission();
+  const polled=h.calls.filter(c=>c.url.endsWith('/poll'));
+  assert.equal(polled.at(-1).body.cwd,'/fictional/project/src');
+  // The folder changes after the poll that carried the claim: nothing is submitted.
+  const moved=await harness({root:'/fictional/project',fetch:(url)=>{if(url.endsWith('/poll'))moved.setCwd('/fictional/project/docs');}});
+  moved.setCwd('/fictional/project/src');await moved.enroll();await moved.tick();
+  assert.equal(moved.submissions.length,0);
+  await moved.waitForEvent('unknown');
+});
+
+test('with an older Motet that checks no folders, only the project folder itself receives',async()=>{
+  const h=await harness({root:'/fictional/project',folderProtocol:false});h.setCwd('/fictional/project/src');
+  await h.enroll();await h.tick();
+  assert.equal(h.submissions.length,0);
+  assert(h.calls.filter(c=>c.url.endsWith('/poll')).every(c=>!('cwd' in c.body)),'no folder is reported to an older Motet');
+  const at=await harness({root:'/fictional/project',folderProtocol:false});await at.enroll();await at.tick();await at.waitSubmission();
+});
+
+test('watch-connect restores an opted-out manual pairing made from a subfolder, on the same manual credential',async()=>{
+  const old=await harness({project:'/fictional/project/sub'});await old.enroll();
+  const key=[...old.storage.keys()].find(k=>k.startsWith('watch-owner-v1:'));
+  await old.command('watch-disconnect');
+  assert.equal(old.storage.get(key).active,false);
+  const reload=await harness({storage:old.storage,root:'/fictional/project',project:'/fictional/project/sub'});
+  const cursor=reload.calls.length;
+  assert.match((await reload.command('watch-connect')).text,/Motet connected/);
+  const connect=reload.calls.slice(cursor).find(c=>c.url.endsWith('/connect'));
+  assert.equal(connect.body.project,'/fictional/project');
+  assert(!reload.calls.some(c=>c.url.endsWith('/register')));
+  assert.equal(reload.storage.get(key).project,'/fictional/project');
+  // A pairing for a folder outside this project is not reconnected, and says so.
+  const other=await harness({project:'/fictional/elsewhere'});await other.enroll();await other.command('watch-disconnect');
+  const away=await harness({storage:other.storage,root:'/fictional/project',project:'/fictional/project'});
+  assert.match((await away.command('watch-connect')).text,/outside this project/);
+});
+
+test('a host whose root() fails keeps the stricter current-folder check',async()=>{
+  const h=await harness({root:Error('root unavailable')});
+  await h.enroll();
+  assert.equal(h.calls.find(c=>c.url.endsWith('/enroll')).body.project,'/fictional/project');
+  h.setCwd('/fictional/project/sub');await h.tick();
+  assert.equal(h.submissions.length,0);
+  await h.waitCall('/disconnect',()=>true,{settled:true});
 });
 
 test('expired or malformed server claim never reaches native input',async()=>{
@@ -917,17 +1056,154 @@ test('opt-out excludes a new supervisor throughout its deferred preference write
   }finally{hold=false;gate.release();await disconnect;}
 });
 
-test('identity rejection catch discards lifecycle-invalidated lookups without rejecting the timer',async()=>{
-  const gate=latch();let inCatch=false;
+test('identity rejection catch discards lifecycle-invalidated attempts without rejecting the timer',async()=>{
+  // The refusal belongs to the attempt; a lifecycle change while it is in flight discards it without a lookup.
+  const gate=latch();
   const h=await harness({startup:sdk,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:(url,body)=>{
-    if(url.endsWith('/register')){inCatch=true;return responseJSON({error_code:'identity_rejected'},403);}return globalFetch(url,body);
+    if(url.endsWith('/register'))return gate.hold().then(()=>responseJSON({error_code:'identity_rejected'},403));return globalFetch(url,body);
   }});
-  h.$.session.id=async()=>inCatch?gate.hold():NATIVE;
   const pending=h.tick();
   try{
-    await bounded(gate.entered,'identity rejection lookup');await h.call('session.end',{reason:'resume',sessionId:NATIVE});inCatch=false;gate.release(NATIVE);await pending;
+    await bounded(gate.entered,'registration in flight');await h.call('session.end',{reason:'resume',sessionId:NATIVE});gate.release();await pending;
     h.setSurfaces([]);await h.tick();assert.equal(registrations(h).length,1);assert.equal((await status(h)).connected,false);
-  }finally{inCatch=false;gate.release(NATIVE);await pending;}
+  }finally{gate.release();await pending;}
+});
+
+test('a refusal is remembered for the folder the attempt was made from, not one reached while it was in flight',async()=>{
+  // Registration starts in folder A; the host moves to B before the terminal refusal for A comes back.
+  let first=true,now=100000;
+  const h=await harness({startup:sdk,claimed:false,root:'/fictional/project',storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>{
+      if(!url.endsWith('/register'))return globalFetch(url,body);
+      if(first){first=false;h.setCwd('/fictional/project');return responseJSON({error_code:'identity_rejected'},409);}
+      return body.project==='/fictional/project'&&h.$.session.cwd&&globalFetch(url,body);
+    }});
+  h.setCwd('/fictional/project/src');
+  await h.tick();assert.equal(registrations(h).length,1);
+  for(let i=0;i<4&&registrations(h).length<2;i++){now+=120000;h.setNow(now);await h.tick();}
+  assert.equal(registrations(h).length,2,'B gets its own first attempt');
+  // Staying in a refused folder still makes no extra attempts.
+  let refusals=0;
+  const a=await harness({startup:sdk,claimed:false,root:'/fictional/project',storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>url.endsWith('/register')?(refusals++,responseJSON({error_code:'identity_rejected'},409)):globalFetch(url,body)});
+  a.setCwd('/fictional/project/src');
+  for(let i=0;i<5;i++){now+=120000;a.setNow(now);await a.tick();}
+  assert.equal(refusals,1);
+});
+
+test('a refused registration is remembered for the folder it happened in, and a move retries',async()=>{
+  // An older Motet (or a stage showing another folder) refuses this chat while it works in a subfolder.
+  let refuse=true,now=100000;
+  const h=await harness({startup:sdk,claimed:false,root:'/fictional/project',storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>url.endsWith('/register')&&refuse?responseJSON({error_code:'identity_rejected'},409):globalFetch(url,body)});
+  h.setCwd('/fictional/project/src');
+  await h.tick();assert.equal(registrations(h).length,1);
+  for(let i=0;i<4;i++){now+=120000;h.setNow(now);await h.tick();}
+  assert.equal(registrations(h).length,1,'the same refusal in the same folder is not retried');
+  refuse=false;h.setCwd('/fictional/project');now+=120000;h.setNow(now);await h.tick();
+  assert.equal(registrations(h).length,2,'back in the project folder, the chat registers again');
+  assert.equal(registrations(h).at(-1).body.project,'/fictional/project');
+});
+
+// An earlier plugin (no stable root) in a subfolder claimed and answered, but the reply never reached Motet.
+async function bufferedChildReply({manual=false}={}){
+  const storage=new Map(manual?[]:[[GLOBAL_KEY,CONFIG]]);
+  const old=await harness({storage,project:'/fictional/project/sub',fetch:(url,body)=>{
+    if(url.endsWith('/register'))return responseJSON(registered(body));
+    if(url.endsWith('/event')&&body.kind==='answered')throw Error('lost answer');
+  }});
+  if(manual)await old.enroll();
+  await old.tick();await old.tick();await old.waitSubmission();
+  await old.call('turn.start',{text:ENVELOPE,turnId:'child-turn'});
+  await old.call('turn.complete',{turnId:'child-turn',answer:ANSWER,isAborted:false,reason:'answer'});
+  await old.waitCall('/event',(b,c)=>b.kind==='answered'&&c.failed,{settled:true});
+  return storage;
+}
+
+async function upgradeAndMove(storage,{manual=false}={}){
+  let reported=0,moved=false,now=100000;
+  const reload=await harness({storage,root:'/fictional/project',project:'/fictional/project',claimed:false,fetch:(url,body)=>{
+    if(url.endsWith('/event')&&body.kind==='answered'){reported++;return null;}
+    const target=url.endsWith(manual?'/connect':'/register');
+    if(!target)return null;
+    if(body.receipt_only)return manual?null:responseJSON(registered(body));
+    if(body.project==='/fictional/project'&&!reported)return responseJSON({error:'An earlier request is open.',error_code:'move_pending'},409);
+    if(body.project==='/fictional/project'){moved=true;return manual?null:responseJSON(registered(body,{enrollment_id:ATTEMPT,token:'c'.repeat(64)}));}
+    return null;
+  }});
+  for(let i=0;i<30&&!moved;i++){now+=60000;reload.setNow(now);await reload.tick();await new Promise(r=>setImmediate(r));}
+  assert(moved,'the chat moved to its project folder');
+  const connects=reload.calls.filter(c=>c.url.endsWith(manual?'/connect':'/register')).map(c=>c.body);
+  assert.equal(connects[0].receipt_only,true);
+  assert.equal(connects[0].project,'/fictional/project/sub');
+  assert.equal(connects.at(-1).project,'/fictional/project');
+  assert.equal(connects.at(-1).receipt_only,undefined);
+  assert.equal(reported,1,'the original receipt is reported exactly once');
+  assert.equal(reload.events().filter(e=>e.kind==='answered')[0].answer,ANSWER);
+  const receiptPolls=reload.calls.filter(c=>c.url.endsWith('/poll')&&c.body.project==='/fictional/project/sub');
+  assert(receiptPolls.every(c=>c.body.accept===false),'the earlier folder never accepts a claim');
+  assert.equal(reload.submissions.length,0,'no prompt is replayed');
+}
+
+test('an upgraded automatic connection reports a buffered reply from its earlier folder, then moves',async()=>{
+  await upgradeAndMove(await bufferedChildReply());
+});
+
+test('an upgraded manual pairing reports a buffered reply from its earlier folder, then moves',async()=>{
+  await upgradeAndMove(await bufferedChildReply({manual:true}),{manual:true});
+});
+
+async function upgradeAgainst(storage,{manual=false,refuseReceipt=false,missingContext=false}={}){
+  let moved=false,now=100000;
+  const target=url=>url.endsWith(manual?'/connect':'/register');
+  const reload=await harness({storage,root:'/fictional/project',project:'/fictional/project',claimed:false,fetch:(url,body)=>{
+    if(url.endsWith('/event')&&body.kind==='answered'&&refuseReceipt)return responseJSON({error:'Claude request does not match its original claim.',error_code:'receipt_rejected'},409);
+    if(!target(url))return null;
+    if(body.receipt_only)return missingContext?responseJSON({error:'No earlier Motet connection of this chat holds that folder.',error_code:'receipt_context_missing'},409):
+      (manual?null:responseJSON(registered(body)));
+    if(body.project==='/fictional/project'){moved=true;return manual?null:responseJSON(registered(body,{enrollment_id:ATTEMPT,token:'c'.repeat(64)}));}
+    return null;
+  }});
+  for(let i=0;i<30&&!moved;i++){now+=60000;reload.setNow(now);await reload.tick();await new Promise(r=>setImmediate(r));}
+  for(let i=0;i<5;i++){now+=60000;reload.setNow(now);await reload.tick();}
+  const connects=reload.calls.filter(c=>target(c.url)).map(c=>c.body);
+  return {reload,moved,connects,receiptOnly:connects.filter(b=>b.receipt_only),
+    answers:reload.calls.filter(c=>c.url.endsWith('/event')&&c.body.kind==='answered').length};
+}
+
+for(const manual of [false,true]){
+  test(`a refused earlier receipt ends receipt-only mode and the chat moves (${manual?'manual':'automatic'})`,async()=>{
+    const {reload,moved,connects,receiptOnly,answers}=await upgradeAgainst(await bufferedChildReply({manual}),{manual,refuseReceipt:true});
+    assert(moved,'the chat moved to its project folder');
+    assert.equal(receiptOnly.length,1,'one receipt-only connection, not a storm');
+    assert(answers>=1&&answers<=MAX_RECEIPT_REJECTIONS,'the refused receipt is tried at most its retry limit');
+    assert.equal(connects.at(-1).project,'/fictional/project');
+    assert(reload.calls.filter(c=>c.url.endsWith('/poll')&&c.body.project==='/fictional/project/sub').every(c=>c.body.accept===false));
+    assert.equal(reload.submissions.length,0);
+  });
+
+  test(`a missing earlier context is given up, its receipts kept, and the chat moves (${manual?'manual':'automatic'})`,async()=>{
+    const storage=await bufferedChildReply({manual});
+    const before=JSON.stringify([...storage.entries()].filter(([key])=>key.startsWith('watch-owner-runtime-')));
+    const {reload,moved,receiptOnly,answers}=await upgradeAgainst(storage,{manual,missingContext:true});
+    assert(moved,'the chat moved to its project folder');
+    assert.equal(receiptOnly.length,1,'the missing context is asked for once');
+    assert.equal(answers,manual?1:0,'nothing is reported to a context Motet does not hold');
+    if(!manual)assert.equal(JSON.stringify([...storage.entries()].filter(([key])=>key.startsWith('watch-owner-runtime-')).filter(([key])=>before.includes(key))),
+      JSON.stringify(JSON.parse(before)),'the earlier receipts stay stored for recovery');
+    assert.equal(reload.submissions.length,0);
+  });
+}
+
+test('evidence that is not ready yet is retried on later ticks without a reset',async()=>{
+  let attempts=0,now=100000;
+  const h=await harness({startup:sdk,root:'/fictional/project',storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>url.endsWith('/register')&&++attempts<=2?responseJSON({error:'Waiting for verified local Claude parent metadata.',error_code:'not_observed'},409):globalFetch(url,body)});
+  h.setCwd('/fictional/project/src');
+  for(let i=0;i<10&&attempts<3;i++){now+=120000;h.setNow(now);await h.tick();}
+  assert.equal(attempts,3);
+  assert.equal(h.submissions.length,0);
+  assert.equal(JSON.parse((await h.command('watch-status')).text).connected,true);
 });
 
 test('semantic observers remove subscriptions on success timeout and predicate exceptions',async()=>{

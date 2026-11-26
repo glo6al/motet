@@ -38,6 +38,205 @@ def uid():
     return str(uuid.uuid4())
 
 
+class WithinProjectTests(unittest.TestCase):
+    """A Claude chat that changes directory inside its own project is still that project's chat."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
+        self.project = os.path.join(os.path.realpath(temp.name), 'project')
+        self.inside = os.path.join(self.project, 'archive', 'notes')
+        os.makedirs(self.inside)
+        elsewhere = tempfile.TemporaryDirectory(); self.addCleanup(elsewhere.cleanup)
+        self.elsewhere = os.path.realpath(elsewhere.name)
+
+    def resolved(self, cwd):
+        mod.within_project(cwd, self.project)
+        self.assertTrue(mod.RESOLVER.settle())
+        return mod.within_project(cwd, self.project)
+
+    def test_project_and_folders_inside_it_are_accepted(self):
+        for cwd in (self.project, self.inside, os.path.join(self.inside, '..')):
+            self.assertTrue(mod.folder_inside(cwd, self.project), cwd)
+            self.assertTrue(self.resolved(cwd), cwd)
+
+    def test_sibling_parent_relative_and_malformed_folders_are_outside(self):
+        for cwd in (self.project + '-sibling', os.path.dirname(self.project), os.path.join(self.project, '..', 'other'),
+                    self.elsewhere, 'project/archive', '', None, 7, self.inside + '\x00', '/' + 'x' * 5000,
+                    os.path.join(self.project, 'not-created-yet')):           # a missing folder is not a usable one
+            self.assertFalse(mod.folder_inside(cwd, self.project), cwd)
+            self.assertFalse(mod.within_project(cwd, self.project), cwd)
+        self.assertFalse(mod.within_project(self.inside, None))
+        self.assertFalse(mod.within_project(self.inside, 'project'))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX symbolic links; Windows forms are simulated below')
+    def test_links_are_resolved_before_the_comparison(self):
+        escape = os.path.join(self.project, 'escape'); os.symlink(self.elsewhere, escape, target_is_directory=True)
+        alias = os.path.join(self.project, 'alias'); os.symlink(self.inside, alias, target_is_directory=True)
+        outside_alias = os.path.join(self.elsewhere, 'into-project')
+        os.symlink(self.inside, outside_alias, target_is_directory=True)
+        for cwd in (escape, os.path.join(escape, 'deeper'), os.path.join(escape, '..')):
+            self.assertFalse(mod.folder_inside(cwd, self.project), cwd)
+            self.assertFalse(self.resolved(cwd), cwd)
+        self.assertTrue(self.resolved(alias))
+        # Not inside by name: refused before any link is read.
+        self.assertFalse(mod.folder_inside(outside_alias, self.project))
+
+    def test_checks_under_the_lock_never_touch_the_disk(self):
+        caller, real = threading.current_thread(), os.path.realpath
+        def guarded(path):
+            if threading.current_thread() is caller:
+                raise AssertionError('resolved on the calling thread')
+            return real(path)
+        fresh = os.path.join(self.inside, 'fresh-' + uid()); os.mkdir(fresh)
+        with patch.object(mod.PATH, 'realpath', side_effect=guarded):
+            for cwd in (self.project, self.project + '-sibling', self.elsewhere, fresh):
+                mod.within_project(cwd, self.project)
+            self.assertFalse(mod.within_project(fresh, self.project))      # not resolved yet: outside
+            self.assertTrue(mod.RESOLVER.settle())
+            self.assertTrue(mod.within_project(fresh, self.project))
+
+    def hanging_resolver(self, stuck):
+        gate, entered = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        def resolve(cwd, root):
+            if cwd in stuck:
+                entered.set(); gate.wait(30)
+            return True
+        resolver = mod.FolderResolver(resolve=resolve)
+        resolver.DEADLINE = 0.3
+        return resolver, gate, entered
+
+    def test_a_hung_folder_does_not_hold_up_other_folders(self):
+        hung, other = os.path.join(self.inside, 'hung'), os.path.join(self.inside, 'other')
+        resolver, gate, entered = self.hanging_resolver({hung})
+        with patch.object(mod, 'RESOLVER', resolver):
+            started = time.monotonic()
+            self.assertFalse(mod.within_project(hung, self.project))
+            self.assertTrue(entered.wait(5))
+            self.assertFalse(mod.within_project(other, self.project))
+            self.assertTrue(resolver.prime(other, self.project))          # B settles while A still hangs
+            self.assertTrue(mod.within_project(other, self.project))
+            self.assertFalse(mod.within_project(hung, self.project))
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertTrue(resolver.settle())                            # A has passed its deadline
+            self.assertFalse(mod.within_project(hung, self.project))      # and counts as outside
+            gate.set()
+            for _ in range(200):
+                if mod.within_project(hung, self.project):
+                    break
+                time.sleep(0.01)
+            self.assertTrue(mod.within_project(hung, self.project))       # its own late answer is used
+
+    def test_hung_folders_past_their_deadline_free_their_slots(self):
+        stuck = {os.path.join(self.inside, 'hung-%d' % n) for n in range(mod.FolderResolver.MAX_ACTIVE + 2)}
+        resolver, gate, entered = self.hanging_resolver(stuck)
+        later = os.path.join(self.inside, 'later')
+        with patch.object(mod, 'RESOLVER', resolver):
+            for cwd in stuck:
+                self.assertFalse(mod.within_project(cwd, self.project))
+            self.assertTrue(entered.wait(5))
+            self.assertFalse(mod.within_project(later, self.project))     # queued behind the stuck ones
+            self.assertTrue(resolver.settle(5))
+            self.assertTrue(mod.within_project(later, self.project))
+            self.assertTrue(all(not mod.within_project(cwd, self.project) for cwd in stuck))
+            self.assertLessEqual(len(resolver.running), resolver.MAX_THREADS)
+
+    def test_a_thread_that_cannot_start_counts_as_outside_and_is_retried(self):
+        now = [100.0]
+        resolver = mod.FolderResolver(resolve=lambda cwd, root: True, clock=lambda: now[0])
+        class NoThread:
+            def __init__(self, **kwargs): pass
+            def start(self): raise RuntimeError("can't start new thread")
+        resolver.thread = NoThread
+        with patch.object(mod, 'RESOLVER', resolver):
+            self.assertFalse(mod.within_project(self.inside, self.project))       # no exception reaches the caller
+            self.assertEqual((resolver.running, list(resolver.queue)), ({}, []))
+            self.assertFalse(mod.within_project(self.inside, self.project))
+            del resolver.thread                                                  # threads can start again
+            now[0] += resolver.FRESH + 1
+            self.assertFalse(mod.within_project(self.inside, self.project))
+            self.assertTrue(resolver.settle())
+            self.assertTrue(mod.within_project(self.inside, self.project))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX symbolic links')
+    def test_revalidation_needs_its_own_resolution_even_on_a_still_clock(self):
+        # The clock never advances, so an earlier answer carries the same time as this request. Only a resolution
+        # started for this request may answer it.
+        alias = os.path.join(self.project, 'alias'); os.symlink(self.inside, alias, target_is_directory=True)
+        gate, calls = threading.Event(), []
+        self.addCleanup(gate.set)
+        def resolve(cwd, root):
+            calls.append(cwd)
+            if len(calls) > 1:
+                gate.wait(10)
+            return mod.folder_inside(cwd, root)
+        resolver = mod.FolderResolver(resolve=resolve, clock=lambda: 100.0)
+        resolver.REVALIDATE = 0.3
+        self.assertTrue(resolver.revalidate(alias, self.project))         # warmed: inside
+        os.unlink(alias); os.symlink(self.elsewhere, alias, target_is_directory=True)
+        self.assertFalse(mod.folder_inside(alias, self.project))
+        self.assertFalse(resolver.revalidate(alias, self.project))        # its resolution is held: not the old hit
+        self.assertTrue(resolver.lookup(alias, self.project))             # the cache still holds the old answer
+        gate.set()
+        self.assertFalse(resolver.revalidate(alias, self.project))        # a resolution of its own: outside
+
+    def test_results_expire(self):
+        now = [100.0]
+        calls = []
+        resolver = mod.FolderResolver(resolve=lambda cwd, root: calls.append(cwd) or True, clock=lambda: now[0])
+        with patch.object(mod, 'RESOLVER', resolver):
+            mod.within_project(self.inside, self.project); self.assertTrue(resolver.settle())
+            self.assertTrue(mod.within_project(self.inside, self.project))
+            self.assertEqual(len(calls), 1)
+            now[0] += resolver.FRESH + 1
+            self.assertTrue(mod.within_project(self.inside, self.project))    # kept while it refreshes
+            self.assertTrue(resolver.settle()); self.assertEqual(len(calls), 2)
+            now[0] += resolver.KEEP + 1
+            resolver.resolve = lambda cwd, root: (_ for _ in ()).throw(OSError('fictional'))
+            self.assertFalse(mod.within_project(self.inside, self.project))   # too old: outside until resolved
+            self.assertTrue(resolver.settle())
+            self.assertFalse(mod.within_project(self.inside, self.project))   # a failed resolution is outside
+
+    def test_windows_path_forms_simulated(self):
+        import ntpath
+        root = 'C:\\Work\\Project'
+        links = {'C:\\Work\\Project\\escape': 'E:\\Elsewhere', 'C:\\Work\\Project\\inner': 'C:\\Work\\Project\\src'}
+        def resolve(path):          # a link anywhere along the path is followed, as Windows realpath does
+            path = ntpath.normpath(path)
+            for link, target in links.items():
+                if path.lower() == link.lower() or path.lower().startswith(link.lower() + '\\'):
+                    return target + path[len(link):]
+            return path
+        touched = []
+        with patch.object(sys, 'platform', 'win32'), patch.object(mod, 'PATH', ntpath), \
+                patch.object(ntpath, 'isdir', return_value=True), \
+                patch.object(ntpath, 'realpath', side_effect=lambda p: touched.append(p) or resolve(p)):
+            for cwd in (root, 'C:\\Work\\Project\\archive', 'c:\\work\\project\\Archive', 'C:/Work/Project/archive',
+                        'C:\\Work\\Project\\inner'):
+                self.assertTrue(mod.folder_inside(cwd, root), cwd)
+            for cwd in ('C:\\Work\\Project\\escape', 'C:\\Work\\Project\\escape\\deeper'):
+                self.assertFalse(mod.folder_inside(cwd, root), cwd)
+            touched.clear()
+            for cwd in ('C:\\Work\\Project2', 'C:\\Work\\Project-sibling\\sub', 'C:\\Work\\Project\\..\\Other',
+                        'D:\\Work\\Project\\archive', '\\\\server\\share\\Project', 'Work\\Project\\archive',
+                        'C:Project\\archive'):
+                self.assertFalse(mod.folder_inside(cwd, root), cwd)
+                self.assertFalse(mod.within_project(cwd, root), cwd)
+            share = '\\\\server\\share\\Project'
+            for cwd in (share + '\\sub', '\\\\server\\other\\Project\\sub', '\\\\?\\C:\\Work\\Project\\sub'):
+                self.assertFalse(mod.folder_inside(cwd, share if cwd.startswith(share) else root), cwd)
+            self.assertTrue(mod.within_project(share, share))     # the exact project needs no disk
+            self.assertEqual(touched, [])                         # outside by name or on a share: never resolved
+            with patch.object(mod_windows(), 'drive_type', return_value=4):
+                self.assertFalse(mod.folder_inside('Z:\\Work\\Project\\sub', 'Z:\\Work\\Project'))
+            self.assertEqual(touched, [])
+
+
+def mod_windows():
+    import new_chat_folder_chooser_windows
+    return new_chat_folder_chooser_windows
+
+
 class ClaudeModTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -51,7 +250,9 @@ class ClaudeModTests(unittest.TestCase):
             lease.start()
             self.addCleanup(lease.stop)
         self.project = os.path.realpath(self.temp.name)
-        self.wrong_project = os.path.join(self.project, 'fictional-wrong')   # canonical on every system
+        # A sibling folder (outside the project, sharing its name as a prefix); canonical on every system. A folder
+        # inside the project is the same chat's project after a `cd`, so it is not a wrong project.
+        self.wrong_project = self.project + '-fictional-wrong'
         self.sid, self.aid = uid(), None
         self.aid = 'c:'+self.sid
         self.agents = {self.aid: {'runtime': 'Claude', 'name': 'Fictional', 'cwd': self.project}}
