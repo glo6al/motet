@@ -9,7 +9,7 @@
 1. Run a fresh project sweep. Never build a brief from memory.
 2. Open with what needs the owner, from Waiting on you: most important first, each ready for a one-word answer.
 3. Then what happened since the owner left, project by project: what finished, what failed, who is stuck. A line each.
-4. Then each team's suggested goals for today: one or two concrete outcomes, each with what it is based on and its done line.
+4. Then suggested goals for today, for the teams where goals would help: one or two concrete outcomes, each with what it is based on and its done line. Use discernment: a quiet project or a team already on track can be left alone.
    - A team working toward a project goal the owner set: mark that its goals start at the set time if the owner doesn't answer.
    - A team between project goals: say it is waiting, and list the project goals its manager suggests for the owner to choose from.
    - A team whose project couldn't be fully read: no suggestion, and say which part couldn't be read.
@@ -20,6 +20,7 @@
 ### Never
 
 - Suggest a goal without a fresh sweep.
+- Invent goals to fill the brief. Saying nothing about a team is fine.
 - Start a team that is between project goals, or set a project goal.
 - Bury a decision the owner needs to make under the news.
 
