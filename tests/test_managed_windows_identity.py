@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Managed Claude's machine identity and pinned executable on Windows (step 8b.4; the feature stays off there
-until 8b.5).
+"""Managed Claude's machine identity and pinned executable on Windows (step 8b.4; switched on there in 8b.5).
 
 On every system: the SMBIOS parser (fixture tables), the Windows host fingerprint, the build pin by architecture,
 the refused locations, and the bounded hash. Under the Windows simulation on macOS and Linux: finding the build
@@ -246,11 +245,15 @@ class SimulatedExecutableTests(unittest.TestCase):
         self.addCleanup(stack.close)
 
     @staticmethod
-    def past_the_mac_gate():
-        """The gates that keep managed Claude to macOS until 8b.5 read sys.platform (the supervisor's start, and
-        preflight for a real manager): answer 'darwin' while the Windows path behind them is exercised, so these
-        tests run the same on Linux as on a Mac."""
-        return mock.patch.object(sys, 'platform', 'darwin')
+    def as_windows_platform():
+        """The platform gates (the supervisor's start, and preflight for a real manager) read sys.platform, which
+        lets macOS and Windows through and refuses Linux: answer 'win32' while the Windows path behind them is
+        exercised, so these tests run the same on Linux as on a Mac. Preflight on Windows also needs Python 3.12;
+        that gate is tested in test_managed_windows_end_to_end, so here it is taken as met on every Python."""
+        stack = ExitStack()
+        stack.enter_context(mock.patch.object(sys, 'platform', 'win32'))
+        stack.enter_context(mock.patch.object(claude_managed, 'windows_python_supported', return_value=True))
+        return stack
 
     def manager(self):
         return claude_managed.ManagedClaude(self.home / '.live-room', home=self.home, enabled=True,
@@ -303,7 +306,7 @@ class SimulatedExecutableTests(unittest.TestCase):
         return hashed
 
     def available(self, manager):
-        with mock.patch.object(windows, 'breakaway_refusal', return_value=None), self.past_the_mac_gate():
+        with mock.patch.object(windows, 'breakaway_refusal', return_value=None), self.as_windows_platform():
             capability = manager.preflight()
         return capability.available, capability.code
 
@@ -397,7 +400,7 @@ class SimulatedExecutableTests(unittest.TestCase):
             return FakeProcess(), mock.Mock()
         with mock.patch.object(windows, 'open_pinned', open_pinned), \
                 mock.patch.object(windows, 'start_in_job', start_in_job), \
-                mock.patch.object(windows, 'ThreadedPipes', mock.Mock()), self.past_the_mac_gate():
+                mock.patch.object(windows, 'ThreadedPipes', mock.Mock()), self.as_windows_platform():
             transport.start()
         self.assertEqual(events, ['hashed', ('started', exe, str(project))])
         with self.assertRaises(OSError):
@@ -419,7 +422,7 @@ class SimulatedExecutableTests(unittest.TestCase):
             return opened[-1]
         with mock.patch.object(windows, 'open_pinned', open_pinned), \
                 mock.patch.object(windows, 'start_in_job', side_effect=windows.JobError('fictional refusal')), \
-                self.past_the_mac_gate():
+                self.as_windows_platform():
             with self.assertRaises(runner_module.RunnerError) as raised:
                 transport.start()
         self.assertEqual(raised.exception.code, 'unsupported_build')

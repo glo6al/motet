@@ -3,12 +3,16 @@
 Construction and observation never launch a native process. Production readiness
 is deliberately separate from the feature gate and has no environment override.
 
+Platforms (step 8b.5): macOS and Windows (MANAGED_PLATFORMS). Linux stays refused, as it always has been: its
+identity, location and owner steps have never been defined or checked. Every platform still needs the owner-made
+readiness record for this machine, user and pinned build; there is no self-serve setup.
+
 Storage. POSIX: every folder and file is checked on its descriptor (this user's, no group or other bits, one name,
-no link), created 0700 or 0600, and the host and registry locks are blocking ``flock``. Windows (step 8b.1; the
-feature stays refused there until 8b.5): the same folders and files through private_storage, checked on their
-handles and created private from the start; SQLite's own companion files follow private_storage's companion rule;
-folders are flushed through a held handle; and the locks are private_storage's byte lock on the same files, the lock
-the attachment namespace fence takes on ``managed-claude.lock``, waited for up to LOCK_SECONDS.
+no link), created 0700 or 0600, and the host and registry locks are blocking ``flock``. Windows (step 8b.1): the
+same folders and files through private_storage, checked on their handles and created private from the start;
+SQLite's own companion files follow private_storage's companion rule; folders are flushed through a held handle; and
+the locks are private_storage's byte lock on the same files, the lock the attachment namespace fence takes on
+``managed-claude.lock``, waited for up to LOCK_SECONDS.
 """
 from __future__ import annotations
 
@@ -35,7 +39,7 @@ from new_chat_inventory import canonical_uuid, validate_folder
 from attribution import AUTHORS, motet_worded, motet_words
 import private_storage as ps
 from new_chat_types import (Capability, ExecutionResult, FrozenFolder, NewChatError, VerifiedIdentity,
-                            MANAGED_PERMISSION_TIMEOUT_SECONDS)
+                            MANAGED_PERMISSION_TIMEOUT_SECONDS, MANAGED_CLAUDE_PLATFORMS as MANAGED_PLATFORMS)
 
 VERSION = '2.1.323'
 PINNED_SHA256 = '5432918d904a9b6afef7bb79d20df24d76052eabc1f41bceb84091d21f8889a7'
@@ -55,6 +59,12 @@ PERMISSION_REASONS = frozenset(('owner', 'timeout', 'withdrawn', 'turn_ended', '
 STATES = frozenset(('starting', 'ready', 'running', 'needs_attention', 'exited', 'uncertain'))
 PUBLIC_STATES = {'queued': 'sending', 'dispatching': 'sending', 'delivered': 'awaiting_reply',
                  'completed': 'answered', 'failed': 'failed', 'unknown': 'unknown'}
+# MANAGED_PLATFORMS (new_chat_types.MANAGED_CLAUDE_PLATFORMS): macOS and Windows. Linux is deliberately absent:
+# lifting the Mac gate must not switch it on there as a side effect.
+# Windows also needs Python 3.12 or later: before 3.12, os.stat cuts Windows file ids to 64 bits (ReFS keeps 128-bit
+# ids), and the transcript identities managed Claude compares come from os.stat (chat_directory), as the server's
+# WIN_IDS rule says for previews.
+WINDOWS_PYTHON = (3, 12)
 
 
 
@@ -64,7 +74,7 @@ def local_configuration_identity():
     if ps.WIN:
         return _windows_configuration_identity()
     if sys.platform != 'darwin':
-        raise ValueError('Managed Claude requires macOS.')
+        raise ValueError('Managed Claude requires macOS or Windows.')
     output = subprocess.run(['/usr/sbin/ioreg', '-a', '-r', '-d', '1', '-c', 'IOPlatformExpertDevice'],
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             timeout=2, check=True).stdout
@@ -136,7 +146,7 @@ def _readiness_file_identity(st):
 
 def load_configuration_readiness(state_dir, *, enabled=False, demo=False):
     """Read the local qualification once at startup. Missing or unsafe records fail closed."""
-    if enabled is not True or demo is not False or sys.platform != 'darwin':
+    if enabled is not True or demo is not False or sys.platform not in MANAGED_PLATFORMS:
         return False
     if ps.WIN:
         return _windows_readiness(state_dir)
@@ -216,6 +226,37 @@ class ManagedError(NewChatError):
         super().__init__(code, message, status)
 
 
+WINDOWS_PYTHON_WHY = 'Claude run by Motet on Windows needs Python 3.12 or later. Start Motet with a newer Python.'
+STATE_NOT_PRIVATE_WHY = ('Claude run by Motet is off: the .live-room folder in your home folder is not yours alone '
+                         '(another account or group can open it, or it is not owned by you). Make it yours alone, '
+                         'then restart Motet.')
+# Why the server chose not to run managed Claude on a platform that has it (server.CLAUDE_MANAGED_OFF holds the code).
+OFF_REASONS = {'python_unsupported': WINDOWS_PYTHON_WHY, 'state_not_private': STATE_NOT_PRIVATE_WHY}
+
+
+def windows_python_supported(platform=None, version=None):
+    """False only on Windows with a Python older than WINDOWS_PYTHON."""
+    platform = sys.platform if platform is None else platform
+    version = sys.version_info if version is None else version
+    return platform != 'win32' or tuple(version[:2]) >= WINDOWS_PYTHON
+
+
+def state_folder_private(state_dir):
+    """Whether the state folder managed Claude keeps its registry in passes the registry's own check (``_private``,
+    resolved as ManagedClaude resolves it). A missing folder passes: creating the registry checks again, fail-closed.
+    The server asks this at startup so that a folder an older Motet left with wider access (on Windows it keeps
+    whatever access it had) turns managed Claude off plainly instead of hiding every ordinary Claude chat."""
+    try:
+        state_dir = Path(os.path.abspath(os.fspath(state_dir)))
+        directory = state_dir.parent.resolve(strict=True) / state_dir.name
+        _private(directory, True)
+        return True
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, RuntimeError, ManagedError):
+        return False
+
+
 def _fail(code='managed_unavailable', status=409):
     messages = {
         'managed_disabled': 'Managed Claude is unavailable.',
@@ -233,6 +274,7 @@ def _fail(code='managed_unavailable', status=409):
                                       'Motet runs in does not let it leave its job. Try starting Motet from an '
                                       'ordinary terminal window or a shortcut.'),
         'supervisor_not_started': 'Motet could not start the Claude supervisor. Nothing was started.',
+        **OFF_REASONS,
     }
     raise ManagedError(status, code, messages.get(code, messages['managed_unavailable']))
 
@@ -618,8 +660,10 @@ class ManagedClaude:
             self._active()
             if not self.configuration_ready:
                 _fail('configuration_unverified', 503)
-            if not self._test and sys.platform != 'darwin':
+            if not self._test and sys.platform not in MANAGED_PLATFORMS:
                 _fail('app_version_unsupported', 503)
+            if not self._test and not windows_python_supported():
+                _fail('python_unsupported', 503)
             if ps.WIN and self._breakaway_refusal() is not None:
                 # Before any reservation: a supervisor that could not leave the server's job would end with it.
                 _fail('supervisor_detach_refused', 503)
@@ -1499,6 +1543,27 @@ class ManagedClaude:
 
     def close(self):
         self.closed = True
+
+
+class UnavailableAdapter:
+    """New chat's Claude entry when the server chose not to run managed Claude here (CLAUDE_MANAGED_OFF): every
+    call refuses with that plain reason, and nothing is read, created or started."""
+
+    def __init__(self, code):
+        self.code, self.message = code, OFF_REASONS[code]
+
+    def preflight(self):
+        return Capability(False, self.code, self.message, ADAPTER_VERSION, supports_work=False,
+                          supports_blank=False, ownership='watch_managed')
+
+    def _refuse(self, *args, **kwargs):
+        raise ManagedError(503, self.code, self.message)
+
+    reserve = launch_once = verify_existing = start_managed_work_once = _refuse
+    managed_status = managed_execution_status = _refuse
+
+    def close(self):
+        pass
 
 
 class Adapter:

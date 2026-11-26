@@ -4,6 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 MANAGED_PERMISSION_TIMEOUT_SECONDS = 120
+# Where Claude run by Motet may start (step 8b.5 added Windows). Linux is deliberately absent. The one definition the
+# manager, its supervisor and the server all read.
+MANAGED_CLAUDE_PLATFORMS = ('darwin', 'win32')
 
 
 @dataclass(frozen=True)

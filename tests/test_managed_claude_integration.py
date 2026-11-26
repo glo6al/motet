@@ -3,6 +3,7 @@ from dataclasses import replace
 from contextlib import contextmanager
 import http.client
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -17,6 +18,7 @@ from officer_messaging import MessagingStore, MessagingError
 import server
 
 
+@unittest.skipIf(os.name == 'nt', fixture.POSIX_ONLY)
 class ManagedIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.native = fixture.Fixture(methodName='runTest')
@@ -69,7 +71,8 @@ class ManagedIntegrationTests(unittest.TestCase):
             finally:
                 httpd.shutdown(); httpd.server_close(); thread.join()
 
-    @unittest.skipUnless(sys.platform == 'darwin', 'Managed ownership factory is macOS-only')
+    @unittest.skipUnless(sys.platform == 'darwin', 'Queues to a Codex chat (macOS only) through POSIX links; the '
+                         'factory on Windows: test_managed_windows_end_to_end')
     def test_disabled_managed_ownership_under_home_alias_preserves_ordinary_paths(self):
         physical_home = self.native.root / 'home'
         physical_home.mkdir(mode=0o700)

@@ -12,7 +12,9 @@ from new_chat_types import NewChatError
 MAX_BODY = 65536
 
 
-def handle_http(handler, service, owner_key, port):
+def handle_http(handler, service, owner_key, port, unavailable=None):
+    """``unavailable``: the plain reason the server knows New chat did not start (service None), else the generic
+    words are used."""
     handler.close_connection = True
 
     def reply(status, value):
@@ -42,7 +44,7 @@ def handle_http(handler, service, owner_key, port):
             raise NewChatError('invalid_request', 'Invalid New chat route.', 400)
         route = parsed.path
         if service is None:
-            raise NewChatError('unavailable', 'New chat is unavailable on this host.', 503)
+            raise NewChatError('unavailable', unavailable or 'New chat is unavailable on this host.', 503)
         if handler.command == 'GET':
             if headers('Transfer-Encoding') or any(v != '0' for v in headers('Content-Length')) or len(headers('Content-Length')) > 1:
                 raise NewChatError('invalid_request', 'GET requests cannot contain a body.', 400)

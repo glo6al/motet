@@ -16,11 +16,12 @@ from attachments_owner_guards import LINKS, OUTCOMES, OwnerAttachmentGuard, Owne
 from attachments_owner_marker import CLEAR, UNCERTAIN
 from attachments_owner_transport import OwnerAttachmentLedger
 from claude_managed import Adapter, ManagedClaude, ManagedError, TestDependencies, VERSION
-# These suites race managed Claude through POSIX fixtures (os.getuid, fcntl, dir_fd). Managed Claude runs on the Mac
-# only until step 8b.5, so the reason comes from the platform, never from whether its module imports.
+# These suites race managed Claude through POSIX fixtures (os.getuid, fcntl, dir_fd), so they skip on Windows; the
+# reason comes from the platform, never from whether its module imports. Managed Claude on Windows (step 8b.5) is
+# checked by test_managed_windows_storage and test_managed_windows_end_to_end.
 MANAGED_WHY = (None if os.name != 'nt' else
-               'Managed Claude runs on the Mac only until step 8b.5, and these fixtures are POSIX (owner ids, '
-               'fcntl locks, dir_fd).')
+               'These fixtures are POSIX (owner ids, fcntl locks, dir_fd); managed Claude on Windows is checked by '
+               'test_managed_windows_storage and test_managed_windows_end_to_end.')
 from new_chat_types import FrozenFolder
 from officer_messaging import MessagingStore
 from test_attachments_owner_guards import admission, uid

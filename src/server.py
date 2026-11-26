@@ -77,7 +77,16 @@ NATIVE_AGENT_ATTACHMENTS_ENABLED = True
 NEW_CHAT = None                 # owner-only; never a Bridge capability
 NEW_CHAT_ENABLED = True         # rollout gate: intentionally no environment or HTTP override
 CLAUDE_MANAGED_ENABLED = True   # separate lifecycle rollout; no environment or HTTP override
+# Where managed Claude and New chat may start (step 8b.5 added Windows, for Claude only: Codex New chat still needs
+# the Mac app and refuses elsewhere in plain words). Linux stays off; the readiness record is still required. One
+# definition, shared with the manager and its supervisor.
+from new_chat_types import MANAGED_CLAUDE_PLATFORMS
 CLAUDE_MANAGED = None
+# Why startup chose not to run managed Claude on a platform that has it, as a code whose plain words are
+# claude_managed.OFF_REASONS ('state_not_private', or 'python_unsupported' on Windows before Python 3.12), else
+# None. With no manager and no managed state on disk, ordinary Claude chats then need no ownership proof, as before
+# managed Claude existed here.
+CLAUDE_MANAGED_OFF = None
 CLAUDE_MANAGED_FAILED = False   # failed registry startup must not erase its ownership fence
 NEW_CHAT_CLAUDE_DIRECTORY = None
 ANTIGRAVITY_OPEN = None        # separate owner-only native navigation; never a peer capability
@@ -5479,7 +5488,7 @@ class H(BaseHTTPRequestHandler):
             return managed_claude_http.handle_http(self, CLAUDE_MANAGED, KEY, PORT, MESSAGING)
         if self.path.startswith('/api/new-chat/'):
             import new_chat_http
-            return new_chat_http.handle_http(self, NEW_CHAT, KEY, PORT)
+            return new_chat_http.handle_http(self, NEW_CHAT, KEY, PORT, new_chat_unavailable_reason())
         if self.path.startswith('/officer/'):
             return self.officer_models_http('GET')
         if self.path.startswith('/history/'):
@@ -5686,7 +5695,7 @@ class H(BaseHTTPRequestHandler):
             return managed_claude_http.handle_http(self, CLAUDE_MANAGED, KEY, PORT, MESSAGING)
         if self.path.startswith('/api/new-chat/'):
             import new_chat_http
-            return new_chat_http.handle_http(self, NEW_CHAT, KEY, PORT)
+            return new_chat_http.handle_http(self, NEW_CHAT, KEY, PORT, new_chat_unavailable_reason())
         if self.path in ('/officer/validate', '/officer/evidence'):
             if not self.host_ok() or not self.keyed(self.headers.get('X-Live-Room-Key', '')):
                 return self.send(403, b'forbidden')
@@ -6333,7 +6342,7 @@ def claude_permission_ownership_check_required():
         return True
     manager = _managed_permission_registry()
     if manager is None:
-        return (sys.platform == 'darwin' and CLAUDE_MANAGED_ENABLED
+        return (sys.platform in MANAGED_CLAUDE_PLATFORMS and CLAUDE_MANAGED_ENABLED and CLAUDE_MANAGED_OFF is None
                 or _managed_permission_artifacts_present())
     try:
         launch_enabled = manager.enabled and manager.configuration_ready and not manager.demo
@@ -6485,12 +6494,15 @@ def new_chat_inventory():
     """
     import codex_transcript
     from new_chat_types import VerifiedIdentity
-    if sys.platform != 'darwin':
+    if sys.platform not in MANAGED_CLAUDE_PLATFORMS:
         return []
     sessions = os.path.join(HOME, '.codex', 'sessions')
+    # Windows: Claude's own folders only. Codex New chat is not available there, and its transcripts there are not
+    # a source this inventory has been checked against.
+    kinds = ('x:', 'c:') if sys.platform == 'darwin' else ('c:',)
     with LOCK:
         candidates = [aid for aid, row in tuple(AGENTS.items())
-                      if aid.startswith(('x:', 'c:')) and not row.get('sub') and not row.get('parent')]
+                      if aid.startswith(kinds) and not row.get('sub') and not row.get('parent')]
     if len(candidates) > 256:
         return []
     result = []
@@ -6601,11 +6613,25 @@ def admit_new_chat(identity, folder, tails, permit):
 
 
 def start_managed_claude():
-    if sys.platform != 'darwin':
+    """``(manager, failed)``. A managed-Claude problem never hides or blocks a chat Motet did not start: where the
+    state folder fails the registry's privacy check (on Windows an older ``.live-room`` keeps whatever access it had)
+    or Windows runs a Python older than 3.12, no manager is built, CLAUDE_MANAGED_OFF says why, and the ownership
+    fence falls back to whether managed state exists on disk. With none, ordinary chats are unmanaged as before;
+    with some, every Claude chat stays fail-closed (unknown) until it can be read."""
+    global CLAUDE_MANAGED_OFF
+    CLAUDE_MANAGED_OFF = None
+    if sys.platform not in MANAGED_CLAUDE_PLATFORMS:
         return None, False
     try:
-        from claude_managed import ManagedClaude, load_configuration_readiness
+        from claude_managed import (ManagedClaude, load_configuration_readiness, state_folder_private,
+                                    windows_python_supported)
         state_dir = os.path.join(HOME, '.live-room')
+        if not windows_python_supported():
+            CLAUDE_MANAGED_OFF = 'python_unsupported'
+            return None, False
+        if not state_folder_private(state_dir):
+            CLAUDE_MANAGED_OFF = 'state_not_private'
+            return None, False
         demo = os.environ.get('WATCH_DEMO') == '1'
         ready = load_configuration_readiness(state_dir, enabled=CLAUDE_MANAGED_ENABLED, demo=demo)
         return ManagedClaude(state_dir, home=HOME, enabled=CLAUDE_MANAGED_ENABLED,
@@ -6826,9 +6852,20 @@ def start_messaging():
         return None, str(error) if isinstance(error, MessagingStorageUnavailable) else MESSAGING_STORAGE_WHY
 
 
+def new_chat_unavailable_reason():
+    """The plain reason New chat did not start, where startup knows it, else None. On Windows New chat's own state
+    lives in the same ``.live-room``, so a folder that is not private stops it as well as managed Claude."""
+    if NEW_CHAT is None and CLAUDE_MANAGED_OFF == 'state_not_private':
+        from claude_managed import OFF_REASONS
+        return OFF_REASONS[CLAUDE_MANAGED_OFF]
+    return None
+
+
 def start_new_chat():
-    """No native calls on startup; rollout and installed-provider capabilities stay gated."""
-    if sys.platform != 'darwin':
+    """No native calls on startup; rollout and installed-provider capabilities stay gated. On Windows the Codex
+    adapter is still built (constructing it touches nothing) and its preflight refuses in plain words, so New chat
+    offers Claude only there."""
+    if sys.platform not in MANAGED_CLAUDE_PLATFORMS:
         return None
     from codex_new_chat import Adapter
     from new_chat_service import NewChatService
@@ -6837,6 +6874,9 @@ def start_new_chat():
         if CLAUDE_MANAGED is not None:
             from claude_managed import Adapter as ClaudeAdapter
             adapters['claude_code'] = ClaudeAdapter(CLAUDE_MANAGED)
+        elif CLAUDE_MANAGED_OFF is not None:
+            from claude_managed import UnavailableAdapter
+            adapters['claude_code'] = UnavailableAdapter(CLAUDE_MANAGED_OFF)
         chooser = None
         if NEW_CHAT_ENABLED and os.environ.get('WATCH_DEMO') != '1':
             from new_chat_folder_chooser import FolderChooser, host_chooser
@@ -6853,6 +6893,14 @@ if __name__ == '__main__':
     from dictation_proxy import from_environment as dictation_from_environment
     DICTATION_PROXY = dictation_from_environment(HOME, PORT)
     CLAUDE_MANAGED, CLAUDE_MANAGED_FAILED = start_managed_claude()
+    if CLAUDE_MANAGED_OFF is not None:
+        from claude_managed import OFF_REASONS
+        # The one place this shows where the ownership fence hides chats: with managed records on disk and no
+        # manager, every Claude chat stays fail-closed until the cause is fixed.
+        print(OFF_REASONS[CLAUDE_MANAGED_OFF]
+              + (' Until then every Claude chat stays off the stage and Allow / Deny is left to Claude: Motet has '
+                 'records of chats it started here and cannot tell them apart.'
+                 if _managed_permission_artifacts_present() else ''))
     NEW_CHAT = start_new_chat()
     ATTACHMENTS = start_attachments()
     ANTIGRAVITY_OPEN = antigravity_open.Adapter(HOME)

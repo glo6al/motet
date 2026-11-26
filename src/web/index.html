@@ -7845,7 +7845,7 @@ function workspaceNewChatAddFolder(trigger,recovery=null,event=null){
   if(!workspaceNewChatCanAdd()||event?.isTrusted!==true)return;workspaceNewChatRememberDraft();
   if(!WNC.addFolder){
     const d=wncEl('dialog','workspace-dialog');d.id='workspaceAddFolderDialog';d.setAttribute('aria-labelledby','workspaceAddFolderTitle');d.setAttribute('aria-describedby','workspaceAddFolderStatus workspaceAddFolderTrust');
-    d.innerHTML='<header><h2 id="workspaceAddFolderTitle">Add project folder</h2><button type="button" data-close aria-label="Close Add project folder">×</button></header><form><div class="workspace-nc-folder-message"><span class="workspace-nc-folder-reserve" aria-hidden="true">Choose the folder in the window that opened on this Mac.</span><span id="workspaceAddFolderStatus" role="status"></span></div><small id="workspaceAddFolderTrust" class="workspace-nc-folder-hint">Add only folders you trust. A chat started there uses that folder\'s own settings and hooks.</small><button type="button" data-refresh hidden>Refresh availability</button><footer><button type="button" data-action>Cancel</button></footer></form>';
+    d.innerHTML='<header><h2 id="workspaceAddFolderTitle">Add project folder</h2><button type="button" data-close aria-label="Close Add project folder">×</button></header><form><div class="workspace-nc-folder-message"><span class="workspace-nc-folder-reserve" aria-hidden="true">Choose the folder in the window that opened on this computer.</span><span id="workspaceAddFolderStatus" role="status"></span></div><small id="workspaceAddFolderTrust" class="workspace-nc-folder-hint">Add only folders you trust. A chat started there uses that folder\'s own settings and hooks.</small><button type="button" data-refresh hidden>Refresh availability</button><footer><button type="button" data-action>Cancel</button></footer></form>';
     document.body.append(d);WNC.addFolder=d;
     const status=d.querySelector('[role=status]'),action=d.querySelector('[data-action]'),refresh=d.querySelector('[data-refresh]');
     const current=opening=>d.open&&d._opening===opening&&WNC.adapter===opening.adapter&&workspaceNewChatReady()&&(typeof KEY==='undefined'||KEY===opening.owner);
@@ -7872,13 +7872,13 @@ function workspaceNewChatAddFolder(trigger,recovery=null,event=null){
       if(value.state==='saved'){finish(opening,value.folder);return}
       if(value.state==='cancelled'){workspaceNewChatAddFolderClose();return}
       if(value.state==='not_local'){message('Adding a folder needs the computer that runs Motet. Open Motet there and choose the folder.');action.hidden=true;return}
-      if(value.state==='busy'){retry(opening,'A folder window is already open on this Mac. Close it, then try again.');return}
+      if(value.state==='busy'){retry(opening,'A folder window is already open on this computer. Close it, then try again.');return}
       if(value.state==='refused'){if(value.reasonCode==='capacity'){message('The saved project folder limit has been reached.',true);action.hidden=true}else retry(opening,'Motet cannot use that folder.',true);return}
-      if(value.state==='failed'){retry(opening,'Motet could not open the folder window on this Mac. Try again.',false,true);return}
+      if(value.state==='failed'){retry(opening,'Motet could not open the folder window on this computer. Try again.',false,true);return}
       if(value.state==='unknown'){opening.unknown=true;message('Motet could not confirm whether the folder was added. Refresh availability to check before adding it again.');action.hidden=true;revealRefresh(opening);return}
       if(value.state!=='pending'){unknown(opening);return}
-      if(Date.now()-opening.started>150000){Promise.resolve(opening.adapter.cancelFolderChoice(opening.requestId,opening.epoch)).catch(()=>{});retry(opening,'Motet could not open the folder window on this Mac. Try again.',false,true);return}
-      message(value.windowStarted===true?'Choose the folder in the window that opened on this Mac.':'Opening the folder window…');
+      if(Date.now()-opening.started>150000){Promise.resolve(opening.adapter.cancelFolderChoice(opening.requestId,opening.epoch)).catch(()=>{});retry(opening,'Motet could not open the folder window on this computer. Try again.',false,true);return}
+      message(value.windowStarted===true?'Choose the folder in the window that opened on this computer.':'Opening the folder window…');
       opening.timer=setTimeout(()=>read(opening),500);
     };
     const read=async opening=>{if(!current(opening))return;if(document.visibilityState!=='visible'){opening.resume=()=>read(opening);return}try{const value=await opening.adapter.folderChoiceStatus(opening.requestId,opening.epoch);if(!current(opening))return;await follow(opening,value)}catch(_){if(current(opening))unknown(opening)}};
@@ -7886,7 +7886,7 @@ function workspaceNewChatAddFolder(trigger,recovery=null,event=null){
       if(!current(opening)||click?.isTrusted!==true)return;clearTimeout(opening.timer);if(opening.requestId)Promise.resolve(opening.adapter.cancelFolderChoice(opening.requestId,opening.epoch)).catch(()=>{});opening.requestId=null;opening.epoch=null;opening.retry=false;opening.unknown=false;opening.accepted=false;opening.started=Date.now();opening.submissionFocus=document.activeElement;
       message('Opening the folder window…');action.hidden=false;action.disabled=false;action.dataset.primary='false';action.textContent='Cancel';refresh.hidden=true;
       const refreshed=await opening.adapter.retryContext();if(!current(opening))return;
-      if(!refreshed||!opening.adapter.canChooseFolders()){retry(opening,'Motet could not open the folder window on this Mac. Try again.',false,true);return}
+      if(!refreshed||!opening.adapter.canChooseFolders()){retry(opening,'Motet could not open the folder window on this computer. Try again.',false,true);return}
       if(document.visibilityState!=='visible'){opening.retry=true;message('The folder window was not opened. Try again when this page is visible.');action.dataset.primary='true';action.textContent='Try again';return}
       opening.requestId=crypto.randomUUID();opening.epoch=opening.adapter.folderChoiceEpoch();
       const data={requestId:opening.requestId,epoch:opening.epoch,gesture:{trusted:true}};const hint=opening.recovery?.oldFolder||opening.recovery?.folder;if(hint)data.initialPath=hint;

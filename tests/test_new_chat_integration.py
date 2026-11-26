@@ -322,7 +322,8 @@ class DisabledHTTPTests(unittest.TestCase):
                 self.assertIs(service.call_args.kwargs['enabled'], enabled)
 
     def test_unsupported_platform_never_constructs_storage_or_adapter(self):
-        with patch.object(server.sys, 'platform', 'win32'), \
+        # Linux: New chat starts on macOS and (for Claude) on Windows only.
+        with patch.object(server.sys, 'platform', 'linux'), \
                 patch('new_chat_service.NewChatService') as service, patch('codex_new_chat.Adapter') as adapter:
             self.assertIsNone(server.start_new_chat())
             service.assert_not_called()
