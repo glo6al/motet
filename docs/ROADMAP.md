@@ -15,6 +15,7 @@ Planned work after v0.1.0, nearest first. "Designed" means the screens are drawn
 - **Dictation on more devices.** Optional local desktop dictation uses a separately installed free recognizer and displays editable words before Send. Phone capture needs a reviewed secure connection; broader native-platform support also remains. See [local dictation](DICTATION.md).
 - **A live browser at the desk.** A real page you open and operate yourself in a desk's Browser tab, kept apart from the record of what the agent's tools fetched. Nothing opens until you ask.
 - **Stop a chat Motet started.** A chat that Claude run by Motet started has no window of its own, so its desk will offer "Stop this chat" in the menu under the chat's name, with one confirmation. Stopping ends the chat and the sub-agents it started; its history stays, and the stage shows it as stopped until you dismiss it. In this first version a stopped chat is final: it cannot take new messages.
+- **Motet's agent core.** A working day for Motet: goals and promises, wake-ups, proposals approved in one click, help requests from agents, and actions on its own within set rules. See [Motet agent core](MOTET_AGENT_CORE.md). The rules below hold until it ships; the design lists [what changes](MOTET_AGENT_CORE.md#what-changes-from-todays-rules-when-this-is-built).
 - **Permission requests at phone width.** The same request cards on a phone-sized screen. Today a request can only be answered on the computer that runs Motet; answering from another device has to be proven safe before this is built.
 
 ### Asked for, not designed
@@ -124,7 +125,7 @@ These run alongside the product priorities; broader messaging support does not r
 - Fleet-wide running cost estimates where reliable cumulative usage and pricing inputs are available. API accounting for Motet’s own model calls is separate; native context-window snapshots must not be presented as billable usage or subscription charges.
 - A stage overview that uses portrait-screen height more effectively.
 - Broader transcript fixtures and provider compatibility checks.
-- Motet acting on a standing request from the owner: watching for a named event, following up with an agent, or keeping two agents in step. Not agreed or designed. It would stay inside the rules below: the owner decides in advance what it may do, and nothing in a log or a peer message can widen that.
+- Motet acting on a standing request from the owner: watching for a named event, following up with an agent, or keeping two agents in step. Now designed as subroutines in the [agent core](MOTET_AGENT_CORE.md#7-subroutines-tasks-on-a-schedule); not built. It stays inside the rules below until it ships.
 - Running Motet's own questions on a model provider other than Anthropic.
 - Everything on Windows, then Linux as a tested platform.
 
