@@ -77,6 +77,9 @@ NATIVE_AGENT_ATTACHMENTS_ENABLED = True
 NEW_CHAT = None                 # owner-only; never a Bridge capability
 NEW_CHAT_ENABLED = True         # rollout gate: intentionally no environment or HTTP override
 CLAUDE_MANAGED_ENABLED = True   # separate lifecycle rollout; no environment or HTTP override
+# Where managed Claude and New chat may start (step 8b.5 added Windows, for Claude only: Codex New chat still needs
+# the Mac app and refuses elsewhere in plain words). Linux stays off; the readiness record is still required.
+MANAGED_CLAUDE_PLATFORMS = ('darwin', 'win32')
 CLAUDE_MANAGED = None
 CLAUDE_MANAGED_FAILED = False   # failed registry startup must not erase its ownership fence
 NEW_CHAT_CLAUDE_DIRECTORY = None
@@ -6333,7 +6336,7 @@ def claude_permission_ownership_check_required():
         return True
     manager = _managed_permission_registry()
     if manager is None:
-        return (sys.platform == 'darwin' and CLAUDE_MANAGED_ENABLED
+        return (sys.platform in MANAGED_CLAUDE_PLATFORMS and CLAUDE_MANAGED_ENABLED
                 or _managed_permission_artifacts_present())
     try:
         launch_enabled = manager.enabled and manager.configuration_ready and not manager.demo
@@ -6485,12 +6488,15 @@ def new_chat_inventory():
     """
     import codex_transcript
     from new_chat_types import VerifiedIdentity
-    if sys.platform != 'darwin':
+    if sys.platform not in MANAGED_CLAUDE_PLATFORMS:
         return []
     sessions = os.path.join(HOME, '.codex', 'sessions')
+    # Windows: Claude's own folders only. Codex New chat is not available there, and its transcripts there are not
+    # a source this inventory has been checked against.
+    kinds = ('x:', 'c:') if sys.platform == 'darwin' else ('c:',)
     with LOCK:
         candidates = [aid for aid, row in tuple(AGENTS.items())
-                      if aid.startswith(('x:', 'c:')) and not row.get('sub') and not row.get('parent')]
+                      if aid.startswith(kinds) and not row.get('sub') and not row.get('parent')]
     if len(candidates) > 256:
         return []
     result = []
@@ -6601,7 +6607,7 @@ def admit_new_chat(identity, folder, tails, permit):
 
 
 def start_managed_claude():
-    if sys.platform != 'darwin':
+    if sys.platform not in MANAGED_CLAUDE_PLATFORMS:
         return None, False
     try:
         from claude_managed import ManagedClaude, load_configuration_readiness
@@ -6827,8 +6833,10 @@ def start_messaging():
 
 
 def start_new_chat():
-    """No native calls on startup; rollout and installed-provider capabilities stay gated."""
-    if sys.platform != 'darwin':
+    """No native calls on startup; rollout and installed-provider capabilities stay gated. On Windows the Codex
+    adapter is still built (constructing it touches nothing) and its preflight refuses in plain words, so New chat
+    offers Claude only there."""
+    if sys.platform not in MANAGED_CLAUDE_PLATFORMS:
         return None
     from codex_new_chat import Adapter
     from new_chat_service import NewChatService

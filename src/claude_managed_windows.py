@@ -1,5 +1,5 @@
-"""Managed Claude's processes and pipes on Windows (step 8b.2). Importing this module starts nothing and loads no
-Win32 call; the feature stays refused on Windows until step 8b.5.
+"""Managed Claude's processes and pipes on Windows (step 8b.2; switched on in 8b.5). Importing this module starts
+nothing and loads no Win32 call.
 
 POSIX keeps its own way (claude_managed.spawn_runner and claude_managed_runner.NativeTransport): the supervisor
 starts in a new session so it outlives the server, Claude starts in its own session, the pipes are non-blocking

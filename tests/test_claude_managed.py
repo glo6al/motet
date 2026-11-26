@@ -21,6 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import claude_managed as managed
 from new_chat_types import FrozenFolder, VerifiedIdentity
 
+# POSIX fixtures (owner ids, modes, links, flock, a Unix socket). On Windows the same code is checked by
+# test_managed_windows_storage (under the simulation) and test_managed_windows_end_to_end (for real).
+POSIX_ONLY = 'POSIX fixtures; Windows: test_managed_windows_storage and test_managed_windows_end_to_end.'
+
 
 def uid():
     return str(uuid.uuid4())
@@ -45,6 +49,7 @@ class Directory:
         return self.current
 
 
+@unittest.skipIf(os.name == 'nt', POSIX_ONLY)
 class ConfigurationReadinessTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -200,6 +205,7 @@ class ConfigurationReadinessTests(unittest.TestCase):
             self.assertFalse(server.managed_source_allowed('fictional.jsonl', server.ClaudeTail))
 
 
+@unittest.skipIf(os.name == 'nt', POSIX_ONLY)
 class Fixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

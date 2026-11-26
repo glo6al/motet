@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Managed Claude's control channel (step 8b.3; the feature stays off on Windows until 8b.5).
+"""Managed Claude's control channel (step 8b.3; switched on in 8b.5).
 
 On every system: the supervisor's serve loop over an endpoint (the seam the Windows named pipe and the POSIX Unix
 socket share), with the line protocol answered through socket pairs. On macOS and Linux, under the Windows

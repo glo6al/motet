@@ -3,12 +3,14 @@
 Importing this module has no effects. The web process never adopts a PID or
 restarts a native child: only this original supervisor can record its exit.
 
+Platforms: macOS and Windows (MANAGED_PLATFORMS; step 8b.5 added Windows). Linux stays refused.
+
 Private state. POSIX: the run folder is opened from "/" without following a link and every file in it is opened
 relative to it and checked on its descriptor (this user's, no group or other bits, one name), and ``run.lock`` is
-``flock``, as before. Windows (step 8b.1; the feature stays refused there until 8b.5): the run folder is held through
-private_storage's no-link walk and checked private on its handle, its files are opened or created private through
-that held folder, SQLite's companion files follow private_storage's companion rule, and ``run.lock`` is
-private_storage's byte lock. The folder identity is read from a handle there, as New chat's inventory records it.
+``flock``, as before. Windows (step 8b.1): the run folder is held through private_storage's no-link walk and checked
+private on its handle, its files are opened or created private through that held folder, SQLite's companion files
+follow private_storage's companion rule, and ``run.lock`` is private_storage's byte lock. The folder identity is read
+from a handle there, as New chat's inventory records it.
 """
 import contextlib
 import hashlib
@@ -31,6 +33,7 @@ from new_chat_types import MANAGED_PERMISSION_TIMEOUT_SECONDS as PERMISSION_SECO
 import private_storage as ps
 
 PINNED_VERSION = '2.1.323'
+MANAGED_PLATFORMS = ('darwin', 'win32')   # as claude_managed's: Linux stays refused (step 8b.5 added Windows)
 PINNED_SHA256 = '5432918d904a9b6afef7bb79d20df24d76052eabc1f41bceb84091d21f8889a7'
 MAX_FRAME = 256 * 1024
 MAX_RESPONSE = 8 * 1024 * 1024
@@ -453,8 +456,8 @@ def read_decision(run_dir, permission_id, request_id, decision):
 class NativeTransport:
     """Pinned native JSONL, bounded reads/writes, one owned Popen instance.
 
-    POSIX: non-blocking pipes under a selector; Shutdown sends SIGTERM and waits. Windows (step 8b.2; refused there
-    until 8b.5): Claude runs in a kill-on-close job and its pipes are read and written by threads
+    POSIX: non-blocking pipes under a selector; Shutdown sends SIGTERM and waits. Windows (step 8b.2; on since
+    8b.5): Claude runs in a kill-on-close job and its pipes are read and written by threads
     (claude_managed_windows: ``pipes`` and ``job`` are set), with the same line limit, budgets and deadlines;
     Shutdown closes its input, waits as long, then ends the whole job. See claude_managed_windows for why Claude
     ends with its supervisor there."""
@@ -509,7 +512,7 @@ class NativeTransport:
                 os.close(fd)
 
     def start(self):
-        if sys.platform != 'darwin':
+        if sys.platform not in MANAGED_PLATFORMS:
             _fail('unsupported_build')
         exe = self.manifest['executable']['path']
         if ps.WIN:

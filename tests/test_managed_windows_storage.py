@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Managed Claude and New chat private storage on Windows (step 8b.1). The feature itself stays refused on Windows
-until 8b.5; these check the storage it will use.
+"""Managed Claude and New chat private storage on Windows (step 8b.1; the feature was switched on there in 8b.5).
 
 On macOS and Linux the existing runner, manager, New chat service and inventory suites run again under
 tests/windows_simulation.py: private_storage answers with the POSIX walk, fcntl and os.getuid fail if a Windows

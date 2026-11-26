@@ -82,21 +82,25 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_new_chat_service.py
         if: ${{ !cancelled() }}
-      # Off on Windows: managed Claude (chats Motet starts) needs the Mac app, macOS identity and its pinned runner.
+      # Managed Claude (chats Motet starts) on every system since step 8b.5. Their POSIX fixtures skip on Windows,
+      # where the Windows suites below check the same code against real access lists, jobs and pipes.
       - run: python tests/test_managed_new_chat_service.py
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_claude_managed_runner.py
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_claude_managed.py
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_managed_claude_integration.py
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
         timeout-minutes: 5
       - run: python tests/test_managed_claude_http.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-      # The private storage managed Claude and New chat will use on Windows (the feature stays off there until step
-      # 8b.5): simulated on macOS and Linux, against real access lists on Windows.
+      # The private storage managed Claude and New chat use on Windows: simulated on macOS and Linux, against real
+      # access lists on Windows.
       - run: python tests/test_managed_windows_storage.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
@@ -114,6 +118,12 @@ jobs:
       # system, locating and refusing the binary under the Windows simulation, and the firmware call, deny-writers
       # handle and junction refusal on real Windows.
       - run: python tests/test_managed_windows_identity.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+      # Managed Claude switched on (step 8b.5): the platform gates on every system (Linux stays off, Codex New chat
+      # stays Mac-only); on real Windows a whole managed start, one message with one Allow, and Stop through a
+      # fictional claude.exe, with the job tree gone afterwards. A missing Windows prerequisite fails, never skips.
+      - run: python tests/test_managed_windows_end_to_end.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
       - run: node docs/fixtures/new-chat/managed-fixture.test.mjs

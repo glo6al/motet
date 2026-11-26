@@ -177,10 +177,10 @@ def _flock_contender(host, pipe):
 
 
 # The composition is the delivery of files to agent chats. On Windows it is not built (NATIVE_ATTACHMENT_DELIVERY_HOST
-# keeps it off until that delivery is ported) and these tests also race managed Claude, which is Mac-only by design.
+# keeps it off until that delivery is ported) and these tests also race managed Claude through POSIX fixtures.
 # The fence and owner runtime it rests on are tested on Windows in test_attachments_windows_namespace.py.
 WHY = (MANAGED_WHY and 'Delivery to agent chats is off on Windows (not ported yet), and these tests race managed '
-       'Claude, which is Mac-only by design.') or (not GIT and 'Requires Git.') or None
+       'Claude through POSIX fixtures.') or (not GIT and 'Requires Git.') or None
 
 
 @unittest.skipIf(WHY, WHY)

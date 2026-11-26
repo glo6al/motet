@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Managed Claude's processes and pipes on Windows (step 8b.2; the feature stays off there until 8b.5).
+"""Managed Claude's processes and pipes on Windows (step 8b.2; switched on there in 8b.5).
 
 On every system: the runner's native transport in its threaded mode (the reader thread and deadline-bound writes
 Windows uses, because it can select sockets only) against a fictional child, and the Shutdown decision

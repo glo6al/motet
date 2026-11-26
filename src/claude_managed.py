@@ -3,12 +3,16 @@
 Construction and observation never launch a native process. Production readiness
 is deliberately separate from the feature gate and has no environment override.
 
+Platforms (step 8b.5): macOS and Windows (MANAGED_PLATFORMS). Linux stays refused, as it always has been: its
+identity, location and owner steps have never been defined or checked. Every platform still needs the owner-made
+readiness record for this machine, user and pinned build; there is no self-serve setup.
+
 Storage. POSIX: every folder and file is checked on its descriptor (this user's, no group or other bits, one name,
-no link), created 0700 or 0600, and the host and registry locks are blocking ``flock``. Windows (step 8b.1; the
-feature stays refused there until 8b.5): the same folders and files through private_storage, checked on their
-handles and created private from the start; SQLite's own companion files follow private_storage's companion rule;
-folders are flushed through a held handle; and the locks are private_storage's byte lock on the same files, the lock
-the attachment namespace fence takes on ``managed-claude.lock``, waited for up to LOCK_SECONDS.
+no link), created 0700 or 0600, and the host and registry locks are blocking ``flock``. Windows (step 8b.1): the
+same folders and files through private_storage, checked on their handles and created private from the start;
+SQLite's own companion files follow private_storage's companion rule; folders are flushed through a held handle; and
+the locks are private_storage's byte lock on the same files, the lock the attachment namespace fence takes on
+``managed-claude.lock``, waited for up to LOCK_SECONDS.
 """
 from __future__ import annotations
 
@@ -55,6 +59,9 @@ PERMISSION_REASONS = frozenset(('owner', 'timeout', 'withdrawn', 'turn_ended', '
 STATES = frozenset(('starting', 'ready', 'running', 'needs_attention', 'exited', 'uncertain'))
 PUBLIC_STATES = {'queued': 'sending', 'dispatching': 'sending', 'delivered': 'awaiting_reply',
                  'completed': 'answered', 'failed': 'failed', 'unknown': 'unknown'}
+# Where managed Claude may run (step 8b.5 added Windows). Linux is deliberately absent: lifting the Mac gate must not
+# switch it on there as a side effect.
+MANAGED_PLATFORMS = ('darwin', 'win32')
 
 
 
@@ -64,7 +71,7 @@ def local_configuration_identity():
     if ps.WIN:
         return _windows_configuration_identity()
     if sys.platform != 'darwin':
-        raise ValueError('Managed Claude requires macOS.')
+        raise ValueError('Managed Claude requires macOS or Windows.')
     output = subprocess.run(['/usr/sbin/ioreg', '-a', '-r', '-d', '1', '-c', 'IOPlatformExpertDevice'],
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             timeout=2, check=True).stdout
@@ -136,7 +143,7 @@ def _readiness_file_identity(st):
 
 def load_configuration_readiness(state_dir, *, enabled=False, demo=False):
     """Read the local qualification once at startup. Missing or unsafe records fail closed."""
-    if enabled is not True or demo is not False or sys.platform != 'darwin':
+    if enabled is not True or demo is not False or sys.platform not in MANAGED_PLATFORMS:
         return False
     if ps.WIN:
         return _windows_readiness(state_dir)
@@ -618,7 +625,7 @@ class ManagedClaude:
             self._active()
             if not self.configuration_ready:
                 _fail('configuration_unverified', 503)
-            if not self._test and sys.platform != 'darwin':
+            if not self._test and sys.platform not in MANAGED_PLATFORMS:
                 _fail('app_version_unsupported', 503)
             if ps.WIN and self._breakaway_refusal() is not None:
                 # Before any reservation: a supervisor that could not leave the server's job would end with it.
