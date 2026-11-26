@@ -14,8 +14,9 @@
    - A team between project goals: say it is waiting, and list the project goals its manager suggests for the owner to choose from.
    - A team whose project couldn't be fully read: no suggestion, and say which part couldn't be read.
 5. Then promises due today, and any that are slipping.
-6. End with warnings: backups off, spending heading for the daily cap, a goal that won't make its date at this pace.
-7. Let the owner confirm or edit the goals in one go. For each goal confirmed, or started at the set time, run Kick off a goal.
+6. Then stale Agenda items, those with no progress by their check-by date, each as “Keep, change, or drop?” with its owner and what it was for.
+7. End with warnings: backups off, spending heading for the daily cap, a goal that won't make its date at this pace.
+8. Let the owner confirm or edit the goals in one go. For each goal confirmed, or started at the set time, run Kick off a goal.
 
 ### Never
 

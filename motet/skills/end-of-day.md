@@ -18,6 +18,8 @@
    - Tidy memory: join duplicates, mark what is out of date, and write a short summary that points back to its log entries.
    - Find promises that were made but never followed up, and put them on tomorrow's Agenda.
    - Check every correction or preference the owner gave today was written down.
+   - Check each “done” or “blocked” an agent reported on its Agenda item against its log and the record. Until it checks out, the item says “says done” or “says blocked”.
+   - Once a week, the tidy: propose which Agenda items to close (done, overtaken, or untouched for weeks), as one list in Next up for the owner to approve in one go. Close nothing without that yes.
 4. If the Mac was asleep at the set time, run it once when it wakes, not once for each missed day.
 
 ### Never
