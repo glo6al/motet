@@ -1115,6 +1115,49 @@ class ClaudePeerBackendTests(unittest.TestCase):
     def test_derived_move_waits_for_receipts_reported_from_the_earlier_folder(self):
         self.derived_receipts_then_move(expired=False)
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX symbolic links')
+    def test_receipts_from_a_renamed_earlier_folder_are_still_reported(self):
+        # The earlier folder was renamed and its old name now links outside the project: the receipt context is
+        # historical evidence, matched exactly, so the original outcome is still reported and the chat moves.
+        inside = self.subfolder_enrollment()
+        child = lambda accept=True: self.http('/claude-mod/poll', dict(
+            generation=self.generation, native_id=self.sid, project=str(inside), accept=accept,
+            client_id=self.body['client_id']), token=self.token)
+        _, owner = self.request('Fictional owner question from the earlier folder')
+        claim = child()[1]['claim']
+        self.assertEqual(claim['request_id'], owner['request_id'])
+        inside.rename(Path(self.project, 'archive-renamed'))
+        elsewhere = tempfile.TemporaryDirectory(); self.addCleanup(elsewhere.cleanup)
+        inside.symlink_to(os.path.realpath(elsewhere.name), target_is_directory=True)
+        self.assertFalse(mod.project(str(inside)))
+        server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=self.project)
+        seq = self.current_seq()
+        self.assertEqual(self.register_at(self.project, seq + 1)[1].get('error_code'), 'move_pending')
+        # A context that is not exactly this chat's earlier enrollment still fails.
+        status, value = self.register_at(str(Path(self.project, 'archive-renamed')), seq + 2, receipt_only=True)
+        self.assertEqual((status, value.get('error_code')), (409, 'receipt_context_missing'))
+        foreign = dict(self.body, native_id=uid(), project=str(inside), connection_seq=seq + 3, receipt_only=True)
+        self.assertEqual(self.http('/claude-mod/register', foreign, token=self.grant['grant'])[1].get('error_code'),
+                         'identity_rejected')
+        stranger = dict(self.body, project=str(inside), connection_seq=seq + 4, receipt_only=True)
+        self.assertEqual(self.http('/claude-mod/register', stranger, token='f' * 64)[0], 403)
+        # The exact earlier context: receipts only.
+        status, value = self.register_at(str(inside), seq + 5, receipt_only=True)
+        self.assertEqual(status, 200, value)
+        self.token, self.generation = value['token'], value['generation']
+        self.assertIsNone(child()[1]['claim'])
+        answered = dict(generation=self.generation, native_id=self.sid, client_id=self.body['client_id'],
+                        request_id=claim['request_id'], attempt_id=claim['attempt_id'], kind='answered',
+                        turn_id='fictional-turn', answer='WATCH_REPLY ' + claim['request_id'] + '\nFictional reply.')
+        self.assertEqual(self.http('/claude-mod/event', answered, token=self.token)[0], 200)
+        row = next(r for r in self.store._rows() if r['request_id'] == owner['request_id'])
+        self.assertTrue(row.get('settled'))
+        status, value = self.register_at(self.project, seq + 6)
+        self.assertEqual(status, 200, value)
+        self.assertEqual(self.active_projects(), [self.project])
+        # Only the one original claim was ever handed out.
+        self.assertEqual(sum(1 for r in self.store._rows() if r.get('launched')), 1)
+
     def test_derived_move_reports_an_already_expired_request_first(self):
         self.derived_receipts_then_move(expired=True)
 

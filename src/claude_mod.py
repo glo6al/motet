@@ -1130,7 +1130,11 @@ class ClaudeMod:
                 aid = 'c:' + data['native_id']
                 stored = self.db.execute('SELECT project FROM claude_mod_enrollments WHERE agent=? AND active=1 '
                                          'AND grant_id IS NOT NULL', (aid,)).fetchone()
-            if not project(data['project']):
+            # Receipts only, for exactly the folder this chat's existing enrollment names: that is historical
+            # evidence, so today's filesystem need not still spell it canonically (the folder may have been renamed
+            # or replaced). It still receives no claim. Every other registration names a canonical folder now.
+            historical = data.get('receipt_only') is True and stored is not None and stored[0] == data['project']
+            if not historical and not project(data['project']):
                 raise ModError(409, 'The Claude project is not canonical.', 'identity_rejected')
             snapshot = agents() if callable(agents) else agents
             proof = None
