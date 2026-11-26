@@ -1025,6 +1025,125 @@ class ClaudePeerBackendTests(unittest.TestCase):
         self.assertEqual(status, 200, value)
         self.assertEqual(self.active_projects(), [self.project])
 
+    def current_seq(self):
+        return self.store.db.execute('SELECT connection_seq FROM claude_mod_enrollments WHERE agent=? AND active=1',
+                                     (self.aid,)).fetchone()[0]
+
+    def derived_receipts_then_move(self, expired):
+        # An earlier plugin claimed an owner question from the subfolder it enrolled in; its reply is buffered.
+        inside = self.subfolder_enrollment()
+        child = lambda accept=True, **extra: self.http('/claude-mod/poll', dict(
+            generation=self.generation, native_id=self.sid, project=str(inside), accept=accept,
+            client_id=self.body['client_id'], **extra), token=self.token)
+        _, owner = self.request('Fictional owner question')
+        claim = child()[1]['claim']
+        self.assertEqual(claim['request_id'], owner['request_id'])
+        row = lambda: next(r for r in self.store._rows() if r['request_id'] == owner['request_id'])
+        if expired:
+            with self.store.lock, self.store.db:
+                held = row(); held['created'] = time.time() - mod.TTL - 1; self.store.mods.put(held)
+                self.store.mods.maintain()
+            self.assertEqual(row()['state'], 'expired')
+        # The 0.6.4 plugin reloads in the project folder: the move waits for that open request.
+        server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=self.project)
+        seq = self.current_seq()
+        status, value = self.register_at(self.project, seq + 1)
+        self.assertEqual((status, value.get('error_code')), (409, 'move_pending'), value)
+        # Receipts only, for the unchanged earlier enrollment: no claim, but the original outcome is accepted.
+        status, value = self.register_at(str(inside), seq + 2, receipt_only=True)
+        self.assertEqual(status, 200, value)
+        self.token, self.generation = value['token'], value['generation']
+        # The chat is not receivable in its earlier folder: no new question is queued there.
+        later = dict(agent=self.aid, question='Fictional later owner question', request_id=uid())
+        self.assertEqual(self.http('/agent-message', later, owner=True)[0], 503)
+        self.assertIsNone(child()[1]['claim'])
+        self.assertIsNone(child(cwd=str(inside))[1]['claim'])
+        answered = dict(generation=self.generation, native_id=self.sid, client_id=self.body['client_id'],
+                        request_id=claim['request_id'], attempt_id=claim['attempt_id'], kind='answered',
+                        turn_id='fictional-turn', answer='WATCH_REPLY ' + claim['request_id'] + '\nFictional reply.')
+        self.assertEqual(self.http('/claude-mod/event', answered, token=self.token)[0], 200)
+        self.assertTrue(row().get('settled'))
+        # Then the move.
+        status, value = self.register_at(self.project, seq + 3)
+        self.assertEqual(status, 200, value)
+        self.assertEqual(self.active_projects(), [self.project])
+
+    def test_derived_move_waits_for_receipts_reported_from_the_earlier_folder(self):
+        self.derived_receipts_then_move(expired=False)
+
+    def test_derived_move_reports_an_already_expired_request_first(self):
+        self.derived_receipts_then_move(expired=True)
+
+    def test_receipt_only_registration_needs_the_unchanged_earlier_enrollment(self):
+        inside = self.subfolder_enrollment()
+        seq = self.current_seq()
+        for folder in (str(Path(inside, 'other')), self.project):
+            status, value = self.register_at(folder, seq + 1, receipt_only=True)
+            self.assertEqual((status, value.get('error_code')), (409, 'receipt_context_missing'), folder)
+        self.assertEqual(self.register_at(str(inside), seq + 1, receipt_only=False)[0], 400)
+
+    def test_manual_move_waits_for_receipts_reported_from_the_earlier_folder(self):
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                self.manual_receipts_then_move(expired)
+                with self.store.lock, self.store.db:
+                    self.store.db.execute('DELETE FROM claude_mod_enrollments')
+
+    def manual_receipts_then_move(self, expired):
+        inside, enrollment = self.manual_child()
+        _, owner = self.request('Fictional manual owner question')
+        claim = self.manual_poll(str(inside))[1]['claim']
+        self.assertEqual(claim['request_id'], owner['request_id'])
+        row = lambda: next(r for r in self.store._rows() if r['request_id'] == owner['request_id'])
+        if expired:
+            with self.store.lock, self.store.db:
+                held = row(); held['created'] = time.time() - mod.TTL - 1; self.store.mods.put(held)
+                self.store.mods.maintain()
+        server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=self.project)
+        connect = lambda project, **extra: self.http('/claude-mod/connect', dict(native_id=self.sid, project=project, **extra),
+                                                     token=self.token)
+        self.assertEqual(connect(self.project)[1].get('error_code'), 'move_pending')
+        self.assertEqual(connect(self.project, receipt_only=True)[1].get('error_code'), 'receipt_context_missing')
+        status, value = connect(str(inside), receipt_only=True)
+        self.assertEqual(status, 200, value)
+        self.generation = value['generation']
+        self.assertIsNone(self.manual_poll(str(inside))[1]['claim'])
+        answered = dict(generation=self.generation, native_id=self.sid, request_id=claim['request_id'],
+                        attempt_id=claim['attempt_id'], kind='answered', turn_id='fictional-turn',
+                        answer='WATCH_REPLY ' + claim['request_id'] + '\nFictional reply.')
+        self.assertEqual(self.http('/claude-mod/event', answered, token=self.token)[0], 200)
+        self.assertTrue(row().get('settled'))
+        status, value = connect(self.project)
+        self.assertEqual(status, 200, value)
+        self.assertEqual(self.store.db.execute('SELECT project,grant_id FROM claude_mod_enrollments WHERE id=?',
+                                               (enrollment['enrollment_id'],)).fetchone(), (self.project, None))
+
+    def test_unresolved_move_evidence_is_retryable_not_a_rejection(self):
+        inside = self.subfolder_enrollment()
+        _, owner = self.request('Fictional question waiting for the move')
+        server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=self.project)
+        seq = self.current_seq()
+        with patch.object(self.store.shared, 'metadata_target',
+                          side_effect=peer_bridge.PeerError(409, 'Fictional directory scan not finished.')):
+            status, value = self.register_at(self.project, seq + 1)
+        self.assertEqual((status, value.get('error_code')), (409, 'not_observed'), value)
+        # A stage folder not resolved yet is retryable too.
+        gate = threading.Event(); self.addCleanup(gate.set)
+        hanging = mod.FolderResolver(resolve=lambda cwd, root: gate.wait(10) and mod.folder_inside(cwd, root))
+        server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=str(inside))
+        with patch.object(mod, 'RESOLVER', hanging), patch.object(mod.FolderResolver, 'prime',
+                                                                lambda self, cwd, root, timeout=2.0: False):
+            status, value = self.register_at(self.project, seq + 2)
+        self.assertEqual((status, value.get('error_code')), (409, 'not_observed'), value)
+        row = next(r for r in self.store._rows() if r['request_id'] == owner['request_id'])
+        self.assertFalse(row.get('launched'))                                 # no claim before the proof is ready
+        gate.set()
+        server.AGENTS[self.aid] = dict(self.agents[self.aid], cwd=self.project)
+        status, value = self.register_at(self.project, seq + 3)
+        self.assertEqual(status, 200, value)
+        row = next(r for r in self.store._rows() if r['request_id'] == owner['request_id'])
+        self.assertEqual((row['state'], row.get('launched')), ('failed', False))     # never claimed: said so
+
     @unittest.skipIf(os.name == 'nt', 'POSIX symbolic links')
     def test_claim_needs_a_fresh_folder_resolution_after_a_link_moves(self):
         self.setup_global()

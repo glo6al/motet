@@ -1083,6 +1083,65 @@ test('a refused registration is remembered for the folder it happened in, and a 
   assert.equal(registrations(h).at(-1).body.project,'/fictional/project');
 });
 
+// An earlier plugin (no stable root) in a subfolder claimed and answered, but the reply never reached Motet.
+async function bufferedChildReply({manual=false}={}){
+  const storage=new Map(manual?[]:[[GLOBAL_KEY,CONFIG]]);
+  const old=await harness({storage,project:'/fictional/project/sub',fetch:(url,body)=>{
+    if(url.endsWith('/register'))return responseJSON(registered(body));
+    if(url.endsWith('/event')&&body.kind==='answered')throw Error('lost answer');
+  }});
+  if(manual)await old.enroll();
+  await old.tick();await old.tick();await old.waitSubmission();
+  await old.call('turn.start',{text:ENVELOPE,turnId:'child-turn'});
+  await old.call('turn.complete',{turnId:'child-turn',answer:ANSWER,isAborted:false,reason:'answer'});
+  await old.waitCall('/event',(b,c)=>b.kind==='answered'&&c.failed,{settled:true});
+  return storage;
+}
+
+async function upgradeAndMove(storage,{manual=false}={}){
+  let reported=0,moved=false,now=100000;
+  const reload=await harness({storage,root:'/fictional/project',project:'/fictional/project',claimed:false,fetch:(url,body)=>{
+    if(url.endsWith('/event')&&body.kind==='answered'){reported++;return null;}
+    const target=url.endsWith(manual?'/connect':'/register');
+    if(!target)return null;
+    if(body.receipt_only)return manual?null:responseJSON(registered(body));
+    if(body.project==='/fictional/project'&&!reported)return responseJSON({error:'An earlier request is open.',error_code:'move_pending'},409);
+    if(body.project==='/fictional/project'){moved=true;return manual?null:responseJSON(registered(body,{enrollment_id:ATTEMPT,token:'c'.repeat(64)}));}
+    return null;
+  }});
+  for(let i=0;i<30&&!moved;i++){now+=60000;reload.setNow(now);await reload.tick();await new Promise(r=>setImmediate(r));}
+  assert(moved,'the chat moved to its project folder');
+  const connects=reload.calls.filter(c=>c.url.endsWith(manual?'/connect':'/register')).map(c=>c.body);
+  assert.equal(connects[0].receipt_only,true);
+  assert.equal(connects[0].project,'/fictional/project/sub');
+  assert.equal(connects.at(-1).project,'/fictional/project');
+  assert.equal(connects.at(-1).receipt_only,undefined);
+  assert.equal(reported,1,'the original receipt is reported exactly once');
+  assert.equal(reload.events().filter(e=>e.kind==='answered')[0].answer,ANSWER);
+  const receiptPolls=reload.calls.filter(c=>c.url.endsWith('/poll')&&c.body.project==='/fictional/project/sub');
+  assert(receiptPolls.every(c=>c.body.accept===false),'the earlier folder never accepts a claim');
+  assert.equal(reload.submissions.length,0,'no prompt is replayed');
+}
+
+test('an upgraded automatic connection reports a buffered reply from its earlier folder, then moves',async()=>{
+  await upgradeAndMove(await bufferedChildReply());
+});
+
+test('an upgraded manual pairing reports a buffered reply from its earlier folder, then moves',async()=>{
+  await upgradeAndMove(await bufferedChildReply({manual:true}),{manual:true});
+});
+
+test('evidence that is not ready yet is retried on later ticks without a reset',async()=>{
+  let attempts=0,now=100000;
+  const h=await harness({startup:sdk,root:'/fictional/project',storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>url.endsWith('/register')&&++attempts<=2?responseJSON({error:'Waiting for verified local Claude parent metadata.',error_code:'not_observed'},409):globalFetch(url,body)});
+  h.setCwd('/fictional/project/src');
+  for(let i=0;i<10&&attempts<3;i++){now+=120000;h.setNow(now);await h.tick();}
+  assert.equal(attempts,3);
+  assert.equal(h.submissions.length,0);
+  assert.equal(JSON.parse((await h.command('watch-status')).text).connected,true);
+});
+
 test('semantic observers remove subscriptions on success timeout and predicate exceptions',async()=>{
   const bus=observationBus();let ready=false;
   const waiting=bus.wait(()=>ready,'success');assert.equal(bus.pending,1);ready=true;bus.notify();assert.equal(await waiting,true);assert.equal(bus.pending,0);

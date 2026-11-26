@@ -297,6 +297,8 @@ class ClaudeMod:
     def __init__(self, store):
         self.store, self.db = store, store.db
         self.room_snapshot = None
+        # Generations connected for receipts only (an earlier folder's retained replies): they never get a claim.
+        self.receipt_generations = {}
         self.attachment_mount = None
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_pairs (
             code_hash TEXT PRIMARY KEY, agent TEXT NOT NULL, project TEXT NOT NULL, expires REAL NOT NULL)''')
@@ -445,11 +447,19 @@ class ClaudeMod:
             return True
         return self.attachment_busy(entry['agent'])
 
+    def _receipt_only(self, generation, on):
+        if on:
+            self.receipt_generations[generation] = True
+            while len(self.receipt_generations) > 1024:
+                self.receipt_generations.pop(next(iter(self.receipt_generations)))
+        else:
+            self.receipt_generations.pop(generation, None)
+
     def _move_ready(self, entry):
         """A chat moves to its project folder only with nothing in flight; requests not yet handed over fail."""
         if self._unsettled(entry):
             raise ModError(409, 'This chat has an earlier Motet request still open. It moves to its project folder '
-                                'once that request settles, or once it is cleared from Chats on hold in Motet.',
+                                'once the plugin has reported that request\'s outcome from its earlier folder.',
                            'move_pending')
         self._fail_unclaimed({entry['id']}, 'This chat moved to its project folder before the request was claimed. '
                                             'Nothing was submitted.')
@@ -485,7 +495,9 @@ class ClaudeMod:
 
     def registration_access(self, data, token):
         fields = ('native_id', 'project', 'client_id', 'connection_seq')
-        schema(data, fields + tuple(k for k in ('peer_protocol', 'reply_notice_protocol', 'lifecycle_protocol', 'peer_envelope_limit') if isinstance(data, dict) and k in data))
+        schema(data, fields + tuple(k for k in ('peer_protocol', 'reply_notice_protocol', 'lifecycle_protocol', 'peer_envelope_limit', 'receipt_only') if isinstance(data, dict) and k in data))
+        if data.get('receipt_only', True) is not True:
+            raise ModError(400, 'Invalid Claude receipt-only registration.')
         if type(data.get('reply_notice_protocol', 0)) is not int or data.get('reply_notice_protocol', 0) not in (0, 1):
             raise ModError(400, 'Unsupported reply-notice protocol.')
         if type(data.get('lifecycle_protocol', 0)) is not int or data.get('lifecycle_protocol', 0) not in (0, 2):
@@ -515,7 +527,21 @@ class ClaudeMod:
         protocol, seq = data.get('peer_protocol', 0), data['connection_seq']
         aid, gid = 'c:'+data['native_id'], grant[0]
         item = agents.get(aid) if isinstance(agents, dict) else None
-        if isinstance(agents, dict) and aid in agents:
+        receipts = data.get('receipt_only') is True
+        if receipts:
+            # Receipt-only: reconnect this chat's existing enrollment, for an earlier folder, unchanged, to report
+            # the outcomes it retained. Its folder need not hold the chat now; it never receives a claim.
+            if isinstance(agents, dict) and aid in agents:
+                if not local_parent(aid, item):
+                    raise ModError(409, 'This is not an eligible local parent Claude chat and project.', 'identity_rejected')
+            elif not (proof and proof['agent'] == aid and self.store.shared.metadata_current(proof)
+                      and (proof['project'] == data['project'] or _textually_inside(data['project'], proof['project']))):
+                raise ModError(409, 'Waiting for verified local Claude parent metadata.', 'not_observed')
+            current = self.db.execute('SELECT id FROM claude_mod_enrollments WHERE agent=? AND active=1', (aid,)).fetchone()
+            current = self.get(current[0]) if current else None
+            if not current or current['grant_id'] != gid or current['project'] != data['project']:
+                raise ModError(409, 'No earlier Motet connection of this chat holds that folder.', 'receipt_context_missing')
+        elif isinstance(agents, dict) and aid in agents:
             if not local_parent(aid, item):
                 raise ModError(409, 'This is not an eligible local parent Claude chat and project.', 'identity_rejected')
             if not item.get('cwd'):
@@ -540,12 +566,14 @@ class ClaudeMod:
         if entry and not entry['grant_id']:
             raise ModError(409, 'This chat retains its manual Motet connection.', 'manual_conflict')
         if (entry and entry['grant_id'] == gid and entry['project'] != data['project']
-                and _textually_inside(entry['project'], data['project'])
-                and self._launch_proven(aid, data['project'], proof) and within_project(entry['project'], data['project'])):
-            # Upgrade: the enrollment names a subfolder of the chat's proven launch folder, which the plugin now
-            # reports. Replace it with one for the launch folder, as a fresh registration would; never across hosts,
-            # and only from a newer registration episode. Every check comes before any change, so a refused
-            # upgrade leaves the enrollment, its connection and its requests exactly as they were.
+                and _textually_inside(entry['project'], data['project'])):
+            # Upgrade: the enrollment names a subfolder of the chat's launch folder, which the plugin now reports
+            # (both canonical names, so their spelling settles containment). Replace it with one for the launch
+            # folder, as a fresh registration would; never across hosts, and only from a newer registration
+            # episode. Every check comes before any change, so a refused upgrade leaves the enrollment, its
+            # connection and its requests exactly as they were. Proof that is not ready yet is retryable.
+            if not self._launch_proven(aid, data['project'], proof):
+                raise ModError(409, 'Waiting for verified local Claude parent metadata.', 'not_observed')
             if entry['client_id'] != data['client_id'] and entry['generation']:
                 raise ModError(409, 'Another Claude host currently owns this chat connection.', 'host_conflict')
             if entry['client_id'] == data['client_id'] and seq <= entry['connection_seq']:
@@ -580,6 +608,7 @@ class ClaudeMod:
                                                time.time(), gid, data['client_id'], seq, protocol, data.get('reply_notice_protocol', 0), data.get('lifecycle_protocol', 0), data.get('peer_envelope_limit', 4000)))
             entry = self.get(eid)
         entry = self.get(entry['id'])
+        self._receipt_only(entry['generation'], receipts)
         peer_lifecycle.record_event(self.db, 'enrollment:' + entry['id'], 'registered', 'connection_episode', '', entry['generation'],
                                     event_id='register:' + entry['id'] + ':' + entry['generation'])
         return dict(self.session(entry), enrollment_id=entry['id'], token=service_token)
@@ -763,6 +792,13 @@ class ClaudeMod:
             return None
         entry = self.authenticate(token)
         self.validate_poll(entry, data)
+        # Attachments are placed in the chat's folder, so only the project folder itself may receive them. With
+        # folder protocol 1 that is judged on the folder the host reports; the stage's or launch folder never
+        # stands in for it. An older plugin reports none and keeps the stage's exact-project rule.
+        if 'cwd' in data and data['cwd'] != entry['project']:
+            return None
+        if entry['generation'] in self.receipt_generations:
+            return None
         snapshot = agents() if callable(agents) else agents
         item = snapshot.get(entry['agent']) if isinstance(snapshot, dict) else None
         if not data['accept'] or self.attachment_entry(entry['agent'], item) != entry:
@@ -810,6 +846,8 @@ class ClaudeMod:
             self.maintain()
             entry = self.authenticate(token)
             self.validate_poll(entry, data)
+            if data['accept'] and entry['generation'] in self.receipt_generations:
+                data = dict(data, accept=False)     # receipts only: heartbeats and outcomes, never a new claim
             new_rows = [r for r in self.rows() if data['accept'] and r.get('mod_enrollment') == entry['id']
                         and not r.get('launched') and r['state'] == 'sending']
             candidates = [r for r in new_rows if self.peer_row(r)]
@@ -843,6 +881,8 @@ class ClaudeMod:
             # Connection or grant replacement during preparation invalidates this
             # poll; retained original attempts can still recover after reconnect.
             entry = self.authenticate(token)
+            if entry['generation'] in self.receipt_generations:
+                data = dict(data, accept=False)
             result = self.poll(entry, data, snapshot, prepared, observed=observed)
             mount = self.attachment_mount
         if mount is None or not data['accept'] or result['claim'] is not None or entry['lifecycle_protocol'] != 2:
@@ -1096,21 +1136,25 @@ class ClaudeMod:
             proof = None
             observed = snapshot.get(aid) if isinstance(snapshot, dict) else None
             cwd = observed.get('cwd') if isinstance(observed, dict) else None
-            if not isinstance(snapshot, dict) or aid not in snapshot:
+            if data.get('receipt_only') is True:
+                if not isinstance(snapshot, dict) or aid not in snapshot:
+                    proof = self._launch_proof(aid, None)
+            elif not isinstance(snapshot, dict) or aid not in snapshot:
                 try:
                     proof = self.store.shared.metadata_target(aid, data['project'])
                 except Exception:
                     raise ModError(409, 'Waiting for verified local Claude parent metadata.', 'not_observed') from None
-            elif project_text(cwd) and cwd != data['project'] and _textually_inside(cwd, data['project']):
+            elif (data.get('receipt_only') is not True and project_text(cwd) and cwd != data['project']
+                  and _textually_inside(cwd, data['project'])):
                 # Outside the store lock: prove the launch folder and resolve the working folder.
                 proof = self._launch_proof(aid, data['project'])
                 RESOLVER.prime(cwd, data['project'])
             stored = stored[0] if stored else None
-            if project_text(stored) and stored != data['project'] and _textually_inside(stored, data['project']):
-                # An enrollment made from a subfolder (before plugin 0.6.3) names that subfolder; the plugin now
+            if (data.get('receipt_only') is not True and project_text(stored) and stored != data['project']
+                    and _textually_inside(stored, data['project'])):
+                # An enrollment made from a subfolder by an earlier plugin names that subfolder; the plugin now
                 # names the chat's project root. Prove the root is the launch folder before moving the enrollment.
                 proof = proof or self._launch_proof(aid, data['project'])
-                RESOLVER.prime(stored, data['project'])
             with self.store.lock, self.db:
                 self.maintain()
                 current = agents() if callable(agents) else agents  # pure room snapshot only
@@ -1151,9 +1195,14 @@ class ClaudeMod:
             if method == 'connect':
                 if entry['grant_id']:
                     raise ModError(409, 'Automatic Claude connections reconnect through registration.', 'register_required')
-                schema(data, ('native_id', 'project'))
+                schema(data, ('native_id', 'project') + (('receipt_only',) if isinstance(data, dict) and 'receipt_only' in data else ()))
                 self.native(entry, data, connected=False)
+                receipts = data.get('receipt_only', False)
+                if receipts not in (True, False) or 'receipt_only' in data and receipts is not True:
+                    raise ModError(400, 'Invalid Claude receipt-only connection.')
                 moved = data['project'] != entry['project']
+                if receipts and moved:
+                    raise ModError(409, 'No earlier Motet connection of this chat holds that folder.', 'receipt_context_missing')
                 # A manual pairing made from a subfolder by an earlier plugin may move to the chat's project folder:
                 # only on this manual credential, only to the proven launch folder, only from a folder inside it,
                 # and only with nothing in flight. It stays a manual, owner-only connection.
@@ -1167,6 +1216,7 @@ class ClaudeMod:
                 self.db.execute('UPDATE claude_mod_enrollments SET generation=?,last_seen=? WHERE id=?', (generation, time.time(), entry['id']))
                 if moved:
                     self.db.execute('UPDATE claude_mod_enrollments SET project=? WHERE id=?', (data['project'], entry['id']))
+                self._receipt_only(generation, receipts)
                 return self.session(self.get(entry['id']))
             if method == 'event':
                 return self.event(entry, data)

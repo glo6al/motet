@@ -315,6 +315,41 @@ class ClaudeAttachmentIntegration(unittest.TestCase):
         self.assertNotIn(ANSWER, json.dumps(self.attach('GET', '/native/requests?' + urlencode(self.context(selection)))))
         self.assertIsNone(self.poll(session))
 
+    def folder_poll(self, session, cwd):
+        data = {k: session[k] for k in ('native_id', 'generation', 'client_id', 'project')}
+        return self.http('POST', '/claude-mod/poll', dict(data, accept=True, cwd=cwd), token=session['token'], owner=False)['claim']
+
+    def test_attachments_go_only_to_the_project_folder_the_host_reports(self):
+        # The stage still shows the project folder. A chat that reports another folder, even one inside the
+        # project, never receives an attachment; an older plugin that reports none keeps the stage's exact rule.
+        self.start()
+        session = self.register()
+        selection = self.selection()
+        intent = self.prepare(selection)
+        self.send(intent)
+        child = self.project / 'notes'; child.mkdir()
+        reported = [str(child)]
+        if os.name != 'nt':
+            outside = self.home / 'elsewhere'; outside.mkdir()
+            alias = self.project / 'alias'; alias.symlink_to(outside, target_is_directory=True)
+            reported.append(str(alias))
+        for cwd in reported:
+            self.assertIsNone(self.folder_poll(session, cwd), cwd)
+        # Not handed over: the one claim this request can have is still available, to an older plugin at the root.
+        claim = self.poll(session)
+        self.assertIsNotNone(claim)
+        self.assertIn('Attachment relay version: 3', claim['envelope'])
+
+    def test_an_attachment_claim_follows_the_reported_project_folder(self):
+        self.start()
+        session = self.register()
+        selection = self.selection()
+        intent = self.prepare(selection)
+        self.send(intent)
+        claim = self.folder_poll(session, str(self.project))
+        self.assertIsNotNone(claim)
+        self.assertIn('Attachment relay version: 3', claim['envelope'])
+
     def test_off_gates_inert_and_retained_busy_orphan_checks_are_target_specific(self):
         state = self.home / '.live-room'
         fence = NativeNamespaceFence(state)

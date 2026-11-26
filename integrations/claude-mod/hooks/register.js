@@ -48,6 +48,42 @@ function insideFolder(path, root, rules) {
 // is the root or inside it by name; otherwise there is no project (null), which matches no enrollment, so a chat
 // that left its project stops. A host without `root()`, or one whose `root()` fails, keeps the stricter `cwd()`
 // comparison.
+// Receipts still to report: retained events neither acknowledged nor refused for good. A context with any keeps
+// its earlier folder until they are reported, so the chat does not move away from replies it still holds.
+async function unreported(requests, acknowledged = {}) {
+  for (const request of Object.values(requests || {})) {
+    for (const value of Array.isArray(request?.events) ? request.events : []) {
+      const hash = await fingerprint(canonicalReceipt(value));
+      if (acknowledged[hash] || acknowledged[await fingerprint(value)]) continue;
+      if ((request.rejections?.[hash]?.count ?? 0) >= MAX_RECEIPT_REJECTIONS) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+// An automatic connection made by an earlier plugin from a folder inside this project, whose retained outcomes are
+// not all reported yet: its folder, so the plugin reconnects there for receipts only before moving.
+async function earlierReceipts($, state, id, project, config) {
+  const keys = await $.store.keys();
+  if (!Array.isArray(keys) || keys.length > 4096) return null;
+  const rules = await pathRules($), contexts = new Map();
+  for (const key of keys) {
+    if (typeof key !== 'string' || ![shardPrefix(id), legacyShardPrefix(id)].some(prefix => key.startsWith(prefix))) continue;
+    const shard = await $.store.get(key);
+    if (!shard || shard.mode !== 'derived' || shard.native_id !== id || shard.grant_id !== config.grant_id ||
+        shard.project === project || !insideFolder(shard.project, project, rules)) continue;
+    const scope = JSON.stringify([shard.project, shard.enrollment_id]);
+    if (!contexts.has(scope)) contexts.set(scope, []);
+    contexts.get(scope).push(shard);
+  }
+  for (const shards of contexts.values()) {
+    const acknowledged = Object.assign({}, ...shards.map(shard => shard.acknowledged || {}));
+    for (const shard of shards) if (await unreported(shard.requests, acknowledged)) return shard.project;
+  }
+  return null;
+}
+
 // A refused registration is not tried again from the same place, so a refusal that repeats cannot storm Motet.
 // The place is the chat's actual folder, not only its project: Motet judges the folder the chat is in, so after a
 // move (back to the project folder, say) the chat registers again.
@@ -462,10 +498,9 @@ async function submitNotice($,state,request,envelope,epoch) {
 // A claim may run only in the folder it was granted for: the folder this chat reported in the poll that carried
 // the claim (Motet resolved it, links included, before granting), or, with an older Motet that does not check
 // folders, the project folder itself.
-async function claimFolderHolds($, state, request) {
+async function claimFolderHolds($, state, granted) {
   if (await sessionProject($) !== state.data.project) return false;
   const cwd = await $.session.cwd();
-  const granted = state.claimFolders.get(request.request_id);
   return state.folderProtocol === 1 && typeof granted === 'string' ? cwd === granted : cwd === state.data.project;
 }
 
@@ -473,13 +508,13 @@ async function failRequest($, state, request) {
   try {if(request.kind==='peer_reply_notice')await noticeEvent($,state,request,'unknown');else await event($,state,request,'unknown');} catch { /* Server claim remains attempted. */ }
 }
 
-async function submit($, state, request, envelope, epoch) {
+async function submit($, state, request, envelope, epoch, granted = null) {
   try {
     const id = await $.session.id(), now = await $.clock.now();
-    if (!state.connected || state.epoch !== epoch || id !== state.data.native_id || !await claimFolderHolds($,state,request)) {await failRequest($,state,request); return;}
+    if (!state.connected || state.epoch !== epoch || id !== state.data.native_id || !await claimFolderHolds($,state,granted)) {await failRequest($,state,request); return;}
     if (now / 1000 >= request.expires_at) {await event($,state,request,'dropped'); return;}
     await save($,state,()=>{request.attempted = true; request.phase = 'pending';});
-    if (!state.connected || state.epoch !== epoch || await $.session.id() !== state.data.native_id || !await claimFolderHolds($,state,request)) {await failRequest($,state,request); return;}
+    if (!state.connected || state.epoch !== epoch || await $.session.id() !== state.data.native_id || !await claimFolderHolds($,state,granted)) {await failRequest($,state,request); return;}
     state.envelope = envelope;
     const result = await $.prompt.submit({text:envelope,asUser:false});
     if (typeof result?.drop === 'string') {
@@ -500,7 +535,7 @@ async function poll($, state) {
   const epoch = state.epoch;
   const folder = state.folderProtocol === 1 ? await $.session.cwd() : null;
   const response = await post($,state,'poll',{...identityBody(state),project:state.data.project,
-    ...(typeof folder === 'string' ? {cwd:folder} : {}),accept:!state.flight && !state.submitting});
+    ...(typeof folder === 'string' ? {cwd:folder} : {}),accept:!state.receiptOnly && !state.flight && !state.submitting});
   if (!sessionResponse({...response,heartbeat_interval_ms:2000,lease_seconds:12},state.data.native_id) || response.generation !== state.generation) throw Error('Invalid Motet poll identity.');
   if (!state.connected || state.epoch !== epoch) return;
   const turns = response.recoverable_turns;
@@ -528,17 +563,17 @@ async function poll($, state) {
     return;
   }
   request.envelope_digest = await fingerprint(claim.envelope);
-  state.claimFolders.set(request.request_id, typeof folder === 'string' ? folder : null);
   state.flight = request;
   await save($,state,data=>{data.requests[request.request_id] = request;});
   state.submitting = true;
-  submit($,state,request,claim.envelope,epoch).catch(()=>{});
+  // The granted folder travels with this one submission and nowhere else, so nothing accumulates per claim.
+  submit($,state,request,claim.envelope,epoch,typeof folder === 'string' ? folder : null).catch(()=>{});
 }
 
 async function activate($, state, response, eligibilityEpoch) {
   checkEligibility(state,eligibilityEpoch);
   if (!sessionResponse(response,state.data.native_id)) throw Error('Invalid Motet connection identity.');
-  if (await $.session.id() !== state.data.native_id || await sessionProject($) !== state.data.project) throw Error('Native conversation changed.');
+  if (await $.session.id() !== state.data.native_id || !state.receiptOnly && await sessionProject($) !== state.data.project) throw Error('Native conversation changed.');
   checkEligibility(state,eligibilityEpoch);
   state.generation = response.generation;
   // Only this current derived connection can negotiate peer input. Saved receipts and
@@ -572,7 +607,7 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
     // Reserve before I/O, including while not connected: lost commits never reuse a tuple's episode.
     if(!Number.isSafeInteger(state.sequence+1))throw Error('Motet connection sequence exhausted.');
     const sequence=++state.sequence;
-    const body={native_id:id,project,client_id:state.clientId,connection_seq:sequence,peer_protocol:1,...notices?{reply_notice_protocol:1}:{},...lifecycle?{lifecycle_protocol:2}:{},...largePeer?{peer_envelope_limit:100000}:{}};
+    const body={native_id:id,project,client_id:state.clientId,connection_seq:sequence,...state.receiptOnly?{receipt_only:true}:{},peer_protocol:1,...notices?{reply_notice_protocol:1}:{},...lifecycle?{lifecycle_protocol:2}:{},...largePeer?{peer_envelope_limit:100000}:{}};
     const response=await post($,state,'register',body,{port:config.port,token:config.grant});
     checkEligibility(state,eligibilityEpoch);
     if(!sessionResponse(response,id)||response.grant_id!==config.grant_id||!UUID.test(response.enrollment_id)||
@@ -584,7 +619,7 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
   }
   let response=await registration();
   if(response.supported_reply_notice_protocol===1 || response.supported_lifecycle_protocol===2 || response.supported_peer_envelope_limit===100000)response=await registration(response.supported_reply_notice_protocol===1,response.supported_lifecycle_protocol===2,response.supported_peer_envelope_limit===100000);
-  if (await $.session.id() !== id || await sessionProject($) !== project) throw Error('Native conversation changed.');
+  if (await $.session.id() !== id || !state.receiptOnly && await sessionProject($) !== project) throw Error('Native conversation changed.');
   checkEligibility(state,eligibilityEpoch);
   const same = state.data?.mode === 'derived' && state.data.native_id === id && state.data.project === project &&
     state.data.grant_id === config.grant_id && state.data.enrollment_id === response.enrollment_id;
@@ -658,7 +693,7 @@ async function supervisor($, state) {
     const config = globalConfiguration(raw) ? raw : null;
     const preference = UUID.test(id) ? await $.store.get(preferenceKey(id)) : null;
     checkEligibility(state,eligibilityEpoch);
-    const changed = state.data && (id !== state.data.native_id || project !== state.data.project ||
+    const changed = state.data && (id !== state.data.native_id || project !== state.data.project && !state.receiptOnly ||
       (state.data.mode === 'derived' && configurationId(config) !== configurationId(state.config)));
     if (changed || preference?.disconnected === true || !UUID.test(id)) {
       if (preference?.disconnected === true || !UUID.test(id)) eligibilityEpoch = invalidateEligibility(state);
@@ -683,6 +718,16 @@ async function supervisor($, state) {
     if (surfaces === null) return;
     if (surfaces.includes('desktop') && UUID.test(id)) state.desktopBinding = {native_id:id,project};
     if (!state.interactive && !(state.desktopBinding?.native_id === id && state.desktopBinding.project === project)) return;
+    if (state.connected && state.receiptOnly && !state.flushing && !state.recovering &&
+        !await unreported(state.data.requests, state.data.acknowledged)) {
+      // Every outcome from the earlier folder is reported: leave that context and connect in the project folder.
+      const data = state.data;
+      suspend($,state);
+      state.receiptOnly = false; state.retryAt = 0; state.failures = 0;
+      if (data.mode === 'derived') {state.data = null; state.key = null;}
+      else state.data = {...data, project};
+      return;
+    }
     if (now < state.retryAt) return;
     if (!state.connected) {
       if (state.submitting) return;
@@ -694,18 +739,24 @@ async function supervisor($, state) {
         // same manual connection; Motet moves it only after proving the root is this chat's launch folder, and it
         // stays a manual (owner-only) connection. Nothing is saved until Motet accepts.
         else if (manual?.native_id === id && manual.active && typeof project === 'string' && insideFolder(manual.project, project, await pathRules($))) {
-          state.data = {...manual, project}; state.key = legacyKey(id);
+          state.receiptOnly = await unreported(manual.requests);
+          state.data = state.receiptOnly ? manual : {...manual, project}; state.key = legacyKey(id);
         }
       }
       if (state.data?.mode === 'derived' || (!state.data && config)) {
         if (!config || state.rejectedGrant === configurationId(config) || state.rejectedIdentity === await refusalKey($,state,id,project,config)) return;
-        await connectDerived($,state,id,project,config,eligibilityEpoch);
+        // Report an earlier folder's retained outcomes first (receipts only, no claims); then move.
+        const earlier = await earlierReceipts($,state,id,project,config);
+        checkEligibility(state,eligibilityEpoch);
+        state.receiptOnly = earlier !== null;
+        if (state.data && state.data.project !== (earlier ?? project)) {state.data = null; state.key = null;}
+        await connectDerived($,state,id,earlier ?? project,config,eligibilityEpoch);
       } else {
         const stored = state.data ?? await $.store.get(legacyKey(id));
         checkEligibility(state,eligibilityEpoch);
-        if (!stored || stored.native_id !== id || stored.project !== project || !stored.active) return;
+        if (!stored || stored.native_id !== id || stored.project !== project && !state.receiptOnly || !stored.active) return;
         state.key = legacyKey(id); state.data = stored;
-        const response = await post($,state,'connect',{native_id:id,project});
+        const response = await post($,state,'connect',{native_id:id,project:stored.project,...state.receiptOnly?{receipt_only:true}:{}});
         checkEligibility(state,eligibilityEpoch);
         await activate($,state,response,eligibilityEpoch);
       }
@@ -814,7 +865,7 @@ async function completeRecoveredTurns($, state) {
 
 export function register(on) {
   const state = {clientId:crypto.randomUUID(),sequence:-1,data:null,key:null,config:null,generation:null,connected:false,epoch:0,eligibilityEpoch:0,desktopBinding:null,disconnecting:0,
-    timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,claimFolders:new Map(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
+    timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
     rejectedGrant:'',rejectedIdentity:'',startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
@@ -877,7 +928,7 @@ export function register(on) {
         state.rejectedGrant = ''; state.rejectedIdentity = '';
         await $.store.set(preferenceKey(id),{version:1,disconnected:false});
         suspend($,state);
-        state.data = null; state.key = null; state.config = config;
+        state.data = null; state.key = null; state.config = config; state.receiptOnly = false;
         state.flight = null; state.envelope = null; state.bound.clear();
         state.retryAt = 0; state.failures = 0;
         return {text:'Motet automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
@@ -901,9 +952,11 @@ export function register(on) {
         // subfolder: it offers the project folder on the same manual credential, and Motet moves it only to the
         // proven launch folder. It stays manual; nothing is saved unless Motet accepts.
         if (stored?.native_id === id && (stored.project === project || insideFolder(stored.project, project, await pathRules($)))) {
-          state.key = legacyKey(id); state.data = {...stored, project, active:true};
-          await activate($,state,await post($,state,'connect',{native_id:id,project}));
-          return {text:'Motet connected to this existing chat. ' + LIMITATION};
+          state.receiptOnly = stored.project !== project && await unreported(stored.requests);
+          state.key = legacyKey(id); state.data = {...stored, project:state.receiptOnly ? stored.project : project, active:true};
+          await activate($,state,await post($,state,'connect',{native_id:id,project:state.data.project,...state.receiptOnly?{receipt_only:true}:{}}));
+          return {text:state.receiptOnly ? 'Motet reconnected this chat to report its earlier replies; it then moves to this project folder. ' + LIMITATION :
+            'Motet connected to this existing chat. ' + LIMITATION};
         }
         state.data = null; state.key = null;
         if (stored?.native_id === id) return {text:"This chat's manual Motet pairing is for a folder outside this project, so it was not reconnected. Pair this chat again from Motet."};
