@@ -89,11 +89,11 @@ async function unconfirmedFlow(code){
   h.reply().resolve({schemaVersion:1,requestId:h.reply().requestId,runId:RUN,agent:CLEO,state:'uncertain',ownerStop:record,already:false});await tick();await tick();await tick();
   api.workspaceManagedDeskPaint(h.cleo);api.workspaceManagedComposerPaint();const host=api.MCP.noticeHost;
   assert.equal(api.workspaceManagedStatusPill(h.cleo),'may still be running');assert.equal(api.workspaceManagedStopPillState(h.cleo),'waiting');
-  assert.equal(host.hidden,false);const [title,body,small,row]=host.children;
-  assert.equal(text(title),'Motet could not confirm that Cleo stopped.');assert.equal(text(body),'You asked it to stop at t604. It did not answer in time, so it may still be working.');assert.equal(text(small),'Messages to it are paused. Its history stays here.');
-  const [retry,copy]=row.children;assert.equal(text(retry),'Try again');assert.equal(text(copy),'Copy the Terminal command instead');
+  assert.equal(host.hidden,false);assert.equal(host.children.length,2,'the title and its two actions, nothing else');const [title,row]=host.children;
+  assert.equal(text(title),'Motet could not confirm that Cleo stopped.');assert.doesNotMatch(text(host),/asked it to stop|did not answer|history stays|paused/);
+  const [retry,copy]=row.children;assert.equal(text(retry),'Try again');assert.equal(text(copy),'Copy the Terminal command');
   assert.equal(api.MCP.composerNotice.textContent,'Messages to Cleo are paused');assert.equal($('#sendHint').textContent,'','could not confirm: no contact-lost hint under the box');assert.doesNotMatch(api.workspaceManagedSendReason(CLEO,h.cleo),/cannot reach/);
-  copy.onclick();await tick();assert.deepEqual(h.copies,['pkill -KILL -f -- fictional']);assert.equal(text(copy),'Copied');h.timers.at(-1).f();assert.equal(text(copy),'Copy the Terminal command instead');
+  copy.onclick();await tick();assert.deepEqual(h.copies,['pkill -KILL -f -- fictional']);assert.equal(text(copy),'Copied');h.timers.at(-1).f();assert.equal(text(copy),'Copy the Terminal command');
   assert.equal(api.workspaceManagedStopOffered(h.cleo),false,'Try again lives in the notice, not the menu');
   retry.onclick();retry.onclick();assert.equal(h.stops.length,2,'Try again sends one more stop');assert.notEqual(h.stops[1].requestId,h.stops[0].requestId,'Try again uses a new request id');
   api.workspaceManagedDeskPaint(h.cleo);assert.equal(api.workspaceManagedStatusPill(h.cleo),'stopping…');assert.equal(host.hidden,true);
@@ -103,7 +103,7 @@ async function unconfirmedFlow(code){
 
 async function lostReply(code){
   const h=harness(code),{api}=h;await ready(h);api.workspaceManagedStopBegin(h.cleo);h.reply().reject(Error('network'));await tick();await tick();await tick();
-  api.workspaceManagedDeskPaint(h.cleo);const host=api.MCP.noticeHost;assert.equal(api.workspaceManagedStatusPill(h.cleo),'may still be running','a lost reply is never shown as stopped');assert.equal(host.hidden,false);assert.equal(host.children[3].children.length,1,'no Terminal command without a server record');
+  api.workspaceManagedDeskPaint(h.cleo);const host=api.MCP.noticeHost;assert.equal(api.workspaceManagedStatusPill(h.cleo),'may still be running','a lost reply is never shown as stopped');assert.equal(host.hidden,false);assert.equal(host.children[1].children.length,1,'no Terminal command without a server record');
   const h2=harness(code);await ready(h2);h2.api.workspaceManagedStopBegin(h2.cleo);h2.reply().reject(Object.assign(Error('ended'),{code:'already_ended'}));await tick();await tick();await tick();assert.equal(h2.api.workspaceManagedStopPhase(h2.cleo),null,'a chat that already ended is not shown as a stop');
 }
 
