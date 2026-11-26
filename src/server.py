@@ -6893,6 +6893,14 @@ if __name__ == '__main__':
     from dictation_proxy import from_environment as dictation_from_environment
     DICTATION_PROXY = dictation_from_environment(HOME, PORT)
     CLAUDE_MANAGED, CLAUDE_MANAGED_FAILED = start_managed_claude()
+    if CLAUDE_MANAGED_OFF is not None:
+        from claude_managed import OFF_REASONS
+        # The one place this shows where the ownership fence hides chats: with managed records on disk and no
+        # manager, every Claude chat stays fail-closed until the cause is fixed.
+        print(OFF_REASONS[CLAUDE_MANAGED_OFF]
+              + (' Until then every Claude chat stays off the stage and Allow / Deny is left to Claude: Motet has '
+                 'records of chats it started here and cannot tell them apart.'
+                 if _managed_permission_artifacts_present() else ''))
     NEW_CHAT = start_new_chat()
     ATTACHMENTS = start_attachments()
     ANTIGRAVITY_OPEN = antigravity_open.Adapter(HOME)

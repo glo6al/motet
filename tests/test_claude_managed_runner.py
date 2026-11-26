@@ -17,6 +17,11 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import claude_managed_runner as managed
 
+# POSIX fixtures (owner ids, modes, links, flock, a Unix socket): CI runs this suite on macOS and Linux only, and
+# by hand on Windows it skips. Windows is covered by test_managed_windows_storage (this suite again, under the
+# simulation) and test_managed_windows_end_to_end (for real).
+POSIX_ONLY = 'POSIX fixtures; Windows: test_managed_windows_storage, _process and _end_to_end.'
+
 
 def uid():
     return str(uuid.uuid4())
@@ -129,6 +134,7 @@ class FakeTransport:
         return native
 
 
+@unittest.skipIf(os.name == 'nt', POSIX_ONLY)
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='watch-managed-runner-')
@@ -1037,6 +1043,7 @@ class RunnerTests(unittest.TestCase):
             self.assertIsNone(row['resolutionReason'])
 
 
+@unittest.skipIf(os.name == 'nt', 'POSIX pipes under a selector; Windows: test_managed_windows_process.')
 class NativePipeTests(unittest.TestCase):
     def test_fake_child_subprocess_uses_bounded_jsonl_and_actual_exit(self):
         # Explicitly inject a fictional child Popen; NativeTransport.start(), which

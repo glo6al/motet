@@ -3,6 +3,7 @@ from dataclasses import replace
 from contextlib import contextmanager
 import http.client
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -17,6 +18,7 @@ from officer_messaging import MessagingStore, MessagingError
 import server
 
 
+@unittest.skipIf(os.name == 'nt', fixture.POSIX_ONLY)
 class ManagedIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.native = fixture.Fixture(methodName='runTest')

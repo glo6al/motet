@@ -228,8 +228,8 @@ class ManagedError(NewChatError):
 
 WINDOWS_PYTHON_WHY = 'Claude run by Motet on Windows needs Python 3.12 or later. Start Motet with a newer Python.'
 STATE_NOT_PRIVATE_WHY = ('Claude run by Motet is off: the .live-room folder in your home folder is not yours alone '
-                         '(another account or group can open it, or it is not owned by you). Make it private to you, '
-                         'then restart Motet. Chats you started yourself are not affected.')
+                         '(another account or group can open it, or it is not owned by you). Make it yours alone, '
+                         'then restart Motet.')
 # Why the server chose not to run managed Claude on a platform that has it (server.CLAUDE_MANAGED_OFF holds the code).
 OFF_REASONS = {'python_unsupported': WINDOWS_PYTHON_WHY, 'state_not_private': STATE_NOT_PRIVATE_WHY}
 

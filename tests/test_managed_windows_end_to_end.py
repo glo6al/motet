@@ -272,13 +272,15 @@ class PlatformGateTests(unittest.TestCase):
                     mock.patch('new_chat_folder_chooser.host_chooser', chooser):
                 self.assertEqual(server.start_managed_claude(), (None, False))
                 self.assertEqual(server.CLAUDE_MANAGED_OFF, 'state_not_private')
-                # New chat says why, plainly: through its Claude entry where New chat itself starts (macOS and
-                # Linux keep New chat's own folder private inside it), and through New chat's refusal on Windows,
-                # where New chat's own state needs that folder private too.
+                # New chat says why, plainly. On real Windows New chat's own storage opens .live-room as a private
+                # folder (new_chat_service._windows_storage), so New chat does not start and its HTTP refusal
+                # carries the reason. On macOS and Linux it keeps its own new-chat folder private inside it, so it
+                # starts and its Claude entry refuses with the reason.
                 service = server.start_new_chat()
-                if service is None:
-                    self.assertTrue(WINDOWS, 'New chat should start where its own folder can be private')
+                if WINDOWS:
+                    self.assertIsNone(service)
                 else:
+                    self.assertIsNotNone(service)
                     try:
                         capability = service._capability('claude_code')
                     finally:
