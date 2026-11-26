@@ -24,6 +24,15 @@ import server
 # 3 seconds is kept elsewhere. No test here relies on a request timing out.
 CLIENT_TIMEOUT = 30 if os.name == 'nt' else 3
 
+# The product's Claude plugin lease (12 s). A live plugin renews it every 2 s, but these tests send no heartbeat
+# between steps, and a slow runner can spend more than 12 s between setup and a poll. The fixture therefore runs
+# with a lease far longer than any run, so no test depends on wall-clock speed. Tests that expire a lease do so
+# explicitly (last_seen=0, or LEASE + 1 seconds ago), never by waiting. The product constant is not changed.
+# Suites that run the real plugin (it heartbeats every 2 s, and requires the 12-second lease on the wire) set
+# fixture_lease = None and keep the product lease.
+PRODUCT_LEASE = mod.LEASE
+TEST_LEASE = 3600
+
 
 def uid():
     return str(uuid.uuid4())
@@ -37,6 +46,10 @@ class ClaudeModTests(unittest.TestCase):
                                      CLAUDE_MANAGED_ENABLED=False, CLAUDE_MANAGED_FAILED=False)
         legacy_host.start()
         self.addCleanup(legacy_host.stop)
+        if getattr(self, 'fixture_lease', TEST_LEASE):
+            lease = patch.object(mod, 'LEASE', getattr(self, 'fixture_lease', TEST_LEASE))
+            lease.start()
+            self.addCleanup(lease.stop)
         self.project = os.path.realpath(self.temp.name)
         self.wrong_project = os.path.join(self.project, 'fictional-wrong')   # canonical on every system
         self.sid, self.aid = uid(), None

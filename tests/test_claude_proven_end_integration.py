@@ -25,6 +25,7 @@ OWNER_INPUT = 'Fictional extra owner input that must stay private.'
 class ClaudeProvenEndIntegration(unittest.TestCase):
     http = owner_fixture.ClaudeModTests.http
     setUp = owner_fixture.ClaudeModTests.setUp
+    fixture_lease = None            # the real plugin heartbeats and requires the product lease on the wire
     tearDown = owner_fixture.ClaudeModTests.tearDown
 
     def reserve_requests(self, request_id, sibling, sibling_request):
