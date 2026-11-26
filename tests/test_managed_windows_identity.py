@@ -248,8 +248,12 @@ class SimulatedExecutableTests(unittest.TestCase):
     def as_windows_platform():
         """The platform gates (the supervisor's start, and preflight for a real manager) read sys.platform, which
         lets macOS and Windows through and refuses Linux: answer 'win32' while the Windows path behind them is
-        exercised, so these tests run the same on Linux as on a Mac."""
-        return mock.patch.object(sys, 'platform', 'win32')
+        exercised, so these tests run the same on Linux as on a Mac. Preflight on Windows also needs Python 3.12;
+        that gate is tested in test_managed_windows_end_to_end, so here it is taken as met on every Python."""
+        stack = ExitStack()
+        stack.enter_context(mock.patch.object(sys, 'platform', 'win32'))
+        stack.enter_context(mock.patch.object(claude_managed, 'windows_python_supported', return_value=True))
+        return stack
 
     def manager(self):
         return claude_managed.ManagedClaude(self.home / '.live-room', home=self.home, enabled=True,

@@ -5,7 +5,9 @@ On every system, with the platform patched explicitly (never taken from the mach
 let macOS and Windows through and keep Linux refused, as it was before 8b.5. That covers the readiness record,
 preflight, the supervisor's start, the server's managed factory, New chat and its known-folder inventory, and the
 owner fence. On Windows, Codex New chat is refused in plain words, and building its adapter neither touches anything
-nor stops Claude from starting.
+nor stops Claude from starting. Managed Claude never hides or blocks a chat Motet did not start: with the default
+manager (no readiness record), and with a state folder that is not private (then no manager is built, New chat says
+why, and only managed state on disk keeps Claude chats fail-closed). Windows needs Python 3.12 or later, and says so.
 
 On real Windows only, with no real Claude, through the manager's test seams (claude_managed.TestDependencies: a
 fictional executable, its pin and the supervisor's spawn). A whole managed start runs in order:
@@ -21,8 +23,9 @@ The fictional "claude.exe" is pip's own console-script launcher (distlib) with a
 builds pip.exe. So the started program is the very file that was hashed and held, as the real build is, and the
 check that Claude was started from that file is made for real. The supervisor, and the supervisor's read-only
 readers in this process (status after it ended), accept that file's pin in place of Claude Code 2.1.323's; nothing
-else is changed. A missing real-Windows prerequisite fails these tests; it
-never skips them.
+else is changed. These seams bypass the Python 3.12 gate (as they bypass the platform gate), so the mechanics are
+checked on every Python CI runs; the server factory's own answer is checked per Python. A missing real-Windows
+prerequisite fails these tests; it never skips them.
 
 Run: python tests/test_managed_windows_end_to_end.py
 """
@@ -64,6 +67,41 @@ def private_folder(path):
     return path
 
 
+def open_to_others(folder):
+    """Give the folder an access other accounts can use: Everyone may read it (by SID, so any Windows language), or
+    group and others may on POSIX. That is what an older Motet's folder may carry."""
+    if WINDOWS:
+        subprocess.run(['icacls', str(folder), '/grant', '*S-1-1-0:(R)'], check=True, capture_output=True, timeout=60)
+    else:
+        os.chmod(str(folder), 0o755)
+
+
+def assert_ordinary_chats_alone(test, home, expect_manager):
+    """Start managed Claude as the server does for ``home``; then an ordinary Claude chat (one Motet did not start,
+    and its sub-agent) must be shown and its permission hooks answered: both hook routes (/permission, and a
+    Notification permission prompt) go on exactly when its classification is 'unmanaged'."""
+    with mock.patch.multiple(server, HOME=str(home), CLAUDE_MANAGED_FAILED=False, CLAUDE_MANAGED_ENABLED=True,
+                             MESSAGING=None, CLAUDE_MANAGED_OFF=None):
+        manager, failed = server.start_managed_claude()
+        test.assertFalse(failed)
+        test.assertEqual(manager is not None, expect_manager)
+        if manager is not None:
+            test.assertFalse(manager.configuration_ready)       # no readiness record: built, not ready
+        session = str(uuid.uuid4())
+        project = home / '.claude' / 'projects' / 'fictional-orchard'
+        transcript = project / (session + '.jsonl')
+        child = project / session / 'subagents' / 'agent-fictional.jsonl'
+        with mock.patch.object(server, 'CLAUDE_MANAGED', manager):
+            test.assertFalse(server.claude_permission_ownership_check_required())
+            test.assertEqual(server.claude_permission_ownership('c:' + session, session),
+                             dict(classification='unmanaged', checkRequired=False))
+            test.assertEqual(server.claude_permission_ownership('c:agent-fictional', session),
+                             dict(classification='unmanaged', checkRequired=False))
+            test.assertTrue(server.managed_source_allowed(str(transcript), server.ClaudeTail))
+            test.assertTrue(server.managed_source_allowed(str(child), server.ClaudeTail))
+        test.assertFalse(os.path.lexists(str(home / '.live-room' / 'managed-claude')))   # nothing was created
+
+
 class PlatformGateTests(unittest.TestCase):
     """The platform gates, on every system. Each case names its platform; private_storage's Windows switch is
     patched with it only where everything behind the gate is replaced, since a Mac or Linux machine has no Win32."""
@@ -88,7 +126,7 @@ class PlatformGateTests(unittest.TestCase):
         windows.assert_called_once_with(state)
         for name, read in (('darwin', True), ('linux', False)):
             with self.subTest(platform=name), self.platform(name), \
-                    mock.patch.object(claude_managed, '_windows_readiness', side_effect=AssertionError('Windows read')), \
+                    mock.patch.object(claude_managed, '_windows_readiness', side_effect=AssertionError('read')), \
                     mock.patch.object(claude_managed, 'Path', side_effect=OSError('the POSIX read began')) as posix:
                 self.assertIs(claude_managed.load_configuration_readiness(state, enabled=True), False)
                 self.assertEqual(posix.called, read)
@@ -104,6 +142,7 @@ class PlatformGateTests(unittest.TestCase):
         for name, windows, code in (('win32', True, 'fictional_reached'), ('darwin', False, 'fictional_reached'),
                                     ('linux', False, 'app_version_unsupported')):
             with self.subTest(platform=name), self.platform(name, windows), \
+                    mock.patch.object(claude_managed, 'windows_python_supported', return_value=True), \
                     mock.patch.object(claude_managed.ManagedClaude, '_breakaway_refusal', return_value=None), \
                     mock.patch.object(claude_managed.ManagedClaude, '_executable', side_effect=reached) as executable:
                 capability = manager.preflight()
@@ -124,7 +163,7 @@ class PlatformGateTests(unittest.TestCase):
         windows_start.assert_called_once_with(exe)
         for name, reached in (('darwin', True), ('linux', False)):
             with self.subTest(platform=name), self.platform(name), \
-                    mock.patch.object(runner.NativeTransport, '_windows_start', side_effect=AssertionError('Windows')), \
+                    mock.patch.object(runner.NativeTransport, '_windows_start', side_effect=AssertionError('W')), \
                     mock.patch.object(runner.os.path, 'realpath', side_effect=lambda path: path + '-moved') as posix:
                 with self.assertRaises(runner.RunnerError) as raised:
                     transport.start()
@@ -133,7 +172,8 @@ class PlatformGateTests(unittest.TestCase):
         self.assertIsNone(transport.process)
 
     def test_the_server_starts_the_managed_manager_on_macos_and_windows_only(self):
-        with mock.patch.object(server, 'HOME', str(self.home)), \
+        with mock.patch.object(server, 'HOME', str(self.home)), mock.patch.object(server, 'CLAUDE_MANAGED_OFF', None), \
+                mock.patch.object(claude_managed, 'windows_python_supported', return_value=True), \
                 mock.patch.object(claude_managed, 'load_configuration_readiness', return_value=True) as readiness:
             for name in ('win32', 'darwin'):
                 with self.subTest(platform=name), mock.patch.object(sys, 'platform', name):
@@ -151,6 +191,7 @@ class PlatformGateTests(unittest.TestCase):
         manager = claude_managed.ManagedClaude(self.home / '.live-room', home=self.home, enabled=True)
         chooser = mock.Mock(return_value=mock.Mock(return_value=None))
         with mock.patch.object(server, 'HOME', str(self.home)), mock.patch.object(server, 'CLAUDE_MANAGED', manager), \
+                mock.patch.object(server, 'CLAUDE_MANAGED_OFF', None), \
                 mock.patch.dict(os.environ, {'WATCH_DEMO': ''}), \
                 mock.patch('new_chat_folder_chooser.host_chooser', chooser), \
                 mock.patch.object(codex_new_chat, '_regular', side_effect=AssertionError('Codex files read')):
@@ -166,7 +207,8 @@ class PlatformGateTests(unittest.TestCase):
                 finally:
                     service.close()
         self.assertFalse(codex.available)
-        self.assertEqual((codex.code, codex.message), ('unsupported_platform', 'Codex New chat currently requires macOS.'))
+        self.assertEqual((codex.code, codex.message),
+                         ('unsupported_platform', 'Codex New chat currently requires macOS.'))
 
     def test_codex_new_chat_is_refused_in_plain_words_on_windows_without_touching_anything(self):
         adapter = codex_new_chat.Adapter(home=self.home)        # building it reads nothing
@@ -181,8 +223,86 @@ class PlatformGateTests(unittest.TestCase):
                 adapter.create_once(folder, lambda *_: None)
             self.assertEqual(raised.exception.code, 'unsupported_platform')
 
+    def test_the_platform_list_is_defined_once(self):
+        import new_chat_types
+        self.assertEqual(new_chat_types.MANAGED_CLAUDE_PLATFORMS, ('darwin', 'win32'))
+        for copy in (claude_managed.MANAGED_PLATFORMS, runner.MANAGED_PLATFORMS, server.MANAGED_CLAUDE_PLATFORMS):
+            self.assertIs(copy, new_chat_types.MANAGED_CLAUDE_PLATFORMS)
+
+    def test_windows_needs_python_312_and_says_so(self):
+        self.assertFalse(claude_managed.windows_python_supported('win32', (3, 11, 9)))
+        self.assertTrue(claude_managed.windows_python_supported('win32', (3, 12, 0)))
+        self.assertTrue(claude_managed.windows_python_supported('darwin', (3, 9, 6)))
+        older = mock.patch.object(claude_managed, 'windows_python_supported', return_value=False)
+        with mock.patch.object(sys, 'platform', 'win32'), older, mock.patch.object(server, 'HOME', str(self.home)), \
+                mock.patch.object(server, 'CLAUDE_MANAGED_OFF', None):
+            self.assertEqual(server.start_managed_claude(), (None, False))
+            self.assertEqual(server.CLAUDE_MANAGED_OFF, 'python_unsupported')
+            manager = claude_managed.ManagedClaude(self.home / '.live-room', home=self.home, enabled=True,
+                                                   configuration_ready=True)
+            capability = manager.preflight()
+        self.assertEqual((capability.code, capability.message),
+                         ('python_unsupported', claude_managed.WINDOWS_PYTHON_WHY))
+        refusing = claude_managed.UnavailableAdapter('python_unsupported').preflight()
+        self.assertEqual((refusing.available, refusing.code, refusing.ownership),
+                         (False, 'python_unsupported', 'watch_managed'))
+        with self.assertRaises(claude_managed.ManagedError):
+            claude_managed.UnavailableAdapter('python_unsupported').reserve(None, None)
+
+    def test_the_default_manager_leaves_ordinary_claude_chats_alone(self):
+        """No readiness record, so the manager is built but not ready (the default on every Mac and PC): an
+        ordinary Claude chat stays visible and its permission hooks are answered as before. On real Windows this
+        runs against real access lists."""
+        private_folder(self.home / '.live-room')
+        with mock.patch.object(sys, 'platform', 'win32'), \
+                mock.patch.object(claude_managed, 'windows_python_supported', return_value=True):
+            assert_ordinary_chats_alone(self, self.home, expect_manager=True)
+
+    def test_a_state_folder_that_is_not_private_leaves_ordinary_chats_alone(self):
+        state = private_folder(self.home / '.live-room')
+        open_to_others(state)
+        chooser = mock.Mock(return_value=mock.Mock(return_value=None))
+        with mock.patch.object(sys, 'platform', 'win32'), \
+                mock.patch.object(claude_managed, 'windows_python_supported', return_value=True):
+            assert_ordinary_chats_alone(self, self.home, expect_manager=False)
+            with mock.patch.multiple(server, HOME=str(self.home), CLAUDE_MANAGED=None, CLAUDE_MANAGED_FAILED=False,
+                                     CLAUDE_MANAGED_ENABLED=True, MESSAGING=None, NEW_CHAT=None,
+                                     CLAUDE_MANAGED_OFF=None), \
+                    mock.patch.dict(os.environ, {'WATCH_DEMO': ''}), \
+                    mock.patch('new_chat_folder_chooser.host_chooser', chooser):
+                self.assertEqual(server.start_managed_claude(), (None, False))
+                self.assertEqual(server.CLAUDE_MANAGED_OFF, 'state_not_private')
+                # New chat says why, plainly: through its Claude entry where New chat itself starts (macOS and
+                # Linux keep New chat's own folder private inside it), and through New chat's refusal on Windows,
+                # where New chat's own state needs that folder private too.
+                service = server.start_new_chat()
+                if service is None:
+                    self.assertTrue(WINDOWS, 'New chat should start where its own folder can be private')
+                else:
+                    try:
+                        capability = service._capability('claude_code')
+                    finally:
+                        service.close()
+                    self.assertEqual((capability.available, capability.code, capability.message),
+                                     (False, 'state_not_private', claude_managed.STATE_NOT_PRIVATE_WHY))
+                self.assertEqual(server.new_chat_unavailable_reason(), claude_managed.STATE_NOT_PRIVATE_WHY)
+                import new_chat_http
+                from test_new_chat_http import Handler
+                handler = Handler()
+                new_chat_http.handle_http(handler, None, 'fictional-key', 18801, server.new_chat_unavailable_reason())
+                self.assertEqual(handler.result, (503, {'schemaVersion': 1, 'error': {
+                    'code': 'unavailable', 'message': claude_managed.STATE_NOT_PRIVATE_WHY}}))
+                # Managed state on disk that cannot be read keeps every Claude chat fail-closed, as before.
+                with open(str(state / 'managed-claude.expected'), 'w') as marker:
+                    marker.write('1\n')
+                self.assertTrue(server.claude_permission_ownership_check_required())
+                self.assertEqual(server.claude_permission_ownership('c:' + str(uuid.uuid4()))['classification'],
+                                 'unknown')
+                self.assertFalse(server.managed_source_allowed(str(self.home / 'fictional.jsonl'), server.ClaudeTail))
+
     def test_the_owner_fence_counts_windows_as_a_managed_platform(self):
-        with mock.patch.multiple(server, CLAUDE_MANAGED=None, CLAUDE_MANAGED_FAILED=False, CLAUDE_MANAGED_ENABLED=True), \
+        with mock.patch.multiple(server, CLAUDE_MANAGED=None, CLAUDE_MANAGED_FAILED=False, CLAUDE_MANAGED_ENABLED=True,
+                                 CLAUDE_MANAGED_OFF=None), \
                 mock.patch.object(server, '_managed_permission_registry', return_value=None), \
                 mock.patch.object(server, '_managed_permission_artifacts_present', return_value=False):
             for name, required in (('win32', True), ('darwin', True), ('linux', False)):
@@ -422,22 +542,39 @@ class WindowsEndToEndTests(unittest.TestCase):
         for name, pid in processes.items():
             self.assertTrue(gone(pid, 15), '%s (process %d) is still running' % (name, pid))
 
+    def test_without_a_record_ordinary_claude_chats_stay_visible_and_answerable(self):
+        """The default on a real PC: no readiness record. With Python 3.12 or later the manager is built and not
+        ready; with an older Python none is built (it needs 3.12). Either way an ordinary chat is untouched."""
+        assert_ordinary_chats_alone(self, self.home, expect_manager=claude_managed.windows_python_supported())
+
     def test_a_record_for_another_machine_keeps_it_refused(self):
         record = dict(claude_managed.local_configuration_identity(), hostFingerprint='0' * 64)
         self.write_private(self.state / claude_managed.READINESS_FILENAME, json.dumps(record).encode('utf-8'))
         self.assertIs(claude_managed.load_configuration_readiness(str(self.state), enabled=True), False)
         self.assertEqual(self.manager(False).preflight().code, 'configuration_unverified')
-        with mock.patch.object(server, 'HOME', str(self.home)):
-            manager, failed = server.start_managed_claude()
-        self.assertFalse(failed)
-        self.assertFalse(manager.configuration_ready)
+        manager = self.server_factory()
+        if manager is not None:
+            self.assertFalse(manager.configuration_ready)
 
     def test_the_server_factory_reads_this_pcs_record(self):
         self.ready()
-        with mock.patch.object(server, 'HOME', str(self.home)):
+        manager = self.server_factory()
+        if manager is not None:
+            self.assertTrue(manager.configuration_ready)
+
+    def server_factory(self):
+        """The server's managed factory for this home: a manager on Python 3.12 or later; before 3.12, none, with
+        the plain reason (managed Claude on Windows needs 3.12; CI runs both)."""
+        with mock.patch.object(server, 'HOME', str(self.home)), mock.patch.object(server, 'CLAUDE_MANAGED_OFF', None):
             manager, failed = server.start_managed_claude()
+            off = server.CLAUDE_MANAGED_OFF
         self.assertFalse(failed)
-        self.assertTrue(manager.configuration_ready)
+        if claude_managed.windows_python_supported():
+            self.assertIsInstance(manager, claude_managed.ManagedClaude)
+            self.assertIsNone(off)
+        else:
+            self.assertEqual((manager, off), (None, 'python_unsupported'))
+        return manager
 
     def test_a_whole_managed_start_one_message_and_stop(self):
         manager, run_id, processes = self.start()

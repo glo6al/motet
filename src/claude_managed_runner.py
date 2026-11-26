@@ -30,10 +30,10 @@ import time
 import uuid
 
 from new_chat_types import MANAGED_PERMISSION_TIMEOUT_SECONDS as PERMISSION_SECONDS
+from new_chat_types import MANAGED_CLAUDE_PLATFORMS as MANAGED_PLATFORMS   # Linux stays refused (8b.5 added Windows)
 import private_storage as ps
 
 PINNED_VERSION = '2.1.323'
-MANAGED_PLATFORMS = ('darwin', 'win32')   # as claude_managed's: Linux stays refused (step 8b.5 added Windows)
 PINNED_SHA256 = '5432918d904a9b6afef7bb79d20df24d76052eabc1f41bceb84091d21f8889a7'
 MAX_FRAME = 256 * 1024
 MAX_RESPONSE = 8 * 1024 * 1024
