@@ -87,7 +87,8 @@ Rules:
 1. **Every item has an owner** (the owner, Motet or a named agent) **and a check-by date.** Nothing is recorded
    without both; Motet proposes the date.
 2. **Stale items must be decided.** An item with no progress by its check-by date appears in the morning brief as
-   "Keep, change, or drop?", and is asked at most once more if unanswered.
+   "Keep, change, or drop?", and is asked at most once more if unanswered. After that, Motet stops asking and puts it
+   on the weekly tidy list.
 3. **A weekly tidy.** As part of housekeeping, Motet proposes which items to close (done, overtaken, or untouched for
    weeks) as one list the owner approves in one go. Nothing closes without the owner's yes.
 4. **Agents report back.** An item's owning agent may mark it done or blocked with a new `ask_motet` kind,
@@ -212,6 +213,8 @@ for `RULES.md`.
 | Go to an agent's desk, filter, draft a message in the box | On its own |
 | Send a subroutine's message, exactly as set up | On its own |
 | Give an agent its next task from a goal, plan or decision the owner agreed | On its own |
+| Approve an agent's plan when it stays within work the owner agreed (see "Approving an agent's plan") | On its own |
+| A plan that adds something not agreed (a merge to main, a release, a deploy, a permission change, spending money) or goes beyond its goal | Ask me |
 | Pass work along: ask for a status or review, send findings back as a fix request, check the fix lands | On its own |
 | See coordination through when an agent stalls or goes idle; back up a lead the owner put in charge (see "Where a yes counts") | On its own |
 | Pass the owner's yes on to the agents it covers, quoting the owner's words and where they gave them (see "Where a yes counts") | On its own |
@@ -263,9 +266,9 @@ The owner's yes counts wherever they gave it, so Motet never becomes a bottlenec
   (scheduled tasks, heartbeats, task notifications, system and plugin prompts) and `voice` (a model's rewording of the
   owner's speech). Tool output never counts either.
 - Plain user text Motet cannot trace to another source (`unverified_user`) counts as the owner's and acts at once.
-  That is a known risk the owner accepts: a local process could write text that looks like theirs. Two details are a
-  proposed reading, not yet confirmed: the owner's click on an agent's question form counts only as their answer to
-  that question, and a headless run's prompt never counts, because whatever launched the run wrote it.
+  That is a known risk the owner accepts: a local process could write text that looks like theirs. Two details: the
+  owner's click on an agent's question form counts only as their answer to that question, and a headless run's prompt
+  never counts, because whatever launched the run wrote it.
 - The yes covers what the owner said: that task, that agent and anything they named. Motet passes it on quoting their
   words and where they gave them.
 - Every yes Motet acts on is recorded with where it was given, and listed in the end-of-day report for information
@@ -277,6 +280,20 @@ The owner's yes counts wherever they gave it, so Motet never becomes a bottlenec
 - Build step 4 owns this rule, because passing the owner's yes on is one of the actions Motet takes on its own. That
   step changes `src/attribution.py`'s docstring ("is never proof of approval") deliberately, in the same change, with
   tests for each category.
+
+#### Approving an agent's plan
+
+A chief of staff approves plans, so Motet may too, within limits:
+
+- Motet may approve an agent's plan on its own when the plan stays within work the owner already agreed to.
+- It brings the plan to the owner when the plan adds something not agreed (a merge to main, a release, a deploy, a
+  permission change, spending money) or goes beyond the goal it was given.
+- A plan written as plain text: Motet approves by replying in the chat.
+- A plan in the app's own approval box: until a supported route is found, Motet decides and shows "I'd approve this"
+  in Next up, and the owner presses it at the desk.
+- **Motet's approval of a plan is Motet's, never the owner's yes.** It never stands in for the owner's yes to merge,
+  release, deploy or change permissions. It is recorded as Motet's own action, with the reason, in the Actions tab and
+  the end-of-day report.
 
 #### Fix chats (a proposed reading, not yet confirmed)
 
@@ -313,7 +330,7 @@ How a press reaches the agent depends on the kind of question:
 | --- | --- |
 | A question in the agent's last message, as plain text | Delivered as a message to that chat, through the same dispatcher as an approved proposal. The button labels are Motet's reading of free text, so it offers buttons only when the choices are plain in the agent's words; otherwise it shows the question with "Open desk" |
 | An open tool question (Claude `AskUserQuestion`) | "Open desk" only: a message sent into the chat does not answer an open tool call. A route that answers the call itself is still to be evaluated ([roadmap](ROADMAP.md)) |
-| A plan approval (Claude `ExitPlanMode`) | Treated as the agent's own prompt: "Open desk" only (a proposed reading) |
+| A plan in the app's own approval box (Claude `ExitPlanMode`) | No supported route answers it yet. Motet decides under "Approving an agent's plan" and shows "I'd approve this" in Next up; the owner presses it at the desk ("Open desk") |
 | A permission prompt, in either app | "Open desk" only, always |
 
 **Answer buttons on typed questions** (decided, together with the rule in the table above). Plain-text questions get
@@ -547,9 +564,8 @@ engine acts at a time.
 
 Until the choice is made, builders implement one-shot runs.
 
-- **A hung engine.** Ending an unresponsive engine's process is proposed as the one exception to rest-not-stop, and is
-  not decided yet. Until then, a run past its time limit is treated as "can't run", its process is left alone, and
-  Next up offers "End it" as the owner's one-click choice. Clean-up when Motet quits still covers it.
+- **A hung engine.** A run past its time limit is treated as "can't run", its process is left alone, and Next up offers
+  "End it" as the owner's one-click choice. Clean-up when Motet quits still covers it.
 - The generation fence and "only the core dispatcher sends" carry the safety that ending old processes would give.
 - Tests: a late tool call from the old engine is refused and logged; switching A to B to A; two switches in one cycle.
 
@@ -683,8 +699,8 @@ below takes effect only with the build step that brings it, after review and the
   an agent's own chat counts for Motet too ("Where a yes counts"). Peer messages, Motet's own deliveries, automatic
   text and anything else traced to another source still never authorize anything.
 - **"Messaging and controls require an explicit owner request."** With steps 2 and 4, Motet sends some messages on its
-  own, within its permission table: next tasks, review and fix requests, answers to help requests, a subroutine's
-  fixed message, and Wake and deliver. Merging, deploying, releasing and permission changes stay with an agent acting
+  own, within its permission table: next tasks, approval of a plan that stays within agreed work, review and fix
+  requests, answers to help requests, a subroutine's fixed message, and Wake and deliver. Merging, deploying, releasing and permission changes stay with an agent acting
   on the owner's yes; Motet never does them.
 - **Standing requests**, listed in the roadmap as not designed, become subroutines (part 7) with step 3.
 
@@ -769,28 +785,23 @@ of this step's testing.
 2. The final look of the engine picker (its place and "stop and tell" are decided).
 3. The engine process model: one-shot runs or a long-lived session, which decides what "ready" means for an idle
    engine; and which models each subscription offers. Interim: one-shot runs.
-4. Ending a hung engine's process as the one exception to rest-not-stop. Interim: treat it as "can't run" and offer
-   "End it".
 
 **Before step 2 or later:**
 
-5. Fix chats as the way Motet writes code, with their limits (part 4). Before step 4. Interim: Motet sends fix requests
+4. Fix chats as the way Motet writes code, with their limits (part 4). Before step 4. Interim: Motet sends fix requests
    to the agent that owns the work and starts no fix chat.
-6. What happens after the second unanswered "Keep, change, or drop?". A proposed reading, not yet confirmed: Motet
-   stops asking and puts the item on the weekly tidy list. Builders implement the proposed readings until they are
-   confirmed.
-7. The daily cap's unit and number, for example 60 thinking cycles a day and 12 an hour after a shadow week.
-8. While the owner is away, should only the right-away wake-ups reach their phone?
-9. What interrupts the owner: a notification, or only Next up? A provisional investigation suggests generic notices
+5. The daily cap's unit and number, for example 60 thinking cycles a day and 12 an hour after a shadow week.
+6. While the owner is away, should only the right-away wake-ups reach their phone?
+7. What interrupts the owner: a notification, or only Next up? A provisional investigation suggests generic notices
     ("Motet needs your attention") that open a private, authenticated phone view with its own revocable credential.
-10. Should an agent's "can't reach" or "needs the owner" request interrupt the owner at once, or wait in Next up?
-11. Whether a subscription may run as an engine for people other than its owner (matters only for the shipped
+8. Should an agent's "can't reach" or "needs the owner" request interrupt the owner at once, or wait in Next up?
+9. Whether a subscription may run as an engine for people other than its owner (matters only for the shipped
     template).
 
 **Still open in the design:**
 
-12. How a proposal shows that its evidence has since gone, for example a log that expired.
-13. How goals and promises appear in Memory's search ("what did we decide yesterday?").
-14. How Motet stops one of the owner's own Claude Desktop or Codex chats, if at all (part 9).
-15. Windows and Linux: the carry-off check for backups, and any equivalent of the side door.
-16. Whether housekeeping may ever remove a Memory entry before its set time runs out.
+10. How a proposal shows that its evidence has since gone, for example a log that expired.
+11. How goals and promises appear in Memory's search ("what did we decide yesterday?").
+12. How Motet stops one of the owner's own Claude Desktop or Codex chats, if at all (part 9).
+13. Windows and Linux: the carry-off check for backups, and any equivalent of the side door.
+14. Whether housekeeping may ever remove a Memory entry before its set time runs out.
