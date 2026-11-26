@@ -1,6 +1,6 @@
 **Name:** Morning brief
 
-**Use when:** The owner opens Motet for the first time after being away overnight. If they haven't by the set time, the brief waits for them, and the day's goals that start at the set time start.
+**Use when:** The owner opens Motet for the first time after being away overnight. If they haven't by the set time, the brief waits for them, and the day's goals that start at the set time start. Not while the owner has turned the brief off in Settings: then goal suggestions go to Next up as one proposal, warnings as one folded line, and nothing starts at the set time without the owner's yes.
 
 **Reads:** a fresh project sweep; the Agenda (goals, promises, standing yeses); the Waiting on you list; last night's end-of-day report; whether backups are on.
 

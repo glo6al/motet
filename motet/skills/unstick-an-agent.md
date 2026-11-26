@@ -19,7 +19,7 @@
 - Call an agent stuck from silence alone.
 - Answer an agent's own permission prompt.
 - Stop an agent for any reason other than those in RULES.md.
-- Change the code that enforces Motet's own permissions, cost cap or rules.
+- Change the code that enforces Motet's own permissions, daily cap or rules.
 - Start a fresh chat to replace an agent you stopped. What happens next is the owner's call.
 
 ### For example
