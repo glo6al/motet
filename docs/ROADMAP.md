@@ -14,11 +14,13 @@ Planned work after v0.1.0, nearest first. "Designed" means the screens are drawn
 
 - **Dictation on more devices.** Optional local desktop dictation uses a separately installed free recognizer and displays editable words before Send. Phone capture needs a reviewed secure connection; broader native-platform support also remains. See [local dictation](DICTATION.md).
 - **A live browser at the desk.** A real page you open and operate yourself in a desk's Browser tab, kept apart from the record of what the agent's tools fetched. Nothing opens until you ask.
+- **Stop a chat Motet started.** A chat that Claude run by Motet started has no window of its own, so its desk will offer "Stop this chat" in the menu under the chat's name, with one confirmation. Stopping ends the chat and the sub-agents it started; its history stays, and the stage shows it as stopped until you dismiss it. In this first version a stopped chat is final: it cannot take new messages.
 - **Permission requests at phone width.** The same request cards on a phone-sized screen. Today a request can only be answered on the computer that runs Motet; answering from another device has to be proven safe before this is built.
 
 ### Asked for, not designed
 
 - **Enable file delivery for Claude setups first created with an older Python.** Design an explicit, owner-approved adoption or migration of their existing managed-chat storage before enabling files. Do not migrate automatically. Preserve ordinary messaging, retained identities and every existing file-protection check throughout. The notice people see today will also be reworded, because it applies to every agent and not only Claude.
+- **Restart a stopped chat.** Pick up a chat you stopped from Motet where it left off, instead of it being final.
 - **Steer a queued message, answer an agent's own questions, and change its model or effort from Motet.** Still to be evaluated; see [priority 2](#2-make-actions-reliable-within-the-conversation).
 - **Find and return to older sessions.** See [priority 1](#1-make-supported-conversations-easy-to-find-and-return-to).
 - **Git state per session, New chat for more apps, linked handoffs and review verdicts, and optional holds.** See [priority 4](#4-deepen-work-context-and-coordination).
