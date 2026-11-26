@@ -10,7 +10,7 @@
 2. If the record can't tell, ask the agent once where it stands: what it is doing, what is left, and what it is waiting for.
 3. If the project has a manager, and the manager isn't the one stuck, tell the manager and let it act first. Step in yourself when the manager is stuck too, or hasn't acted by the next check.
 4. Nudge: remind the agent what it was asked and what is left, and pass on any message that went unanswered.
-5. If it is still stuck, keeps repeating, or is working beyond what was agreed: write down where it was (branch, last commit, what is done, what is left) with the Handover skill, and stop it. Then ask the owner how to go on, on the Waiting on you list, with that handover. Never start a fresh chat in its place. Tell the owner each time, and why.
+5. If it is still stuck, keeps repeating, or is working beyond what was agreed: write down where it was (branch, last commit, what is done, what is left) with the Handover skill, and stop it. Then ask the owner how to go on, on the Waiting on you list, with that handover. Never start a fresh chat in its place. Tell the owner each time, and why. If the owner answers carry on, wake it (Wake and deliver) and hand over the messages that waited; until then it stays stopped.
 6. If it is stuck on something small in the code, fix it yourself: your own branch, the project's rules, the other provider's review. Tell the agent that owns the work what you changed, so no one edits the same file twice.
 7. At the next check, make sure the agent is moving again, or, if you stopped it, that the owner's question is still on Waiting on you.
 
