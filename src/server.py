@@ -6304,7 +6304,8 @@ def shared_directory_snapshot(store):
         for entry in entries:
             aid = entry['agent']
             item = active.get(aid)
-            veto = aid in active and (not claude_mod.local_parent(aid, item) or item.get('cwd') != entry['project'])
+            veto = aid in active and (not claude_mod.local_parent(aid, item)
+                                      or not claude_mod.within_project(item.get('cwd'), entry['project']))
             peer_ready = not veto and store.mods.peer_ready(entry)
             result[aid] = dict(capability='reachable' if peer_ready else 'unavailable',
                                reason='' if peer_ready else 'Agent receiving requires explicit Motet setup and a compatible live official plugin in this exact Claude chat.',

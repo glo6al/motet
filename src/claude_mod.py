@@ -3,6 +3,7 @@
 SQLite reservations precede returning a claim. Claims never replay; only status
 and completion events may replay. The official host owns native input execution.
 """
+import collections
 import hashlib
 import hmac
 import json
@@ -11,6 +12,7 @@ import peer_bridge
 import peer_lifecycle
 import peer_progress
 import secrets
+import threading
 import time
 import uuid
 
@@ -71,12 +73,213 @@ def schema(data, required):
         raise ModError(400, 'Invalid Claude mod request fields.')
 
 
+PATH = os.path        # the platform's path rules; simulated Windows tests swap in ntpath
+
+
 def project_text(value):
-    return isinstance(value, str) and 0 < len(value) <= 4096 and os.path.isabs(value) and '\x00' not in value
+    return isinstance(value, str) and 0 < len(value) <= 4096 and PATH.isabs(value) and '\x00' not in value
 
 
 def project(value):
-    return project_text(value) and os.path.realpath(value) == value
+    return project_text(value) and PATH.realpath(value) == value
+
+
+def _network(path):
+    """A folder on a network share: a Windows UNC or long-path name (\\\\server\\share, \\\\?\\...) or a drive
+    letter Windows reports as mapped to a share (the same test the folder window uses for its hint). Such a folder is
+    never resolved, so an unreachable server cannot hold a check up. Mounted shares elsewhere cannot be told apart
+    by name; they are resolved only on the resolver thread, never under a lock."""
+    import new_chat_folder_chooser_windows as windows
+    return PATH.splitdrive(path)[0].startswith(('\\\\', '//')) or windows.remote_drive(path, windows.drive_type)
+
+
+def _textually_inside(cwd, root):
+    try:
+        return PATH.commonpath((root, PATH.normpath(cwd))) == root
+    except ValueError:
+        return False
+
+
+def folder_inside(cwd, root):
+    """Whether `cwd` is an existing folder that is the canonical project `root` or inside it, links resolved.
+    Touches the disk: call it only off every lock (the resolver thread does). A folder not inside by its name, or
+    on a network share, is refused without any disk access; so is a folder that does not exist (realpath does not
+    check that by itself), is not a directory, or whose real place cannot be found."""
+    if not project_text(cwd) or not project_text(root):
+        return False
+    if not (cwd == root or _textually_inside(cwd, root)) or _network(cwd) or _network(root):
+        return False
+    try:
+        real = PATH.realpath(cwd)
+        return PATH.isabs(real) and PATH.commonpath((root, real)) == root and PATH.isdir(real)
+    except (OSError, ValueError):
+        return False
+
+
+class FolderResolver:
+    """Resolves working folders off every lock, so a check made under the store lock never waits on a disk.
+
+    Each folder is resolved on its own daemon thread, at most MAX_ACTIVE at once and at most one per folder. A
+    result is used while it is younger than KEEP seconds and refreshed once it is older than FRESH; until a folder's
+    first result arrives it counts as outside. A resolution still running after DEADLINE seconds (a dead mount, for
+    one) counts as outside and stops counting against MAX_ACTIVE, so it never holds up other folders; that folder is
+    tried again only once its thread returns. At most MAX_THREADS threads exist, stuck ones included. New work is
+    started under the lock whenever a folder is looked up or a resolution finishes, so no request is left waiting
+    for a wake-up that never comes.
+
+    Every resolution carries a number from one counter, taken when it starts. The cached answer serves readiness
+    and listing only. Dispatching a claim needs `revalidate`, which accepts only a resolution numbered after the
+    call began, so no earlier answer (whatever the clock read) can authorise it."""
+    FRESH, KEEP, DEADLINE, REVALIDATE = 5.0, 60.0, 10.0, 2.0
+    # If MAX_THREADS distinct folders all hang for good, no thread is left and every unresolved folder counts as
+    # outside until the server restarts. That fails closed (those chats show unavailable) and needs that many dead
+    # mounts at once, so it is accepted rather than spending more threads.
+    MAX_PENDING, MAX_RESULTS, MAX_ACTIVE, MAX_THREADS = 256, 1024, 4, 64
+    thread = threading.Thread
+
+    def __init__(self, resolve=None, clock=time.monotonic):
+        self.resolve, self.clock = resolve, clock
+        self.changed = threading.Condition(threading.Lock())
+        self.results, self.queue, self.queued = {}, collections.deque(), set()
+        self.running = {}           # folder -> (start time, resolution number)
+        self.issued = 0             # the last resolution number handed out
+        self.wanted = {}            # folder -> a revalidation needs a resolution numbered above this
+
+    def lookup(self, cwd, root):
+        key = (cwd, root)
+        with self.changed:
+            now = self.clock()
+            self._expire(now)
+            hit = self.results.get(key)
+            if (hit is None or now - hit[1] >= self.FRESH) and len(self.queued) < self.MAX_PENDING:
+                self._queue(key)
+            self._start(now)
+            return hit is not None and now - hit[1] < self.KEEP and hit[0]
+
+    def _queue(self, key):
+        if key not in self.queued and key not in self.running:
+            self.queued.add(key)
+            self.queue.append(key)
+
+    def _expire(self, now):
+        for key, (started, number) in self.running.items():
+            hit = self.results.get(key)
+            if now - started >= self.DEADLINE and (hit is None or hit[2] < number):
+                self._keep(key, False, started + self.DEADLINE, number)
+
+    def _keep(self, key, inside, at, number):
+        self.results.pop(key, None)
+        self.results[key] = (inside, at, number)
+        while len(self.results) > self.MAX_RESULTS:
+            self.results.pop(next(iter(self.results)))
+        self.changed.notify_all()
+
+    def _start(self, now):
+        while self.queue and len(self.running) < self.MAX_THREADS:
+            if sum(1 for started, _ in self.running.values() if now - started < self.DEADLINE) >= self.MAX_ACTIVE:
+                return
+            key = self.queue.popleft()
+            self.queued.discard(key)
+            self.issued += 1
+            self.running[key] = (now, self.issued)
+            try:
+                self.thread(target=self._work, args=(key, self.issued), name='claude-folder-resolver',
+                            daemon=True).start()
+            except Exception:
+                # No thread could be started (the process is out of threads): that folder counts as outside now
+                # and is tried again on a later lookup. Never raise into the caller, who holds the store lock.
+                self.running.pop(key, None)
+                self._keep(key, False, now, self.issued)
+                return
+
+    def _work(self, key, number):
+        try:
+            inside = bool((self.resolve or folder_inside)(*key))
+        except Exception:
+            inside = False
+        with self.changed:
+            now = self.clock()
+            started, _ = self.running.pop(key, (now, number))
+            self._keep(key, inside, started, number)
+            if key in self.wanted and self.wanted[key] >= number:
+                # A revalidation began after this resolution was numbered: resolve the folder again for it.
+                self._queue(key)
+            self._start(now)
+
+    def revalidate(self, cwd, root, timeout=None):
+        """For a caller that holds no lock, before dispatch: wait up to `timeout` seconds for a resolution of the
+        folder numbered after this call began. Without one in time, or if it says outside, the folder is outside."""
+        timeout = self.REVALIDATE if timeout is None else timeout
+        key, end = (cwd, root), time.monotonic() + timeout
+        with self.changed:
+            floor = self.issued                     # any resolution numbered above this started after this call
+            self.wanted[key] = max(self.wanted.get(key, floor), floor)
+            self._queue(key)
+            self._start(self.clock())
+            try:
+                while True:
+                    self._expire(self.clock())
+                    hit = self.results.get(key)
+                    if hit is not None and hit[2] > floor:
+                        return hit[0]
+                    left = end - time.monotonic()
+                    if left <= 0:
+                        return False
+                    self.changed.wait(left)
+            finally:
+                if self.wanted.get(key) == floor:
+                    del self.wanted[key]
+
+    def prime(self, cwd, root, timeout=2.0):
+        """For a caller that holds no lock (registration): look the folder up, then wait up to `timeout` seconds
+        for a fresh result. A folder still unresolved by then counts as outside."""
+        key, end = (cwd, root), time.monotonic() + timeout
+        self.lookup(cwd, root)
+        with self.changed:
+            while True:
+                hit = self.results.get(key)
+                if hit is not None and self.clock() - hit[1] < self.FRESH:
+                    return hit[0]
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self.changed.wait(left)
+
+    def settle(self, timeout=5.0):
+        """Tests: wait until every queued folder has been resolved, or has passed its deadline."""
+        end = time.monotonic() + timeout
+        with self.changed:
+            while True:
+                now = self.clock()
+                self._expire(now)
+                self._start(now)
+                if not self.queue and all(now - started >= self.DEADLINE for started, _ in self.running.values()):
+                    return True
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self.changed.wait(min(left, 0.05))
+
+
+RESOLVER = FolderResolver()
+
+
+def within_project(cwd, root):
+    """Whether a chat's current working folder is its enrolled project or a folder inside it. No disk access.
+
+    A Claude chat that changes directory into a subfolder stays the same chat in the same project; its transcript
+    records that folder as `cwd`. `root` is the enrolled project, already canonical (`project`). The exact folder
+    passes at once. A folder not inside the project by its name, or on a network share, is outside at once. Any
+    other folder is answered from the resolver's last result (links resolved off the lock), so `..` or a link that
+    leads out of the project, a sibling folder, another drive, or a folder not resolved yet is outside it.
+    """
+    if not project_text(cwd) or not project_text(root):
+        return False
+    if cwd == root:
+        return True
+    if not _textually_inside(cwd, root) or _network(cwd) or _network(root):
+        return False
+    return RESOLVER.lookup(cwd, root)
 
 
 def local_parent(agent, item):
@@ -189,7 +392,8 @@ class ClaudeMod:
         result = dict(version=1, native_id=entry['agent'][2:], generation=entry['generation'], heartbeat_interval_ms=2000, lease_seconds=LEASE, peer_protocol=entry['peer_protocol'],
                       reply_notice_protocol=entry['reply_notice_protocol'], supported_reply_notice_protocol=1,
                       lifecycle_protocol=entry['lifecycle_protocol'], supported_lifecycle_protocol=2,
-                      peer_envelope_limit=entry['peer_envelope_limit'], supported_peer_envelope_limit=100000)
+                      peer_envelope_limit=entry['peer_envelope_limit'], supported_peer_envelope_limit=100000,
+                      folder_protocol=1)
         if entry['grant_id']:
             result.update(grant_id=entry['grant_id'], client_id=entry['client_id'], connection_seq=entry['connection_seq'])
         return result
@@ -221,17 +425,40 @@ class ClaudeMod:
                             and self.db.execute('SELECT 1 FROM claude_mod_grants WHERE id=? AND active=1', (e['grant_id'],)).fetchone()
                             and not self.room_veto(e['agent'], e['project']) and
                             (agents is None or e['agent'] not in agents or eligible(e['agent'], agents[e['agent']])
-                             and agents[e['agent']]['cwd'] == e['project']))
+                             and within_project(agents[e['agent']]['cwd'], e['project'])))
             return dict(version=1, authorized=authorized, connected_chats=connected, peer_receive=bool(grant and grant[0] == 1))
+
+    def _fail_unclaimed(self, enrollments, error):
+        """Requests provably never handed to the plugin (not launched, still sending): fail them, saying so."""
+        for row in self.rows():
+            if row.get('mod_enrollment') in enrollments and not row.get('launched') and row['state'] == 'sending':
+                row.update(state='failed', error=error)
+                self.put(row)
+
+    def _unsettled(self, entry):
+        """Whether a request already handed to this enrollment, or held for its chat, is still open."""
+        for row in self.rows():
+            if (row.get('mod_enrollment') == entry['id'] and row.get('launched') and not row.get('settled')
+                    and not peer_lifecycle.is_terminal(self.db, row['request_id'])):
+                return True
+        if any(state != 'reserved' for _, state, _ in peer_lifecycle.blockers(self.db, entry['agent'])):
+            return True
+        return self.attachment_busy(entry['agent'])
+
+    def _move_ready(self, entry):
+        """A chat moves to its project folder only with nothing in flight; requests not yet handed over fail."""
+        if self._unsettled(entry):
+            raise ModError(409, 'This chat has an earlier Motet request still open. It moves to its project folder '
+                                'once that request settles, or once it is cleared from Chats on hold in Motet.',
+                           'move_pending')
+        self._fail_unclaimed({entry['id']}, 'This chat moved to its project folder before the request was claimed. '
+                                            'Nothing was submitted.')
 
     def _revoke(self):
         entries = [r[0] for r in self.db.execute('SELECT id FROM claude_mod_enrollments WHERE active=1 AND grant_id IS NOT NULL')]
         for eid in entries:
             self.uncertain(eid, 'Automatic Claude access was revoked. Earlier input may still run; nothing was resubmitted.')
-        for row in self.rows():
-            if row.get('mod_enrollment') in entries and not row.get('launched') and row['state'] == 'sending':
-                row.update(state='failed', error='Automatic Claude access was revoked before claim. Nothing was submitted.')
-                self.put(row)
+        self._fail_unclaimed(set(entries), 'Automatic Claude access was revoked before claim. Nothing was submitted.')
         self.db.execute('UPDATE claude_mod_grants SET active=0')
         self.db.execute('UPDATE claude_mod_enrollments SET active=0,generation=NULL,last_seen=0 WHERE grant_id IS NOT NULL')
         self.db.execute('DELETE FROM claude_mod_setup_codes')
@@ -293,8 +520,18 @@ class ClaudeMod:
                 raise ModError(409, 'This is not an eligible local parent Claude chat and project.', 'identity_rejected')
             if not item.get('cwd'):
                 raise ModError(409, 'Waiting for Motet to observe this local Claude project.', 'not_observed')
-            if not eligible(aid, item) or item['cwd'] != data['project']:
+            if not eligible(aid, item) or (item['cwd'] != data['project']
+                                           and not _textually_inside(item['cwd'], data['project'])):
                 raise ModError(409, 'This is not an eligible local parent Claude chat and project.', 'identity_rejected')
+            if item['cwd'] != data['project']:
+                # The chat works in a folder inside the named project. The plugin's word is not enough: the project
+                # must be the chat's recorded launch folder (its transcript's first cwd), so a parent folder or '/'
+                # is never accepted, and the working folder must really be inside it.
+                if not self._launch_proven(aid, data['project'], proof):
+                    raise ModError(409, 'Waiting for verified local Claude parent metadata.', 'not_observed')
+                if not within_project(item['cwd'], data['project']):
+                    # Not resolved yet, or it resolves outside: retry later rather than a final rejection.
+                    raise ModError(409, 'Waiting for Motet to observe this local Claude project.', 'not_observed')
         elif (not proof or proof['agent'] != aid or proof['project'] != data['project']
               or not self.store.shared.metadata_current(proof)):
             raise ModError(409, 'Waiting for verified local Claude parent metadata.', 'not_observed')
@@ -302,6 +539,21 @@ class ClaudeMod:
         entry = self.get(active[0]) if active else None
         if entry and not entry['grant_id']:
             raise ModError(409, 'This chat retains its manual Motet connection.', 'manual_conflict')
+        if (entry and entry['grant_id'] == gid and entry['project'] != data['project']
+                and _textually_inside(entry['project'], data['project'])
+                and self._launch_proven(aid, data['project'], proof) and within_project(entry['project'], data['project'])):
+            # Upgrade: the enrollment names a subfolder of the chat's proven launch folder, which the plugin now
+            # reports. Replace it with one for the launch folder, as a fresh registration would; never across hosts,
+            # and only from a newer registration episode. Every check comes before any change, so a refused
+            # upgrade leaves the enrollment, its connection and its requests exactly as they were.
+            if entry['client_id'] != data['client_id'] and entry['generation']:
+                raise ModError(409, 'Another Claude host currently owns this chat connection.', 'host_conflict')
+            if entry['client_id'] == data['client_id'] and seq <= entry['connection_seq']:
+                raise ModError(409, 'This registration episode is stale.', 'stale_connection')
+            self._move_ready(entry)
+            self.uncertain(entry['id'], 'This Claude enrollment moved to its project folder. Earlier input may still run; nothing was resubmitted.')
+            self.db.execute('UPDATE claude_mod_enrollments SET active=0,generation=NULL WHERE id=?', (entry['id'],))
+            entry = None
         if entry and (entry['grant_id'] != gid or entry['project'] != data['project']):
             raise ModError(409, 'This chat retains a different Motet enrollment.', 'identity_rejected')
         payload = json.dumps(['watch-claude-session-v1', data['native_id'], data['project']], separators=(',', ':'), ensure_ascii=True)
@@ -352,9 +604,10 @@ class ClaudeMod:
         return fields + (('client_id',) if entry['grant_id'] else ())
 
     def room_veto(self, agent, project):
-        """Trusted pure in-memory callback; no discovery or filesystem work."""
+        """Trusted pure in-memory callback; no discovery or filesystem work (folders are resolved off the lock)."""
         current = self.room_snapshot() if self.room_snapshot else {}
-        return agent in current and (not local_parent(agent, current[agent]) or current[agent].get('cwd') != project)
+        return agent in current and (not local_parent(agent, current[agent])
+                                     or not within_project(current[agent].get('cwd'), project))
 
     def capability(self, agent, item=None):
         with self.store.lock, self.db:
@@ -364,7 +617,7 @@ class ClaudeMod:
             ready = bool(entry and entry['generation'] and entry['last_seen'] > time.time() - LEASE and not self.store.worker_failed)
             if entry and self.room_veto(agent, entry['project']):
                 ready = False
-            if item is not None and entry and (not eligible(agent, item) or item.get('cwd') != entry['project']):
+            if item is not None and entry and (not eligible(agent, item) or not within_project(item.get('cwd'), entry['project'])):
                 ready = False
             return ready, entry, ('' if ready else 'Connect the official Motet plugin in this exact existing Claude chat.')
 
@@ -377,7 +630,7 @@ class ClaudeMod:
         grant = self.db.execute('SELECT peer_receive FROM claude_mod_grants WHERE id=? AND active=1',
                                 (entry['grant_id'],)).fetchone()
         return bool(grant and grant[0] == 1 and (item is None or
-                    local_parent(entry['agent'], item) and item.get('cwd') == entry['project']))
+                    local_parent(entry['agent'], item) and within_project(item.get('cwd'), entry['project'])))
 
     def peer_capability(self, agent, item):
         with self.store.lock, self.db:
@@ -392,12 +645,49 @@ class ClaudeMod:
             self.maintain()
             return not self.store.worker_failed and bool(self.db.execute('SELECT 1 FROM claude_mod_enrollments WHERE active=1 AND generation IS NOT NULL AND last_seen>?', (time.time()-LEASE,)).fetchone())
 
-    def enroll(self, data):
+    @staticmethod
+    def _claim_folder(entry, item, reported, observed):
+        """The folder gate for a new claim. With folder protocol 1 the host reports where the chat is: the project
+        itself, or that same folder resolved for this poll, existing and inside the project. An older plugin reports
+        nothing and gets the project folder only, as the stage (or, idle, the launch folder) shows it; that plugin
+        itself submits only in the project folder. Anything else refuses the claim; the poll still succeeds."""
+        if reported is not None:
+            if reported == entry['project']:
+                return True
+            return bool(observed) and observed[0] == reported and observed[1] == entry['project'] and observed[2] is True
+        cwd = item.get('cwd')
+        return project_text(cwd) and cwd == entry['project']
+
+    def _launch_proof(self, aid, project):
+        try:
+            return self.store.shared.metadata_target(aid, project)
+        except Exception:
+            return None
+
+    def _launch_proven(self, aid, project, proof):
+        """The chat directory's fresh proof that `project` is this chat's launch folder (first transcript cwd)."""
+        return bool(isinstance(proof, dict) and proof.get('agent') == aid and proof.get('project') == project
+                    and self.store.shared.metadata_current(proof))
+
+    def _pair(self, data):
+        """The unexpired pairing for this code and chat, checked before any discovery; no filesystem work."""
         schema(data, ('code', 'native_id', 'project'))
-        if not isinstance(data['code'], str) or len(data['code']) > 100 or not ident(data['native_id']) or not project(data['project']):
+        if (not isinstance(data['code'], str) or len(data['code']) > 100 or not ident(data['native_id'])
+                or not project_text(data['project'])):
             raise ModError(400, 'Invalid Claude enrollment identity.')
         pair = self.db.execute('SELECT agent,project,expires FROM claude_mod_pairs WHERE code_hash=?', (digest(data['code']),)).fetchone()
-        if not pair or pair[2] <= time.time() or pair[:2] != ('c:'+data['native_id'], data['project']):
+        if not pair or pair[2] <= time.time() or pair[0] != 'c:'+data['native_id']:
+            raise ModError(403, 'Claude pairing code is expired, used, or does not match this chat.')
+        return pair
+
+    def enroll(self, data, proof=None, canonical=None):
+        pair = self._pair(data)
+        if not (project(data['project']) if canonical is None else canonical):
+            raise ModError(400, 'Invalid Claude enrollment identity.')
+        # The room saw the chat in pair[1] (a canonical name). A different project named by the plugin must be the
+        # chat's recorded launch folder and hold pair[1]; the plugin's report alone never widens the project.
+        if pair[1] != data['project'] and not (_textually_inside(pair[1], data['project'])
+                                               and self._launch_proven(pair[0], data['project'], proof)):
             raise ModError(403, 'Claude pairing code is expired, used, or does not match this chat.')
         for eid, in self.db.execute('SELECT id FROM claude_mod_enrollments WHERE agent=? AND active=1', (pair[0],)).fetchall():
             self.uncertain(eid, 'This Claude enrollment was replaced. Earlier input may still run; nothing was resubmitted.')
@@ -405,7 +695,7 @@ class ClaudeMod:
         if self.db.execute('SELECT COUNT(*) FROM claude_mod_enrollments WHERE active=1').fetchone()[0] >= MAX_ENROLLMENTS:
             raise ModError(429, 'Too many active Claude connections.', 'connection_limit')
         eid, token, generation = str(uuid.uuid4()), secrets.token_hex(32), str(uuid.uuid4())
-        self.db.execute('INSERT INTO claude_mod_enrollments (id,token_hash,agent,project,generation,last_seen,active) VALUES (?,?,?,?,?,?,1)', (eid, digest(token), pair[0], pair[1], generation, time.time()))
+        self.db.execute('INSERT INTO claude_mod_enrollments (id,token_hash,agent,project,generation,last_seen,active) VALUES (?,?,?,?,?,?,1)', (eid, digest(token), pair[0], data['project'], generation, time.time()))
         self.db.execute('DELETE FROM claude_mod_pairs WHERE code_hash=?', (digest(data['code']),))
         result = self.session(self.get(eid))
         return dict(result, enrollment_id=eid, token=token)
@@ -442,10 +732,14 @@ class ClaudeMod:
         return turns
 
     def validate_poll(self, entry, data):
-        schema(data, self.fields(entry, ('generation', 'native_id', 'project', 'accept')))
+        # Folder protocol 1: a poll may report the chat's current folder ('cwd'); an older plugin sends none.
+        schema(data, self.fields(entry, ('generation', 'native_id', 'project', 'accept')
+                                 + (('cwd',) if isinstance(data, dict) and 'cwd' in data else ())))
         self.native(entry, data)
         if data['project'] != entry['project'] or type(data['accept']) is not bool:
             raise ModError(409, 'The enrolled Claude project does not match.')
+        if 'cwd' in data and not project_text(data['cwd']):
+            raise ModError(400, 'Invalid Claude working folder.')
 
     def attachment_entry(self, agent, item):
         """Current derived owner enrollment, without maintenance or discovery."""
@@ -453,6 +747,7 @@ class ClaudeMod:
             return None
         row = self.db.execute('SELECT id FROM main.claude_mod_enrollments WHERE agent=? AND active=1', (agent,)).fetchone()
         entry = self.get(row[0]) if row else None
+        # Attachments are placed in the chat's current folder, so they keep the exact project match.
         if (not entry or entry['project'] != item['cwd'] or not ident(entry['grant_id'])
                 or not ident(entry['client_id']) or not ident(entry['generation'])
                 or entry['lifecycle_protocol'] != 2 or entry['last_seen'] <= time.time() - LEASE
@@ -531,6 +826,14 @@ class ClaudeMod:
                 prepared[row['request_id']] = self.store.shared.prepare_mod_claim(row)
             except Exception:
                 prepared[row['request_id']] = None
+        # A chat that reports working in a folder inside its project may receive a new claim only on a resolution
+        # of that reported folder started for this poll, off the lock; a cached answer, the stage's last folder or
+        # the launch folder never authorises it.
+        observed = None
+        reported = data.get('cwd')
+        if (new_rows and project_text(reported) and reported != entry['project']
+                and _textually_inside(reported, entry['project']) and not _network(reported)):
+            observed = (reported, entry['project'], RESOLVER.revalidate(reported, entry['project']))
         with self.store.lock, self.db:
             snapshot = agents() if callable(agents) else agents  # pure current room vetoes
             snapshot = dict(snapshot) if isinstance(snapshot, dict) else {}
@@ -540,7 +843,7 @@ class ClaudeMod:
             # Connection or grant replacement during preparation invalidates this
             # poll; retained original attempts can still recover after reconnect.
             entry = self.authenticate(token)
-            result = self.poll(entry, data, snapshot, prepared)
+            result = self.poll(entry, data, snapshot, prepared, observed=observed)
             mount = self.attachment_mount
         if mount is None or not data['accept'] or result['claim'] is not None or entry['lifecycle_protocol'] != 2:
             return result
@@ -570,7 +873,7 @@ class ClaudeMod:
         except (LedgerError, AttachmentError):
             return True
 
-    def poll(self, entry, data, agents, prepared, notice_proofs=None):
+    def poll(self, entry, data, agents, prepared, notice_proofs=None, observed=None):
         self.validate_poll(entry, data)
         self.db.execute('UPDATE claude_mod_enrollments SET last_seen=? WHERE id=?', (time.time(), entry['id']))
         rows = self.rows()
@@ -579,7 +882,7 @@ class ClaudeMod:
         busy = busy or self.attachment_busy(entry['agent'])
         claim = None
         item = agents.get(entry['agent']) if isinstance(agents, dict) else None
-        can_claim = local_parent(entry['agent'], item) and item.get('cwd') == entry['project']
+        can_claim = local_parent(entry['agent'], item) and self._claim_folder(entry, item, data.get('cwd'), observed)
         if data['accept'] and can_claim and not busy and not self.store.worker_failed:
             for row in sorted(rows, key=lambda r: r['created']):
                 if (peer_lifecycle.is_terminal(self.db, row['request_id']) or row.get('mod_enrollment') != entry['id']
@@ -784,16 +1087,30 @@ class ClaudeMod:
             with self.store.lock, self.db:
                 self.maintain()
                 self.registration_access(data, token)
+                aid = 'c:' + data['native_id']
+                stored = self.db.execute('SELECT project FROM claude_mod_enrollments WHERE agent=? AND active=1 '
+                                         'AND grant_id IS NOT NULL', (aid,)).fetchone()
             if not project(data['project']):
                 raise ModError(409, 'The Claude project is not canonical.', 'identity_rejected')
             snapshot = agents() if callable(agents) else agents
-            aid = 'c:' + data['native_id']
             proof = None
+            observed = snapshot.get(aid) if isinstance(snapshot, dict) else None
+            cwd = observed.get('cwd') if isinstance(observed, dict) else None
             if not isinstance(snapshot, dict) or aid not in snapshot:
                 try:
                     proof = self.store.shared.metadata_target(aid, data['project'])
                 except Exception:
                     raise ModError(409, 'Waiting for verified local Claude parent metadata.', 'not_observed') from None
+            elif project_text(cwd) and cwd != data['project'] and _textually_inside(cwd, data['project']):
+                # Outside the store lock: prove the launch folder and resolve the working folder.
+                proof = self._launch_proof(aid, data['project'])
+                RESOLVER.prime(cwd, data['project'])
+            stored = stored[0] if stored else None
+            if project_text(stored) and stored != data['project'] and _textually_inside(stored, data['project']):
+                # An enrollment made from a subfolder (before plugin 0.6.3) names that subfolder; the plugin now
+                # names the chat's project root. Prove the root is the launch folder before moving the enrollment.
+                proof = proof or self._launch_proof(aid, data['project'])
+                RESOLVER.prime(stored, data['project'])
             with self.store.lock, self.db:
                 self.maintain()
                 current = agents() if callable(agents) else agents  # pure room snapshot only
@@ -804,10 +1121,30 @@ class ClaudeMod:
             if result is not None:
                 return result
         agents = agents() if callable(agents) else agents
+        manual_move = None
+        if method == 'connect':
+            # Authenticate before any discovery. Only a genuine move of this manual pairing to a folder holding its
+            # own is proved, off the lock; the pinned enrollment is checked again before anything changes.
+            with self.store.lock, self.db:
+                self.maintain()
+                pinned = self.authenticate(token)
+            if (not pinned['grant_id'] and isinstance(data, dict) and isinstance(data.get('project'), str)
+                    and data['project'] != pinned['project'] and data.get('native_id') == pinned['agent'][2:]
+                    and _textually_inside(pinned['project'], data['project']) and project(data['project'])):
+                manual_move = (pinned['id'], pinned['project'], self._launch_proof(pinned['agent'], data['project']))
+        proof, canonical = None, False
+        if method == 'enroll':
+            # Check the one-time code first; prove a wider project only when the pairing folder differs from it.
+            with self.store.lock, self.db:
+                self.maintain()
+                pair = self._pair(data)
+            canonical = project(data['project'])
+            if canonical and pair[1] != data['project'] and _textually_inside(pair[1], data['project']):
+                proof = self._launch_proof(pair[0], data['project'])
         with self.store.lock, self.db:
             self.maintain()
             if method == 'enroll':
-                return self.enroll(data)
+                return self.enroll(data, proof, canonical)
             if method == 'setup':
                 return self.setup(data, port)
             entry = self.authenticate(token)
@@ -816,11 +1153,20 @@ class ClaudeMod:
                     raise ModError(409, 'Automatic Claude connections reconnect through registration.', 'register_required')
                 schema(data, ('native_id', 'project'))
                 self.native(entry, data, connected=False)
-                if data['project'] != entry['project']:
+                moved = data['project'] != entry['project']
+                # A manual pairing made from a subfolder by an earlier plugin may move to the chat's project folder:
+                # only on this manual credential, only to the proven launch folder, only from a folder inside it,
+                # and only with nothing in flight. It stays a manual, owner-only connection.
+                if moved and not (manual_move and manual_move[:2] == (entry['id'], entry['project'])
+                                  and self._launch_proven(entry['agent'], data['project'], manual_move[2])):
                     raise ModError(409, 'The enrolled Claude project does not match.')
+                if moved:
+                    self._move_ready(entry)
                 self.uncertain(entry['id'], 'Claude reconnected after an earlier claim. Delivery remains unknown; it will not resubmit.')
                 generation = str(uuid.uuid4())
                 self.db.execute('UPDATE claude_mod_enrollments SET generation=?,last_seen=? WHERE id=?', (generation, time.time(), entry['id']))
+                if moved:
+                    self.db.execute('UPDATE claude_mod_enrollments SET project=? WHERE id=?', (data['project'], entry['id']))
                 return self.session(self.get(entry['id']))
             if method == 'event':
                 return self.event(entry, data)
