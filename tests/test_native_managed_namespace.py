@@ -335,6 +335,19 @@ class NamespaceTests(unittest.TestCase):
         self.assertEqual(reopened.manager.status(run)['ownerStop'], stop)
         self.assertEqual(captured(lambda: reopened.action('decide', other, uid(), uid())), ('ok', 'written'))
 
+    def test_a_stop_request_id_goes_through_the_reservation_check(self):
+        manager = ManagedFixture(self.root, self.namespace)
+        run = manager.start()
+        agent = 'c:' + manager.manager.status(run)['nativeId']
+        taken = uid()
+        self.assertEqual(captured(lambda: native_action(self.root, self.namespace, taken))[0], 'ok')
+        self.assertEqual(captured(lambda: manager.manager.stop(run, taken, agent)), CONFLICT)
+        self.assertNotIn('stop', manager.calls, 'nothing was asked of the supervisor')
+        self.assertIsNone(manager.manager.status(run)['ownerStop'], 'and nothing was recorded')
+        request = uid()
+        self.assertEqual(manager.manager.stop(run, request, agent)['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(captured(lambda: native_action(self.root, self.namespace, request)), CONFLICT)
+
     def test_process_exit_after_commit_requires_exact_recovery(self):
         for kind in ('native', 'enqueue', 'decide'):
             with self.subTest(kind=kind):

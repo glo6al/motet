@@ -570,6 +570,7 @@ class TestDependencies:
     read_decision: object = None
     namespace: object = None
     unsupervised: object = None      # the stop's own end when the supervisor does not answer (``_end_unsupervised``)
+    real_processes: bool = False     # the stop's process work for real (a test with a real supervisor and Claude)
 
 
 class ManagedClaude:
@@ -1057,7 +1058,9 @@ class ManagedClaude:
             row['state'] = 'uncertain'
             self._save(db, row)
 
-    def _checked_snapshot(self, value, row):
+    def _checked_snapshot(self, value, row, owner_stop=False):
+        """``owner_stop``: the owner stopped this run. A supervisor started by an older Motet words that stop's
+        denial and failed messages as its own shutdown ('shutdown'); they are said here as the owner's stop."""
         if (not isinstance(value, dict) or value.get('runId') != row['runId']
                 or value.get('nativeId') != row['nativeId'] or value.get('incarnation') != row['incarnation']
                 or value.get('cwd') != row['folder']['path'] or value.get('state') not in STATES
@@ -1073,7 +1076,8 @@ class ManagedClaude:
             if type(clean.get('text', '')) is not str or len(clean.get('text', '')) > 8000:
                 _fail()
             # Error strings are runner allowlisted; enforce our own public mapping.
-            clean['error'] = (OWNER_STOP_ERROR if clean.get('error') == 'owner_stop' else
+            clean['error'] = (OWNER_STOP_ERROR if clean.get('error') == 'owner_stop'
+                              or owner_stop and clean.get('error') == 'shutdown' else
                               'Managed delivery failed or is uncertain.' if clean.get('error') else '')
             reply = clean.get('reply', '')
             if type(reply) is not str:
@@ -1100,6 +1104,8 @@ class ManagedClaude:
                     and clean['expiresAt'] < clean['createdAt']):
                 _fail()
             clean.update(_permission_resolution(permission))
+            if owner_stop and clean['resolutionReason'] == 'shutdown':
+                clean['resolutionReason'] = 'owner_stop'
             clean['inputAvailable'] = permission.get('inputAvailable', permission.get('state') not in ('unsupported', 'rejected'))
             if type(clean['inputAvailable']) is not bool:
                 _fail()
@@ -1124,6 +1130,7 @@ class ManagedClaude:
         self._active()
         with self._registry() as db:
             row = self._row(db, run_id)
+            owner_stop = self._stop_record(db, run_id) is not None
         value = None
         live = False
         try:
@@ -1143,7 +1150,7 @@ class ManagedClaude:
             value = dict(runId=run_id, nativeId=row['nativeId'], incarnation=row['incarnation'],
                          cwd=row['folder']['path'], state='uncertain' if row['launchClaimed'] else 'starting',
                          nativeExit=None, identityVerified=False, messages=[], permissions=[], evidenceAvailable=False)
-        snapshot = self._checked_snapshot(value, row)
+        snapshot = self._checked_snapshot(value, row, owner_stop)
         with self._registry() as db:
             current = self._row(db, run_id)
             if not live and not snapshot['nativeExit'] and current['launchClaimed']:
@@ -1268,9 +1275,10 @@ class ManagedClaude:
                 if fresh is not None:
                     with self._registry() as db:
                         row = self._row(db, old[0])
+                        owner_stop = self._stop_record(db, old[0]) is not None
                     checked = self._checked_snapshot(dict(runId=row['runId'], nativeId=row['nativeId'],
                         incarnation=row['incarnation'], cwd=row['folder']['path'], state=row['state'],
-                        nativeExit=None, messages=[fresh], permissions=[]), row)['messages'][0]
+                        nativeExit=None, messages=[fresh], permissions=[]), row, owner_stop)['messages'][0]
                     if (checked['requestId'], checked['source'], checked['digest']) != (request_id, message['source'], message['digest']):
                         _fail('request_conflict')
                     # Read-only evidence can add a receipt or terminal outcome. It
@@ -1669,8 +1677,10 @@ class ManagedClaude:
     def stop(self, run_id, request_id, agent):
         """The owner's stop of the chat Motet started as ``run_id``. ``agent`` must be that chat ('c:' + its native
         ID); anything else is refused (not_managed). A chat already stopped answers with its record and does nothing
-        (``already``); one that ended by itself before any stop is refused (already_ended). A request ID is acted on
-        once: its replay answers with the current record, and a second request while a stop is being carried out
+        (``already``); one that ended by itself before any stop is refused (already_ended): its status is read
+        first, so an end the registry has not caught up with is not recorded as the owner's stop. A request ID is
+        acted on once, and goes through the attachment namespace's reservation check as a message's or a decision's
+        does: its replay answers with the current record, and a second request while a stop is being carried out
         does nothing. Stopping asks the supervisor (``stop``): it denies each waiting request and fails each queued
         message as the owner's stop, and ends Claude's whole process tree. If the supervisor does not answer, Motet
         ends what it can verify itself (``_end_unsupervised``). The outcome is recorded: stopped, or unconfirmed."""
@@ -1678,13 +1688,16 @@ class ManagedClaude:
         if not canonical_uuid(request_id) or not canonical_uuid(run_id) or type(agent) is not str:
             _fail('invalid_request', 400)
         digest = hashlib.sha256(json.dumps(['stop', run_id]).encode()).hexdigest()
-        act = False
         with self._registry() as db:
             if db is None or db.execute('SELECT 1 FROM runs WHERE id=?', (run_id,)).fetchone() is None:
                 _fail('not_managed', 404)
             row = self._row(db, run_id)
             if agent != 'c:' + row['nativeId'] or not row['nativeReceipt']:
                 _fail('not_managed', 404)
+        self.status(run_id)               # the chat's own state now, before deciding whether it has already ended
+        act = False
+        with self._registry(reservation_id=request_id) as db:
+            row = self._row(db, run_id)
             if db.execute('SELECT 1 FROM messages WHERE id=?', (request_id,)).fetchone():
                 _fail('request_conflict')
             old = db.execute('SELECT run,digest FROM operations WHERE id=?', (request_id,)).fetchone()
@@ -1721,25 +1734,33 @@ class ManagedClaude:
         return dict(requestId=request_id, runId=run_id, agent=agent, state=snapshot['state'],
                     ownerStop=snapshot['ownerStop'], already=already)
 
+    def _real_processes(self):
+        """Whether the stop's own process work runs: always in production; in a test only when it asks for it."""
+        return not self._test or self._test.real_processes
+
     def _end(self, run_id, request_id):
         """Ask the supervisor to stop; if it does not answer, end what can be verified without it. True once
-        Claude's exit is confirmed (the registry then holds it)."""
+        Claude's exit is confirmed (the registry then holds it).
+
+        A supervisor started by an older Motet knows only 'shutdown' (it refuses 'stop' without acting on it). It
+        is given that instead. Its records then word the denied request and the failed messages as Motet shutting
+        down; status() says them as the owner's stop, since the stop record shows whose it was. On a Mac that
+        shutdown signals Claude alone, so Claude's tree is read (and verified) first, and whatever of it is still
+        running once Claude has ended is ended too (``_tree_after_legacy``). On Windows that shutdown ends the job."""
         answered = False
         try:
             self._request(run_id, 'stop', dict(requestId=request_id, by='owner'), seconds=STOP_SECONDS)
             answered = True
         except ManagedError as error:
             if error.code == 'managed_not_ready':
-                # A supervisor started by an older Motet knows only 'shutdown' (which it words as Motet shutting
-                # down); it refused 'stop' without acting on it.
+                before = self._tree_before_legacy(run_id)
                 try:
                     self._request(run_id, 'shutdown', dict(requestId=request_id), seconds=STOP_SECONDS)
                     answered = True
                 except Exception:
                     pass
-            elif error.code != 'request_conflict':
-                pass
-            else:
+                self._tree_after_legacy(before)
+            elif error.code == 'request_conflict':
                 answered = True      # the supervisor knows this request ID differently; it did not act on it here
         except Exception:
             pass
@@ -1749,10 +1770,10 @@ class ManagedClaude:
             return False             # the supervisor is listening and could not confirm; the next stop asks it again
         try:
             run_dir = self._run_dir(run_id)
-            if self._test:
-                confirmed = bool(self._test.unsupervised and self._test.unsupervised(run_dir))
-            else:
+            if self._real_processes():
                 confirmed = self._end_unsupervised(run_dir)
+            else:
+                confirmed = bool(self._test.unsupervised and self._test.unsupervised(run_dir))
         except Exception:
             confirmed = False
         if confirmed:
@@ -1761,6 +1782,28 @@ class ManagedClaude:
                 row.update(state='exited', occupied=False)
                 self._save(db, row)
         return confirmed
+
+    def _tree_before_legacy(self, run_id):
+        """POSIX: Claude's verified tree (identities), read before an older supervisor's shutdown; else {}."""
+        if ps.WIN or not self._real_processes():
+            return {}
+        try:
+            import managed_process_tree as tree
+            _, root, _ = self._verified_claude(self._run_dir(run_id))
+            return tree.members(tree.table(), root, {}) if root is not None else {}
+        except Exception:
+            return {}
+
+    def _tree_after_legacy(self, before):
+        """End whatever of the tree read before an older supervisor's shutdown is still running. Each process is
+        still checked by ID, start time and owner before every signal (managed_process_tree.end)."""
+        if not before:
+            return
+        try:
+            import managed_process_tree as tree
+            tree.end(None, also=list(before.values()))
+        except Exception:
+            pass
 
     @staticmethod
     def _supervisor_gone(run_dir):
@@ -1775,22 +1818,19 @@ class ManagedClaude:
         finally:
             ps.close_lock(fd)
 
-    def _end_unsupervised(self, run_dir):
-        """The stop when the supervisor does not answer. Windows: Claude runs in a job that ends when its only
-        handle, the supervisor's, closes, so Claude has ended once the supervisor has (its lock is free); nothing is
-        signalled. POSIX: Claude is found by the process ID its supervisor recorded, and verified before anything is
-        signalled: this user's, its own process group's leader, started between the launch claim and the recorded
-        start, and running the pinned executable with this chat's session ID. Then its tree is ended
-        (managed_process_tree.end), and the supervisor's too if it is still running (identified as Claude's parent,
-        or by its command line naming this run's folder). Confirmed when no process with Claude's command line for
-        this session is left, nothing of its tree is running and the supervisor has ended."""
-        if ps.WIN:
-            return self._supervisor_gone(run_dir)
+    @staticmethod
+    def _verified_claude(run_dir):
+        """POSIX: ``(native, root, claude)``. ``native`` is the process the supervisor recorded (None if none was).
+        ``root`` is the live process with that ID, only if it is verified as this chat's Claude (else None): this
+        user's, its own process group's leader, started between the launch claim and the recorded start, and running
+        the pinned executable with this chat's session ID. ``claude(row)`` tells a process with Claude's command
+        line for this session. That command line must show the session ID: the native build keeps its full
+        arguments (a build that rewrote its process title would never be verified, so never signalled)."""
         from claude_managed_runner import read_native_process
         import managed_process_tree as tree
         native = read_native_process(run_dir)
         if native is None:
-            return False
+            return None, None, None
         marker, exe = ' --session-id ' + native['nativeId'] + ' ', native['executable']
 
         def claude(row):
@@ -1801,16 +1841,32 @@ class ManagedClaude:
             head = command[:at + 1] if at > 0 else ''
             return row.uid == os.getuid() and (head.startswith(exe + ' ') or ' ' + exe + ' ' in head)
 
-        rows = tree.table()
-        row = rows.get(native['pid'])
+        row = tree.table().get(native['pid'])
         root = row if (row is not None and claude(row) and row.pgid == row.pid
                        and native['claimedAt'] - 2 <= row.start <= native['startedAt'] + 1) else None
+        return native, root, claude
+
+    def _end_unsupervised(self, run_dir):
+        """The stop when the supervisor does not answer. Windows: Claude runs in a job that ends when its only
+        handle, the supervisor's, closes, so Claude has ended once the supervisor has (its lock is free); nothing is
+        signalled. POSIX: Claude is found by the process ID its supervisor recorded and verified before anything is
+        signalled (``_verified_claude``). Then its tree is ended (managed_process_tree.end), and the supervisor's
+        too if it is still running: Claude's parent, or this Python running the supervisor on this run's folder, as
+        its own group's leader. Confirmed when no process with Claude's command line for this session is left,
+        nothing of its tree is running and the supervisor has ended."""
+        if ps.WIN:
+            return self._supervisor_gone(run_dir)
+        import managed_process_tree as tree
+        native, root, claude = self._verified_claude(run_dir)
+        if native is None:
+            return False
         left = tree.end(root) if root is not None and tree.alive(root) else {}
         if not self._supervisor_gone(run_dir):
             folder = ' ' + os.fspath(run_dir)
+            runner = str(Path(__file__).with_name('claude_managed_runner.py'))
             for candidate in tree.table().values():
                 if (candidate.uid == os.getuid() and tree.alive(candidate) and candidate.command.endswith(folder)
-                        and 'claude_managed_runner.py' in candidate.command
+                        and ' ' + runner + ' ' in candidate.command + ' ' and candidate.pgid == candidate.pid
                         and (root is None or candidate.pid == root.ppid)):
                     left.update(tree.end(candidate))
         return (not left and self._supervisor_gone(run_dir)

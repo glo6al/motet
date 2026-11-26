@@ -8,6 +8,7 @@ const fn=name=>{const a=html.indexOf('function '+name+'('),b=html.indexOf('\nfun
 const controllerStart=html.indexOf('function workspaceRequestCard('),controllerEnd=html.indexOf('/* end managed Claude workspace controller */',controllerStart);
 assert.ok(controllerStart>0&&controllerEnd>controllerStart,'managed controller source markers');
 const controllerSource=html.slice(controllerStart,controllerEnd);
+assert.ok(html.includes('id="deskStopChat"'));assert.doesNotMatch(html,/id="deskStopChat"[^>]*title=/,'the menu item has no explainer tooltip');
 const tick=()=>new Promise(r=>setImmediate(r));
 
 const CLEO='c:11111111-1111-4111-8111-111111111111',RUN='22222222-2222-4222-8222-222222222222',PERM='33333333-3333-4333-8333-333333333333';
@@ -64,17 +65,17 @@ async function stoppedFlow(code){
   assert.deepEqual(h.stops[0],{runId:RUN,requestId:'55555555-5555-4555-8555-555555555555',agent:CLEO});
   api.workspaceManagedDeskPaint(h.cleo);api.workspaceManagedComposerPaint();
   assert.equal(api.workspaceManagedStatusPill(h.cleo),'stopping…');assert.equal(api.workspaceManagedStopPillState(h.cleo),'working');
-  const notice=api.MCP.composerNotice;assert.equal(notice.textContent,'Stopping Cleo…');assert.equal(notice.hidden,false);assert.equal($('#ofIn').hidden,true);assert.equal($('#ofSend').hidden,true);assert.equal($('#sendHint').textContent,'Motet is ending this chat. This takes a few seconds.');
+  const notice=api.MCP.composerNotice;assert.equal(notice.textContent,'Stopping Cleo…');assert.equal(notice.hidden,false);assert.equal($('#ofIn').hidden,true);assert.equal($('#ofSend').hidden,true);assert.equal($('#sendHint').textContent,'','no hint under the box: the status line says stopping…');
   assert.notEqual(api.workspaceManagedSendReason(CLEO,h.cleo),'','no message is sent while stopping');assert.equal(api.workspaceManagedStopOffered(h.cleo),false);
   const record={by:'owner',outcome:'stopped',requestedAt:500,lastAttemptAt:500,stoppedAt:503,terminalCommand:'fictional command'};
   h.status.state='exited';h.status.ownerStop=record;h.status.permissions=[{...h.status.permissions[0],state:'shutdown',canAllow:false,canDeny:false,decision:'deny',decisionState:'written',resolutionReason:'owner_stop',resolvedAt:502}];h.status.capabilities={permissions:false};h.status.queued=0;
   h.reply().resolve({schemaVersion:1,requestId:h.reply().requestId,runId:RUN,agent:CLEO,state:'exited',ownerStop:record,already:false});await tick();await tick();await tick();
   api.workspaceManagedDeskPaint(h.cleo);api.workspaceManagedComposerPaint();
   assert.equal(api.workspaceManagedStatusPill(h.cleo),'stopped · t503');assert.equal(api.workspaceManagedStopPillState(h.cleo),'ended');
-  assert.equal(notice.textContent,'Cleo is stopped');assert.equal($('#sendHint').textContent,'You stopped this chat at t503. Its history stays here. It cannot take new messages.');
+  assert.equal(notice.textContent,'Cleo is stopped');assert.equal($('#sendHint').textContent,'','no hint under the box: the status line carries the time');
   assert.equal(api.MCP.noticeHost.hidden,true,'no red notice for a stopped chat');assert.doesNotMatch(api.MCP.noticeHost.textContent,/contact|cannot reach/);
   assert.doesNotMatch(notice.textContent+$('#sendHint').textContent,/paused|cannot reach|contact lost/,'none of the contact-lost words');
-  assert.equal(api.workspaceManagedSendReason(CLEO,h.cleo),'This chat is stopped. It cannot take new messages.');
+  assert.equal(api.workspaceManagedSendReason(CLEO,h.cleo),'This chat is stopped.');
   $('#deskPin').hidden=false;api.workspaceManagedStopMenuPaint(h.cleo);assert.equal($('#deskStopArea').hidden,true,'after a stop the menu loses Stop this chat');assert.equal($('#deskPin').hidden,false,'Pin stays');
   assert.equal(api.workspaceManagedOutcome(h.status.permissions[0]).title,'Denied when you stopped this chat');
   return h;
@@ -91,7 +92,7 @@ async function unconfirmedFlow(code){
   assert.equal(host.hidden,false);const [title,body,small,row]=host.children;
   assert.equal(text(title),'Motet could not confirm that Cleo stopped.');assert.equal(text(body),'You asked it to stop at t604. It did not answer in time, so it may still be working.');assert.equal(text(small),'Messages to it are paused. Its history stays here.');
   const [retry,copy]=row.children;assert.equal(text(retry),'Try again');assert.equal(text(copy),'Copy the Terminal command instead');
-  assert.equal(api.MCP.composerNotice.textContent,'Messages to Cleo are paused');assert.equal($('#sendHint').textContent,'Motet cannot reach this chat right now. Nothing you type would be delivered.');
+  assert.equal(api.MCP.composerNotice.textContent,'Messages to Cleo are paused');assert.equal($('#sendHint').textContent,'','could not confirm: no contact-lost hint under the box');assert.doesNotMatch(api.workspaceManagedSendReason(CLEO,h.cleo),/cannot reach/);
   copy.onclick();await tick();assert.deepEqual(h.copies,['pkill -KILL -f -- fictional']);assert.equal(text(copy),'Copied');h.timers.at(-1).f();assert.equal(text(copy),'Copy the Terminal command instead');
   assert.equal(api.workspaceManagedStopOffered(h.cleo),false,'Try again lives in the notice, not the menu');
   retry.onclick();retry.onclick();assert.equal(h.stops.length,2,'Try again sends one more stop');assert.notEqual(h.stops[1].requestId,h.stops[0].requestId,'Try again uses a new request id');
@@ -151,7 +152,8 @@ function stage(){
   const mutants=[
     ['double click guard',"if(old?.inFlight)return false;",''],
     ['menu on unmanaged chats',"if(!cap||cap.classification!=='managed'||!managedUUID(cap.runId)||cap.key!==KEY||cap.generation!==MCP.generation)return false;",''],
-    ['stopped words','You stopped this chat at ','You ended this chat at '],
+    ['stopped words',"+' is stopped'","+' has ended'"],
+    ['no hint under the box',"setHint('');return}","setHint('You stopped this chat.');return}"],
     ['contact-lost notice after stop',"MCP.noticeHost.hidden=stop.phase!=='unconfirmed';","MCP.noticeHost.hidden=false;"],
     ['new id for Try again',"const requestId=globalThis.crypto?.randomUUID?.();if(!managedUUID(requestId))return false;const entry=","const requestId=old?.lastId||globalThis.crypto?.randomUUID?.();if(!managedUUID(requestId))return false;const entry="],
   ];

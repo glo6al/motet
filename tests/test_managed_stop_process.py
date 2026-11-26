@@ -16,7 +16,6 @@ is never signalled. No real Claude is started; fictional names only.
 Run: python3 tests/test_managed_stop_process.py
 """
 from contextlib import contextmanager
-from dataclasses import replace
 import hashlib
 import http.client
 import json
@@ -77,6 +76,14 @@ SUPERVISOR = r'''import sys
 sys.path.insert(0, %r)
 import claude_managed_runner as runner
 runner.PINNED_SHA256 = sys.argv[2]
+if sys.argv[3:] == ['legacy']:
+    # A supervisor as an older Motet started it: it knows no 'stop', only 'shutdown' (SIGTERM to Claude alone).
+    command = runner.Runner.command
+    def older(self, name, params):
+        if name == 'stop':
+            runner._fail('invalid_request')
+        return command(self, name, params)
+    runner.Runner.command = older
 raise SystemExit(runner.serve(sys.argv[1]))
 '''
 
@@ -105,6 +112,7 @@ class MacStopTests(unittest.TestCase):
         base.chmod(0o700)
         self.started = {}
         self.supervisors = []
+        self.legacy = []
         self.addCleanup(self.end_everything)
         self.state = base / '.live-room'
         self.state.mkdir(mode=0o700)
@@ -134,7 +142,7 @@ class MacStopTests(unittest.TestCase):
 
     def spawn(self, run_dir):
         """The supervisor's start as spawn_runner makes it (its own session, no inherited streams)."""
-        process = subprocess.Popen([sys.executable, str(self.supervisor), str(run_dir), self.sha],
+        process = subprocess.Popen([sys.executable, str(self.supervisor), str(run_dir), self.sha] + self.legacy,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    start_new_session=True, close_fds=True)
         self.supervisors.append(process)
@@ -148,9 +156,8 @@ class MacStopTests(unittest.TestCase):
                 executable=dict(path=str(self.exe), version=claude_managed.VERSION, sha256=self.sha),
                 spawn=self.spawn, request=claude_managed.client_request, read_snapshot=runner.read_snapshot,
                 directory=None, launch_timeout=claude_managed.STARTUP_TIMEOUT,
-                read_message=runner.read_message, read_decision=runner.read_decision))
-        # The stop's own end without a supervisor is the real one here.
-        manager._test = replace(manager._test, unsupervised=manager._end_unsupervised)
+                read_message=runner.read_message, read_decision=runner.read_decision,
+                real_processes=True))           # the stop's own process work is the real one here
         run_id = manager.reserve(self.folder, str(uuid.uuid4()))
         native = manager.launch_once(run_id, self.folder, lambda *args: None)
         with open(str(self.project / 'fictional-claude.json')) as source:
@@ -225,6 +232,14 @@ class MacStopTests(unittest.TestCase):
         self.assert_all_gone()
         with manager._registry() as db:
             self.assertFalse(manager._row(db, run_id)['occupied'])
+
+    def test_an_older_supervisors_shutdown_is_followed_by_the_rest_of_the_tree(self):
+        self.legacy = ['legacy']
+        manager, run_id, native = self.start()
+        result = manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'stopped'))
+        self.assert_all_gone()           # the grandchild and the detached one too, not only Claude
+        self.assertEqual(self.supervisors[-1].wait(timeout=30), 0)
 
     def test_a_process_id_that_names_another_process_is_never_signalled(self):
         manager, run_id, native = self.start('fictional-linger')

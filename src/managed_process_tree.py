@@ -41,7 +41,9 @@ def table(run=subprocess.run):
     try:
         output = run([PS, '-A', '-ww', '-o', 'pid=,ppid=,pgid=,uid=,stat=,lstart=,command='],
                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                     env={'LC_ALL': 'C', 'PATH': '/usr/bin:/bin'}, timeout=5, check=True).stdout
+                     env=dict({'LC_ALL': 'C', 'PATH': '/usr/bin:/bin'},
+                              **({'TZ': os.environ['TZ']} if 'TZ' in os.environ else {})),   # start times as mktime reads them
+                     timeout=5, check=True).stdout
     except (OSError, subprocess.SubprocessError) as error:
         raise TreeError('process table unavailable') from error
     rows = {}
@@ -105,14 +107,15 @@ def _signal(rows, targets, number):
                 pass
 
 
-def end(root, *, group_signal=None, gentle=GENTLE_SECONDS, firm=FIRM_SECONDS, read=table,
+def end(root, *, also=(), group_signal=None, gentle=GENTLE_SECONDS, firm=FIRM_SECONDS, read=table,
         clock=time.monotonic, sleep=time.sleep):
     """SIGTERM the tree, wait up to ``gentle`` seconds, SIGKILL what is left, wait up to ``firm``. ``root`` is the
-    recorded identity of the chat's own process (a Process). ``group_signal(number)``, when given, also signals the
-    root's group directly; only the supervisor gives it, while Claude is its own unreaped child (so neither its ID
+    recorded identity of the chat's own process (a Process), or None once it has gone; ``also`` are identities from
+    an earlier read of the tree, ended with theirs. ``group_signal(number)``, when given, also signals the root's
+    group directly; only the supervisor gives it, while Claude is its own unreaped child (so neither its ID
     nor its group's can be reused). Returns the identities still running at the end: empty means the whole tree
     has ended."""
-    known = {}
+    known = {row.pid: row for row in also}
     for number, seconds in ((signal.SIGTERM, gentle), (signal.SIGKILL, firm)):
         rows = read()
         known.update(members(rows, root, known))

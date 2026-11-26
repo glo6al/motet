@@ -1149,9 +1149,9 @@ class Fixture(unittest.TestCase):
 
     def test_a_chat_that_ended_by_itself_is_not_called_stopped(self):
         run_id, native = self.start()
+        # Claude ended by itself; the registry has not read that yet when the owner clicks Stop.
         self.snapshots[run_id].update(state='exited', nativeExit=dict(
             confirmed=True, code=0, incarnation=self.snapshots[run_id]['incarnation']))
-        self.manager.status(run_id)
         with self.assertRaises(managed.ManagedError) as raised:
             self.manager.stop(run_id, uid(), 'c:' + native)
         self.assertEqual(raised.exception.code, 'already_ended')
@@ -1196,13 +1196,30 @@ class Fixture(unittest.TestCase):
             self.manager.stop(run_id, self.manager._stop_record_id(run_id), 'c:' + native)
         self.assertEqual(raised.exception.code, 'request_conflict')
 
-    def test_an_older_supervisor_gets_its_shutdown(self):
+    def test_an_older_supervisor_gets_its_shutdown_said_as_the_owners_stop(self):
         run_id, native = self.start()
+        self.waiting(run_id)
         self.refused_commands = ('stop',)
         request = uid()
         self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['ownerStop']['outcome'], 'stopped')
         self.assertEqual([c for _, c, _ in self.commands if c in ('stop', 'shutdown')], ['stop', 'shutdown'])
         self.assertEqual(self.stops()[-1], dict(requestId=request))
+        # The older supervisor recorded its own shutdown; the stop record says whose it was.
+        self.assertEqual(self.snapshots[run_id]['permissions'][0]['resolutionReason'], 'shutdown')
+        snapshot = self.manager.status(run_id)
+        self.assertEqual((snapshot['permissions'][0]['resolutionReason'], snapshot['permissions'][0]['decision']),
+                         ('owner_stop', 'deny'))
+        self.assertEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)
+        self.assertEqual(self.manager.lookup_message(snapshot['messages'][0]['requestId'])['error'],
+                         managed.OWNER_STOP_ERROR)
+
+    def test_a_shutdown_without_an_owners_stop_keeps_its_own_words(self):
+        run_id, native = self.start()
+        self.waiting(run_id)
+        self.manager.shutdown(run_id, uid())
+        snapshot = self.manager.status(run_id)
+        self.assertEqual(snapshot['permissions'][0]['resolutionReason'], 'shutdown')
+        self.assertNotEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)
 
     def test_without_its_supervisor_the_stop_is_motets_own_and_verified(self):
         run_id, native = self.start()
