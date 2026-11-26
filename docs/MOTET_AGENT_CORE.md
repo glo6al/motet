@@ -311,7 +311,7 @@ How a press reaches the agent depends on the kind of question:
 
 | Kind of question | What the press does |
 | --- | --- |
-| A question in the agent's last message, as plain text | Delivered as a message to that chat, through the same dispatcher as an approved proposal |
+| A question in the agent's last message, as plain text | Delivered as a message to that chat, through the same dispatcher as an approved proposal. The button labels are Motet's reading of free text, so it offers buttons only when the choices are plain in the agent's words; otherwise it shows the question with "Open desk" |
 | An open tool question (Claude `AskUserQuestion`) | "Open desk" only: a message sent into the chat does not answer an open tool call. A route that answers the call itself is still to be evaluated ([roadmap](ROADMAP.md)) |
 | A plan approval (Claude `ExitPlanMode`) | Treated as the agent's own prompt: "Open desk" only (a proposed reading) |
 | A permission prompt, in either app | "Open desk" only, always |
@@ -321,7 +321,9 @@ signal, and the design draws answer buttons on question items. Under the rule ab
 "Open desk", so the owner would see far fewer buttons than drawn. The options:
 
 1. **Buttons only where they work** (recommended): plain-text questions get buttons; typed questions and plan
-   approvals show "Open desk", and the screens mark which is which.
+   approvals show "Open desk", and the screens mark which is which. A typed question shows its choices as plain words
+   ("It is a choice box in her chat: arm64, x86, or both"), with what Motet would pick, so the owner can decide on
+   Next up and only goes to the desk to press it. The choices are text, never buttons.
 2. **Find a route first:** investigate, before step 2, whether Motet can answer an open `AskUserQuestion` itself.
 3. **No answer buttons in version 1:** every question opens the agent's desk.
 
