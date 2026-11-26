@@ -142,6 +142,15 @@ class LiveSourceTests(unittest.TestCase):
             f.write(b'\n')
         self.assertEqual(self.observe(floor).state, 'reply')
 
+    def test_record_over_one_megabyte_is_read_not_refused(self):
+        # Records of several MB are normal in busy rollouts; the shared record limit applies, not 1 MB.
+        floor = self.prepare()
+        large = {'type': 'response_item', 'payload': {'type': 'message', 'role': 'assistant',
+                                                      'content': [{'type': 'output_text', 'text': 'x' * (2 * 1024 * 1024)}]}}
+        self.append(queued_start(), raw_user(), user_item(), large, ended())
+        self.assertGreater(self.rollout.stat().st_size, 2 * 1024 * 1024)
+        self.assertEqual(self.observe(floor).state, 'reply')
+
     def test_terminal_without_verified_marker_records_only_end(self):
         floor = self.prepare()
         self.append(queued_start(), raw_user(), user_item(), ended(reply='Uncorrelated text.'))

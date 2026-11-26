@@ -108,6 +108,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get('PORT', '8793'))
 WINDOW = int(os.environ.get('WINDOW_MIN', '20')) * 60
+ROOM_QUIET = WINDOW * 6                 # a log silent this long leaves the room until it is written to again
 HOME = os.path.expanduser('~')
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIVE_CAP, OLD_CAP, BACKLOG = 60000, 6000, 200000
@@ -2977,7 +2978,7 @@ def expire_hooked(tails, now):
     for aid, t in list(HOOKED.items()):
         if aid in followed:
             HOOKED.pop(aid, None)                   # its log turned up: from here on it lives and dies with the log
-        elif now - t > WINDOW * 6:
+        elif now - t > ROOM_QUIET:
             with LOCK:
                 held = any(p['aid'] == aid for p in PENDING.values())
             if held:
@@ -5049,7 +5050,7 @@ def watch():
                 failed += 1
                 print('poll failed', p, type(e).__name__, e)
             try:
-                gone = now - os.path.getmtime(p) > WINDOW * 6 and not kept(p, now)
+                gone = now - os.path.getmtime(p) > ROOM_QUIET and not kept(p, now)
             except OSError:
                 gone = True                                 # the log was deleted
             if gone:
@@ -6251,6 +6252,23 @@ class Server(ThreadingHTTPServer):
                 Server.active -= 1
 
 
+CODEX_PROCESS_UNREADABLE = ('Motet cannot read the process list right now, so this Codex chat cannot be verified. '
+                            'It is checked again automatically.')
+
+
+def codex_outside_room_reason():
+    """Why a Codex chat the room is not following cannot be verified, while the desktop app and queue are fine. The
+    fallback covers every such chat, so it names both causes it can be: quiet for the room's window, or not found."""
+    if not SCAN['ready']:
+        return 'Motet has not finished finding active chats yet; this Codex chat is not verified until it does.'
+    minutes = ROOM_QUIET // 60
+    hours = minutes // 60
+    span = (('1 hour' if hours == 1 else '%d hours' % hours) if minutes and not minutes % 60
+            else '1 minute' if minutes == 1 else '%d minutes' % minutes)
+    return ('Motet has not seen this Codex chat active in the last %s, or has not found it yet. It can be messaged '
+            'once it is active again.' % span)
+
+
 def shared_directory_snapshot(store):
     """Read readiness facts without holding SQLite's lock or exposing transcript text."""
     import claude_channel
@@ -6267,13 +6285,19 @@ def shared_directory_snapshot(store):
             desktop = proc.returncode == 0
         except (OSError, subprocess.SubprocessError):
             pass
-    result = {'__codex_transport__': {'capability': 'unavailable' if not ready or not desktop else 'unverified',
-                                    'reason': 'Codex desktop and verified queue transport are required.'}}
+    # The fallback covers Codex chats the room is not following. With the desktop app and queue ready, that is a
+    # chat whose log has gone quiet (it left the room) or one not found yet, so say that, not a transport fault.
+    result = {'__codex_transport__': {'capability': 'unavailable', 'reason': 'Codex desktop and verified queue transport are required.'}
+              if not ready or not desktop else {'capability': 'unverified', 'reason': codex_outside_room_reason()}}
     for aid, agent in active.items():
         if (aid.startswith('x:') and agent.get('runtime') == 'Codex' and not agent.get('parent')
                 and not agent.get('observed') and not agent.get('stale')):
             result[aid] = {'capability': 'reachable' if ready and desktop else 'unavailable',
                            'reason': '' if ready and desktop else 'Codex desktop or queue transport is unavailable.'}
+        elif (aid.startswith('x:') and agent.get('runtime') == 'Codex' and not agent.get('parent')
+                and not agent.get('observed') and ready and desktop):
+            # In the room but marked stale: the process list could not be read, not idle.
+            result[aid] = {'capability': 'unverified', 'reason': CODEX_PROCESS_UNREADABLE}
     with store.lock, store.db:
         store.mods.maintain()
         entries = [store.mods.get(row[0]) for row in store.db.execute('SELECT id FROM claude_mod_enrollments WHERE active=1')]

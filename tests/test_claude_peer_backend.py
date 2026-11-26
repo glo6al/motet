@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import chat_directory
+import claude_mod as mod
 import peer_bridge
 import server
 import test_claude_mod as owner_fixture
@@ -819,7 +820,7 @@ class ClaudePeerBackendTests(unittest.TestCase):
         self.assertEqual(self.store.shared.result(result['request_id'])['state'],'answered')
         self.assertEqual(self.store.mods.setup_status({})['connected_chats'],1)
         entry=self.store.mods.get(self.registration['enrollment_id'])
-        self.assertFalse(self.store.mods.peer_ready(dict(entry,last_seen=time.time()-13)),'an expired lease cannot be peer-ready')
+        self.assertFalse(self.store.mods.peer_ready(dict(entry,last_seen=time.time()-mod.LEASE-1)),'an expired lease cannot be peer-ready')
         self.store.db.execute('UPDATE claude_mod_enrollments SET last_seen=0');self.store.db.commit()
         self.assertEqual(self.store.mods.setup_status({})['connected_chats'],0)
         self.assertEqual(self.target()['capability'],'unavailable')
@@ -884,6 +885,24 @@ class ClaudePeerBackendTests(unittest.TestCase):
             status,value,_=self.register_global(grant,peer_protocol=1)
             self.assertEqual((status,value['error_code']),(409,'not_observed'))
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM claude_mod_enrollments WHERE active=1').fetchone()[0],0)
+
+    def test_fixture_lease_does_not_depend_on_runner_speed(self):
+        # A slow runner (one Windows CI run took 140 s for this suite) may spend more than the product's 12-second
+        # lease between setup and the first poll. The fixture's lease covers that; the product lease would not.
+        self.assertEqual(owner_fixture.PRODUCT_LEASE, 12)
+        self.assertEqual(mod.LEASE, owner_fixture.TEST_LEASE)
+        self.setup_global(); sent = self.send()
+        later = time.time() + owner_fixture.PRODUCT_LEASE + 1
+        with patch.object(mod, 'time', wraps=time) as clock:
+            clock.time.return_value = later
+            status, result = self.global_poll(self.body['client_id'])
+            self.assertEqual(status, 200, result)
+            self.assertEqual(self.peer_row(sent['request_id'])['request_id'], result['claim']['request_id'])
+            # The same delay under the product lease is the CI failure: the enrollment lapses before the poll.
+            clock.time.return_value = later + owner_fixture.PRODUCT_LEASE + 1
+            with patch.object(mod, 'LEASE', owner_fixture.PRODUCT_LEASE):
+                status, result = self.global_poll(self.body['client_id'])
+        self.assertEqual((status, result.get('error_code')), (409, 'stale_connection'), result)
 
     def test_idle_present_room_vetoes_and_prepare_race(self):
         self.target();server.AGENTS.clear();self.setup_global()

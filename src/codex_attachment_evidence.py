@@ -17,9 +17,13 @@ import uuid
 import codex_transcript
 
 
+# This reader holds the whole rollout in memory, so MAX_SOURCE, not the record limit, bounds it. A Codex
+# compaction record (several MB) is a normal record, so the line limit is the shared rollout record limit; a
+# rollout that outgrows MAX_SOURCE is still refused whole ('source_byte_limit'). The source cap stays at 16 MiB:
+# raising it would raise the memory each attachment attempt holds, which is its own decision.
 MAX_INDEX = MAX_SOURCE = 16 * 1024 * 1024
 MAX_CHUNK = 2 * 1024 * 1024
-MAX_LINE, MAX_LINES, MAX_TURNS = 1_000_000, 16_384, 256
+MAX_LINE, MAX_LINES, MAX_TURNS = codex_transcript.MAX_RECORD, 16_384, 256
 MAX_ATTEMPTS, MAX_MAP_BYTES = 32, 2 * 1024 * 1024
 POLICY, MAP_SCHEMA_VERSION = 1, 2
 

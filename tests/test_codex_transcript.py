@@ -1,4 +1,5 @@
 """Fictional native metadata and continuation fixtures; never contacts agents."""
+import io
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,40 @@ class FilenameTests(unittest.TestCase):
         self.assertEqual(c.pure_text([dict(type='input_text', text='Fictional instruction.')], 'developer'), 'Fictional instruction.')
         self.assertIsNone(c.pure_text([dict(part, image_url='fictional')], 'assistant'))
         self.assertIsNone(c.pure_text([dict(part, annotations='malformed')], 'assistant'))
+
+
+class ReadThroughTests(unittest.TestCase):
+    class Counted(io.BytesIO):
+        taken = 0
+        def readline(self, size=-1):
+            line = super().readline(size)
+            self.taken += len(line)
+            return line
+
+    def read(self, raw, budget, limit):
+        source = self.Counted(raw)
+        data = source.read(budget)
+        return c.read_through(source, data, limit), source.taken
+
+    def test_completes_a_final_record_within_the_limit(self):
+        raw = b'{"a":1}\n' + b'{"b":"' + b'x' * 50 + b'"}\n{"c":2}\n'
+        data, taken = self.read(raw, 12, 100)
+        self.assertEqual(data, raw[:raw.index(b'\n', 12) + 1])
+        self.assertLessEqual(taken, 101)
+
+    def test_record_longer_than_the_limit_stays_incomplete_and_bounded(self):
+        raw = b'{"a":1}\n' + b'x' * 10_000 + b'\n'
+        data, taken = self.read(raw, 20, 100)
+        self.assertFalse(data.endswith(b'\n'))
+        self.assertEqual(len(data) - data.rfind(b'\n') - 1, 101)
+        self.assertLessEqual(taken, 101)
+        data, taken = self.read(raw, 500, 100)
+        self.assertEqual((len(data), taken), (500, 0))
+
+    def test_complete_or_empty_reads_are_unchanged(self):
+        self.assertEqual(self.read(b'{"a":1}\n{"b":2}\n', 8, 100), (b'{"a":1}\n', 0))
+        self.assertEqual(self.read(b'', 8, 100), (b'', 0))
+        self.assertEqual(self.read(b'{"a":', 8, 100), (b'{"a":', 0))
 
 
 class IndexErrorTests(unittest.TestCase):
@@ -413,6 +448,85 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(self.row['capture_disposition'], 'withheld')
         for key in ('reply', 'candidate_reply', 'final', 'final_turn'):
             self.assertEqual(self.row.get(key, ''), '')
+
+    def tick_until_ended(self, limit=40):
+        for _ in range(limit):
+            self.store.tick()
+            saved = next(row for row in self.store._rows() if row['request_id'] == self.rid)
+            if saved.get('settled') or saved.get('tracking_stopped'):
+                return saved
+        self.fail('The bound turn did not end.')
+
+    def bound_end_after(self, write_record):
+        self.bind_progress_turn()
+        with self.old.open('ab') as source:
+            write_record(source)
+        self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                    last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional answer.'))
+        reads = []
+        real = c.read_through
+        def counted(source, data, limit=None):
+            result = real(source, data, limit)
+            reads.append(len(result))
+            return result
+        with patch.object(c, 'read_through', counted):
+            saved = self.tick_until_ended()
+        # Each poll holds at most one read budget plus one bounded record.
+        self.assertTrue(reads)
+        self.assertLessEqual(max(reads), m.MAX_READ + m.MAX_LINE + 1)
+        return saved
+
+    def test_large_compaction_record_inside_bound_turn_keeps_the_reply(self):
+        payload = {'message': 'Fictional summary', 'replacement_history': [{'text': 'x' * (7 * 1024 * 1024)}]}
+        saved = self.bound_end_after(lambda source: source.write(
+            json.dumps(dict(type='compacted', payload=payload)).encode() + b'\n'))
+        self.assertFalse(saved.get('codex_gap_seen'))
+        self.assertFalse(saved.get('codex_discard_record'))
+        self.assertEqual(self.public_result(2)['reply'], 'Fictional answer.')
+
+    def test_large_malformed_record_inside_bound_turn_is_still_a_gap(self):
+        self.bound_end_after(lambda source: source.write(
+            b'{"type":"compacted","payload":{"opaque":"' + b'x' * (7 * 1024 * 1024) + b'\n'))
+        self.assert_durable_peer_end(gap=True)
+
+    def test_record_over_the_record_limit_is_still_a_gap(self):
+        # A real record just over 32 MiB: never parsed, skipped in bounded reads.
+        self.bound_end_after(lambda source: source.write(
+            b'{"type":"compacted","payload":{"opaque":"' + b'x' * (c.MAX_RECORD + 1) + b'"}}\n'))
+        self.assert_durable_peer_end(gap=True)
+
+    def test_unfinished_record_is_read_again_only_after_the_file_changes(self):
+        # A writer that stopped mid-record (no newline) must not cost a full re-read on every tick.
+        self.bind_progress_turn()
+        record = json.dumps(dict(type='compacted', payload={'opaque': 'x' * (3 * 1024 * 1024)})).encode()
+        with self.old.open('ab') as source:
+            source.write(record[:-10])
+        reads = []
+        real = c.read_through
+        def counted(source, data, limit=None):
+            reads.append(len(data))
+            return real(source, data, limit)
+        def saved():
+            return next(row for row in self.store._rows() if row['request_id'] == self.rid)
+        with patch.object(c, 'read_through', counted):
+            self.store.tick()
+            self.assertEqual(len(reads), 1)
+            waiting = saved()
+            self.assertTrue(waiting.get('codex_tail_wait'))
+            self.assertFalse(waiting.get('codex_gap_seen'))
+            for _ in range(3):
+                self.store.tick()
+            self.assertEqual(len(reads), 1)
+            self.assertEqual(saved()['cursor'], waiting['cursor'])
+            with self.old.open('ab') as source:
+                source.write(record[-10:] + b'\n')
+            self.append(self.old, 'event_msg', dict(type='task_complete', turn_id='bound',
+                        last_agent_message='WATCH_REPLY ' + self.rid + '\nFictional answer.'))
+            self.tick_until_ended()
+            self.assertGreaterEqual(len(reads), 2)
+        self.assertNotIn('codex_tail_wait', saved())
+        self.assertFalse(saved().get('codex_gap_seen'))
+        self.assertEqual(self.public_result(2)['reply'], 'Fictional answer.')
 
     def test_oversized_before_explicit_envelope_drains_across_restart_and_withholds(self):
         self.oversized(self.old)
