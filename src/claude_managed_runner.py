@@ -46,6 +46,12 @@ CONTROL_SECONDS = 30
 SUPPORTED_TOOLS = frozenset(('Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
                              'Glob', 'Grep', 'LS', 'WebFetch', 'WebSearch', 'Task', 'Agent',
                              'Skill', 'TodoWrite', 'ToolSearch'))
+# Claude's "approve this plan?" prompt. Approving a plan also chooses how the edits are then made, which a bare allow
+# does not, and this headless session has no app box for the owner to answer it in. So it is never supported here
+# (never pending, never allowable): it is denied at once with this reason, which hands the plan back to the owner.
+PLAN_TOOL = 'ExitPlanMode'
+PLAN_DENIED = ('Motet cannot approve a plan: approving one also chooses how edits are made, and only the owner can '
+               'do that. Do not carry out the plan. End this turn with the plan as your reply so the owner can review it.')
 ERRORS = {
     'unsafe_state': (503, 'Managed session state is unavailable.'),
     'invalid_request': (400, 'The managed request is invalid.'),
@@ -1017,7 +1023,7 @@ class Runner:
         if retained >= MAX_RETAINED:
             _fail('native_uncertain')
         reason = ('inactive_turn' if not self.started or self.active is None else
-                  'unsupported_tool' if tool not in SUPPORTED_TOOLS else
+                  'unsupported_tool' if tool not in SUPPORTED_TOOLS or tool == PLAN_TOOL else
                   'oversized' if len(original.encode('utf-8')) > MAX_INPUT else
                   'capacity' if count >= 8 or not self._storage_available(len(original.encode('utf-8'))) else None)
         accepted = reason is None
@@ -1036,8 +1042,11 @@ class Runner:
 
     @staticmethod
     def _permission_payload(row):
-        return {'behavior': 'allow', 'updatedInput': _load(row['input'])} if row['decision'] == 'allow' else {
-            'behavior': 'deny', 'message': 'Motet denied this request. Do not retry without a new owner instruction.'}
+        if row['decision'] == 'allow':
+            return {'behavior': 'allow', 'updatedInput': _load(row['input'])}
+        if row['tool'] == PLAN_TOOL:
+            return {'behavior': 'deny', 'message': PLAN_DENIED}
+        return {'behavior': 'deny', 'message': 'Motet denied this request. Do not retry without a new owner instruction.'}
 
     def _permission_response_echo(self, response):
         # With replay-user-messages, the pinned CLI also echoes our permission
