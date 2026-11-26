@@ -8,7 +8,7 @@
 
 1. Read why the bridge refused. Go on only for “does not have verified transport readiness”. Any other reason, such as a name that matches two chats, a message too long or the bridge locked, goes to Something went wrong. Keep the refused message with its original record.
 2. Check the chat is in Motet's agent list and is the exact chat the sender named, and that the owner hasn't explicitly stopped or archived it. If not, hold the message and tell the sender why.
-3. Check the caps and the daily cost cap. Over a cap: hold the message, tell the sender, and put it in the end-of-day report.
+3. Check the caps and the daily cap. Over a cap: hold the message, tell the sender, and put it in the end-of-day report.
 4. Write in the Deck Log what Motet is about to do: who sent it, which chat it wakes, the message, the time.
 5. Deliver the way that chat allows, under the message's original record: an open Claude chat not set up for Motet, through its side door, and only while the agent messaging switch is on; a Codex chat, after re-checking it and that the app is running, once through the bridge's Codex route; a closed chat, by reopening that same chat and delivering into it. If it can't be reopened or reached, hold the message, tell the sender, and add “open this chat” to Waiting on you.
 6. Deliver the sender's message exactly as written, once, marked as from the sender via Motet. Add nothing, and above all no approval.

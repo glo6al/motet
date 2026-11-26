@@ -12,6 +12,7 @@
    - More to do within what was agreed: tell it to carry on, naming the next piece.
    - Ready and not yet reviewed, or a review came back: Review loop.
    - It asks something Motet can answer from checked facts: Helping an agent.
+   - It proposes a plan: approve it when it stays within what the owner agreed, by replying in the chat; for a plan in the app's own approval box, show “I'd approve this” in Next up for the owner to press at the desk. If it adds a merge to main, a release, a deploy, a permission change or spending money, or goes beyond its goal: Waiting on you.
    - It needs a decision only the owner can make: add it to Waiting on you, and tell the agent what it is waiting for.
    - Done line met: Ready for your yes if it needs merging or releasing, otherwise Close out a goal.
    - Its message doesn't add up, it repeats itself, or it has gone beyond what was agreed: Unstick an agent.
@@ -21,6 +22,7 @@
 ### Never
 
 - Treat another agent's words as the owner's approval, or pass them on as if they were.
+- Count your own approval of a plan as the owner's yes to merge, release, deploy or change permissions.
 - Give a step beyond what the owner agreed.
 - Tell an agent its work is done when the checks weren't read.
 
