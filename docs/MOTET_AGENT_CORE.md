@@ -6,8 +6,8 @@ How Motet could keep agreed work moving between the owner's questions: its goals
 
 Part of the [Motet README](../README.md).
 
-Everything here is decided design except the items under "Not decided yet" at the end and the readings marked
-"proposed" in the text, which must not be built on as if settled until they are confirmed. Each build step still needs an independent review by the other provider and the owner's yes to merge.
+Everything here is decided design except the items under "Not decided yet" at the end, which must not be built on as
+if settled. Each build step still needs an independent review by the other provider and the owner's yes to merge.
 Today the self templates exist in `motet/`; the core itself is not built.
 
 ## In one paragraph
@@ -295,9 +295,9 @@ A chief of staff approves plans, so Motet may too, within limits:
   release, deploy or change permissions. It is recorded as Motet's own action, with the reason, in the Actions tab and
   the end-of-day report.
 
-#### Fix chats (a proposed reading, not yet confirmed)
+#### Fix chats
 
-`RULES.md` says Motet fixes code itself. The proposed reading, still to be confirmed by the owner:
+Motet writes code through a fix chat it starts, never from its engine:
 
 - A fix chat runs on its own only when the fix belongs to work the owner agreed. A fix outside any goal or plan is new
   work: Ask me.
@@ -401,9 +401,11 @@ is dropped.
 **Placement.** The brief waits behind one line on Motet's box, "Your morning brief is ready", until the owner opens
 it. The quiet line and Pause sit on the title line of Motet's box on the stage.
 
-**Settings switches (not decided yet).** Separate switches for the morning brief and for Next up are being designed.
-Until the design is approved, no switch is built and both stay as described. The recommended meaning for the brief's
-switch:
+**Settings switches.** The owner can turn the morning brief and Next up off, separately. Whatever is off, nothing
+that needs the owner is hidden: an agent waiting or blocked on them, a permission request, spending near the cap and a
+failure that blocks a team still reach them on the stage, the bell and the Watch report.
+
+With the **morning brief** off:
 
 - no brief and no "ready" line;
 - items waiting on the owner stay in Next up; warnings (backups off, spending near the cap, a goal off pace) become
@@ -411,12 +413,17 @@ switch:
   count, and only a slipping promise that needs the owner becomes a Next up item;
 - goal suggestions arrive as one Next up proposal covering all teams (Confirm goals, Edit, Dismiss);
 - stale-item questions arrive as Next up items;
-- **no 10 a.m. auto-start**, because it assumes the owner saw the brief;
+- **no 10 a.m. auto-start**: a day's goals start only when the owner approves them;
 - "you came back" still refreshes the sweep but composes nothing;
-- the end-of-day report is unaffected and has no switch of its own.
+- the 10 a.m. time has its own control in the same Settings row, shown as not in use while the brief is off;
+- the end-of-day report is unaffected.
 
-The alternatives are "nothing in the morning" and "no brief, but the 10 a.m. start still applies". The 10 a.m. time
-gets its own control in the same Settings row, shown as not in use while the brief is off.
+With **Next up** off:
+
+- the list is not shown and Motet makes no proposals; Pause is unaffected;
+- Motet still acts on its own within its rules, recorded in the Actions tab and the end-of-day report;
+- when something needs the owner's yes, Motet sends one plain message in its conversation, only when a team is stuck
+  without the answer; otherwise it waits for the brief, when it is on, and the end-of-day report.
 
 ### 6. Agents reaching Motet
 
@@ -760,7 +767,7 @@ the tool list is checked at each start; usage is recorded every cycle.
 Nothing is sent. Also the switch from `INSTRUCTIONS.md` to `SOUL.md`, `IDENTITY.md` and `RULES.md`, Motet refining
 its own files, and the "built so far" note. Acceptance: the brief uses only reliable signals, labelled honestly; the
 owner-activity record ignores hook traffic; the switch happens behind the "built so far" note; every write is
-repeat-safe. Needs: the design of the brief's off switch.
+repeat-safe.
 
 **2. Heartbeat, one-click proposals and help requests.** Event wake-ups, the cycle, Next up with its count and answer
 buttons, the approval path, the daily cap, and `ask_motet` with "can't reach an agent", "did it arrive, has it
@@ -780,28 +787,24 @@ of this step's testing.
 
 **Before Engines or step 1:**
 
-1. The Settings switches for the morning brief and Next up: what "off" means for each (part 5). Interim: no switch is
-   built until the design is approved.
-2. The final look of the engine picker (its place and "stop and tell" are decided).
-3. The engine process model: one-shot runs or a long-lived session, which decides what "ready" means for an idle
+1. The final look of the engine picker (its place and "stop and tell" are decided).
+2. The engine process model: one-shot runs or a long-lived session, which decides what "ready" means for an idle
    engine; and which models each subscription offers. Interim: one-shot runs.
 
 **Before step 2 or later:**
 
-4. Fix chats as the way Motet writes code, with their limits (part 4). Before step 4. Interim: Motet sends fix requests
-   to the agent that owns the work and starts no fix chat.
-5. The daily cap's unit and number, for example 60 thinking cycles a day and 12 an hour after a shadow week.
-6. While the owner is away, should only the right-away wake-ups reach their phone?
-7. What interrupts the owner: a notification, or only Next up? A provisional investigation suggests generic notices
+3. The daily cap's unit and number, for example 60 thinking cycles a day and 12 an hour after a shadow week.
+4. While the owner is away, should only the right-away wake-ups reach their phone?
+5. What interrupts the owner: a notification, or only Next up? A provisional investigation suggests generic notices
     ("Motet needs your attention") that open a private, authenticated phone view with its own revocable credential.
-8. Should an agent's "can't reach" or "needs the owner" request interrupt the owner at once, or wait in Next up?
-9. Whether a subscription may run as an engine for people other than its owner (matters only for the shipped
+6. Should an agent's "can't reach" or "needs the owner" request interrupt the owner at once, or wait in Next up?
+7. Whether a subscription may run as an engine for people other than its owner (matters only for the shipped
     template).
 
 **Still open in the design:**
 
-10. How a proposal shows that its evidence has since gone, for example a log that expired.
-11. How goals and promises appear in Memory's search ("what did we decide yesterday?").
-12. How Motet stops one of the owner's own Claude Desktop or Codex chats, if at all (part 9).
-13. Windows and Linux: the carry-off check for backups, and any equivalent of the side door.
-14. Whether housekeeping may ever remove a Memory entry before its set time runs out.
+8. How a proposal shows that its evidence has since gone, for example a log that expired.
+9. How goals and promises appear in Memory's search ("what did we decide yesterday?").
+10. How Motet stops one of the owner's own Claude Desktop or Codex chats, if at all (part 9).
+11. Windows and Linux: the carry-off check for backups, and any equivalent of the side door.
+12. Whether housekeeping may ever remove a Memory entry before its set time runs out.
