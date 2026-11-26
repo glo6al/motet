@@ -22,7 +22,9 @@ def _status(manager, run_id):
                             "createdAt", "expiresAt", "decision", "resolutionReason", "decisionState",
                             "resolvedAt", "inputAvailable")
                             if k in item} for item in raw.get("permissions", [])],
-            "capabilities": {"permissions": raw["evidenceAvailable"] and raw["state"] not in ("uncertain", "exited")}}
+            "capabilities": {"permissions": raw["evidenceAvailable"] and raw["state"] not in ("uncertain", "exited")},
+            # The owner's stop of this chat, if any (claude_managed.ManagedClaude.stop), and the messages it would fail.
+            "ownerStop": raw.get("ownerStop"), "queued": raw.get("queued", 0)}
 
 MAX_BODY = 65536
 
@@ -128,6 +130,23 @@ def handle_http(handler, service, owner_key, port, owner_store=None):
             # The manager returns a safe retained decision receipt, never its native callback.
             return reply(200, {'schemaVersion': 1, **{k: value[k] for k in
                 ('requestId', 'permissionId', 'decision', 'state', 'decisionState', 'resolutionReason', 'resolvedAt') if k in value}})
+        match = re.fullmatch(r'/api/managed-claude/runs/([0-9a-f-]{36})/stop', route)
+        if match:
+            # The owner's stop of a chat Motet started. Only a Claude chat ('c:') can be one; a Codex chat, or any
+            # chat Motet did not start, is refused before anything is signalled.
+            if (set(data) != {'requestId', 'agent'} or not canonical_uuid(data['requestId'])
+                    or type(data['agent']) is not str or len(data['agent']) > 80):
+                raise NewChatError('invalid_request', 'Expected requestId and the chat to stop.', 400)
+            if not data['agent'].startswith('c:'):
+                raise NewChatError('not_managed', 'Motet did not start this chat, so it cannot stop it.', 404)
+            with owner_store.lock if owner_store is not None else nullcontext():
+                if owner_store is not None and any(owner_store.db.execute(query, (data['requestId'],)).fetchone() for query in (
+                        'SELECT 1 FROM requests WHERE id=?', 'SELECT 1 FROM controls WHERE id=?',
+                        'SELECT 1 FROM expired_controls WHERE id=?')):
+                    raise NewChatError('request_conflict', 'That identifier belongs to another owner or peer operation.', 409)
+            value = service.stop(match[1], data['requestId'], data['agent'])
+            return reply(200, {'schemaVersion': 1, **{k: value[k] for k in
+                ('requestId', 'runId', 'agent', 'state', 'ownerStop', 'already')}})
         raise NewChatError('unknown_route', 'Unknown Managed Claude route.', 404)
     except NewChatError as exc:
         return error(exc.status, exc.code, exc.message)

@@ -387,6 +387,7 @@ class ManagedFixture:
         self.turns = []
         self.messages = {}
         self.decisions = {}
+        self.stopped = set()
         self.request_failure = request_failure
         project = self.root / 'project'
         info = project.stat()
@@ -403,9 +404,11 @@ class ManagedFixture:
 
     def snapshot(self, path):
         manifest = json.loads((path / 'manifest.json').read_bytes())
+        ended = path.name in self.stopped
         return dict(runId=path.name, nativeId=manifest['nativeId'], incarnation=manifest['incarnation'],
-                    cwd=self.folder.path, state='ready', nativeExit=None, identityVerified=True,
-                    messages=list(self.messages.values()), permissions=[])
+                    cwd=self.folder.path, state='exited' if ended else 'ready',
+                    nativeExit=dict(confirmed=True, code=-15, incarnation=manifest['incarnation']) if ended else None,
+                    identityVerified=True, messages=list(self.messages.values()), permissions=[])
 
     def request(self, path, command, params):
         self.calls.append(command)
@@ -422,6 +425,9 @@ class ManagedFixture:
             value = dict(params, state='written')
             self.decisions[params['requestId']] = value
             return value
+        if command == 'stop':                     # the owner's stop: the fictional Claude's exit is recorded
+            self.stopped.add(path.name)
+            return dict(requestId=params['requestId'], state='exited')
         require(command == 'status')
         return self.snapshot(path)
 

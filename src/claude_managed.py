@@ -55,7 +55,12 @@ TEXT_RETENTION = 7 * 86400
 STARTUP_TIMEOUT = 15
 PERMISSION_TIMEOUT_SECONDS = MANAGED_PERMISSION_TIMEOUT_SECONDS
 PERMISSION_REASONS = frozenset(('owner', 'timeout', 'withdrawn', 'turn_ended', 'native_exit',
-                               'oversized', 'unsupported_tool', 'capacity', 'shutdown', 'inactive_turn'))
+                               'oversized', 'unsupported_tool', 'capacity', 'shutdown', 'inactive_turn', 'owner_stop'))
+# The owner's stop of a chat Motet started (stop): how long the web process waits for the supervisor's answer (it
+# takes up to about six seconds: SIGTERM, three seconds, SIGKILL, two more), and the outcomes its record can hold.
+STOP_SECONDS = 15
+STOP_OUTCOMES = ('stopping', 'stopped', 'unconfirmed')
+OWNER_STOP_ERROR = 'Not delivered: you stopped this chat.'
 STATES = frozenset(('starting', 'ready', 'running', 'needs_attention', 'exited', 'uncertain'))
 PUBLIC_STATES = {'queued': 'sending', 'dispatching': 'sending', 'delivered': 'awaiting_reply',
                  'completed': 'answered', 'failed': 'failed', 'unknown': 'unknown'}
@@ -274,6 +279,8 @@ def _fail(code='managed_unavailable', status=409):
                                       'Motet runs in does not let it leave its job. Try starting Motet from an '
                                       'ordinary terminal window or a shortcut.'),
         'supervisor_not_started': 'Motet could not start the Claude supervisor. Nothing was started.',
+        'not_managed': 'Motet did not start this chat, so it cannot stop it.',
+        'already_ended': 'This chat has already ended.',
         **OFF_REASONS,
     }
     raise ManagedError(status, code, messages.get(code, messages['managed_unavailable']))
@@ -415,8 +422,9 @@ def _text(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def client_request(run_dir, command, params):
-    """Authenticated bounded IPC only; never starts or adopts a process."""
+def client_request(run_dir, command, params, seconds=2):
+    """Authenticated bounded IPC only; never starts or adopts a process. ``seconds`` bounds the wait for the
+    answer (2, or STOP_SECONDS for a stop, which the supervisor answers only once it has ended Claude)."""
     path = Path(run_dir)
     _private(path, True)
     for name in ('manifest.json', 'token', 'run.lock'):
@@ -429,7 +437,7 @@ def client_request(run_dir, command, params):
     if len(token) != 64 or any(c not in '0123456789abcdef' for c in token):
         _fail()
     if ps.WIN:
-        return _windows_request(path, token, command, params)
+        return _windows_request(path, token, command, params, seconds)
     target = path / 'control.sock'
     st = os.lstat(target)
     if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
@@ -441,6 +449,7 @@ def client_request(run_dir, command, params):
         connection.settimeout(2)
         connection.connect(str(target))
         connection.sendall(frame)
+        connection.settimeout(seconds)
         response = bytearray()
         while b'\n' not in response:
             chunk = connection.recv(min(8192, MAX_RESPONSE + 1 - len(response)))
@@ -479,7 +488,7 @@ def _not_started_code(error):
     return None
 
 
-def _windows_request(path, token, command, params):
+def _windows_request(path, token, command, params, seconds=2):
     """Windows ``client_request`` over the supervisor's named pipe: its name and process ID come from the private
     ``control.json`` in the run folder; claude_managed_windows.open_pipe refuses a pipe whose server is not that
     process or whose owner and access list are not this user's private ones, before the token is sent. The frame,
@@ -502,6 +511,8 @@ def _windows_request(path, token, command, params):
         _fail('invalid_request', 400)
     with windows.open_pipe(record['pipe'], record['pid']) as connection:
         connection.sendall(frame)
+        if seconds != windows.CONTROL_SECONDS:
+            connection.settimeout(seconds)      # a stop's longer wait; every other call keeps the pipe's own bound
         response = bytearray()
         while b'\n' not in response:
             chunk = connection.recv(min(8192, MAX_RESPONSE + 1 - len(response)))
@@ -558,6 +569,7 @@ class TestDependencies:
     read_message: object = None
     read_decision: object = None
     namespace: object = None
+    unsupervised: object = None      # the stop's own end when the supervisor does not answer (``_end_unsupervised``)
 
 
 class ManagedClaude:
@@ -579,6 +591,8 @@ class ManagedClaude:
         self._proofs = {}
         self._directory = None
         self._windows_verified = None     # Windows: the last executable check that passed (verify_pinned)
+        self._stopping = set()            # runs whose owner's stop is being carried out by this process now
+        self.stop_observer = None         # told (agent, ownerStop) of each stop record status reads; set by the server
         self.closed = False
         # No state creation, provider access, socket calls, or process work here.
 
@@ -903,14 +917,14 @@ class ManagedClaude:
         _private(path, True)
         return path
 
-    def _request(self, run_id, command, params):
+    def _request(self, run_id, command, params, seconds=2):
         self._active()
         path = self._run_dir(run_id)
         for name in ('manifest.json', 'token', 'run.lock'):
             _private(path / name)
         if self._test:
             return self._test.request(path, command, params)
-        return client_request(path, command, params)
+        return client_request(path, command, params, seconds)
 
     def launch_once(self, run_id, folder, record_native_receipt):
         self._active()
@@ -1059,7 +1073,8 @@ class ManagedClaude:
             if type(clean.get('text', '')) is not str or len(clean.get('text', '')) > 8000:
                 _fail()
             # Error strings are runner allowlisted; enforce our own public mapping.
-            clean['error'] = ('Managed delivery failed or is uncertain.' if clean.get('error') else '')
+            clean['error'] = (OWNER_STOP_ERROR if clean.get('error') == 'owner_stop' else
+                              'Managed delivery failed or is uncertain.' if clean.get('error') else '')
             reply = clean.get('reply', '')
             if type(reply) is not str:
                 _fail()
@@ -1156,10 +1171,18 @@ class ManagedClaude:
             if snapshot['nativeExit']:
                 current['occupied'] = False
             self._save(db, current)
+            stop = self._stop_reconciled(db, run_id, snapshot)
+            if stop is not None and stop['outcome'] == 'stopped' and not snapshot['nativeExit']:
+                self._stopped_without_receipt(snapshot, stop)
             for message in snapshot['messages']:
                 old = db.execute('SELECT run,source,digest,data FROM messages WHERE id=?', (message['requestId'],)).fetchone()
                 if old and old[:3] == (run_id, message['source'], message.get('digest')):
                     db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(_keep_author(old[3], message)), message['requestId']))
+        snapshot['ownerStop'] = self._public_stop(stop, row['nativeId'])
+        snapshot['queued'] = sum(message['state'] == 'queued' for message in snapshot['messages'])
+        if stop is not None and self.stop_observer is not None:
+            # Outside the registry's locks: the room puts the record on the agent's row (server.managed_stop_seen).
+            self.stop_observer('c:' + row['nativeId'], snapshot['ownerStop'])
         return snapshot
 
     def enqueue(self, run_id, request_id, source, text):
@@ -1178,6 +1201,8 @@ class ManagedClaude:
                 return self._retained(json.loads(old[3]))
             if not run['nativeReceipt'] or run['state'] not in ('ready', 'running', 'needs_attention'):
                 _fail('managed_not_ready')
+            if self._stop_record(db, run_id) is not None:
+                _fail('managed_not_ready')            # the owner stopped this chat: it takes no new messages
             validate_folder(FrozenFolder(**run['folder']))
             if db.execute('SELECT count(*) FROM messages').fetchone()[0] >= MAX_MESSAGES:
                 _fail('capacity', 429)
@@ -1512,6 +1537,7 @@ class ManagedClaude:
                 with self._registry() as db:
                     row = self._row(db, owned['runId'])
                 ready = bool(snapshot['identityVerified'] and snapshot['state'] in ('ready', 'running', 'needs_attention')
+                             and snapshot['ownerStop'] is None
                              and self.verify_existing(agent[2:], FrozenFolder(**row['folder'])))
         reason = '' if ready else 'This managed Claude session is unavailable for new messages.'
         unsupported = 'Live controls are unavailable for managed Claude sessions.'
@@ -1540,6 +1566,255 @@ class ManagedClaude:
         except Exception:
             pass
         return self.status(run_id)
+
+    # The owner's stop of a chat Motet started. Both its record and each stop request are rows of the registry's
+    # ``operations`` table: the record (one per run) under an ID derived from the run (STOP_RECORD), each request under
+    # its own request ID (source 'stop'), so a request ID is acted on once and cannot be reused for a message or a
+    # permission decision. No table is added: the registry's tables are exactly the ones the attachment namespace
+    # fence checks, and an older Motet reads these rows as operations it never asks about. They live in the private
+    # registry and survive a restart and a reload.
+    STOP_RECORD = 'owner-stop-record'
+
+    @classmethod
+    def _stop_record_id(cls, run_id):
+        return str(uuid.uuid5(uuid.UUID(run_id), 'watch-' + cls.STOP_RECORD + '-v1'))
+
+    @classmethod
+    def _stop_record(cls, db, run_id):
+        raw = (db.execute('SELECT run,digest,data FROM operations WHERE id=?', (cls._stop_record_id(run_id),)).fetchone()
+               if db is not None else None)
+        if raw is None:
+            return None
+        try:
+            if tuple(raw[:2]) != (run_id, cls.STOP_RECORD):
+                _fail()
+            record = json.loads(raw[2])
+            times = [record[key] for key in ('requestedAt', 'lastAttemptAt')] + (
+                [record['stoppedAt']] if record['stoppedAt'] is not None else [])
+            if (set(record) != {'runId', 'by', 'outcome', 'requestedAt', 'lastAttemptAt', 'stoppedAt', 'attempts'}
+                    or record['runId'] != run_id or record['by'] != 'owner' or record['outcome'] not in STOP_OUTCOMES
+                    or any(type(t) not in (int, float) or not math.isfinite(t) or t <= 0 for t in times)
+                    or (record['stoppedAt'] is None) != (record['outcome'] != 'stopped')
+                    or type(record['attempts']) is not int or record['attempts'] < 1):
+                _fail()
+            return record
+        except (ValueError, KeyError, TypeError):
+            _fail()
+
+    @classmethod
+    def _save_stop(cls, db, record):
+        db.execute('INSERT OR REPLACE INTO operations VALUES (?,?,?,?)', (cls._stop_record_id(record['runId']),
+                   record['runId'], cls.STOP_RECORD, json.dumps(record, ensure_ascii=True)))
+
+    def _stop_reconciled(self, db, run_id, snapshot):
+        """The run's stop record, brought up to date with ``snapshot``: a confirmed exit makes a stop that was being
+        carried out, or could not be confirmed, a stopped one (at the time it is first seen); a stop recorded as being
+        carried out that no thread here is carrying out (Motet restarted part-way) could not be confirmed."""
+        record = self._stop_record(db, run_id)
+        if record is None or record['outcome'] == 'stopped':
+            return record
+        with self._lock:
+            active = run_id in self._stopping
+        if snapshot['state'] == 'exited':
+            record.update(outcome='stopped', stoppedAt=time.time())
+        elif record['outcome'] == 'stopping' and not active:
+            record['outcome'] = 'unconfirmed'
+        else:
+            return record
+        self._save_stop(db, record)
+        return record
+
+    @staticmethod
+    def _stopped_without_receipt(snapshot, stop):
+        """A stop Motet confirmed without the supervisor (``_end_unsupervised``): the supervisor never failed the
+        queued messages or answered the waiting requests, and Claude has ended, so neither can happen now."""
+        for message in snapshot['messages']:
+            if message['state'] == 'queued':
+                message.update(state='failed', error=OWNER_STOP_ERROR)
+        for permission in snapshot['permissions']:
+            if permission.get('decision') is None and permission.get('state') in ('pending', 'unknown'):
+                permission.update(state='cancelled', resolutionReason='native_exit', resolvedAt=stop['stoppedAt'],
+                                  canAllow=False, canDeny=False)
+
+    @staticmethod
+    def terminal_command(native_id):
+        """A line the owner can run to end this chat's Claude when Motet could not confirm it ended: it names the
+        chat by its session, never by a process ID."""
+        if ps.WIN:
+            return ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*--session-id %s*' } | "
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" % native_id)
+        return "pkill -KILL -f -- '--session-id %s'" % native_id
+
+    def _public_stop(self, record, native_id):
+        if record is None:
+            return None
+        return dict(by='owner', outcome=record['outcome'], requestedAt=record['requestedAt'],
+                    lastAttemptAt=record['lastAttemptAt'], stoppedAt=record['stoppedAt'],
+                    terminalCommand=self.terminal_command(native_id))
+
+    def stop_facts(self):
+        """Every recorded stop, by agent ('c:' + native ID), for the room: outcome and times only."""
+        with self._registry() as db:
+            if db is None:
+                return {}
+            rows = [self._row(db, ident) for (ident,) in db.execute('SELECT id FROM runs')]
+            out = {}
+            for row in rows:
+                record = self._stop_record(db, row['runId'])
+                if record is not None:
+                    out['c:' + row['nativeId']] = {key: record[key] for key in
+                                                   ('outcome', 'requestedAt', 'lastAttemptAt', 'stoppedAt')}
+            return out
+
+    def stop(self, run_id, request_id, agent):
+        """The owner's stop of the chat Motet started as ``run_id``. ``agent`` must be that chat ('c:' + its native
+        ID); anything else is refused (not_managed). A chat already stopped answers with its record and does nothing
+        (``already``); one that ended by itself before any stop is refused (already_ended). A request ID is acted on
+        once: its replay answers with the current record, and a second request while a stop is being carried out
+        does nothing. Stopping asks the supervisor (``stop``): it denies each waiting request and fails each queued
+        message as the owner's stop, and ends Claude's whole process tree. If the supervisor does not answer, Motet
+        ends what it can verify itself (``_end_unsupervised``). The outcome is recorded: stopped, or unconfirmed."""
+        self._active()
+        if not canonical_uuid(request_id) or not canonical_uuid(run_id) or type(agent) is not str:
+            _fail('invalid_request', 400)
+        digest = hashlib.sha256(json.dumps(['stop', run_id]).encode()).hexdigest()
+        act = False
+        with self._registry() as db:
+            if db is None or db.execute('SELECT 1 FROM runs WHERE id=?', (run_id,)).fetchone() is None:
+                _fail('not_managed', 404)
+            row = self._row(db, run_id)
+            if agent != 'c:' + row['nativeId'] or not row['nativeReceipt']:
+                _fail('not_managed', 404)
+            if db.execute('SELECT 1 FROM messages WHERE id=?', (request_id,)).fetchone():
+                _fail('request_conflict')
+            old = db.execute('SELECT run,digest FROM operations WHERE id=?', (request_id,)).fetchone()
+            if old and tuple(old) != (run_id, digest):
+                _fail('request_conflict')
+            record = self._stop_record(db, run_id)
+            with self._lock:
+                busy = run_id in self._stopping
+            if old or busy or record is not None and record['outcome'] == 'stopped':
+                pass
+            elif record is None and not row['occupied'] and row['state'] == 'exited':
+                _fail('already_ended')
+            else:
+                if db.execute('SELECT count(*) FROM operations').fetchone()[0] >= MAX_MESSAGES:
+                    _fail('capacity', 429)
+                now = time.time()
+                record = (dict(runId=run_id, by='owner', outcome='stopping', requestedAt=now, lastAttemptAt=now,
+                               stoppedAt=None, attempts=1) if record is None else
+                          dict(record, outcome='stopping', lastAttemptAt=now, attempts=record['attempts'] + 1))
+                self._save_stop(db, record)
+                db.execute('INSERT INTO operations VALUES (?,?,?,?)', (request_id, run_id, digest, json.dumps(
+                    dict(requestId=request_id, runId=run_id, source='stop', by='owner', digest=digest, at=now))))
+                with self._lock:
+                    self._stopping.add(run_id)
+                act = True
+        already = not act and record is not None and record['outcome'] == 'stopped'
+        if act:
+            try:
+                self._end(run_id, request_id)
+            finally:
+                with self._lock:
+                    self._stopping.discard(run_id)
+        snapshot = self.status(run_id)
+        return dict(requestId=request_id, runId=run_id, agent=agent, state=snapshot['state'],
+                    ownerStop=snapshot['ownerStop'], already=already)
+
+    def _end(self, run_id, request_id):
+        """Ask the supervisor to stop; if it does not answer, end what can be verified without it. True once
+        Claude's exit is confirmed (the registry then holds it)."""
+        answered = False
+        try:
+            self._request(run_id, 'stop', dict(requestId=request_id, by='owner'), seconds=STOP_SECONDS)
+            answered = True
+        except ManagedError as error:
+            if error.code == 'managed_not_ready':
+                # A supervisor started by an older Motet knows only 'shutdown' (which it words as Motet shutting
+                # down); it refused 'stop' without acting on it.
+                try:
+                    self._request(run_id, 'shutdown', dict(requestId=request_id), seconds=STOP_SECONDS)
+                    answered = True
+                except Exception:
+                    pass
+            elif error.code != 'request_conflict':
+                pass
+            else:
+                answered = True      # the supervisor knows this request ID differently; it did not act on it here
+        except Exception:
+            pass
+        if self.status(run_id)['state'] == 'exited':
+            return True
+        if answered:
+            return False             # the supervisor is listening and could not confirm; the next stop asks it again
+        try:
+            run_dir = self._run_dir(run_id)
+            if self._test:
+                confirmed = bool(self._test.unsupervised and self._test.unsupervised(run_dir))
+            else:
+                confirmed = self._end_unsupervised(run_dir)
+        except Exception:
+            confirmed = False
+        if confirmed:
+            with self._registry() as db:
+                row = self._row(db, run_id)
+                row.update(state='exited', occupied=False)
+                self._save(db, row)
+        return confirmed
+
+    @staticmethod
+    def _supervisor_gone(run_dir):
+        """Whether no supervisor runs for this run: it holds ``run.lock`` for its whole life (POSIX flock, Windows
+        private_storage's byte lock), and the lock is free only once it has ended."""
+        path = Path(run_dir) / 'run.lock'
+        _private(path)
+        fd = (ps.open_no_links(os.fspath(path), single_link=True, private=True) if ps.WIN
+              else os.open(path, os.O_RDONLY | os.O_NOFOLLOW))
+        try:
+            return bool(ps.try_lock(fd))
+        finally:
+            ps.close_lock(fd)
+
+    def _end_unsupervised(self, run_dir):
+        """The stop when the supervisor does not answer. Windows: Claude runs in a job that ends when its only
+        handle, the supervisor's, closes, so Claude has ended once the supervisor has (its lock is free); nothing is
+        signalled. POSIX: Claude is found by the process ID its supervisor recorded, and verified before anything is
+        signalled: this user's, its own process group's leader, started between the launch claim and the recorded
+        start, and running the pinned executable with this chat's session ID. Then its tree is ended
+        (managed_process_tree.end), and the supervisor's too if it is still running (identified as Claude's parent,
+        or by its command line naming this run's folder). Confirmed when no process with Claude's command line for
+        this session is left, nothing of its tree is running and the supervisor has ended."""
+        if ps.WIN:
+            return self._supervisor_gone(run_dir)
+        from claude_managed_runner import read_native_process
+        import managed_process_tree as tree
+        native = read_native_process(run_dir)
+        if native is None:
+            return False
+        marker, exe = ' --session-id ' + native['nativeId'] + ' ', native['executable']
+
+        def claude(row):
+            # The pinned build runs as itself (its path first); a build run by an interpreter (a script with a
+            # shebang) has its path second. Either way the path comes before this chat's session ID.
+            command = row.command + ' '
+            at = command.find(marker)
+            head = command[:at + 1] if at > 0 else ''
+            return row.uid == os.getuid() and (head.startswith(exe + ' ') or ' ' + exe + ' ' in head)
+
+        rows = tree.table()
+        row = rows.get(native['pid'])
+        root = row if (row is not None and claude(row) and row.pgid == row.pid
+                       and native['claimedAt'] - 2 <= row.start <= native['startedAt'] + 1) else None
+        left = tree.end(root) if root is not None and tree.alive(root) else {}
+        if not self._supervisor_gone(run_dir):
+            folder = ' ' + os.fspath(run_dir)
+            for candidate in tree.table().values():
+                if (candidate.uid == os.getuid() and tree.alive(candidate) and candidate.command.endswith(folder)
+                        and 'claude_managed_runner.py' in candidate.command
+                        and (root is None or candidate.pid == root.ppid)):
+                    left.update(tree.end(candidate))
+        return (not left and self._supervisor_gone(run_dir)
+                and not any(claude(row) and tree.alive(row) for row in tree.table().values()))
 
     def close(self):
         self.closed = True

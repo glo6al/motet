@@ -29,6 +29,12 @@ class Manager:
                                  'resolvedAt': None, 'inputAvailable': True,
                                  'nativeRequestId': 'not-public'}]}
 
+    def stop(self, run, request, agent):
+        self.calls.append(('stop', run, request, agent))
+        return dict(requestId=request, runId=run, agent=agent, state='exited', already=False, token='not-public',
+                    ownerStop=dict(by='owner', outcome='stopped', requestedAt=1900000050, lastAttemptAt=1900000050,
+                                   stoppedAt=1900000052, terminalCommand="pkill -KILL -f -- '--session-id x'"))
+
     def decide(self, run, permission, request, decision):
         self.calls.append(('decision', run, permission, request, decision))
         return dict(requestId=request, permissionId=permission, decision=decision, state='written',
@@ -134,6 +140,60 @@ class ManagedHttpTests(unittest.TestCase):
                 self.assertEqual(h.result[0], 409)
                 self.assertFalse(manager.calls)
                 db.execute('DELETE FROM '+table)
+        finally:
+            db.close()
+
+    def stop_post(self, body):
+        raw = json.dumps(body).encode()
+        return Handler(RUN + '/stop', 'POST', raw,
+                       [('Content-Type', 'application/json'), ('Content-Length', str(len(raw)))])
+
+    def test_stop_route_body_reply_and_status_record(self):
+        m = Manager()
+        code, result = self.call(self.stop_post({'requestId': PERMISSION, 'agent': 'c:' + NATIVE}), m)
+        self.assertEqual(code, 200)
+        self.assertEqual(m.calls, [('stop', NATIVE, PERMISSION, 'c:' + NATIVE)])
+        self.assertNotIn('token', result)
+        self.assertEqual((result['state'], result['already'], result['ownerStop']['outcome']), ('exited', False, 'stopped'))
+        raw = m.status(NATIVE)
+        raw.update(ownerStop=dict(by='owner', outcome='unconfirmed', requestedAt=1, lastAttemptAt=1, stoppedAt=None,
+                                  terminalCommand='fictional'), queued=2)
+        m.status = lambda ident: raw
+        code, result = self.call(Handler(RUN), m)
+        self.assertEqual((result['ownerStop']['outcome'], result['queued']), ('unconfirmed', 2))
+        del raw['ownerStop'], raw['queued']
+        code, result = self.call(Handler(RUN), m)
+        self.assertEqual((result['ownerStop'], result['queued']), (None, 0))
+
+    def test_stop_refuses_codex_and_malformed_requests_without_calling_the_manager(self):
+        for body, status in (({'requestId': PERMISSION, 'agent': 'x:' + NATIVE}, 404),
+                             ({'requestId': PERMISSION, 'agent': NATIVE}, 404),
+                             ({'requestId': PERMISSION}, 400), ({'requestId': 'not-a-uuid', 'agent': 'c:' + NATIVE}, 400),
+                             ({'requestId': PERMISSION, 'agent': 'c:' + NATIVE, 'restart': True}, 400),
+                             ({'requestId': PERMISSION, 'agent': 7}, 400)):
+            with self.subTest(body=body):
+                m = Manager()
+                code, result = self.call(self.stop_post(body), m)
+                self.assertEqual(code, status)
+                if status == 404:
+                    self.assertEqual(result['error']['code'], 'not_managed')
+                self.assertFalse(m.calls)
+        m = Manager()
+        h = self.stop_post({'requestId': PERMISSION, 'agent': 'c:' + NATIVE})
+        h.headers.replace_header('X-Live-Room-Key', 'wrong')
+        self.assertEqual(self.call(h, m)[0], 403)
+        self.assertFalse(m.calls)
+
+    def test_stop_id_cannot_reuse_an_owner_operation(self):
+        db = sqlite3.connect(':memory:')
+        try:
+            for table in ('requests', 'controls', 'expired_controls'):
+                db.execute('CREATE TABLE ' + table + ' (id TEXT)')
+            db.execute('INSERT INTO requests VALUES(?)', (PERMISSION,))
+            h, manager = self.stop_post({'requestId': PERMISSION, 'agent': 'c:' + NATIVE}), Manager()
+            handle_http(h, manager, 'fictional-key', 18801, SimpleNamespace(db=db, lock=threading.RLock()))
+            self.assertEqual(h.result[0], 409)
+            self.assertFalse(manager.calls)
         finally:
             db.close()
 

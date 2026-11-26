@@ -265,6 +265,26 @@ class Fixture(unittest.TestCase):
             return copy.deepcopy(message)
         if command == 'decision':
             return dict(params, state='decided', token='must not escape')
+        if command in ('stop', 'shutdown') and command in getattr(self, 'refused_commands', ()):
+            managed._fail('managed_not_ready')        # an older supervisor refusing a command it does not know
+        if command in ('stop', 'shutdown'):
+            # The fictional supervisor's stop: the owner's denial of each waiting request, each queued message
+            # failed, and Claude's exit recorded; or, when told to be stubborn, an end it could not confirm.
+            reason = 'owner_stop' if command == 'stop' else 'shutdown'
+            for message in snapshot['messages']:
+                if message['state'] == 'queued':
+                    message.update(state='failed', error=reason)
+            for permission in snapshot['permissions']:
+                if permission['state'] == 'pending':
+                    permission.update(state='shutdown', decision='deny', decisionState='written',
+                                      resolutionReason=reason, resolvedAt=1_900_000_100, canAllow=False, canDeny=False)
+            if getattr(self, 'stubborn', False):
+                snapshot['state'] = 'uncertain'
+            else:
+                snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=-15,
+                                                                incarnation=snapshot['incarnation']))
+            return dict(requestId=params['requestId'], state='exited' if not getattr(self, 'stubborn', False)
+                        else 'unknown')
         return copy.deepcopy(snapshot)
 
     def read_snapshot(self, path):
@@ -1038,6 +1058,178 @@ class Fixture(unittest.TestCase):
         self.assertEqual(retained['text'], '')
         self.manager.enqueue(run_id, request, 'owner', 'hello')
         self.assertEqual(len([c for c in self.commands if c[1] == 'enqueue']), 1)
+
+    # The owner's stop of a chat Motet started (ManagedClaude.stop).
+
+    def waiting(self, run_id):
+        """A queued message and a waiting permission request in the fictional chat."""
+        self.manager.enqueue(run_id, uid(), 'owner', 'Fictional queued note.')
+        permission = dict(id=uid(), tool='Write', input={'content': 'fictional'}, state='pending', canAllow=True,
+                          canDeny=True, createdAt=1900000000, expiresAt=1900000120, decision=None,
+                          resolutionReason=None, decisionState=None, resolvedAt=None, inputAvailable=True)
+        self.snapshots[run_id]['permissions'].append(permission)
+        return permission
+
+    def stops(self):
+        return [params for _, command, params in self.commands if command in ('stop', 'shutdown')]
+
+    def test_stop_denies_the_waiting_request_fails_the_queue_and_records_the_owner(self):
+        run_id, native = self.start()
+        self.waiting(run_id)
+        before = self.manager.status(run_id)
+        self.assertEqual((before['ownerStop'], before['queued']), (None, 1))
+        request = uid()
+        result = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertEqual(self.stops(), [dict(requestId=request, by='owner')])
+        self.assertEqual((result['state'], result['already'], result['agent']), ('exited', False, 'c:' + native))
+        stop = result['ownerStop']
+        self.assertEqual((stop['by'], stop['outcome']), ('owner', 'stopped'))
+        self.assertGreaterEqual(stop['stoppedAt'], stop['requestedAt'])
+        self.assertIn('--session-id ' + native, stop['terminalCommand'])
+        snapshot = self.manager.status(run_id)
+        self.assertEqual((snapshot['queued'], snapshot['messages'][0]['state'], snapshot['messages'][0]['error']),
+                         (0, 'failed', managed.OWNER_STOP_ERROR))
+        permission = snapshot['permissions'][0]
+        self.assertEqual((permission['decision'], permission['resolutionReason'], permission['canAllow']),
+                         ('deny', 'owner_stop', False))
+        with self.manager._registry() as db:
+            self.assertFalse(self.manager._row(db, run_id)['occupied'])          # its slot is released
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.enqueue(run_id, uid(), 'owner', 'After the stop.')
+        self.assertEqual(raised.exception.code, 'managed_not_ready')
+        self.assertFalse(self.manager.owner_capabilities('c:' + native)['actions']['queue']['available'])
+
+    def test_stop_is_acted_on_once_per_request_and_once_stopped(self):
+        run_id, native = self.start()
+        request = uid()
+        first = self.manager.stop(run_id, request, 'c:' + native)
+        replay = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertEqual(replay['ownerStop'], first['ownerStop'])
+        again = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertTrue(again['already'])
+        self.assertEqual(again['ownerStop'], first['ownerStop'])
+        self.assertEqual(len(self.stops()), 1, 'a replay or a stopped chat never asks the supervisor again')
+
+    def test_a_second_stop_while_one_is_carried_out_does_nothing(self):
+        run_id, native = self.start()
+        plain, during = self.request, []
+
+        def slow(path, command, params):
+            if command == 'stop' and not during:
+                # A double click with its own request ID arrives while the supervisor is ending Claude (the registry
+                # is not held then, so this nested call is what another request thread would do).
+                during.append(self.manager.stop(run_id, uid(), 'c:' + native))
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=slow)
+        first = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual(during[0]['ownerStop']['outcome'], 'stopping')
+        self.assertFalse(during[0]['already'])
+        self.assertEqual(first['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_stop_refuses_other_chats_and_reused_request_ids(self):
+        run_id, native = self.start()
+        for run, agent in ((run_id, 'c:' + uid()), (run_id, 'x:' + native), (uid(), 'c:' + native)):
+            with self.subTest(agent=agent), self.assertRaises(managed.ManagedError) as raised:
+                self.manager.stop(run, uid(), agent)
+            self.assertEqual((raised.exception.code, raised.exception.status), ('not_managed', 404))
+        message = uid()
+        self.manager.enqueue(run_id, message, 'owner', 'Fictional note.')
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.stop(run_id, message, 'c:' + native)
+        self.assertEqual(raised.exception.code, 'request_conflict')
+        request = uid()
+        self.manager.stop(run_id, request, 'c:' + native)
+        for reuse in (lambda: self.manager.decide(run_id, uid(), request, 'deny'),
+                      lambda: self.manager.enqueue(run_id, request, 'owner', 'Fictional note.')):
+            with self.assertRaises(managed.ManagedError) as raised:
+                reuse()
+            self.assertIn(raised.exception.code, ('request_conflict', 'managed_not_ready'))
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_a_chat_that_ended_by_itself_is_not_called_stopped(self):
+        run_id, native = self.start()
+        self.snapshots[run_id].update(state='exited', nativeExit=dict(
+            confirmed=True, code=0, incarnation=self.snapshots[run_id]['incarnation']))
+        self.manager.status(run_id)
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual(raised.exception.code, 'already_ended')
+        self.assertIsNone(self.manager.status(run_id)['ownerStop'])
+        self.assertEqual(self.stops(), [])
+
+    def test_an_unconfirmed_stop_is_recorded_and_try_again_asks_again(self):
+        run_id, native = self.start()
+        self.stubborn = True
+        first = self.manager.stop(run_id, uid(), 'c:' + native)
+        stop = first['ownerStop']
+        self.assertEqual(stop['outcome'], 'unconfirmed')
+        self.assertIsNone(stop['stoppedAt'])
+        self.stubborn = False
+        again = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual(len(self.stops()), 2, 'Try again asks the supervisor again')
+        self.assertEqual(again['outcome'], 'stopped')
+        self.assertEqual(again['requestedAt'], stop['requestedAt'])
+        self.assertGreaterEqual(again['lastAttemptAt'], stop['lastAttemptAt'])
+
+    def test_the_record_survives_a_restart_and_a_stop_cut_short_is_unconfirmed(self):
+        run_id, native = self.start()
+        stop = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        restarted = self.make()
+        self.assertEqual(restarted.status(run_id)['ownerStop'], stop)
+        self.assertEqual(restarted.stop_facts(), {'c:' + native: {key: stop[key] for key in
+                         ('outcome', 'requestedAt', 'lastAttemptAt', 'stoppedAt')}})
+        other_run, other = self.start()
+        with self.manager._registry() as db:         # Motet ended part-way through a stop: nothing carries it on
+            self.manager._save_stop(db, dict(runId=other_run, by='owner', outcome='stopping', requestedAt=1900000000,
+                                             lastAttemptAt=1900000000, stoppedAt=None, attempts=1))
+        self.assertEqual(self.make().status(other_run)['ownerStop']['outcome'], 'unconfirmed')
+        with self.manager._registry() as db:
+            # No table is added: the attachment namespace fence requires exactly the registry's own tables.
+            self.assertEqual({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")},
+                             {'runs', 'messages', 'operations'})
+            db.execute('UPDATE operations SET data=? WHERE id=?', (json.dumps({'runId': other_run}),
+                                                                    self.manager._stop_record_id(other_run)))
+        with self.assertRaises(managed.ManagedError):
+            self.make().status(other_run)                                       # a malformed record fails closed
+        with self.assertRaises(managed.ManagedError) as raised:                # its ID is no request's to reuse
+            self.manager.stop(run_id, self.manager._stop_record_id(run_id), 'c:' + native)
+        self.assertEqual(raised.exception.code, 'request_conflict')
+
+    def test_an_older_supervisor_gets_its_shutdown(self):
+        run_id, native = self.start()
+        self.refused_commands = ('stop',)
+        request = uid()
+        self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['ownerStop']['outcome'], 'stopped')
+        self.assertEqual([c for _, c, _ in self.commands if c in ('stop', 'shutdown')], ['stop', 'shutdown'])
+        self.assertEqual(self.stops()[-1], dict(requestId=request))
+
+    def test_without_its_supervisor_the_stop_is_motets_own_and_verified(self):
+        run_id, native = self.start()
+        permission = self.waiting(run_id)
+        self.disconnected = True
+        ends = []
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: ends.append(run_dir) or False)
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'unconfirmed')
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: ends.append(run_dir) or True)
+        result = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual([Path(path).name for path in ends], [run_id, run_id])
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'stopped'))
+        snapshot = self.manager.status(run_id)
+        self.assertEqual([m['state'] for m in snapshot['messages']], ['failed'])
+        self.assertEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)
+        ended = snapshot['permissions'][0]
+        self.assertEqual((ended['id'], ended['resolutionReason'], ended['decision'], ended['canAllow']),
+                         (permission['id'], 'native_exit', None, False))
+        with self.manager._registry() as db:
+            row = self.manager._row(db, run_id)
+        self.assertEqual((row['state'], row['occupied']), ('exited', False))
+
+    def test_terminal_command_names_the_session_not_a_process(self):
+        native = uid()
+        command = managed.ManagedClaude.terminal_command(native)
+        self.assertIn('--session-id ' + native, command)
+        self.assertNotRegex(command.replace(native, ''), r'(^|\s)\d+($|\s)')     # no process ID in it
 
 
 from new_chat_types import NewChatError

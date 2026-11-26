@@ -321,6 +321,20 @@ class NamespaceTests(unittest.TestCase):
         self.assertEqual(captured(lambda: native_action(self.root, self.namespace, request)), CONFLICT)
         self.assertEqual(reopened.calls, [])
 
+    def test_the_owners_stop_leaves_the_registry_the_fence_checks(self):
+        manager = ManagedFixture(self.root, self.namespace)
+        run, other = manager.start(), manager.start()
+        native = manager.manager.status(run)['nativeId']
+        stop = manager.manager.stop(run, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual(stop['outcome'], 'stopped')
+        # The fence checks the registry holds exactly its own tables on every reserved action; the stop's record and
+        # request are operations rows, so actions on other chats still pass it, also after a reopen.
+        self.assertEqual(captured(lambda: manager.action('enqueue', other, uid()))[0], 'ok')
+        reopened = ManagedFixture(self.root, self.namespace)
+        reopened.stopped = manager.stopped                  # the same fictional supervisors, already ended
+        self.assertEqual(reopened.manager.status(run)['ownerStop'], stop)
+        self.assertEqual(captured(lambda: reopened.action('decide', other, uid(), uid())), ('ok', 'written'))
+
     def test_process_exit_after_commit_requires_exact_recovery(self):
         for kind in ('native', 'enqueue', 'decide'):
             with self.subTest(kind=kind):

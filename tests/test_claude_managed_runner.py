@@ -48,7 +48,8 @@ class FakeTransport:
         self.frames = collections.deque()
         self.writes = []
         self.code = None
-        self.starts = self.terminates = 0
+        self.starts = self.terminates = self.ends = 0
+        self.stubborn = False
         self.claims_seen = []
 
     def start(self):
@@ -104,6 +105,14 @@ class FakeTransport:
     def wait(self, timeout=3):
         if self.code is None:
             raise TimeoutError()
+        return self.code
+
+    def end_tree(self, gentle=3, firm=2):
+        # The owner's stop: the whole tree ends, or (stubborn) something in it is still running after SIGKILL.
+        self.ends += 1
+        if self.stubborn:
+            raise TimeoutError()
+        self.code = -9
         return self.code
 
     def close(self):
@@ -492,6 +501,52 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.shutdown(request), receipt)
         self.assertEqual(self.transport.terminates, 1)
         self.assertEqual([m['state'] for m in runner.snapshot()['messages']], ['unknown', 'failed'])
+
+    def test_owner_stop_is_said_as_the_owners_and_ends_the_tree_once_per_request(self):
+        runner = self.runner()
+        self.send(runner)
+        self.send(runner, 'unsent')
+        self.transport.permission()
+        runner.step()
+        request = uid()
+        receipt = runner.command('stop', {'requestId': request, 'by': 'owner'})
+        self.assertEqual(receipt['state'], 'exited')
+        self.assertEqual((self.transport.ends, self.transport.terminates), (1, 0))
+        snapshot = runner.snapshot()
+        permission = snapshot['permissions'][0]
+        self.assertEqual((permission['decision'], permission['resolutionReason'], permission['decisionState']),
+                         ('deny', 'owner_stop', 'written'))
+        denial = self.transport.decisions[0]['response']['response']
+        self.assertEqual(denial, {'behavior': 'deny',
+                                  'message': 'The owner stopped this chat in Motet, so this request was denied.'})
+        self.assertEqual([(m['state'], m['error']) for m in snapshot['messages']],
+                         [('unknown', 'native_exited'), ('failed', 'owner_stop')])
+        self.assertEqual(runner.stop(request), receipt)
+        self.assertEqual(self.transport.ends, 1, 'a replayed request ID does not act again')
+        for params in ({'requestId': uid()}, {'requestId': uid(), 'by': 'motet'}, {'requestId': uid(), 'by': 'owner', 'x': 1}):
+            self.assert_error('invalid_request', lambda: runner.command('stop', params))
+
+    def test_an_unconfirmed_owner_stop_keeps_the_supervisor_listening_for_another_try(self):
+        runner = self.runner()
+        self.transport.stubborn = True
+        receipt = runner.stop(uid())
+        self.assertEqual(receipt['state'], 'unknown')
+        self.assertEqual(runner.snapshot()['state'], 'uncertain')
+
+        class Endpoint:
+            calls = 0
+
+            def accept(endpoint, seconds):
+                endpoint.calls += 1
+                if endpoint.calls == 3:
+                    self.transport.stubborn = False
+                    self.assertEqual(runner.stop(uid())['state'], 'exited')       # the owner's Try again
+                return None
+        endpoint = Endpoint()
+        self.assertEqual(managed._serve_loop(runner, endpoint), 0)
+        self.assertEqual(endpoint.calls, 3, 'it listened after the unconfirmed stop, until the exit was recorded')
+        self.assertEqual(self.transport.ends, 2)
+        self.assertTrue(runner.snapshot()['nativeExit']['confirmed'])
 
     def test_read_only_snapshot_is_uncertain_without_exit_no_file_changes(self):
         runner = self.runner()

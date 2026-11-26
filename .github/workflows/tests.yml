@@ -126,6 +126,11 @@ jobs:
       - run: python tests/test_managed_windows_end_to_end.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5
+      # The owner's Stop of a chat Motet started: the process-tree end on macOS and Linux (identity checked before
+      # every signal), and on macOS a real supervisor with the fictional Claude, through the real route.
+      - run: python tests/test_managed_stop_process.py
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        timeout-minutes: 5
       - run: node docs/fixtures/new-chat/managed-fixture.test.mjs
         if: ${{ !cancelled() }}
         timeout-minutes: 5

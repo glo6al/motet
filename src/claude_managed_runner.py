@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import signal
 import socket
 import sqlite3
 import stat
@@ -419,6 +420,37 @@ def read_message(run_dir, request_id):
         _close(root_fd)
 
 
+def read_native_process(run_dir):
+    """What the web process needs to find this run's Claude when its supervisor no longer answers: the manifest's
+    identity and executable, the native process the supervisor recorded (its ID and when it was started) and when
+    the launch was claimed. Read-only; never contacts or signals anything. None when no process was recorded."""
+    root_fd = db = None
+    try:
+        root_fd, manifest, _ = _open_state(run_dir)
+        _validate_db(root_fd)
+        db = sqlite3.connect(Path(run_dir).absolute().as_uri() + '/ledger.sqlite3?mode=ro', uri=True, timeout=1)
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA query_only=ON')
+        if _meta(db, 'identity') != {k: manifest[k] for k in ('runId', 'nativeId', 'incarnation')}:
+            _fail('unsafe_state')
+        native, claim = _meta(db, 'nativeProcess'), _meta(db, 'launchClaim')
+        if (not isinstance(native, dict) or not isinstance(claim, dict) or type(native.get('pid')) is not int
+                or native['pid'] <= 1 or type(native.get('startedAt')) not in (int, float)
+                or type(claim.get('at')) not in (int, float) or claim['at'] > native['startedAt']):
+            return None
+        return {'runId': manifest['runId'], 'nativeId': manifest['nativeId'], 'executable': manifest['executable']['path'],
+                'pid': native['pid'], 'startedAt': native['startedAt'], 'claimedAt': claim['at'],
+                'nativeExit': _meta(db, 'nativeExit')}
+    except RunnerError:
+        raise
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        _fail('unsafe_state')
+    finally:
+        if db is not None:
+            db.close()
+        _close(root_fd)
+
+
 def read_decision(run_dir, permission_id, request_id, decision):
     """Read a retained exact decision claim after disconnection, never answer it.
 
@@ -462,7 +494,8 @@ def read_decision(run_dir, permission_id, request_id, decision):
 class NativeTransport:
     """Pinned native JSONL, bounded reads/writes, one owned Popen instance.
 
-    POSIX: non-blocking pipes under a selector; Shutdown sends SIGTERM and waits. Windows (step 8b.2; on since
+    POSIX: non-blocking pipes under a selector; Shutdown sends SIGTERM and waits, and the owner's Stop ends the whole
+    process tree (``end_tree``). Windows (step 8b.2; on since
     8b.5): Claude runs in a kill-on-close job and its pipes are read and written by threads
     (claude_managed_windows: ``pipes`` and ``job`` are set), with the same line limit, budgets and deadlines;
     Shutdown closes its input, waits as long, then ends the whole job. See claude_managed_windows for why Claude
@@ -631,6 +664,44 @@ class NativeTransport:
     def poll(self):
         return self.process.poll() if self.process else None
 
+    def end_tree(self, gentle=3, firm=2):
+        """The owner's stop: end Claude and everything it started. Windows: close its input, wait, then end the
+        whole job (``terminate`` and ``wait``). POSIX: managed_process_tree.end on Claude's process, its descendants
+        and its process group, SIGTERM then SIGKILL, while Claude is this supervisor's own unreaped child (so its ID
+        and its group's cannot be reused), then reap it. Returns Claude's exit code; raises subprocess.TimeoutExpired
+        if Claude itself is still running. (A process of its tree that outlives SIGKILL is stuck in the kernel, where
+        no signal reaches it.)"""
+        if self.job is not None:
+            self.terminate()
+            return self.wait(timeout=gentle)
+        import managed_process_tree as tree
+        code = self.process.returncode
+        if code is None:
+            pid = self.process.pid
+            try:
+                root = tree.table().get(pid)
+            except tree.TreeError:
+                root = None
+            if root is None or root.ppid != os.getpid():
+                # No verified table: only the unreaped child and its own group, which are certainly Claude's.
+                self._group_signal(signal.SIGTERM)
+                try:
+                    return self.process.wait(timeout=gentle)
+                except subprocess.TimeoutExpired:
+                    self._group_signal(signal.SIGKILL)
+                    return self.process.wait(timeout=firm)
+            tree.end(root, group_signal=self._group_signal, gentle=gentle, firm=firm)
+            code = self.process.wait(timeout=firm)
+        return code
+
+    def _group_signal(self, number):
+        """Signal Claude's process group, only while Claude is still this supervisor's unreaped child."""
+        if self.process is not None and self.process.returncode is None:
+            try:
+                os.killpg(self.process.pid, number)
+            except (ProcessLookupError, PermissionError):
+                pass
+
     def terminate(self):
         # Only the original unreaped Popen child; never load or signal a saved PID.
         if self.job is not None:
@@ -683,6 +754,7 @@ class Runner:
         self.root_fd = self.lock_fd = self.db = self.transport = None
         self.manifest = self.token = None
         self.stopping = False
+        self.awaiting_retry = False     # an owner's stop could not confirm the end: keep listening for another try
         self.started = False
         self.active = None
         self.control_id = None
@@ -845,6 +917,8 @@ class Runner:
                 return self.decide(**params)
             if command == 'shutdown' and set(params) == {'requestId'}:
                 return self.shutdown(**params)
+            if command == 'stop' and set(params) == {'requestId', 'by'} and params['by'] == 'owner':
+                return self.stop(params['requestId'])
             _fail('invalid_request')
 
     def _prune(self):
@@ -1044,6 +1118,9 @@ class Runner:
     def _permission_payload(row):
         if row['decision'] == 'allow':
             return {'behavior': 'allow', 'updatedInput': _load(row['input'])}
+        if 'resolution_reason' in row.keys() and row['resolution_reason'] == 'owner_stop':
+            # The owner stopped this chat in Motet: said as the owner's act, not as Motet's own refusal.
+            return {'behavior': 'deny', 'message': 'The owner stopped this chat in Motet, so this request was denied.'}
         if row['tool'] == PLAN_TOOL:
             return {'behavior': 'deny', 'message': PLAN_DENIED}
         return {'behavior': 'deny', 'message': 'Motet denied this request. Do not retry without a new owner instruction.'}
@@ -1078,8 +1155,7 @@ class Runner:
                              resolution_reason or {'expired': 'timeout', 'shutdown': 'shutdown'}.get(reason, 'owner'),
                              self.wall(), permission_id))
         self.deadlines.pop(row['native_id'], None)
-        row = dict(row)
-        row['decision'] = decision
+        row = dict(self.db.execute('SELECT * FROM permissions WHERE id=?', (permission_id,)).fetchone())
         response = self._permission_payload(row)
         try:
             self._write({'type': 'control_response', 'response': {'subtype': 'success',
@@ -1181,6 +1257,41 @@ class Runner:
                 self.db.execute('UPDATE shutdowns SET state=? WHERE id=?', (state, requestId))
             return {'requestId': requestId, 'state': state, 'nativeExit': _meta(self.db, 'nativeExit')}
 
+    def stop(self, requestId):
+        """The owner's stop of this chat. As ``shutdown``, but said as the owner's: each waiting permission request
+        is denied as stopped by the owner (resolution ``owner_stop``) and each queued message fails as ``owner_stop``.
+        Claude's whole process tree is ended, firmly (NativeTransport.end_tree). If that cannot be confirmed the
+        state is uncertain and this supervisor keeps listening until Claude's exit is recorded, so a stop with a new
+        request ID tries again. A request ID is acted on once; its replay returns its receipt."""
+        with self.lock:
+            if not _uuid(requestId):
+                _fail('invalid_request')
+            previous = self.db.execute('SELECT state FROM shutdowns WHERE id=?', (requestId,)).fetchone()
+            if previous:
+                return {'requestId': requestId, 'state': previous['state'], 'nativeExit': _meta(self.db, 'nativeExit')}
+            if (self.db.execute('SELECT 1 FROM messages WHERE id=?', (requestId,)).fetchone()
+                    or self.db.execute('SELECT 1 FROM permissions WHERE decision_id=?', (requestId,)).fetchone()):
+                _fail('conflict')
+            self.stopping = True
+            with self.db:
+                self.db.execute("INSERT INTO shutdowns VALUES(?,'dispatching')", (requestId,))
+                self.db.execute("UPDATE messages SET state='failed',error='owner_stop',terminal_at=? WHERE state='queued'", (self.wall(),))
+            if _meta(self.db, 'nativeExit') is None:
+                for row in self.db.execute("SELECT id FROM permissions WHERE state='pending'").fetchall():
+                    if _meta(self.db, 'state') == 'uncertain':
+                        break
+                    with contextlib.suppress(RunnerError):
+                        self._decide_native(row['id'], 'deny', None, 'shutdown', resolution_reason='owner_stop')
+                try:
+                    self._exit(self.transport.end_tree())
+                except (OSError, TimeoutError, subprocess.TimeoutExpired):
+                    self._uncertain()
+            state = 'exited' if _meta(self.db, 'nativeExit') else 'unknown'
+            self.awaiting_retry = state != 'exited'
+            with self.db:
+                self.db.execute('UPDATE shutdowns SET state=? WHERE id=?', (state, requestId))
+            return {'requestId': requestId, 'state': state, 'nativeExit': _meta(self.db, 'nativeExit')}
+
     def exchange(self, connection):
         """One bounded, authenticated command; secrets never appear in replies."""
         try:
@@ -1242,7 +1353,9 @@ def _serve_loop(runner, endpoint):
     connection or None): step the native transport, stop after a recorded native exit, and answer one connection at
     a time through ``exchange``. It is a copy of the POSIX loop in ``serve``, which keeps its own Unix socket code;
     a change to either loop belongs in both."""
-    while not runner.stopping:
+    # An owner's stop that could not confirm the end leaves the supervisor listening (and stepping, which records the
+    # exit when it comes), so the owner's next stop can try again; it ends once the exit is recorded.
+    while not runner.stopping or runner.awaiting_retry:
         runner.step()
         if _meta(runner.db, 'nativeExit') is not None:
             break
@@ -1309,7 +1422,7 @@ def serve(run_dir):
         listener.listen(8)
         listener.settimeout(.05)
         # This loop's Windows twin is _serve_loop (over a named pipe); a change here belongs there too.
-        while not runner.stopping:
+        while not runner.stopping or runner.awaiting_retry:
             runner.step()
             if _meta(runner.db, 'nativeExit') is not None:
                 break

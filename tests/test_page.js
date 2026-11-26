@@ -4038,6 +4038,7 @@ let savedProofDeadline;(async()=>{savedProofDeadline=setTimeout(()=>{console.err
 }
 
 require("./test_page_managed.js");
+require('./test_page_stop.js');
 require('./test_attachments_presentation.js');
 require('./test_workspace_attachments_controller.js');
 

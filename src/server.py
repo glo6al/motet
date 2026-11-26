@@ -88,6 +88,11 @@ CLAUDE_MANAGED = None
 # managed Claude existed here.
 CLAUDE_MANAGED_OFF = None
 CLAUDE_MANAGED_FAILED = False   # failed registry startup must not erase its ownership fence
+# The owner's stops of chats Motet started, by agent: {outcome, requestedAt, lastAttemptAt, stoppedAt}. The record
+# itself lives in the managed registry (claude_managed.ManagedClaude.stop); this copy is read from it at startup and
+# updated from each status the manager reads (managed_stop_seen), and goes on the agent's row ('managed_stop') so the
+# stage and its list show it.
+MANAGED_STOPS = {}
 NEW_CHAT_CLAUDE_DIRECTORY = None
 ANTIGRAVITY_OPEN = None        # separate owner-only native navigation; never a peer capability
 DICTATION_PROXY = None        # optional owner-only loopback adapter; no runtime in this process
@@ -802,6 +807,9 @@ def describe(aid, old=False, **kw):
     one, and the events leave in the order the changes were made."""
     with LINKS_LOCK:
         a = AGENTS.setdefault(aid, {})
+        stop = MANAGED_STOPS.get(aid)
+        if stop is not None and a.get('managed_stop') != stop:
+            kw = dict(kw, managed_stop=stop)          # the owner stopped this chat: its row says so from the first event
         if aid in LINKS:
             LINKS[aid]['seen'] = time.time()          # the child is still about: its link is worth keeping (see prune_links)
         if kw.get('parent') and kw['parent'] != aid and AID_RX.match(str(kw['parent'])) and not would_cycle(aid, kw['parent']):
@@ -858,9 +866,38 @@ def facts(aid, old=False, **values):
     """Explicit unknowns survive both live events and reconnect snapshots."""
     with LINKS_LOCK:
         a = AGENTS.setdefault(aid, {})
+        if MANAGED_STOPS.get(aid) is not None:
+            values = dict(values, managed_stop=MANAGED_STOPS[aid])
         if any(k not in a or a[k] != v for k, v in values.items()):
             a.update(values)
             emit(aid, 'agent', old, **a)
+
+
+def managed_stop_seen(agent, owner_stop):
+    """A stop record the manager read or made: kept in MANAGED_STOPS and put on the agent's row, if the room has that
+    agent (a row is never made for it here; describe adds the record when the agent's log first describes it)."""
+    try:
+        stop = {key: owner_stop[key] for key in ('outcome', 'requestedAt', 'lastAttemptAt', 'stoppedAt')}
+    except (KeyError, TypeError):
+        return
+    if not isinstance(agent, str) or not agent.startswith('c:') or MANAGED_STOPS.get(agent) == stop:
+        return
+    with LINKS_LOCK:
+        MANAGED_STOPS[agent] = stop
+        if agent in AGENTS:
+            facts(agent, managed_stop=stop)
+
+
+def load_managed_stops(manager):
+    """At startup: every stop the managed registry records, so a restart and a reload still show them; and each stop
+    the manager reads from then on (managed_stop_seen)."""
+    if manager is None:
+        return
+    manager.stop_observer = managed_stop_seen
+    try:
+        MANAGED_STOPS.update(manager.stop_facts())
+    except Exception:
+        pass                      # an unreadable registry is reported by the managed routes; the room carries on
 
 
 def unlink(child):
@@ -6922,6 +6959,7 @@ if __name__ == '__main__':
     from dictation_proxy import from_environment as dictation_from_environment
     DICTATION_PROXY = dictation_from_environment(HOME, PORT)
     CLAUDE_MANAGED, CLAUDE_MANAGED_FAILED = start_managed_claude()
+    load_managed_stops(CLAUDE_MANAGED)
     if CLAUDE_MANAGED_OFF is not None:
         from claude_managed import OFF_REASONS
         # The one place this shows where the ownership fence hides chats: with managed records on disk and no
