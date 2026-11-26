@@ -1069,6 +1069,20 @@ test('identity rejection catch discards lifecycle-invalidated lookups without re
   }finally{inCatch=false;gate.release(NATIVE);await pending;}
 });
 
+test('a refused registration is remembered for the folder it happened in, and a move retries',async()=>{
+  // An older Motet (or a stage showing another folder) refuses this chat while it works in a subfolder.
+  let refuse=true,now=100000;
+  const h=await harness({startup:sdk,claimed:false,root:'/fictional/project',storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>url.endsWith('/register')&&refuse?responseJSON({error_code:'identity_rejected'},409):globalFetch(url,body)});
+  h.setCwd('/fictional/project/src');
+  await h.tick();assert.equal(registrations(h).length,1);
+  for(let i=0;i<4;i++){now+=120000;h.setNow(now);await h.tick();}
+  assert.equal(registrations(h).length,1,'the same refusal in the same folder is not retried');
+  refuse=false;h.setCwd('/fictional/project');now+=120000;h.setNow(now);await h.tick();
+  assert.equal(registrations(h).length,2,'back in the project folder, the chat registers again');
+  assert.equal(registrations(h).at(-1).body.project,'/fictional/project');
+});
+
 test('semantic observers remove subscriptions on success timeout and predicate exceptions',async()=>{
   const bus=observationBus();let ready=false;
   const waiting=bus.wait(()=>ready,'success');assert.equal(bus.pending,1);ready=true;bus.notify();assert.equal(await waiting,true);assert.equal(bus.pending,0);

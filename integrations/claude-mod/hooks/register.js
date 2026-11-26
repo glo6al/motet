@@ -48,6 +48,14 @@ function insideFolder(path, root, rules) {
 // is the root or inside it by name; otherwise there is no project (null), which matches no enrollment, so a chat
 // that left its project stops. A host without `root()`, or one whose `root()` fails, keeps the stricter `cwd()`
 // comparison.
+// A refused registration is not tried again from the same place, so a refusal that repeats cannot storm Motet.
+// The place is the chat's actual folder, not only its project: Motet judges the folder the chat is in, so after a
+// move (back to the project folder, say) the chat registers again.
+async function refusalKey($, state, id, project, config) {
+  const cwd = await $.session.cwd().catch(()=>null);
+  return JSON.stringify([id, project, cwd, state.folderProtocol, configurationId(config)]);
+}
+
 async function sessionProject($) {
   if (typeof $.session.root === 'function') {
     let root = null;
@@ -690,7 +698,7 @@ async function supervisor($, state) {
         }
       }
       if (state.data?.mode === 'derived' || (!state.data && config)) {
-        if (!config || state.rejectedGrant === configurationId(config) || state.rejectedIdentity === JSON.stringify([id,project,configurationId(config)])) return;
+        if (!config || state.rejectedGrant === configurationId(config) || state.rejectedIdentity === await refusalKey($,state,id,project,config)) return;
         await connectDerived($,state,id,project,config,eligibilityEpoch);
       } else {
         const stored = state.data ?? await $.store.get(legacyKey(id));
@@ -717,8 +725,9 @@ async function supervisor($, state) {
     if (error.status === 403 && state.config) state.rejectedGrant = configurationId(state.config);
     if (error.code === 'identity_rejected') {
       const id = await $.session.id().catch(()=>null), project = await sessionProject($).catch(()=>null);
+      const key = await refusalKey($,state,id,project,state.config);
       if (state.eligibilityEpoch !== eligibilityEpoch) return;
-      state.rejectedIdentity = JSON.stringify([id,project,configurationId(state.config)]);
+      state.rejectedIdentity = key;
     }
     state.error = error.message === 'Motet recovery data limit.' ? 'Motet recovery data limit reached; automatic claims stopped.' :
       'Motet connection interrupted; existing attempts are never resubmitted.';
