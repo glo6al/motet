@@ -406,6 +406,32 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(sum(p['canAllow'] for p in runner.snapshot()['permissions']), 8)
         self.assertEqual(len(natives), 8)
 
+    def test_plan_approval_is_never_allowed_and_hands_the_plan_back_to_the_owner(self):
+        # Approving a plan also chooses the edit mode, so a bare allow is no approval: never pending, never allowable,
+        # denied at once with a reason that sends the plan to the owner; an ordinary tool is still held.
+        runner = self.runner()
+        self.send(runner)
+        plan = self.transport.permission(tool='ExitPlanMode', input={'plan': 'Fictional plan: tidy the orchard.'})
+        ordinary = self.transport.permission()
+        runner.step()
+        (response,) = self.transport.decisions
+        self.assertEqual(response['response']['request_id'], plan)
+        self.assertEqual(response['response']['response'], {'behavior': 'deny', 'message': managed.PLAN_DENIED})
+        self.assertIn('owner', managed.PLAN_DENIED)
+        rows = runner.snapshot()['permissions']
+        self.assertEqual([(p['tool'], p['state'], p['decision'], p['resolutionReason'], p['canAllow']) for p in rows],
+                         [('ExitPlanMode', 'unsupported', 'deny', 'unsupported_tool', False),
+                          ('Write', 'pending', None, None, True)])
+        self.assert_error('stale_permission', lambda: runner.decide(rows[0]['id'], uid(), 'allow'))
+        self.assertEqual(len(self.transport.decisions), 1)
+        # Claude's echo of the plan denial is recognised as the retained decision, not as unexplained output.
+        before = runner.snapshot()
+        self.transport.frames.append(json.loads(json.dumps(response)))
+        runner.step()
+        self.assertEqual(runner.snapshot(), before)
+        runner.decide(rows[1]['id'], uid(), 'allow')
+        self.assertEqual([d['response']['request_id'] for d in self.transport.decisions], [plan, ordinary])
+
     def test_changed_duplicate_native_permission_fails_closed(self):
         runner = self.runner()
         self.send(runner)

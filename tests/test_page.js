@@ -1473,6 +1473,22 @@ function responseReviewChecks(source=responseSource,needCode=needSource){
   assert.equal(t.posts.length,0,'notice, scroll and rendering never send');
 }
 responseReviewChecks();
+/* A plan in the app's own approval box reads as waiting on you for a plan, never as a permission request: no
+   Allow/Deny, its own words wherever a request is named, and questions and held permissions are unchanged. */
+{
+  const t=responseFixture(),plan={kind:'ask',id:'toolu_plan',ts:1,text:'Wants you to approve its plan before it continues.'};
+  t.a.calls={[plan.id]:plan};const n=t.api.need(t.a);
+  assert.equal(n.kind,'Plan');assert.equal(n.perm,undefined);assert.equal(n.sure,true);
+  t.paint();assert.equal(t.node('#responseTitle').textContent,'Plan for you');
+  assert.equal(t.node('#responseDecisions').hidden,true,'a plan is never offered Allow or Deny');assert.equal(t.node('#responseOpenApp').hidden,false,'a plan is answered in the app');
+  t.a.calls={q:{kind:'ask',id:'q',ts:1,text:'Fictional: which orchard?'}};assert.equal(t.api.need(t.a).kind,'Decide','a question is unchanged');
+  t.perm();t.a.calls={[plan.id]:plan};assert.equal(t.api.need(t.a).kind,'Approve','a held permission still comes first');
+  const maps=html.match(/\{Approve:'[^}]*\}/g)||[];assert.equal(maps.length,5);
+  for(const m of maps)assert.match(m,/Plan:'/,'every request label names a plan in its own words: '+m);
+  assert.ok(html.includes("Plan:'has a plan for you'")&&!/Plan:'[^']*permission/i.test(html),'a plan never reads as permission');
+  assert.ok(html.includes("N.kind==='Plan'?'has a plan for you'"),'the copied list names a plan too');
+  console.log('ok plan requests: waiting on you for a plan in the app, no Allow/Deny, questions and permissions unchanged');
+}
 for(const [name,source,needCode] of [
  ['dismiss restriction',responseSource.replace("v.n.perm||v.n.sure&&v.n.kind!=='Needs you'||",''),needSource],
  ['scroll invalidation',responseSource.replace("e.target.contains($('#responseCard'))","false"),needSource],

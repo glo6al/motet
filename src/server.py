@@ -6105,8 +6105,12 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, b'')
         ti = d.get('tool_input') if isinstance(d.get('tool_input'), dict) else {}
         tool = str(d.get('tool_name', 'this action'))[:80]
-        if tool == 'AskUserQuestion':               # a question for you, not permission to act: Allow or Deny cannot answer it,
-            return self.send(200, b'')              # so it is never held and goes straight to the app (the room still shows it is asking)
+        # A question for you (AskUserQuestion) or a plan to approve (ExitPlanMode) is not permission to act: Allow or
+        # Deny cannot answer it. Approving a plan also chooses how the edits are then made, which a bare allow does not,
+        # so until a supported route exists you answer it at the agent's desk in the app. Neither is ever held: it goes
+        # straight to the app, and the room still shows from the log that the agent is waiting on you ('ask').
+        if tool in ('AskUserQuestion', 'ExitPlanMode'):
+            return self.send(200, b'')
         what = str(ti.get('command') or ti.get('file_path') or ti.get('url') or '').strip()     # the request itself, for matching a notice to it
         full = (what + '\n\n' if what else '') + json.dumps(ti, ensure_ascii=False, indent=1)
         pid = secrets.token_hex(8)

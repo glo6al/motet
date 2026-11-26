@@ -327,6 +327,53 @@ class RealServerTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: any(kind == 'perm_end' and how.startswith('the request went away')
                                                   for kind, how in self.emitted if how)))
 
+    def test_plan_and_question_prompts_go_to_the_app_and_are_never_held(self):
+        """Allow or Deny answers neither a question nor a plan (approving a plan also chooses the edit mode), so both
+        get an empty reply at once and Claude shows its own prompt; an ordinary tool is still held for the stage."""
+        class Recorded(dict):
+            def __init__(self):
+                super().__init__()
+                self.tools = []
+
+            def __setitem__(self, key, value):
+                self.tools.append(value['tool'])
+                super().__setitem__(key, value)
+        held = Recorded()
+        self.server_mod.PENDING = held              # restored by the setUp patch
+        for tool, tool_input in (('ExitPlanMode', {'plan': 'Fictional plan: tidy the orchard index.'}),
+                                 ('AskUserQuestion', {'questions': [{'question': 'Fictional: which orchard?'}]})):
+            with self.subTest(tool=tool):
+                body = json.dumps({'session_id': self.SESSION, 'hook_event_name': 'PermissionRequest',
+                                   'tool_name': tool, 'tool_input': tool_input}).encode()
+                proc = self.hook('ask', ['--test-timeout=10'])
+                out, err = proc.communicate(body, timeout=30)
+                self.assertEqual((proc.returncode, out), (0, b''), err)
+        self.assertEqual(held.tools, [], 'a plan or a question was registered as a held permission')
+        self.assertFalse([kind for kind, _ in self.emitted if kind in ('perm', 'perm_end', 'waiting')],
+                         'a plan or a question was offered on the stage as a permission')
+        self.assertEqual(self.decide(True), ALLOW.encode())
+        self.assertEqual(held.tools, ['Bash'], 'an ordinary tool is still held')
+
+    def test_plan_reads_on_the_stage_as_waiting_on_the_owner(self):
+        """The room learns of a plan from the log, as of a question: an open 'ask', never a permission card."""
+        events = []
+        path = self.home / (self.SESSION + '.jsonl')
+        path.write_text('', encoding='utf-8')
+        from unittest.mock import patch
+        with patch.object(self.server_mod, 'emit', lambda aid, kind, old, ts=None, **kw: events.append((kind, kw))):
+            tail = self.server_mod.ClaudeTail(str(path))
+            for cid, name, tool_input in (('toolu_fictional_plan', 'ExitPlanMode', {'plan': 'Fictional plan.'}),
+                                          ('toolu_fictional_question', 'AskUserQuestion',
+                                           {'questions': [{'question': 'Fictional: which orchard?'}]})):
+                tail.handle({'type': 'assistant', 'timestamp': '2026-11-26T10:00:00Z', 'cwd': '/fictional/orchard',
+                             'message': {'role': 'assistant', 'content': [
+                                 {'type': 'tool_use', 'id': cid, 'name': name, 'input': tool_input}]}}, False)
+        asks = [kw for kind, kw in events if kind == 'ask']
+        self.assertEqual([(a['id'], a['text']) for a in asks],
+                         [('toolu_fictional_plan', 'Wants you to approve its plan before it continues.'),
+                          ('toolu_fictional_question', 'Fictional: which orchard?')])
+        self.assertFalse([kind for kind, _ in events if kind in ('perm', 'tool')])
+
 
 def base_commands(port):
     """The macOS and Linux hook strings exactly as the installer wrote them before Windows support (dev e3518b2)."""
