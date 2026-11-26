@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {register} from '../hooks/register.js';
-import {matchingPrompt, matchingAnswer, pairing, validClaim, validNoticeClaim, replyNoticeText, lifecycleReceipt, receiptRecord} from '../hooks/protocol.js';
+import {MAX_RECEIPT_REJECTIONS, matchingPrompt, matchingAnswer, pairing, validClaim, validNoticeClaim, replyNoticeText, lifecycleReceipt, receiptRecord} from '../hooks/protocol.js';
 
 const NATIVE='11111111-1111-4111-8111-111111111111', GENERATION='22222222-2222-4222-8222-222222222222';
 const REQUEST='33333333-3333-4333-8333-333333333333', ATTEMPT='44444444-4444-4444-8444-444444444444';
@@ -1130,6 +1130,48 @@ test('an upgraded automatic connection reports a buffered reply from its earlier
 test('an upgraded manual pairing reports a buffered reply from its earlier folder, then moves',async()=>{
   await upgradeAndMove(await bufferedChildReply({manual:true}),{manual:true});
 });
+
+async function upgradeAgainst(storage,{manual=false,refuseReceipt=false,missingContext=false}={}){
+  let moved=false,now=100000;
+  const target=url=>url.endsWith(manual?'/connect':'/register');
+  const reload=await harness({storage,root:'/fictional/project',project:'/fictional/project',claimed:false,fetch:(url,body)=>{
+    if(url.endsWith('/event')&&body.kind==='answered'&&refuseReceipt)return responseJSON({error:'Claude request does not match its original claim.',error_code:'receipt_rejected'},409);
+    if(!target(url))return null;
+    if(body.receipt_only)return missingContext?responseJSON({error:'No earlier Motet connection of this chat holds that folder.',error_code:'receipt_context_missing'},409):
+      (manual?null:responseJSON(registered(body)));
+    if(body.project==='/fictional/project'){moved=true;return manual?null:responseJSON(registered(body,{enrollment_id:ATTEMPT,token:'c'.repeat(64)}));}
+    return null;
+  }});
+  for(let i=0;i<30&&!moved;i++){now+=60000;reload.setNow(now);await reload.tick();await new Promise(r=>setImmediate(r));}
+  for(let i=0;i<5;i++){now+=60000;reload.setNow(now);await reload.tick();}
+  const connects=reload.calls.filter(c=>target(c.url)).map(c=>c.body);
+  return {reload,moved,connects,receiptOnly:connects.filter(b=>b.receipt_only),
+    answers:reload.calls.filter(c=>c.url.endsWith('/event')&&c.body.kind==='answered').length};
+}
+
+for(const manual of [false,true]){
+  test(`a refused earlier receipt ends receipt-only mode and the chat moves (${manual?'manual':'automatic'})`,async()=>{
+    const {reload,moved,connects,receiptOnly,answers}=await upgradeAgainst(await bufferedChildReply({manual}),{manual,refuseReceipt:true});
+    assert(moved,'the chat moved to its project folder');
+    assert.equal(receiptOnly.length,1,'one receipt-only connection, not a storm');
+    assert(answers>=1&&answers<=MAX_RECEIPT_REJECTIONS,'the refused receipt is tried at most its retry limit');
+    assert.equal(connects.at(-1).project,'/fictional/project');
+    assert(reload.calls.filter(c=>c.url.endsWith('/poll')&&c.body.project==='/fictional/project/sub').every(c=>c.body.accept===false));
+    assert.equal(reload.submissions.length,0);
+  });
+
+  test(`a missing earlier context is given up, its receipts kept, and the chat moves (${manual?'manual':'automatic'})`,async()=>{
+    const storage=await bufferedChildReply({manual});
+    const before=JSON.stringify([...storage.entries()].filter(([key])=>key.startsWith('watch-owner-runtime-')));
+    const {reload,moved,receiptOnly,answers}=await upgradeAgainst(storage,{manual,missingContext:true});
+    assert(moved,'the chat moved to its project folder');
+    assert.equal(receiptOnly.length,1,'the missing context is asked for once');
+    assert.equal(answers,manual?1:0,'nothing is reported to a context Motet does not hold');
+    if(!manual)assert.equal(JSON.stringify([...storage.entries()].filter(([key])=>key.startsWith('watch-owner-runtime-')).filter(([key])=>before.includes(key))),
+      JSON.stringify(JSON.parse(before)),'the earlier receipts stay stored for recovery');
+    assert.equal(reload.submissions.length,0);
+  });
+}
 
 test('evidence that is not ready yet is retried on later ticks without a reset',async()=>{
   let attempts=0,now=100000;

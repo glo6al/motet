@@ -297,8 +297,6 @@ class ClaudeMod:
     def __init__(self, store):
         self.store, self.db = store, store.db
         self.room_snapshot = None
-        # Generations connected for receipts only (an earlier folder's retained replies): they never get a claim.
-        self.receipt_generations = {}
         self.attachment_mount = None
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_pairs (
             code_hash TEXT PRIMARY KEY, agent TEXT NOT NULL, project TEXT NOT NULL, expires REAL NOT NULL)''')
@@ -310,7 +308,9 @@ class ClaudeMod:
                            ('peer_protocol', 'INTEGER NOT NULL DEFAULT 0'),
                            ('reply_notice_protocol', 'INTEGER NOT NULL DEFAULT 0'),
                            ('lifecycle_protocol', 'INTEGER NOT NULL DEFAULT 0'),
-                           ('peer_envelope_limit', 'INTEGER NOT NULL DEFAULT 4000')):
+                           ('peer_envelope_limit', 'INTEGER NOT NULL DEFAULT 4000'),
+                           # Connected for an earlier folder's retained outcomes only: never given a claim.
+                           ('receipt_only', 'INTEGER NOT NULL DEFAULT 0')):
             if name not in columns:
                 self.db.execute(f'ALTER TABLE claude_mod_enrollments ADD COLUMN {name} {kind}')
         self.db.execute('CREATE INDEX IF NOT EXISTS claude_mod_agents ON claude_mod_enrollments(agent,active)')
@@ -401,7 +401,7 @@ class ClaudeMod:
         return result
 
     def get(self, eid):
-        fields = ('id', 'agent', 'project', 'generation', 'last_seen', 'active', 'grant_id', 'client_id', 'connection_seq', 'peer_protocol', 'reply_notice_protocol', 'lifecycle_protocol', 'peer_envelope_limit')
+        fields = ('id', 'agent', 'project', 'generation', 'last_seen', 'active', 'grant_id', 'client_id', 'connection_seq', 'peer_protocol', 'reply_notice_protocol', 'lifecycle_protocol', 'peer_envelope_limit', 'receipt_only')
         row = self.db.execute('SELECT '+','.join(fields)+' FROM claude_mod_enrollments WHERE id=?', (eid,)).fetchone()
         return dict(zip(fields, row)) if row else None
 
@@ -447,13 +447,9 @@ class ClaudeMod:
             return True
         return self.attachment_busy(entry['agent'])
 
-    def _receipt_only(self, generation, on):
-        if on:
-            self.receipt_generations[generation] = True
-            while len(self.receipt_generations) > 1024:
-                self.receipt_generations.pop(next(iter(self.receipt_generations)))
-        else:
-            self.receipt_generations.pop(generation, None)
+    def _receipt_only(self, eid, on):
+        """Record, on the enrollment itself, whether its current connection is for receipts only."""
+        self.db.execute('UPDATE claude_mod_enrollments SET receipt_only=? WHERE id=?', (1 if on else 0, eid))
 
     def _move_ready(self, entry):
         """A chat moves to its project folder only with nothing in flight; requests not yet handed over fail."""
@@ -607,8 +603,8 @@ class ClaudeMod:
                 VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?)''', (eid, digest(service_token), aid, data['project'], str(uuid.uuid4()),
                                                time.time(), gid, data['client_id'], seq, protocol, data.get('reply_notice_protocol', 0), data.get('lifecycle_protocol', 0), data.get('peer_envelope_limit', 4000)))
             entry = self.get(eid)
+        self._receipt_only(entry['id'], receipts)
         entry = self.get(entry['id'])
-        self._receipt_only(entry['generation'], receipts)
         peer_lifecycle.record_event(self.db, 'enrollment:' + entry['id'], 'registered', 'connection_episode', '', entry['generation'],
                                     event_id='register:' + entry['id'] + ':' + entry['generation'])
         return dict(self.session(entry), enrollment_id=entry['id'], token=service_token)
@@ -797,7 +793,7 @@ class ClaudeMod:
         # stands in for it. An older plugin reports none and keeps the stage's exact-project rule.
         if 'cwd' in data and data['cwd'] != entry['project']:
             return None
-        if entry['generation'] in self.receipt_generations:
+        if entry['receipt_only']:
             return None
         snapshot = agents() if callable(agents) else agents
         item = snapshot.get(entry['agent']) if isinstance(snapshot, dict) else None
@@ -846,7 +842,7 @@ class ClaudeMod:
             self.maintain()
             entry = self.authenticate(token)
             self.validate_poll(entry, data)
-            if data['accept'] and entry['generation'] in self.receipt_generations:
+            if data['accept'] and entry['receipt_only']:
                 data = dict(data, accept=False)     # receipts only: heartbeats and outcomes, never a new claim
             new_rows = [r for r in self.rows() if data['accept'] and r.get('mod_enrollment') == entry['id']
                         and not r.get('launched') and r['state'] == 'sending']
@@ -881,7 +877,7 @@ class ClaudeMod:
             # Connection or grant replacement during preparation invalidates this
             # poll; retained original attempts can still recover after reconnect.
             entry = self.authenticate(token)
-            if entry['generation'] in self.receipt_generations:
+            if entry['receipt_only']:
                 data = dict(data, accept=False)
             result = self.poll(entry, data, snapshot, prepared, observed=observed)
             mount = self.attachment_mount
@@ -1216,7 +1212,7 @@ class ClaudeMod:
                 self.db.execute('UPDATE claude_mod_enrollments SET generation=?,last_seen=? WHERE id=?', (generation, time.time(), entry['id']))
                 if moved:
                     self.db.execute('UPDATE claude_mod_enrollments SET project=? WHERE id=?', (data['project'], entry['id']))
-                self._receipt_only(generation, receipts)
+                self._receipt_only(entry['id'], receipts)
                 return self.session(self.get(entry['id']))
             if method == 'event':
                 return self.event(entry, data)

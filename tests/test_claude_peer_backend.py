@@ -1053,6 +1053,9 @@ class ClaudePeerBackendTests(unittest.TestCase):
         status, value = self.register_at(str(inside), seq + 2, receipt_only=True)
         self.assertEqual(status, 200, value)
         self.token, self.generation = value['token'], value['generation']
+        # Recorded on the enrollment itself (durable), so it holds whatever the plugin sends in its polls.
+        self.assertEqual(self.store.db.execute('SELECT receipt_only FROM claude_mod_enrollments WHERE agent=? AND active=1',
+                                               (self.aid,)).fetchone()[0], 1)
         # The chat is not receivable in its earlier folder: no new question is queued there.
         later = dict(agent=self.aid, question='Fictional later owner question', request_id=uid())
         self.assertEqual(self.http('/agent-message', later, owner=True)[0], 503)
@@ -1067,6 +1070,8 @@ class ClaudePeerBackendTests(unittest.TestCase):
         status, value = self.register_at(self.project, seq + 3)
         self.assertEqual(status, 200, value)
         self.assertEqual(self.active_projects(), [self.project])
+        self.assertEqual(self.store.db.execute('SELECT receipt_only FROM claude_mod_enrollments WHERE agent=? AND active=1',
+                                               (self.aid,)).fetchone()[0], 0)
 
     def test_derived_move_waits_for_receipts_reported_from_the_earlier_folder(self):
         self.derived_receipts_then_move(expired=False)

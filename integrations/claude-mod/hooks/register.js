@@ -48,39 +48,49 @@ function insideFolder(path, root, rules) {
 // is the root or inside it by name; otherwise there is no project (null), which matches no enrollment, so a chat
 // that left its project stops. A host without `root()`, or one whose `root()` fails, keeps the stricter `cwd()`
 // comparison.
-// Receipts still to report: retained events neither acknowledged nor refused for good. A context with any keeps
-// its earlier folder until they are reported, so the chat does not move away from replies it still holds.
-async function unreported(requests, acknowledged = {}) {
-  for (const request of Object.values(requests || {})) {
+// Receipts still to report, judged over every record of one connection context at once: an event counts unless
+// some record acknowledges it or Motet refused it for good (MAX_RECEIPT_REJECTIONS times) in any record, the new
+// receipt-only record included. A context with any keeps its earlier folder until they are reported or refused.
+async function pendingReceipts(records) {
+  const acknowledged = Object.assign({}, ...records.map(record => record?.acknowledged || {}));
+  const refused = new Map();
+  for (const record of records) for (const request of Object.values(record?.requests || {}))
+    for (const [hash, rejection] of Object.entries(request?.rejections || {}))
+      refused.set(hash, Math.max(refused.get(hash) ?? 0, rejection?.count ?? 0));
+  for (const record of records) for (const request of Object.values(record?.requests || {})) {
     for (const value of Array.isArray(request?.events) ? request.events : []) {
       const hash = await fingerprint(canonicalReceipt(value));
       if (acknowledged[hash] || acknowledged[await fingerprint(value)]) continue;
-      if ((request.rejections?.[hash]?.count ?? 0) >= MAX_RECEIPT_REJECTIONS) continue;
+      if ((refused.get(hash) ?? 0) >= MAX_RECEIPT_REJECTIONS) continue;
       return true;
     }
   }
   return false;
 }
 
+const receiptContext = (mode, project, grant) => JSON.stringify([mode, project, grant ?? null]);
+
 // An automatic connection made by an earlier plugin from a folder inside this project, whose retained outcomes are
-// not all reported yet: its folder, so the plugin reconnects there for receipts only before moving.
+// not all reported yet: its folder, so the plugin reconnects there for receipts only before moving. A context Motet
+// no longer holds (receipt_context_missing) is given up for this runtime; its records stay for recovery.
 async function earlierReceipts($, state, id, project, config) {
   const keys = await $.store.keys();
   if (!Array.isArray(keys) || keys.length > 4096) return null;
   const rules = await pathRules($), contexts = new Map();
+  const add = record => {
+    if (!record || record.mode !== 'derived' || record.native_id !== id || record.grant_id !== config.grant_id ||
+        record.project === project || !insideFolder(record.project, project, rules) ||
+        state.abandonedReceipts.has(receiptContext('derived', record.project, config.grant_id))) return;
+    const scope = JSON.stringify([record.project, record.enrollment_id]);
+    if (!contexts.has(scope)) contexts.set(scope, []);
+    contexts.get(scope).push(record);
+  };
   for (const key of keys) {
     if (typeof key !== 'string' || ![shardPrefix(id), legacyShardPrefix(id)].some(prefix => key.startsWith(prefix))) continue;
-    const shard = await $.store.get(key);
-    if (!shard || shard.mode !== 'derived' || shard.native_id !== id || shard.grant_id !== config.grant_id ||
-        shard.project === project || !insideFolder(shard.project, project, rules)) continue;
-    const scope = JSON.stringify([shard.project, shard.enrollment_id]);
-    if (!contexts.has(scope)) contexts.set(scope, []);
-    contexts.get(scope).push(shard);
+    add(await $.store.get(key));
   }
-  for (const shards of contexts.values()) {
-    const acknowledged = Object.assign({}, ...shards.map(shard => shard.acknowledged || {}));
-    for (const shard of shards) if (await unreported(shard.requests, acknowledged)) return shard.project;
-  }
+  if (state.receiptOnly) add(state.data);              // the live receipt-only record, possibly newer than storage
+  for (const records of contexts.values()) if (await pendingReceipts(records)) return records[0].project;
   return null;
 }
 
@@ -719,11 +729,12 @@ async function supervisor($, state) {
     if (surfaces.includes('desktop') && UUID.test(id)) state.desktopBinding = {native_id:id,project};
     if (!state.interactive && !(state.desktopBinding?.native_id === id && state.desktopBinding.project === project)) return;
     if (state.connected && state.receiptOnly && !state.flushing && !state.recovering &&
-        !await unreported(state.data.requests, state.data.acknowledged)) {
+        (state.data.mode === 'derived' ? await earlierReceipts($,state,id,project,state.config) !== state.data.project
+                                       : !await pendingReceipts([state.data]))) {
       // Every outcome from the earlier folder is reported: leave that context and connect in the project folder.
       const data = state.data;
       suspend($,state);
-      state.receiptOnly = false; state.retryAt = 0; state.failures = 0;
+      state.receiptOnly = false; state.receiptKey = null; state.retryAt = 0; state.failures = 0;
       if (data.mode === 'derived') {state.data = null; state.key = null;}
       else state.data = {...data, project};
       return;
@@ -739,7 +750,8 @@ async function supervisor($, state) {
         // same manual connection; Motet moves it only after proving the root is this chat's launch folder, and it
         // stays a manual (owner-only) connection. Nothing is saved until Motet accepts.
         else if (manual?.native_id === id && manual.active && typeof project === 'string' && insideFolder(manual.project, project, await pathRules($))) {
-          state.receiptOnly = await unreported(manual.requests);
+          state.receiptKey = receiptContext('manual', manual.project);
+          state.receiptOnly = !state.abandonedReceipts.has(state.receiptKey) && await pendingReceipts([manual]);
           state.data = state.receiptOnly ? manual : {...manual, project}; state.key = legacyKey(id);
         }
       }
@@ -749,6 +761,7 @@ async function supervisor($, state) {
         const earlier = await earlierReceipts($,state,id,project,config);
         checkEligibility(state,eligibilityEpoch);
         state.receiptOnly = earlier !== null;
+        state.receiptKey = earlier === null ? null : receiptContext('derived', earlier, config.grant_id);
         if (state.data && state.data.project !== (earlier ?? project)) {state.data = null; state.key = null;}
         await connectDerived($,state,id,earlier ?? project,config,eligibilityEpoch);
       } else {
@@ -779,6 +792,19 @@ async function supervisor($, state) {
       const key = await refusalKey($,state,id,project,state.config);
       if (state.eligibilityEpoch !== eligibilityEpoch) return;
       state.rejectedIdentity = key;
+    }
+    if (error.code === 'receipt_context_missing' && state.receiptOnly) {
+      // Motet holds no connection for that earlier folder any more. Stop asking for it; its records stay stored
+      // for recovery, and the chat moves to its project folder on the next attempt.
+      if (state.receiptKey) state.abandonedReceipts.add(state.receiptKey);
+      state.receiptOnly = false; state.receiptKey = null;
+      if (state.data?.mode === 'derived') {state.data = null; state.key = null;}
+      else if (state.data) {
+        const project = await sessionProject($).catch(()=>null);
+        if (state.eligibilityEpoch !== eligibilityEpoch) return;
+        state.data = typeof project === 'string' ? {...state.data, project} : null;
+        if (!state.data) state.key = null;
+      }
     }
     state.error = error.message === 'Motet recovery data limit.' ? 'Motet recovery data limit reached; automatic claims stopped.' :
       'Motet connection interrupted; existing attempts are never resubmitted.';
@@ -865,7 +891,7 @@ async function completeRecoveredTurns($, state) {
 
 export function register(on) {
   const state = {clientId:crypto.randomUUID(),sequence:-1,data:null,key:null,config:null,generation:null,connected:false,epoch:0,eligibilityEpoch:0,desktopBinding:null,disconnecting:0,
-    timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
+    timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
     rejectedGrant:'',rejectedIdentity:'',startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
@@ -952,7 +978,9 @@ export function register(on) {
         // subfolder: it offers the project folder on the same manual credential, and Motet moves it only to the
         // proven launch folder. It stays manual; nothing is saved unless Motet accepts.
         if (stored?.native_id === id && (stored.project === project || insideFolder(stored.project, project, await pathRules($)))) {
-          state.receiptOnly = stored.project !== project && await unreported(stored.requests);
+          state.receiptKey = receiptContext('manual', stored.project);
+          state.receiptOnly = stored.project !== project && !state.abandonedReceipts.has(state.receiptKey) &&
+            await pendingReceipts([stored]);
           state.key = legacyKey(id); state.data = {...stored, project:state.receiptOnly ? stored.project : project, active:true};
           await activate($,state,await post($,state,'connect',{native_id:id,project:state.data.project,...state.receiptOnly?{receipt_only:true}:{}}));
           return {text:state.receiptOnly ? 'Motet reconnected this chat to report its earlier replies; it then moves to this project folder. ' + LIMITATION :
