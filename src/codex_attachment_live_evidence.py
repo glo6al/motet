@@ -15,8 +15,11 @@ import stat
 import codex_transcript
 
 
+# The whole rollout is read into memory (no partial reads, so no read-ahead is needed), so MAX_SOURCE bounds this
+# reader; it stays at 16 MiB for the same memory reason as codex_attachment_evidence. A compaction record is a
+# normal record: the line limit is the shared rollout record limit.
 MAX_SOURCE = 16 * 1024 * 1024
-MAX_LINE = 1_000_000
+MAX_LINE = codex_transcript.MAX_RECORD
 MAX_LINES = 16_384
 
 _INDEX = 'state_5.sqlite'

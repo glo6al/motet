@@ -551,6 +551,39 @@ class SharedTests(unittest.TestCase):
         probe.assert_not_called()
         self.assertEqual(snapshot[self.a['agent_id']]['capability'], 'unavailable')
 
+    def test_codex_chat_outside_the_room_gets_a_truthful_reason(self):
+        # A Codex chat the room does not follow (quiet for the room's window, or not found yet) falls back to the
+        # generic Codex entry. With the desktop app and queue ready, the reason names those causes, not the transport.
+        idle, stale = 'x:' + str(uuid.uuid4()), 'x:' + str(uuid.uuid4())
+        def snapshot(scanned, desktop=0):
+            agents = {self.a['agent_id']: {'runtime': 'Codex'}, stale: {'runtime': 'Codex', 'stale': True}}
+            with patch.object(server, 'AGENTS', agents), \
+                    patch.dict(server.SCAN, {'ready': scanned}), \
+                    patch.object(server.sys, 'platform', 'darwin'), \
+                    patch.object(server.subprocess, 'run', return_value=Mock(returncode=desktop)):
+                return server.shared_directory_snapshot(self.store)
+        with patch.object(server, 'ROOM_QUIET', 2 * 3600):
+            facts = snapshot(True)
+        self.assertNotIn(idle, facts)
+        self.assertEqual(facts[self.a['agent_id']], {'capability': 'reachable', 'reason': ''})
+        fallback = facts['__codex_transport__']
+        self.assertEqual(fallback['capability'], 'unverified')
+        self.assertEqual(fallback['reason'], 'Motet has not seen this Codex chat active in the last 2 hours, or has '
+                                             'not found it yet. It can be messaged once it is active again.')
+        self.assertNotIn('transport', fallback['reason'])
+        self.assertNotIn('idle', fallback['reason'])
+        # A chat in the room whose process list could not be read is not called idle.
+        self.assertEqual(facts[stale], {'capability': 'unverified', 'reason': server.CODEX_PROCESS_UNREADABLE})
+        with patch.object(server, 'ROOM_QUIET', 90 * 60):
+            self.assertIn('in the last 90 minutes,', snapshot(True)['__codex_transport__']['reason'])
+        with patch.object(server, 'ROOM_QUIET', 3600):
+            self.assertIn('in the last 1 hour,', snapshot(True)['__codex_transport__']['reason'])
+        self.assertIn('not finished finding active chats', snapshot(False)['__codex_transport__']['reason'])
+        closed = snapshot(True, desktop=1)
+        self.assertEqual(closed['__codex_transport__'], {'capability': 'unavailable',
+                                                         'reason': 'Codex desktop and verified queue transport are required.'})
+        self.assertNotIn(stale, closed)
+
     def test_reply_wire_limit_preserves_complete_answers_only(self):
         result = self.send(); row = self.row(result['request_id'])
         self.bridge.authorize(row)

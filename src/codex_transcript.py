@@ -9,6 +9,9 @@ import private_storage
 
 MAX_HEADER = 1_000_000
 MAX_ENTRIES = 20000
+# One record bound for every reader of Codex rollout records. Context
+# compaction writes a single well-formed `compacted` record of several MB.
+MAX_RECORD = 32 * 1024 * 1024
 UUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 NAME = re.compile(r'^(?:rollout-.*?)(?P<id>' + UUID + r')(?:_' + UUID + r')?\.jsonl$')
 
@@ -68,6 +71,24 @@ def open_regular(root, path):
         os.close(fd)
         raise
     return os.fdopen(fd, 'rb'), st
+
+
+def read_through(source, data, limit=None):
+    """Extend a bounded read so its final record is complete, when it fits.
+
+    `data` was read from `source` at its current position. If it ends inside a
+    record of at most `limit` bytes, read ahead to that record's newline. At
+    most `limit + 1` further bytes are read, so memory stays bounded. A record
+    that is still being written, or is longer than `limit`, stays incomplete and
+    the caller keeps its own wait or fail-closed rule.
+    """
+    limit = MAX_RECORD if limit is None else limit
+    if not data or data.endswith(b'\n'):
+        return data
+    partial = len(data) - data.rfind(b'\n') - 1
+    if partial > limit:
+        return data
+    return data + source.readline(limit + 1 - partial)
 
 
 def header(source, ident, project=None):

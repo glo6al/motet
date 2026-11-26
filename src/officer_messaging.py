@@ -36,7 +36,10 @@ from attribution import AUTHORS, MOTET_GUIDANCE, MOTET_WORDING, OWNER_WORDING_V3
 
 CLI = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
 ACTIVE = ('sending', 'queued', 'awaiting_reply', 'unknown', 'expired')
-MAX_RECORDS, MAX_PENDING, MAX_LINE, MAX_READ = 256, 8, 1_000_000, 2_000_000
+MAX_RECORDS, MAX_PENDING, MAX_READ = 256, 8, 2_000_000
+# Codex compaction records are routinely several MB. They are well-formed and
+# must be parsed, not treated as transcript gaps.
+MAX_LINE = codex_transcript.MAX_RECORD
 TTL, RETENTION = 900, 86400
 CODEX_REPLY_EXPIRED = 'No matching reply yet. The question may still be queued; Motet will not resend.'
 CODEX_PREVIOUS_SOURCE_UNAVAILABLE = 'The original Codex transcript is temporarily unavailable. Motet will check it again.'
@@ -1692,6 +1695,11 @@ class MessagingStore:
                 row.update(state='answered', reply='\n'.join(line for line in answer.splitlines() if line != marker).strip()[:16000], error='')
 
     @staticmethod
+    def _tail_key(row, st):
+        return list(codex_transcript.segment_key(row)) + [codex_transcript.segment(row)['cursor'],
+                                                          st.st_size, st.st_mtime_ns]
+
+    @staticmethod
     def _codex_gap(row):
         row.update(peer_mixed_input=True, capture_disposition='withheld', codex_gap_seen=True,
                    codex_gap_needs_envelope=True, codex_post_gap_start='', current_turn='', state='unknown',
@@ -1714,9 +1722,19 @@ class MessagingStore:
             if opened is None:
                 return
             f, st, current = opened
+            # An unfinished final record is read again only once the file
+            # changes; a writer that stopped mid-record costs nothing per tick.
+            unchanged = row.get('codex_tail_wait') == self._tail_key(row, st)
             with f:
-                f.seek(current['cursor'])
-                data = f.read(MAX_READ)
+                if unchanged:
+                    data = b''
+                else:
+                    f.seek(current['cursor'])
+                    data = f.read(MAX_READ)
+                    if not row.get('codex_discard_record'):
+                        # Read a large final record whole (bounded by MAX_LINE)
+                        # instead of mistaking it for an unreadable gap.
+                        data = codex_transcript.read_through(f, data, MAX_LINE)
             if row.get('error') == 'The transcript is unavailable; Motet will keep checking for a reply.':
                 row['error'] = ''
             if row.get('codex_discard_record'):
@@ -1745,12 +1763,21 @@ class MessagingStore:
                             observations.append(kind)
                     elif row.get('origin') == 'peer':
                         self._codex_gap(row)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, RecursionError):
                     if row.get('origin') == 'peer':
                         self._codex_gap(row)
                 if row['state'] in ('answered', 'quarantined') or row.get('tracking_stopped'):
                     stopped = True
                     break
+            if not unchanged:
+                # Only an unfinished record at the end of the file waits; one cut
+                # short by the read budget is read on the next tick as usual.
+                if (not stopped and lines[-1] and len(lines[-1]) <= MAX_LINE
+                        and not row.get('codex_discard_record')
+                        and current['cursor'] + len(lines[-1]) >= st.st_size):
+                    row['codex_tail_wait'] = self._tail_key(row, st)
+                else:
+                    row.pop('codex_tail_wait', None)
             if not stopped and len(lines[-1]) > MAX_LINE:
                 if row.get('origin') == 'peer':
                     self._codex_gap(row)

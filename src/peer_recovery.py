@@ -21,7 +21,7 @@ import peer_bridge
 import peer_lifecycle
 import private_storage
 
-MAX_LINE = 32 * 1024 * 1024
+MAX_LINE = codex_transcript.MAX_RECORD
 MAX_SOURCE = 4 * 1024 * 1024 * 1024
 MAX_STORE = 16 * 1024 * 1024
 MAX_SELECTED = 100

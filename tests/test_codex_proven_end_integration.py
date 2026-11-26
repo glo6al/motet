@@ -181,10 +181,12 @@ with open(LAUNCH_LOG, 'a') as log:
         cedar_next = self.request(targets['Cedar'], 'Fictional next Cedar request')
         alder_next = self.request(targets['Alder'], 'Fictional next Alder request')
 
-        # An exact ID inside an unreadable record is insufficient to prove an end.
+        # An exact ID inside an unreadable record is insufficient to prove an end. A record over the record limit
+        # is unreadable (the limit is lowered here so the fixture stays small).
         self.append(cedar_path, 'event_msg', type='task_complete', turn_id=cedar_turn,
                     last_agent_message='x' * officer_messaging.MAX_READ)
-        self.store.tick()
+        with patch.object(officer_messaging, 'MAX_LINE', officer_messaging.MAX_READ // 2):
+            self.store.tick()
         self.assertTrue(self.row(cedar).get('codex_discard_record'))
         self.assertNotEqual(peer_lifecycle.get(self.store.db, cedar_transport)['execution'], 'completed')
         self.restart()
