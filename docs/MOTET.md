@@ -4,7 +4,7 @@ How Motet is instructed, what evidence it answers from, what its questions cost,
 
 ## Motet instructions and skills
 
-Motet's voice and working methods live in [`motet/INSTRUCTIONS.md`](../motet/INSTRUCTIONS.md), [`motet/VOCABULARY.md`](../motet/VOCABULARY.md), and five cards under [`motet/skills/`](../motet/skills/): shift reports, stuck-agent checks, conflict checks, handovers, and Watch-rule drafts. Ask normally; Motet selects a card when useful. Each question snapshots the instructions and available cards, so an edit applies to the next question without changing one already running.
+Motet's voice and working methods live in [`motet/INSTRUCTIONS.md`](../motet/INSTRUCTIONS.md), [`motet/VOCABULARY.md`](../motet/VOCABULARY.md), and five cards it loads from [`motet/skills/`](../motet/skills/): shift reports, stuck-agent checks, conflict checks, handovers, and Watch-rule drafts. The folder also holds thirteen skill templates for the agent core, listed below. Ask normally; Motet selects a card when useful. Each question snapshots the instructions and available cards, so an edit applies to the next question without changing one already running.
 
 Only a short skill menu is sent initially. The read-only `load_skill` tool returns a selected card; it adds no stage actions or authority. Loading a card uses the existing request allowance and may add an API round. Tools, permission boundaries, redaction, dispatch, and request limits remain in Python. Missing or invalid core files use the complete built-in instructions; an unavailable card is omitted. A new skill file alone cannot add a tool or enable messaging.
 

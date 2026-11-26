@@ -194,6 +194,7 @@ The detail lives in guides, one subject each.
 | [The bridge](docs/PEER_BRIDGE.md) | Letting a Claude Code chat and a Codex chat talk to each other |
 | [Trust boundary](docs/TRUST_BOUNDARY.md) | What Motet can reach, what leaves the computer, and what is left unproven |
 | [How Motet works](docs/HOW_IT_WORKS.md) | Where the stage gets what it shows, and the project layout |
+| [Motet agent core](docs/MOTET_AGENT_CORE.md) | The design for Motet's working day between your questions: not built yet |
 | [Roadmap](docs/ROADMAP.md) | What is being built, what is designed, what is only an idea, and the known limits |
 | [Windows](docs/WINDOWS.md) | Installing and trying it on Windows, and what to report |
 

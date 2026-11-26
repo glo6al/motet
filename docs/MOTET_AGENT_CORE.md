@@ -6,8 +6,8 @@ How Motet could keep agreed work moving between the owner's questions: its goals
 
 Part of the [Motet README](../README.md).
 
-Everything here is decided design except the items under "Not decided yet" at the end, which must not be built on as
-if settled. Each build step still needs an independent review by the other provider and the owner's yes to merge.
+Everything here is decided design except the items under "Not decided yet" at the end and the readings marked
+"proposed" in the text, which must not be built on as if settled until they are confirmed. Each build step still needs an independent review by the other provider and the owner's yes to merge.
 Today the self templates exist in `motet/`; the core itself is not built.
 
 ## In one paragraph
@@ -316,7 +316,8 @@ How a press reaches the agent depends on the kind of question:
 | A plan approval (Claude `ExitPlanMode`) | Treated as the agent's own prompt: "Open desk" only (a proposed reading) |
 | A permission prompt, in either app | "Open desk" only, always |
 
-**Answer buttons on typed questions.** Plain-text questions get answer buttons; a typed question (an app's
+**Answer buttons on typed questions** (decided, together with the rule in the table above). Plain-text questions get
+answer buttons, offered only when the choices are plain in the agent's words; a typed question (an app's
 multiple-choice form) and a plan approval show "Open desk". The screens may show a form's choices as plain words, never
 as buttons. A short investigation into answering forms safely comes first, and may extend this rule.
 
@@ -483,13 +484,14 @@ thinks and what it costs, never who Motet is or what it remembers.
 | `VOCABULARY.md` | Writing style. The agreed new text waits in `VOCABULARY.next.md` until step 1 | Motet refines it |
 | `ASKING_MOTET.md` | The block every project's agents get (part 6) | Changes like any project file, on the owner's yes |
 | `skills/` | Eighteen skills (see below) | Motet refines and adds skills |
-| `PROJECTS.md` and `projects/` | The owner's projects, roles and teams | The owner corrects each project's details at their own pace; Motet keeps team lists current |
+| `PROJECTS.md` and `projects/` (planned; not yet a template in `motet/`) | The owner's projects, roles and teams | The owner corrects each project's details at their own pace; Motet keeps team lists current |
 
 **Skills.** Five are kept from today: shift report, handover, stuck agent, conflict check and watch rule. Thirteen are
 new: morning brief, project sweep, end of day, kick off a goal, next step after a turn, review loop, ready for your yes,
 close out a goal, unstick an agent, something went wrong, helping an agent, waiting on you, and wake and deliver.
 
-**Projects.** One list of the owner's projects in `PROJECTS.md`, and one file per project in `projects/`. Each project
+**Projects** (planned; not yet a template). One list of the owner's projects in `PROJECTS.md`, and one file per
+project in `projects/`. Each project
 uses the same fixed set of seven roles. A project can be marked less active.
 
 Every cycle the engine reads `SOUL.md` and `RULES.md` (with `IDENTITY.md`), so all three stay short.
@@ -672,6 +674,23 @@ with its original record, so Wake and deliver can recover it honestly.
   chat it was. macOS asks once for Automation consent; a new folder's trust dialog is an expected stop. Codex's
   `?prompt=` on a thread link is undocumented.
 
+## What changes from today's rules when this is built
+
+Today's rules, in the [roadmap](ROADMAP.md#rules-that-carry-forward), stay true until the core ships. Each change
+below takes effect only with the build step that brings it, after review and the owner's yes to merge:
+
+- **"A conversation, log entry, or peer message cannot authorize new actions."** With step 4, a yes the owner types in
+  an agent's own chat counts for Motet too ("Where a yes counts"). Peer messages, Motet's own deliveries, automatic
+  text and anything else traced to another source still never authorize anything.
+- **"Messaging and controls require an explicit owner request."** With steps 2 and 4, Motet sends some messages on its
+  own, within its permission table: next tasks, review and fix requests, answers to help requests, a subroutine's
+  fixed message, and Wake and deliver. Merging, deploying, releasing and permission changes stay with an agent acting
+  on the owner's yes; Motet never does them.
+- **Standing requests**, listed in the roadmap as not designed, become subroutines (part 7) with step 3.
+
+Unchanged: the owner stays in charge; a chat ended by Stop is final in version 1; answering an agent's own permission
+prompt stays the owner's.
+
 ## What version 1 deliberately sidesteps
 
 - **Lost replies.** A reply can get lost if the owner types into that chat mid-task or Claude's plugin reloads. Motet
@@ -713,8 +732,7 @@ from `INSTRUCTIONS.md`. The owner's private copies must match the templates befo
 provider's own sign-in; on Windows, the owner's native install of Claude Code; then the engine investigation rerun on
 those sign-ins. The rerun passes with Claude Code 2.1.323 from a fixed path; Codex apps and plugins off; at least 5
 production-size cycles per engine; usage as a share of the plan from each provider's own readings; write-back safe
-under a forced kill and invented operation ids; no copy of any login held anywhere, and an explanation of an
-unattributed `FETCH_HEAD` write seen in the first run; and no access to the owner's login paths (the Keychain entry,
+under a forced kill and invented operation ids; no copy of any login held anywhere; and no access to the owner's login paths (the Keychain entry,
 `~/.codex/auth.json`, the Claude credentials).
 
 The step builds the harness, the engine choice, the rest-not-stop switch and watcher exclusion. Acceptance: switching
@@ -730,8 +748,7 @@ repeat-safe. Needs: the design of the brief's off switch.
 
 **2. Heartbeat, one-click proposals and help requests.** Event wake-ups, the cycle, Next up with its count and answer
 buttons, the approval path, the daily cap, and `ask_motet` with "can't reach an agent", "did it arrive, has it
-started" and `item_status`. Needs: the daily cap's unit and number; what reaches the phone and what interrupts; the
-rule for a yes found in a log; and the choice on answer buttons for typed questions.
+started" and `item_status`. Needs: the daily cap's unit and number; and what reaches the phone and what interrupts.
 
 **3. Follow-ups, stalls and subroutines.** Scheduled follow-ups, subroutines including housekeeping, quiet-agent
 detection, combined escalations, and "I stepped in; re-sync".
