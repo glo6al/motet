@@ -290,7 +290,8 @@ A chief of staff approves plans, so Motet may too, within limits:
   permission change, spending money) or goes beyond the goal it was given.
 - A plan written as plain text: Motet approves by replying in the chat.
 - A plan in the app's own approval box: until a supported route is found, Motet decides and shows "I'd approve this"
-  in Next up, and the owner presses it at the desk.
+  in Next up, and the owner presses it at the desk. With Next up off, it falls back to the one plain message
+  in Motet's conversation, sent only when a team is stuck waiting on that plan.
 - **Motet's approval of a plan is Motet's, never the owner's yes.** It never stands in for the owner's yes to merge,
   release, deploy or change permissions. It is recorded as Motet's own action, with the reason, in the Actions tab and
   the end-of-day report.
@@ -316,7 +317,9 @@ is a new authority path beside `officer_dispatch`; it must not reuse dispatch by
 
 A waiting item's answer buttons, such as "Yes" or "Only new ones", follow the Approve rule:
 
-- the button shows exactly what will be sent and to whom;
+- what is sent and to whom is the button itself: the recipient is the agent the item already names, and the button's
+  label is exactly the answer words sent, inside Motet's fixed "with the owner's answer:" framing. If the answer can't
+  be the label word for word, there is no answer button, only "Open desk". A tooltip may repeat it;
 - Motet records it before sending and sends it once;
 - it is marked as the owner's answer passed on by Motet ("Motet here, with the owner's answer:" and the words on the
   button), never as if the owner typed it in that chat;
