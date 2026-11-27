@@ -257,6 +257,12 @@ class ClearTests(unittest.TestCase):
             self.assertEqual(command[command.index('--request-id') + 1], shown)
             self.assertNotIn('--transport-id', command)
         self.assertEqual(commands[1][-1], '--apply')
+        # The older per-chat endpoints put the transport ID in brackets; the guide says so in their own words.
+        legacy = (Path(__file__).resolve().parents[1] / 'src' / 'peer_lifecycle.py').read_text(encoding='utf-8')
+        for words in ('Earlier delivery requires recovery for this recipient (', 'This recipient has an active request ('):
+            self.assertIn("'" + words + "' + tid + ')", legacy)
+            self.assertIn('"' + words + '…)"', text)
+        self.assertIn('is the transport ID, so pass it with `--transport-id`', text)
 
     def test_apply_requires_exact_identity_before_network(self):
         for extra in [('--apply',), ('--transport-id', '11111111'), ('--expected-agent','x:invalid'), ('--port','70000')]:

@@ -24,7 +24,10 @@ SHAPES = [('an Anthropic API key', re.compile(rb'sk-ant-[A-Za-z0-9_-]{20,}')),
           ('an AWS access key', re.compile(rb'AKIA[0-9A-Z]{16}')),
           ('a private key block', re.compile(rb'-----BEGIN [A-Z ]*PRIVATE KEY-----'))]
 ANTHROPIC = SHAPES[:1]
-SKIP = ('.git', 'node_modules')     # the pre-publish check: npm's own files hold key-like test strings; what git has staged there is still scanned, from the index
+# The pre-publish check skips npm's own files (key-like test strings) and Python's compiled copies, whose constants hold
+# test keys that the scanned source only builds at run time. What git has staged there is still scanned, from the index.
+SKIP = ('.git', 'node_modules', '__pycache__')
+COMPILED = '.pyc'                   # skipped wherever __pycache__ is skipped, also outside a __pycache__ folder
 EVERYTHING = ('.git',)              # the server's check before the Officer starts: the whole tree, nothing but .git skipped
 INDEX_CLEANUP = 10                  # seconds to stop/reap this scan after a read deadline or failed completion
 INDEX_DEADLINE = 300                # seconds for the whole staged-content read; past it git is killed and the index counts as unread
@@ -279,9 +282,10 @@ def scan(root=ROOT, shapes=SHAPES, skip=SKIP):
         index = []
     if index is None:          # not a repository: nothing is staged, and nothing can vouch for a skipped folder, so none is skipped
         index, skip = [], tuple(d for d in skip if d == '.git')
+    compiled_skipped = '__pycache__' in skip
     for top, dirs, files in os.walk(root, onerror=lambda e: unread.append((rel(e.filename), 'folder could not be listed'))):
         dirs[:] = [d for d in dirs if d not in skip]     # links to folders are listed here but never entered; what git has staged under a skipped folder is scanned from the index below
-        for name in dirs + files:
+        for name in dirs + [f for f in files if not (compiled_skipped and f.endswith(COMPILED))]:
             one(os.path.join(top, name))
     scan_index(root, index, shapes, hits, unread)       # the staged content itself, which is what a commit publishes
     return hits, unread

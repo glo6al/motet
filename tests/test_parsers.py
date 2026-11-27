@@ -39,11 +39,12 @@ def test_release_version():
     changelog = (root / 'CHANGELOG.md').read_text(encoding='utf-8')
     headings = [line for line in changelog.splitlines() if line.startswith('## ')]
     # One entry may wait above the release, for the next version only; it gets its date when the page moves to it.
-    upcoming = re.fullmatch(r'## ([0-9]+)\.([0-9]+)\.([0-9]+) — Unreleased', headings[0]) if headings else None
+    upcoming = re.fullmatch(r'## (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*) — Unreleased', headings[0]) if headings else None
     if upcoming:
         check('an unreleased changelog entry is for a later version than the page',
               tuple(map(int, upcoming.groups())) > tuple(map(int, version.split('.'))))
         headings = headings[1:]
+    check('no unreleased changelog entry sits below a released one', not any('unreleased' in h.lower() for h in headings))
     newest = headings[0] if headings else ''
     check('newest released changelog entry agrees with the page',
           re.fullmatch(r'## ' + re.escape(version) + r' — [0-9]{4}-[0-9]{2}-[0-9]{2}', newest))
@@ -1237,6 +1238,24 @@ def test_officer():
         os.remove(os.path.join(root, 'leak.md'))
         check('the pre-publish scan passes a clean tree, and this repository is clean', check_secrets.scan(root) == ([], []) and check_secrets.scan() == ([], []))
         check('redaction hides a key in a printed name', check_secrets.redact('a/' + fake + '.txt') == 'a/[a key].txt')
+        import subprocess as _sp
+        with tempfile.TemporaryDirectory() as checkout:
+            # A test's compiled copy folds a key its source builds at run time; ignored copies must not fail the scan.
+            plain = lambda: _sp.run(['git', 'init', '-q', checkout], capture_output=True, timeout=30).returncode == 0
+            if plain():
+                os.makedirs(os.path.join(checkout, 'tests', '__pycache__'))
+                for name in (os.path.join('tests', '__pycache__', 'test_fixture.cpython-312.pyc'), 'stray.pyc'):
+                    with open(os.path.join(checkout, name), 'wb') as f:
+                        f.write(b'\0' + fake.encode() + b'\0')
+                check('the pre-publish scan skips untracked compiled Python copies', check_secrets.scan(checkout) == ([], []))
+                _sp.run(['git', '-C', checkout, 'add', '-f', 'stray.pyc'], capture_output=True, timeout=30)
+                check('a staged compiled copy is still scanned', [h[0] for h in check_secrets.scan(checkout)[0]] == ['staged: stray.pyc'])
+                hits, _ = check_secrets.scan(checkout, skip=check_secrets.EVERYTHING)
+                check('the whole-tree check still reads compiled copies',
+                      sorted(h[0] for h in hits) == sorted([os.path.join('tests', '__pycache__', 'test_fixture.cpython-312.pyc'),
+                                                            'stray.pyc', 'staged: stray.pyc']))
+            else:
+                check('git is available for the compiled-copy scan check', False)
         import threading as _th
         class StallPipe:
             def __init__(self): self.ev = _th.Event()

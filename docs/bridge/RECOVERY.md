@@ -17,6 +17,8 @@ python3 scripts/watch_bridge_clear.py --port 8793 \
   --request-id 11111111-1111-4111-8111-111111111111
 ```
 
+The older per-chat peer endpoints, served only while the shared bridge is off, are different: there the bracketed ID in "Earlier delivery requires recovery for this recipient (…)" or "This recipient has an active request (…)" is the transport ID, so pass it with `--transport-id` instead.
+
 The fictional ID above must be replaced with the exact blocked attempt. If the error names no request, use the request ID you kept when sending, or find it with `list_requests`. Inspection returns its internal transport ID, exact recipient, execution/capture state, payload-retention flag and retirement eligibility. It changes nothing and does not include the message, answer or local paths. Eligibility is checked again atomically when applying.
 
 ## Explicitly retire
@@ -31,7 +33,7 @@ python3 scripts/watch_bridge_clear.py --port 8793 \
 
 This command only retires an uncertain launched attempt, or confirms an identical previous retirement. It refuses known-active/unlaunched attempts, completed/dropped results and mismatched recipients. Native work may still continue after retirement; this is an explicit owner decision to release an uncertain reservation, not evidence of cancellation.
 
-`--transport-id` takes the internal transport ID instead of the request ID. Use it only with a transport ID you obtained separately, such as the `transport_id` in an earlier inspection result. It is not the ID shown in a busy or recovery error.
+`--transport-id` takes the internal transport ID instead of the request ID. Use it only with a transport ID you obtained separately, such as the `transport_id` in an earlier inspection result, or the ID in an error from the older per-chat endpoints. It is not the ID in a shared-bridge busy or recovery error.
 
 If the response is lost, the retirement outcome is unknown. Inspect the same attempt again with the same ID. Repeating the same exact retirement is idempotent; creating a new peer request is a different action and could duplicate work.
 
