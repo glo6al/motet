@@ -378,3 +378,40 @@ test('official runtime: a reloaded module that gets no session.start resumes its
   // One timer: three periods after the resume were three supervisor dispatches, not six.
   expect(status.timer_ticks).toBe(3);
 });
+
+// A resume still registering when the chat ends or is cleared must stay inactive, while native input still passes.
+for (const boundary of ['end','clear']) test('official runtime: a pending reload resume stays inactive after '+boundary,async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let release=()=>{},entered=()=>{},first=true,forwarded=false,registrations=0,polls=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,e.value);return{value:undefined}});
+  on('command.register',async()=>{if(first){first=false;entered();await held}return{value:undefined}});
+  on('turn.start',($,e)=>{forwarded=true;return{turnId:e.turnId}});
+  on('turn.complete',($,e)=>({text:e.answer}));
+  on('session.start',($,e)=>({cwd:e.cwd}));
+  on('session.end',($,e)=>({sessionId:e.sessionId}));on('command.run',()=>({text:'fictional transition'}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  const input=$.turn.start({text:'fictional input',turnId:'fixture-turn'});await inside;
+  if(boundary==='end')await $.session.end({reason:'exit',sessionId:NATIVE});
+  else await $.command.run({command:'clear',args:'',origin:{kind:'composer'}});
+  release();await input;await clock.advance(2000);await clock.advance(2000);
+  expect(forwarded).toBe(true);expect({registrations,polls}).toEqual({registrations:0,polls:0});
+  // A late event does not re-arm it; a genuine start does, with one heartbeat.
+  await $.turn.complete({turnId:'late-fixture-turn',answer:'fictional',isAborted:false,reason:'answer',durationMs:1});
+  await clock.advance(2000);await clock.advance(2000);
+  expect({registrations,polls}).toEqual({registrations:0,polls:0});
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  expect(registrations).toBe(1);expect(polls>0).toBe(true);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.timer_ticks).toBe(3);expect(status.timer_resumed).toBe(false);
+});

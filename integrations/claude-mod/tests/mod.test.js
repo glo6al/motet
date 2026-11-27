@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {register} from '../hooks/register.js';
-import {MAX_RECEIPT_REJECTIONS, matchingPrompt, matchingAnswer, pairing, validClaim, validNoticeClaim, replyNoticeText, lifecycleReceipt, receiptRecord} from '../hooks/protocol.js';
+import {TRANSITIONS, MAX_RECEIPT_REJECTIONS, matchingPrompt, matchingAnswer, pairing, validClaim, validNoticeClaim, replyNoticeText, lifecycleReceipt, receiptRecord} from '../hooks/protocol.js';
 
 const NATIVE='11111111-1111-4111-8111-111111111111', GENERATION='22222222-2222-4222-8222-222222222222';
 const REQUEST='33333333-3333-4333-8333-333333333333', ATTEMPT='44444444-4444-4444-8444-444444444444';
@@ -2213,6 +2213,65 @@ test('a resume repairs a session.start whose command registration failed, and cl
   // Another error is not cleared by a later registration.
   fail=true;await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
   assert.equal((await statusOf(h)).error,'Motet command registration failed.');
+});
+
+// A resume still registering when the chat ends or changes conversation must not arm the module afterwards.
+for(const boundary of ['session.end',...TRANSITIONS]){
+  test(`a resume pending across ${boundary} installs nothing, late events do not re-arm, and session.start does`,async()=>{
+    const gate=latch();let first=true;
+    const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+      commandRegister:()=>{if(first){first=false;return gate.hold();}}});
+    await h.call('prompt.submit',{text:'fictional owner input'});
+    await bounded(gate.entered,'resume registering');
+    // Native input is forwarded while the registration is held.
+    assert(h.passed.some(p=>p.name==='prompt.submit'));
+    if(boundary==='session.end')await h.call('session.end',{reason:'exit',sessionId:NATIVE});
+    else await h.command(boundary);
+    gate.release();
+    for(let i=0;i<5;i++)await yieldWhileHeld();
+    assert.equal(h.timers.length,0);await h.tick();await h.tick();
+    // Late events after the boundary start nothing.
+    await h.call('turn.complete',{turnId:'late-fictional-turn',answer:'fictional',isAborted:false,reason:'answer'});
+    await h.call('prompt.submit',{text:'late fictional input'});await h.call('session.attach',{surface:'desktop',clientId:'fictional'});
+    await h.command('watch-status');
+    for(let i=0;i<5;i++)await yieldWhileHeld();
+    assert.equal(h.timers.length,0);
+    assert.equal(h.calls.filter(c=>c.url.endsWith('/register')||c.url.endsWith('/poll')).length,0);
+    // A genuine start arms it again, with exactly one timer.
+    await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+    assert.equal(h.timers.length,1);assert.equal(liveTimers(h).length,1);
+    await h.tick();await h.tick();
+    assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);assert(h.calls.some(c=>c.url.endsWith('/poll')));
+    assert.equal((await statusOf(h)).timer_resumed,false);
+  });
+}
+
+test('a late event after session.end, with no resume pending, does not arm a module that never started',async()=>{
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+  await h.call('session.end',{reason:'exit',sessionId:NATIVE});
+  await h.call('turn.complete',{turnId:'late-fictional-turn',answer:'fictional',isAborted:false,reason:'answer'});
+  for(let i=0;i<5;i++)await yieldWhileHeld();
+  assert.equal(h.timers.length,0);assert.deepEqual(h.registeredCommands,[]);assert.equal(h.calls.length,0);
+  assert(h.passed.some(p=>p.name==='turn.complete'));
+});
+
+test('a transition command starts no resume of its own',async()=>{
+  for(const command of TRANSITIONS){
+    const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+    await h.command(command);for(let i=0;i<5;i++)await yieldWhileHeld();
+    assert.equal(h.timers.length,0,command);assert.deepEqual(h.registeredCommands,[],command);
+    assert(h.passed.some(p=>p.name==='command.run'),command);
+  }
+});
+
+test('a session.start after a lifecycle end keeps a running timer single and resumes stay off',async()=>{
+  const h=await harness({claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+  await h.call('session.end',{reason:'clear',sessionId:NATIVE});
+  await h.call('prompt.submit',{text:'fictional input after clear'});for(let i=0;i<5;i++)await yieldWhileHeld();
+  // The timer from the earlier start keeps running across the end, as before; nothing adds a second one.
+  assert.equal(h.timers.length,1);assert.equal(liveTimers(h).length,1);
+  await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  assert.equal(h.timers.length,2);assert.equal(liveTimers(h).length,1);
 });
 
 // Claude Code refuses to load a module that reads a $ event as a value instead of calling it: 0.6.4 did, with

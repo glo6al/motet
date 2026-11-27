@@ -666,6 +666,12 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
   await activate($,state,response,eligibilityEpoch);
 }
 
+// Ends the current lifecycle for lazy resumes: a pending one installs nothing, and none starts until session.start.
+function endLifecycle(state) {
+  state.lifecycle += 1;
+  state.ended = true;
+}
+
 // Desktop evidence belongs only to this loaded runtime's exact native identity.
 function invalidateEligibility(state) {
   state.desktopBinding = null;
@@ -919,14 +925,17 @@ function startTimer($, state) {
 // then puts back its commands and its timer. It proves nothing about the chat: no startup facts are invented, so
 // eligibility still needs current Desktop evidence, and every tick keeps the same checks (the opt-out, identity,
 // folder rules, receipts only). A session.start before or after this wins and keeps one timer.
+// A resume belongs to the lifecycle it began in. session.start, session.end and every transition command (clear,
+// resume, exit, ...) end that lifecycle, so a resume still registering then installs nothing. After an end or a
+// transition, later events start no resume at all: only a genuine session.start arms the module again.
 async function resume($, state) {
-  if (state.timer || state.resuming) return;
-  const starts = state.starts;
+  if (state.timer || state.resuming || state.ended) return;
+  const lifecycle = state.lifecycle;
   state.resuming = true;
   try {
     await registerCommands($);
     clearRegistrationError(state);
-    if (state.timer || state.starts !== starts) return;
+    if (state.timer || state.ended || state.lifecycle !== lifecycle) return;
     state.resumed = true;
     startTimer($,state);
   } catch {state.error = REGISTRATION_FAILED;}
@@ -938,10 +947,11 @@ export function register(on) {
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrant:'',rejectedIdentity:'',starts:0,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrant:'',rejectedIdentity:'',lifecycle:0,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
-    state.starts += 1;
+    state.lifecycle += 1;
+    state.ended = false;
     state.resumed = false;
     state.interactive = e.isInteractive === true;
     state.startSeen = true;
@@ -961,8 +971,8 @@ export function register(on) {
     return next(e);
   });
   on('command.run',async($,e,next)=>{
-    if (!['exit','logout'].includes(e.command)) resume($,state).catch(()=>{});
-    if (TRANSITIONS.has(e.command)) {invalidateEligibility(state); suspend($,state); return next(e);}
+    if (TRANSITIONS.has(e.command)) {endLifecycle(state); invalidateEligibility(state); suspend($,state); return next(e);}
+    resume($,state).catch(()=>{});
     const owner = ['composer','bridge'].includes(e.origin?.kind);
     if (e.command === 'watch-status') {
       await readSurfaces($,state);
@@ -1089,5 +1099,5 @@ export function register(on) {
     return next(e);
   });
   on('session.attach',async($,e,next)=>{resume($,state).catch(()=>{}); return next(e);});
-  on('session.end',async($,e,next)=>{invalidateEligibility(state); suspend($,state); return next(e);});
+  on('session.end',async($,e,next)=>{endLifecycle(state); invalidateEligibility(state); suspend($,state); return next(e);});
 }
