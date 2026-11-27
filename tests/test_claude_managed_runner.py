@@ -50,6 +50,7 @@ class FakeTransport:
         self.code = None
         self.starts = self.terminates = self.ends = 0
         self.stubborn = False
+        self.survivors = []
         self.claims_seen = []
 
     def start(self):
@@ -113,7 +114,7 @@ class FakeTransport:
         if self.stubborn:
             raise TimeoutError()
         self.code = -9
-        return self.code
+        return self.code, self.survivors
 
     def close(self):
         pass
@@ -525,6 +526,25 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.transport.ends, 1, 'a replayed request ID does not act again')
         for params in ({'requestId': uid()}, {'requestId': uid(), 'by': 'motet'}, {'requestId': uid(), 'by': 'owner', 'x': 1}):
             self.assert_error('invalid_request', lambda: runner.command('stop', params))
+
+    def stopped_with(self, survivors):
+        runner = self.runner()
+        self.transport.survivors = survivors
+        self.assertEqual(runner.stop(uid())['state'], 'exited')             # Claude itself ended
+        return runner.snapshot()
+
+    def test_what_outlives_claude_is_recorded_never_dropped(self):
+        snapshot = self.stopped_with([[4242, 1900000000.0]])
+        self.assertEqual(snapshot['treeSurvivors'], [[4242, 1900000000.0]])
+        self.assertEqual(managed.read_snapshot(self.run)['treeSurvivors'], [[4242, 1900000000.0]])
+
+    def test_a_tree_that_could_not_be_seen_is_recorded_as_such(self):
+        snapshot = self.stopped_with(None)
+        self.assertIsNone(snapshot['treeSurvivors'])
+        self.assertIsNone(managed.read_snapshot(self.run)['treeSurvivors'])
+
+    def test_a_tree_seen_to_end_records_no_survivors(self):
+        self.assertNotIn('treeSurvivors', self.stopped_with([]))
 
     def test_an_unconfirmed_owner_stop_keeps_the_supervisor_listening_for_another_try(self):
         runner = self.runner()

@@ -441,6 +441,8 @@ class ManagedFixture:
             return self.manager.enqueue(run_id, request_id, 'owner', 'Fictional note.')
         if kind == 'decide':
             return self.manager.decide(run_id, permission, request_id, decision)
+        if kind == 'stop':                        # the owner's stop of this chat
+            return self.manager.stop(run_id, request_id, 'c:' + self.manager.status(run_id)['nativeId'])
         require(kind == 'new_chat' and Adapter.first_request_id(run_id) == request_id)
         return Adapter(self.manager).start_managed_work_once(
             run_id, 'Fictional note.', lambda: self.claims.append(request_id), self.turns.append)

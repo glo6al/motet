@@ -2,16 +2,19 @@
 """The owner's stop of a chat Motet started, with real processes on a Mac.
 
 The fictional Claude is the one the Windows end-to-end test runs (test_managed_windows_end_to_end.FICTIONAL_CLAUDE),
-run here as a script with this Python, with two additions: besides its grandchild in its own process group it starts
-a background process in a session of its own (as a program that detaches does), and two marker files in its folder
-make it ignore SIGTERM, or outlive the end of its input (so it outlives its supervisor). A real supervisor
-(claude_managed_runner.serve) runs it, with one change: the pin it checks Claude against is the fictional build's.
-The manager talks to the supervisor over its real socket, and the stop goes through the real route.
+run here as a script with this Python, with three marker files in its folder: one makes it also start a background
+process in a session of its own (as a program that detaches does), one makes it ignore SIGTERM, and one makes it
+outlive the end of its input (so it outlives its supervisor). Its grandchild stays in its process group. A real
+supervisor (claude_managed_runner.serve) runs it, with one change: the pin it checks Claude against is the fictional
+build's; one test gives it an older Motet's commands. The manager talks to the supervisor over its real socket, and
+the stop goes through the real route.
 
-Checked: Stop through the route ends Claude, its grandchild and the detached background process, and the supervisor
-then ends; a Claude that ignores SIGTERM is ended by SIGKILL; with its supervisor killed, Motet itself ends the
-Claude it verified; and a recorded process ID that now names another process, or a start time that does not match,
-is never signalled. No real Claude is started; fictional names only.
+Checked: Stop through the route ends Claude and its group, and the supervisor then ends; a Claude that ignores
+SIGTERM is ended by SIGKILL; a process in a session of its own is never signalled and keeps the stop unconfirmed until
+it is gone; without its supervisor nothing is signalled, and the end is confirmed only once nothing is seen running;
+a bystander whose command line names the run is never adopted as its supervisor; a recorded process ID that now names
+another process is never signalled; an older supervisor's shutdown leaves the stop unconfirmed while its tree runs.
+Only the group signal is ever sent. No real Claude is started; fictional names only.
 
 Run: python3 tests/test_managed_stop_process.py
 """
@@ -59,13 +62,13 @@ def fictional_claude():
         assert source.count(old) == 1, old
     source = source.replace('#!python', '#!' + os.path.realpath(sys.executable), 1)
     source = source.replace(GRANDCHILD, GRANDCHILD + (
-        "    detached = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], "
+        "    detached = (subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], "
         "stdin=subprocess.DEVNULL,\n                                stdout=subprocess.DEVNULL, "
-        "stderr=subprocess.DEVNULL, start_new_session=True)\n"
+        "stderr=subprocess.DEVNULL, start_new_session=True) if os.path.exists('fictional-detach') else None)\n"
         "    if os.path.exists('fictional-ignore-term'):\n"
         "        import signal\n"
         "        signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"))
-    source = source.replace(RECORD, RECORD + " 'detached': detached.pid,")
+    source = source.replace(RECORD, RECORD + " 'detached': detached.pid if detached else None,")
     return source.replace(LOOP_END, LOOP_END + (
         "    if os.path.exists('fictional-linger'):\n"
         "        import time\n"
@@ -134,11 +137,18 @@ class MacStopTests(unittest.TestCase):
     def end_everything(self):
         for pid in self.started.values():
             if alive(pid):
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGKILL)          # the test's own fictional processes, which it started
         for process in self.supervisors:
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=30)
+
+    def end_ourselves(self, *names):
+        """The test ends its own fictional processes, as the owner would with the Terminal command."""
+        for name in names:
+            if alive(self.started[name]):
+                os.kill(self.started[name], signal.SIGKILL)
+            self.assertTrue(gone(self.started[name]), name)
 
     def spawn(self, run_dir):
         """The supervisor's start as spawn_runner makes it (its own session, no inherited streams)."""
@@ -162,12 +172,13 @@ class MacStopTests(unittest.TestCase):
         native = manager.launch_once(run_id, self.folder, lambda *args: None)
         with open(str(self.project / 'fictional-claude.json')) as source:
             record = json.load(source)
-        self.started = {name: record[name] for name in ('claude', 'grandchild', 'detached')}
+        self.started = {name: record[name] for name in ('claude', 'grandchild', 'detached') if record[name]}
         for name, pid in self.started.items():
             self.assertTrue(alive(pid), name)
         claude = tree.table()[record['claude']]
         self.assertEqual(claude.pgid, claude.pid, 'Claude leads its own process group')
-        self.assertNotEqual(tree.table()[record['detached']].pgid, claude.pgid, 'the detached one left it')
+        if record['detached']:
+            self.assertNotEqual(tree.table()[record['detached']].pgid, claude.pgid, 'the detached one left it')
         return manager, run_id, native
 
     def assert_all_gone(self):
@@ -219,27 +230,56 @@ class MacStopTests(unittest.TestCase):
         self.assert_all_gone()
         self.assertEqual(manager.status(run_id)['nativeExit']['code'], -signal.SIGKILL)
 
-    def test_without_its_supervisor_motet_ends_the_claude_it_verified(self):
+    def test_a_process_that_left_claudes_group_is_never_signalled_and_keeps_the_stop_unconfirmed(self):
+        manager, run_id, native = self.start('fictional-detach')
+        result = manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertTrue(gone(self.started['claude']) and gone(self.started['grandchild']), 'its group ended')
+        self.assertTrue(alive(self.started['detached']), 'a process in a session of its own is not signalled')
+        self.assertEqual(manager.status(run_id)['ownerStop']['outcome'], 'unconfirmed')
+        self.end_ourselves('detached')
+        self.assertEqual(manager.status(run_id)['ownerStop']['outcome'], 'stopped', 'confirmed once it is gone')
+
+    def test_without_its_supervisor_nothing_is_signalled_and_the_end_is_confirmed_only_when_seen(self):
         manager, run_id, native = self.start('fictional-linger')
         supervisor = self.supervisors[-1]
         supervisor.kill()
         supervisor.wait(timeout=30)
         time.sleep(.3)
-        for name, pid in self.started.items():
-            self.assertTrue(alive(pid), name + ' outlives its supervisor on a Mac')
         result = manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)
+        self.assertEqual(result['ownerStop']['outcome'], 'unconfirmed')
+        for name, pid in self.started.items():
+            self.assertTrue(alive(pid), name + ' is not signalled without its supervisor')
+        self.end_ourselves('claude', 'grandchild')
+        result = manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)           # Try again
         self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'stopped'))
-        self.assert_all_gone()
         with manager._registry() as db:
             self.assertFalse(manager._row(db, run_id)['occupied'])
 
-    def test_an_older_supervisors_shutdown_is_followed_by_the_rest_of_the_tree(self):
-        self.legacy = ['legacy']
-        manager, run_id, native = self.start()
-        result = manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)
-        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'stopped'))
-        self.assert_all_gone()           # the grandchild and the detached one too, not only Claude
-        self.assertEqual(self.supervisors[-1].wait(timeout=30), 0)
+    def test_a_process_whose_command_names_the_run_is_never_adopted_as_its_supervisor(self):
+        manager, run_id, native = self.start('fictional-linger')
+        supervisor = self.supervisors[-1]
+        supervisor.kill()
+        supervisor.wait(timeout=30)
+        run_dir = manager._run_dir(run_id)
+        # A bystander whose command line names the runner and ends with this run's folder, as the supervisor's does.
+        runner_path = str(SRC / 'claude_managed_runner.py')
+        bystander = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', runner_path, str(run_dir)],
+                                     stdin=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(bystander.wait)
+        self.addCleanup(bystander.kill)
+        self.end_ourselves('claude', 'grandchild')                 # the recorded Claude is gone
+        import fcntl
+        held = os.open(str(run_dir / 'run.lock'), os.O_RDONLY)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)             # a supervisor lock still held, as if hung
+        try:
+            self.assertEqual(manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)['ownerStop']['outcome'],
+                             'unconfirmed')
+            self.assertIsNone(bystander.poll(), 'never adopted from its command line, lock held')
+        finally:
+            os.close(held)                                           # and later released
+        self.assertEqual(manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)['ownerStop']['outcome'], 'stopped')
+        self.assertIsNone(bystander.poll(), 'never adopted from its command line, lock released')
 
     def test_a_process_id_that_names_another_process_is_never_signalled(self):
         manager, run_id, native = self.start('fictional-linger')
@@ -259,16 +299,24 @@ class MacStopTests(unittest.TestCase):
                 self.assertEqual(result['ownerStop']['outcome'], 'unconfirmed')
                 self.assertIsNone(bystander.poll(), 'an unverified process is never signalled')
                 for name, pid in self.started.items():
-                    self.assertTrue(alive(pid), name + ' was not signalled without a verified identity')
-        # With its true record, the next try ends it.
-        self.assertEqual(manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)['ownerStop']['outcome'], 'stopped')
-        self.assert_all_gone()
-        self.assertIsNone(bystander.poll())
+                    self.assertTrue(alive(pid), name + ' was not signalled either')
+
+    def test_an_older_supervisors_shutdown_leaves_the_stop_unconfirmed_while_its_tree_runs(self):
+        self.legacy = ['legacy']
+        manager, run_id, native = self.start('fictional-detach')
+        result = manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertTrue(gone(self.started['claude']), 'the older supervisor ended Claude itself')
+        for name in ('grandchild', 'detached'):
+            self.assertTrue(alive(self.started[name]), name + ' is seen, not signalled')
+        self.assertEqual(self.supervisors[-1].wait(timeout=30), 0)
+        self.end_ourselves('grandchild', 'detached')
+        self.assertEqual(manager.status(run_id)['ownerStop']['outcome'], 'stopped', 'confirmed once they are gone')
 
 
 @unittest.skipIf(os.name == 'nt', 'POSIX process groups and ps')
 class ProcessTreeTests(unittest.TestCase):
-    def test_a_tree_that_ignores_sigterm_ends_including_a_child_in_its_own_session(self):
+    def test_the_group_signal_ends_the_group_and_a_process_of_its_own_session_is_only_reported(self):
         script = ("import os, signal, subprocess, sys, time\n"
                   "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
                   "a = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
@@ -277,22 +325,50 @@ class ProcessTreeTests(unittest.TestCase):
                   "time.sleep(60)\n")
         root = subprocess.Popen([sys.executable, '-c', script], stdout=subprocess.PIPE, start_new_session=True)
         self.addCleanup(root.wait)
-        children = [int(pid) for pid in root.stdout.readline().split()]
+        in_group, own_session = (int(pid) for pid in root.stdout.readline().split())
         root.stdout.close()
-        identity = tree.table()[root.pid]
-        left = tree.end(identity, gentle=.5, firm=2)
-        self.assertEqual(left, {})
-        for pid in children:
-            self.assertTrue(gone(pid), 'process %d is still running' % pid)
+        self.addCleanup(lambda: alive(own_session) and os.kill(own_session, signal.SIGKILL))
 
-    def test_a_start_time_that_does_not_match_is_never_signalled(self):
-        bystander = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
-        self.addCleanup(bystander.wait)
-        self.addCleanup(bystander.kill)
-        row = tree.table()[bystander.pid]
-        with mock.patch.object(tree.os, 'kill', side_effect=AssertionError('signalled')):
-            self.assertEqual(tree.end(row._replace(start=row.start - 60), gentle=.2, firm=.2), {})
-        self.assertIsNone(bystander.poll())
+        def group_signal(number):                   # as the supervisor does: only while root is unreaped
+            if root.returncode is None:
+                os.killpg(root.pid, number)
+        with mock.patch.object(tree.os, 'kill', side_effect=AssertionError('an individual process was signalled')):
+            left = tree.end(tree.table()[root.pid], group_signal=group_signal, gentle=.5, firm=2)
+        self.assertEqual(root.wait(timeout=5), -signal.SIGKILL)
+        self.assertTrue(gone(in_group), 'the group ended')
+        self.assertEqual(list(left), [own_session], 'the one in a session of its own is reported, not signalled')
+        self.assertTrue(alive(own_session))
+
+    def test_a_target_replaced_after_discovery_receives_nothing(self):
+        uid = os.getuid()
+        root = tree.Process(500, os.getpid(), 500, uid, 'S', 1000.0, 'fictional-claude')
+        child = tree.Process(501, 500, 777, uid, 'S', 1001.0, 'fictional-detached')
+        replaced = tree.Process(501, 1, 501, uid, 'S', 2000.0, 'fictional-unrelated-reused-pid')
+        reads = iter([{500: root, 501: child}] + [{500: root._replace(stat='Z'), 501: replaced}] * 200)
+        groups = []
+        clock = iter(range(1000))
+        with mock.patch.object(tree.os, 'kill', side_effect=AssertionError('an individual process was signalled')):
+            left = tree.end(root, group_signal=groups.append, gentle=1, firm=1, read=lambda: next(reads),
+                            clock=lambda: next(clock), sleep=lambda _: None)
+        self.assertEqual(groups, [signal.SIGTERM], 'only the group is ever signalled')
+        self.assertEqual(left, {}, 'the replacement is not the recorded process: neither signalled nor counted')
+
+    def test_claude_already_reaped_its_group_is_reported_not_signalled(self):
+        script = ("import subprocess, sys\n"
+                  "a = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                  "print(a.pid, flush=True)\n")
+        claude = subprocess.Popen([sys.executable, '-c', script], stdout=subprocess.PIPE, start_new_session=True)
+        child = int(claude.stdout.readline())
+        claude.stdout.close()
+        self.addCleanup(lambda: alive(child) and os.kill(child, signal.SIGKILL))
+        claude.wait(timeout=10)                                         # ended and reaped before the stop
+        transport = runner.NativeTransport({})
+        transport.process = claude
+        with mock.patch.object(runner.os, 'killpg', side_effect=AssertionError('a reaped group was signalled')):
+            code, survivors = transport.end_tree(gentle=.2, firm=.2)
+        self.assertEqual(code, 0)
+        self.assertEqual([pid for pid, _ in survivors], [child])
+        self.assertTrue(alive(child))
 
     def test_an_unreadable_process_table_signals_nothing(self):
         def broken(*args, **kwargs):

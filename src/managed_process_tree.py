@@ -1,16 +1,22 @@
-"""End a managed Claude chat's process tree on a Mac (POSIX), by verified identity only. Importing this module does
-nothing.
+"""See, and end, a managed Claude chat's process tree on a Mac (POSIX). Importing this module does nothing.
 
-A process is named here by its identity, never by its number alone: the process ID, the time it started (from
-``ps``, to the second), and this user's ID. Process IDs are reused, so every signal is sent only to a process that
-``ps`` shows, just before the signal, with that same ID, start time and owner; one that has gone, or whose number
-now belongs to another process, is left alone.
+Signals. The only signal sent here goes to Claude's own process group, and only by its supervisor, while Claude is
+that supervisor's own unreaped child (``end``'s ``group_signal``). Claude starts in a session of its own, so its
+process ID is its group's ID, and while Claude is unreaped (alive, or a zombie) neither number can be given to another
+process. Everything still in that group (Claude, and what it started without leaving it) receives the signal.
 
-The tree is the root process, every process descended from it through parent links, and every member of the root's
-process group (Claude starts in its own session, so its group is its own; a background process whose parent has
-already ended stays in that group). It is read again before every round, so a process started while the chat is
-being stopped is found too. A process that both left Claude's group (its own session) and lost its parent link (its
-parent ended first) is no longer part of the tree and cannot be found: nothing records that it came from this chat.
+No individual process is ever signalled by its number. macOS has no way to hold a process's identity across a
+signal (Linux's pidfd has no Mac equivalent): any check of the number, start time or command line before ``kill``
+leaves a moment in which the process can end, be reaped and its number be reused. So a process the group signal does
+not reach (one that started a session of its own, or one left after Claude was reaped) is only observed, never
+signalled, and is reported as still running: the owner's stop is then not confirmed.
+
+Observation. A process is named by its identity: the process ID, the time it started (from ``ps``, to the second)
+and this user's ID. The tree is the root process, every process descended from it through parent links, and every
+member of the root's group while any recorded member is in it. It is read again on every observation, so a process
+started while the chat is being stopped is seen too. A process that both left Claude's group and lost its parent
+link (its parent ended first) is no longer part of the tree and cannot be seen: nothing records that it came from
+this chat.
 
 Windows does not use this: Claude runs in a job there, and ending the job ends everything in it.
 """
@@ -28,7 +34,7 @@ Process = namedtuple('Process', 'pid ppid pgid uid stat start command')
 
 
 class TreeError(OSError):
-    """``ps`` could not be read; nothing can be verified, so nothing is signalled."""
+    """``ps`` could not be read; nothing can be seen, so nothing is confirmed."""
 
 
 def _start(fields):
@@ -97,36 +103,34 @@ def members(rows, root, known):
     return {pid: row for pid, row in found.items() if row.uid == uid}
 
 
-def _signal(rows, targets, number):
-    for pid, known in targets.items():
-        row = rows.get(pid)
+def running(rows, identities):
+    """The recorded identities (Process rows, or ``[pid, start]`` pairs of this user's) still running in ``rows``."""
+    uid = os.getuid()
+    out = {}
+    for item in identities:
+        known = item if isinstance(item, Process) else Process(int(item[0]), 0, 0, uid, '', float(item[1]), '')
+        row = rows.get(known.pid)
         if same(row, known) and alive(row):
-            try:
-                os.kill(pid, number)
-            except (ProcessLookupError, PermissionError):
-                pass
+            out[row.pid] = row
+    return out
 
 
-def end(root, *, also=(), group_signal=None, gentle=GENTLE_SECONDS, firm=FIRM_SECONDS, read=table,
-        clock=time.monotonic, sleep=time.sleep):
-    """SIGTERM the tree, wait up to ``gentle`` seconds, SIGKILL what is left, wait up to ``firm``. ``root`` is the
-    recorded identity of the chat's own process (a Process), or None once it has gone; ``also`` are identities from
-    an earlier read of the tree, ended with theirs. ``group_signal(number)``, when given, also signals the root's
-    group directly; only the supervisor gives it, while Claude is its own unreaped child (so neither its ID
-    nor its group's can be reused). Returns the identities still running at the end: empty means the whole tree
-    has ended."""
-    known = {row.pid: row for row in also}
+def end(root, *, group_signal, gentle=GENTLE_SECONDS, firm=FIRM_SECONDS, read=table, clock=time.monotonic,
+        sleep=time.sleep):
+    """The supervisor's end of the tree: ``group_signal(SIGTERM)``, then up to ``gentle`` seconds for the tree to
+    end, then ``group_signal(SIGKILL)`` and up to ``firm`` seconds. ``root`` is Claude's identity, read while it is
+    the supervisor's unreaped child; ``group_signal`` signals its group only while that is still so. Nothing else
+    is signalled. Returns the identities of the tree still running at the end (empty: the whole tree has ended)."""
+    known = {}
+    left = {}
     for number, seconds in ((signal.SIGTERM, gentle), (signal.SIGKILL, firm)):
-        rows = read()
-        known.update(members(rows, root, known))
-        if group_signal is not None:
-            group_signal(number)
-        _signal(rows, known, number)
+        known.update(members(read(), root, known))
+        group_signal(number)
         deadline = clock() + seconds
         while True:
             rows = read()
             known.update(members(rows, root, known))
-            left = {pid: row for pid, row in known.items() if same(rows.get(pid), row) and alive(rows.get(pid))}
+            left = running(rows, known.values())
             if not left:
                 return {}
             if clock() >= deadline:

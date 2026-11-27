@@ -357,6 +357,8 @@ def _snapshot(db, manifest, disconnected=False, server_time=None):
             'identityVerified': bool(_meta(db, 'identityVerified', False)),
             'messages': messages, 'permissions': permissions, 'timeoutSeconds': PERMISSION_SECONDS,
             'serverTime': time.time() if server_time is None else server_time, 'evidenceAvailable': True}
+    if _meta(db, 'treeSurvivors', []) != []:
+        snapshot['treeSurvivors'] = _meta(db, 'treeSurvivors')          # None: the tree could not be seen
     # Preserve all current approval evidence. Drop only older terminal previews
     # when JSON escaping would exceed the response budget; full rows stay durable.
     while len(_json(snapshot).encode('utf-8')) > MAX_RESPONSE - 1024:
@@ -494,8 +496,8 @@ def read_decision(run_dir, permission_id, request_id, decision):
 class NativeTransport:
     """Pinned native JSONL, bounded reads/writes, one owned Popen instance.
 
-    POSIX: non-blocking pipes under a selector; Shutdown sends SIGTERM and waits, and the owner's Stop ends the whole
-    process tree (``end_tree``). Windows (step 8b.2; on since
+    POSIX: non-blocking pipes under a selector; Shutdown sends SIGTERM and waits, and the owner's Stop ends Claude's
+    process group (``end_tree``). Windows (step 8b.2; on since
     8b.5): Claude runs in a kill-on-close job and its pipes are read and written by threads
     (claude_managed_windows: ``pipes`` and ``job`` are set), with the same line limit, budgets and deadlines;
     Shutdown closes its input, waits as long, then ends the whole job. See claude_managed_windows for why Claude
@@ -665,34 +667,47 @@ class NativeTransport:
         return self.process.poll() if self.process else None
 
     def end_tree(self, gentle=3, firm=2):
-        """The owner's stop: end Claude and everything it started. Windows: close its input, wait, then end the
-        whole job (``terminate`` and ``wait``). POSIX: managed_process_tree.end on Claude's process, its descendants
-        and its process group, SIGTERM then SIGKILL, while Claude is this supervisor's own unreaped child (so its ID
-        and its group's cannot be reused), then reap it. Returns Claude's exit code; raises subprocess.TimeoutExpired
-        if Claude itself is still running. (A process of its tree that outlives SIGKILL is stuck in the kernel, where
-        no signal reaches it.)"""
+        """The owner's stop: end Claude and everything it started. Returns ``(code, survivors)``: Claude's exit
+        code, and the ``[pid, start]`` identities of its tree still running afterwards (empty: all of it ended; None:
+        the tree could not be seen, so its end is not confirmed). Raises subprocess.TimeoutExpired if Claude itself
+        is still running.
+
+        Windows: close its input, wait, then end the whole job (``terminate`` and ``wait``); nothing it started can
+        outlive the job. POSIX: SIGTERM then SIGKILL to Claude's process group while Claude is this supervisor's own
+        unreaped child (managed_process_tree.end), then reap it. A process that left the group is seen but never
+        signalled (no individual process is signalled by its number), and is reported as a survivor. If Claude had
+        already ended and been reaped, its group is not signalled either; whatever is left of it is reported."""
         if self.job is not None:
             self.terminate()
-            return self.wait(timeout=gentle)
+            return self.wait(timeout=gentle), []
         import managed_process_tree as tree
-        code = self.process.returncode
-        if code is None:
-            pid = self.process.pid
+        pid = self.process.pid
+        if self.process.returncode is not None:
             try:
-                root = tree.table().get(pid)
+                rows = tree.table()
             except tree.TreeError:
-                root = None
-            if root is None or root.ppid != os.getpid():
-                # No verified table: only the unreaped child and its own group, which are certainly Claude's.
-                self._group_signal(signal.SIGTERM)
-                try:
-                    return self.process.wait(timeout=gentle)
-                except subprocess.TimeoutExpired:
-                    self._group_signal(signal.SIGKILL)
-                    return self.process.wait(timeout=firm)
-            tree.end(root, group_signal=self._group_signal, gentle=gentle, firm=firm)
-            code = self.process.wait(timeout=firm)
-        return code
+                return self.process.returncode, None
+            return self.process.returncode, sorted([row.pid, row.start] for row in rows.values()
+                                                   if row.pgid == pid and row.uid == os.getuid() and tree.alive(row))
+        try:
+            root = tree.table().get(pid)
+        except tree.TreeError:
+            root = None
+        if root is None or root.ppid != os.getpid():
+            # The tree cannot be seen: only the unreaped child's own group is signalled, and its end is unconfirmed.
+            self._group_signal(signal.SIGTERM)
+            try:
+                return self.process.wait(timeout=gentle), None
+            except subprocess.TimeoutExpired:
+                self._group_signal(signal.SIGKILL)
+                return self.process.wait(timeout=firm), None
+        try:
+            left = tree.end(root, group_signal=self._group_signal, gentle=gentle, firm=firm)
+            survivors = sorted([row.pid, row.start] for row in left.values())
+        except tree.TreeError:
+            self._group_signal(signal.SIGKILL)
+            survivors = None
+        return self.process.wait(timeout=firm), survivors
 
     def _group_signal(self, number):
         """Signal Claude's process group, only while Claude is still this supervisor's unreaped child."""
@@ -1260,9 +1275,10 @@ class Runner:
     def stop(self, requestId):
         """The owner's stop of this chat. As ``shutdown``, but said as the owner's: each waiting permission request
         is denied as stopped by the owner (resolution ``owner_stop``) and each queued message fails as ``owner_stop``.
-        Claude's whole process tree is ended, firmly (NativeTransport.end_tree). If that cannot be confirmed the
-        state is uncertain and this supervisor keeps listening until Claude's exit is recorded, so a stop with a new
-        request ID tries again. A request ID is acted on once; its replay returns its receipt."""
+        Claude's process group is ended, firmly (NativeTransport.end_tree), and what of its tree outlived Claude is
+        recorded (``treeSurvivors``), so the stop is not confirmed while any of it runs. If Claude's own end cannot
+        be confirmed the state is uncertain and this supervisor keeps listening until Claude's exit is recorded, so a
+        stop with a new request ID tries again. A request ID is acted on once; its replay returns its receipt."""
         with self.lock:
             if not _uuid(requestId):
                 _fail('invalid_request')
@@ -1283,7 +1299,12 @@ class Runner:
                     with contextlib.suppress(RunnerError):
                         self._decide_native(row['id'], 'deny', None, 'shutdown', resolution_reason='owner_stop')
                 try:
-                    self._exit(self.transport.end_tree())
+                    code, survivors = self.transport.end_tree()
+                    with self.db:
+                        # What of Claude's tree outlived its end (None: it could not be seen). Never empty unless
+                        # every process of the tree was seen to end; the owner's stop is confirmed only then.
+                        _set(self.db, 'treeSurvivors', survivors[:64] if survivors is not None else None)
+                    self._exit(code)
                 except (OSError, TimeoutError, subprocess.TimeoutExpired):
                     self._uncertain()
             state = 'exited' if _meta(self.db, 'nativeExit') else 'unknown'

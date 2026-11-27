@@ -283,6 +283,8 @@ class Fixture(unittest.TestCase):
             else:
                 snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=-15,
                                                                 incarnation=snapshot['incarnation']))
+                if getattr(self, 'survivors', []) != []:
+                    snapshot['treeSurvivors'] = self.survivors      # what of Claude's tree outlived it
             return dict(requestId=params['requestId'], state='exited' if not getattr(self, 'stubborn', False)
                         else 'unknown')
         return copy.deepcopy(snapshot)
@@ -1149,9 +1151,12 @@ class Fixture(unittest.TestCase):
 
     def test_a_chat_that_ended_by_itself_is_not_called_stopped(self):
         run_id, native = self.start()
-        # Claude ended by itself; the registry has not read that yet when the owner clicks Stop.
+        # Claude ended by itself (code 0); the registry still holds it as ready and occupied when Stop arrives.
         self.snapshots[run_id].update(state='exited', nativeExit=dict(
             confirmed=True, code=0, incarnation=self.snapshots[run_id]['incarnation']))
+        with self.manager._registry() as db:
+            stale = self.manager._row(db, run_id)
+        self.assertEqual((stale['state'], stale['occupied']), ('ready', True))
         with self.assertRaises(managed.ManagedError) as raised:
             self.manager.stop(run_id, uid(), 'c:' + native)
         self.assertEqual(raised.exception.code, 'already_ended')
@@ -1171,6 +1176,69 @@ class Fixture(unittest.TestCase):
         self.assertEqual(again['outcome'], 'stopped')
         self.assertEqual(again['requestedAt'], stop['requestedAt'])
         self.assertGreaterEqual(again['lastAttemptAt'], stop['lastAttemptAt'])
+
+    def test_what_outlived_claude_keeps_the_stop_unconfirmed_until_it_is_gone(self):
+        run_id, native = self.start()
+        running = {'now': True}
+        seen = []
+        self.manager._test = replace(self.dependencies,
+                                     alive=lambda identities: seen.append(identities) or running['now'])
+        self.survivors = [[4242, 1900000000.0]]
+        result = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'),
+                         'Claude ended, but something it started is still running')
+        self.assertEqual(seen[-1], [[4242, 1900000000.0]])
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'unconfirmed')
+        running['now'] = False
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped')
+        other_run, other = self.start()
+        self.survivors = None                                     # the tree could not be seen at all
+        self.assertEqual(self.manager.stop(other_run, uid(), 'c:' + other)['ownerStop']['outcome'], 'unconfirmed')
+        self.assertEqual(self.manager.status(other_run)['ownerStop']['outcome'], 'unconfirmed')
+
+    def test_a_stop_whose_admission_did_not_commit_can_be_tried_again(self):
+        run_id, native = self.start()
+        failing = {'armed': True}
+        connect = sqlite3.connect
+
+        class Connection(sqlite3.Connection):
+            wrote = False
+
+            def execute(self, sql, *args):
+                if sql.startswith('INSERT INTO operations'):
+                    self.wrote = True
+                return super().execute(sql, *args)
+
+            def commit(self):
+                if self.wrote and failing['armed']:
+                    failing['armed'] = False
+                    raise sqlite3.OperationalError('fictional lost commit')
+                return super().commit()
+
+        with patch.object(managed.sqlite3, 'connect', lambda *a, **k: connect(*a, factory=Connection, **k)):
+            with self.assertRaises(managed.ManagedError):
+                self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual(self.stops(), [], 'nothing was asked of the supervisor')
+        self.assertIsNone(self.manager.status(run_id)['ownerStop'], 'and nothing was recorded')
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'stopped',
+                         'a fresh request is carried out: the failed one left no claim behind')
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_a_stop_that_fails_after_its_admission_is_not_repeated_by_its_replay(self):
+        run_id, native = self.start()
+        plain = self.request
+
+        def lost(path, command, params):
+            if command == 'stop':
+                plain(path, command, params)
+                raise RuntimeError('fictional lost reply')
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=lost)
+        request = uid()
+        first = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertEqual(first['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['ownerStop'], first['ownerStop'])
+        self.assertEqual(len(self.stops()), 1)
 
     def test_the_record_survives_a_restart_and_a_stop_cut_short_is_unconfirmed(self):
         run_id, native = self.start()
@@ -1206,12 +1274,17 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.stops()[-1], dict(requestId=request))
         # The older supervisor recorded its own shutdown; the stop record says whose it was.
         self.assertEqual(self.snapshots[run_id]['permissions'][0]['resolutionReason'], 'shutdown')
+        earlier = dict(self.snapshots[run_id]['permissions'][0], id=uid(), resolvedAt=1_000_000_000)
+        self.snapshots[run_id]['permissions'].append(earlier)    # a denial from before the owner asked keeps its words
         snapshot = self.manager.status(run_id)
         self.assertEqual((snapshot['permissions'][0]['resolutionReason'], snapshot['permissions'][0]['decision']),
                          ('owner_stop', 'deny'))
+        self.assertEqual(snapshot['permissions'][1]['resolutionReason'], 'shutdown')
         self.assertEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)
         self.assertEqual(self.manager.lookup_message(snapshot['messages'][0]['requestId'])['error'],
                          managed.OWNER_STOP_ERROR)
+        shown = self.manager.owner_snapshot()['requests'][0]           # what the page lists for the message
+        self.assertEqual((shown['state'], shown['error']), ('failed', managed.OWNER_STOP_ERROR))
 
     def test_a_shutdown_without_an_owners_stop_keeps_its_own_words(self):
         run_id, native = self.start()

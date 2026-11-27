@@ -269,6 +269,46 @@ class NamespaceTests(unittest.TestCase):
                     self.assertEqual(captured(lambda: native_action(root, namespace, uid()))[0], 'ok')
                     self.assertEqual(captured(lambda: manager.action('enqueue', run_id, uid()))[0], 'ok')
 
+    def test_real_process_orderings_for_stop(self):
+        """Stop and an owner attachment operation race for one request ID through the real fence, in separate
+        processes and both orders: the second refuses, issues no command and writes nothing."""
+        for first in ('native', 'managed'):
+            with self.subTest(first=first):
+                root, namespace = self.case()
+                manager = ManagedFixture(root, namespace)
+                run_id, request = manager.start(), uid()
+                active = self.context.Value('i', 0)
+                second = 'native' if first == 'managed' else 'managed'
+                left, right = (self.worker(role=role, kind='stop', root=root, operation=request, run_id=run_id,
+                                           active=active, gated=role == first) for role in (first, second))
+                self.assertTrue(left[1].wait(WAIT) and right[1].wait(WAIT))
+                left[2].set()
+                self.assertTrue(left[4].wait(WAIT))
+                self.assertEqual(active.value, ROLE[first])
+                self.assert_parent_lock_held(root)
+                right[2].set()
+                self.assertTrue(right[3].wait(WAIT))
+                if second == 'native':
+                    self.assertEqual(self.result(right), (UNAVAILABLE, [], [], [], False))
+                left[5].set()
+                winning, calls, _, _, wrote = self.result(left)
+                self.assertEqual(winning[0], 'ok')
+                self.assertTrue(wrote)
+                if first == 'native':
+                    losing, calls, _, _, wrote = self.result(right)
+                    self.assertEqual(losing, CONFLICT)
+                    self.assertNotIn('stop', calls, 'the refused Stop asked nothing of the supervisor')
+                    self.assertFalse(wrote)
+                    self.assertTrue(self.present(root, LINKS, request))
+                    self.assertFalse(self.present(root, 'operations', request, managed=True))
+                    self.assertIsNone(manager.manager.status(run_id)['ownerStop'])
+                else:
+                    self.assertEqual(calls.count('stop'), 1)
+                    self.assertTrue(self.present(root, 'operations', request, managed=True))
+                    self.assertFalse(self.present(root, LINKS, request))
+                    self.assertEqual(captured(lambda: native_action(root, namespace, request)), CONFLICT)
+                self.assertEqual(active.value, 0)
+
     def test_real_process_commit_loss_both_sides(self):
         for kind in ('native', 'enqueue', 'decide'):
             for fault in ('before', 'after'):
