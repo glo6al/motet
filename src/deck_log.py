@@ -186,7 +186,10 @@ class DeckLog(OfficerHistoryMixin):
             self.thread.start()
         except (OSError, sqlite3.Error, ValueError, TypeError) as error:
             self.available = False
-            self.reason = getattr(error, 'reason', None) or 'private_storage_unavailable'
+            # Only the two archive refusals name their own reason; a private-storage refusal (which carries a Windows
+            # access-list reason of its own) stays the general storage reason the page and tests know.
+            self.reason = (error.reason if isinstance(error, (UnsupportedArchiveVersion, ArchiveRecoveryPending))
+                           else 'private_storage_unavailable')
             if self.db:
                 self.db.close()
                 self.db = None
@@ -267,8 +270,10 @@ class DeckLog(OfficerHistoryMixin):
         try:
             probe = sqlite3.connect(pathlib.Path(self.path).as_uri() + '?mode=ro&immutable=1', uri=True)
             self._stored_version(probe)
-        except sqlite3.Error:
-            pass
+        except UnsupportedArchiveVersion:
+            raise
+        except (sqlite3.Error, ValueError, TypeError):
+            pass    # unreadable, or torn mid-commit: the writable open recovers it and checks the version again
         finally:
             if probe is not None:
                 probe.close()

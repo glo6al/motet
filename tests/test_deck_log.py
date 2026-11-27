@@ -650,6 +650,69 @@ class DeckTests(unittest.TestCase):
         self.assertEqual(after[18:20], b'\2\2', 'the journal mode was not changed')
         self.assertEqual(after, before)
 
+    def test_a_private_storage_refusal_keeps_the_general_reason(self):
+        """A Windows access-list refusal carries its own reason word; the page is still told storage is unavailable."""
+        import private_storage
+        self.store.close()
+        refusal = private_storage.PrivateStorageError('private storage unavailable', 'access')
+        with patch.object(d.DeckLog, '_private', side_effect=refusal):
+            self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertFalse(self.store.available)
+        self.assertEqual(self.store.reason, 'private_storage_unavailable')
+
+    def test_a_file_swapped_in_after_the_probe_is_refused(self):
+        """The writable open must reach the very file whose privacy was checked and whose version was probed."""
+        self.offer(candidates=[self.prose('kept as it is')])
+        self.store.close()
+        probe = d.DeckLog._probe_version
+        def probe_then_swap(store):
+            probe(store)
+            copy = store.path + '.swap'
+            shutil.copyfile(store.path, copy)
+            os.chmod(copy, 0o644)
+            os.replace(copy, store.path)
+        with patch.object(d.DeckLog, '_probe_version', probe_then_swap):
+            self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertFalse(self.store.available)
+        self.assertEqual(self.store.reason, 'private_storage_unavailable')
+
+    def test_the_probe_itself_refuses_a_newer_archive(self):
+        """Runs on every system, Windows included: the read-only probe reads the version and refuses on its own."""
+        self.closed_archive(6)
+        bare = d.DeckLog.__new__(d.DeckLog)
+        bare.path = self.store.path
+        with self.assertRaises(d.UnsupportedArchiveVersion):
+            bare._probe_version()
+        database = sqlite3.connect(self.store.path)
+        try:
+            database.execute("UPDATE settings SET value='5' WHERE key='schema_version'")
+            database.commit()
+        finally:
+            database.close()
+        self.assertIsNone(bare._probe_version())
+        self.assertEqual(sorted(self.archive_files()), [''])
+
+    @unittest.skipIf(os.name == 'nt', 'the fixture copies files SQLite holds open, with POSIX modes')
+    def test_a_torn_version_seen_by_the_probe_is_left_to_recovery(self):
+        """Mid-commit, the main file can hold a half-written settings page; rolling the journal back repairs it."""
+        self.closed_archive(5)
+        def torn(database):
+            database.execute('PRAGMA cache_size=2')
+            database.execute('BEGIN')
+            database.execute("UPDATE settings SET value='{torn' WHERE key='schema_version'")
+            for _ in range(100):
+                database.execute('INSERT INTO fixture_spill VALUES (?)', (os.urandom(3000),))
+        self.assertEqual(self.keep_as_left(torn), ['', '-journal'])
+        seen = sqlite3.connect(pathlib.Path(self.store.path).as_uri() + '?mode=ro&immutable=1', uri=True)
+        try:
+            self.assertEqual(seen.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()[0], '{torn')
+        finally:
+            seen.close()
+        self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertTrue(self.store.available, self.store.reason)
+        self.assertEqual(self.stored_version(self.store.path), 5)
+        self.assertEqual([e['text'] for e in self.store.search()['events']], ['kept as it is'])
+
     def test_certainty_persists_independently_of_outcome(self):
         operation = self.store.opaque_identity('operation', 'qualified-operation')
         self.offer(candidates=[dict(kind='run', operation='run', operation_id=operation, phase='result', outcome='success', certainty='probably', source={'slot': '0'})])
@@ -905,9 +968,12 @@ class MutationTests(unittest.TestCase):
             ('label before the column', "self._save_setting('schema_version', SCHEMA_VERSION)\n            self.db.commit()", 'pass', 'test_upgrade_stopped_after_the_column_is_added_still_shuts_out_0_1_0'),
             ('newer version gate', "        self._stored_version()\n        self.db.execute('PRAGMA journal_mode=DELETE')", "        self.db.execute('PRAGMA journal_mode=DELETE')", 'test_the_schema_check_still_refuses_when_the_probe_cannot_read'),
             ('newer version reason', "    reason = 'archive_from_newer_motet'", "    reason = 'private_storage_unavailable'", 'test_newer_archive_is_refused_before_anything_is_written'),
+            ('only archive refusals name a reason', "(error.reason if isinstance(error, (UnsupportedArchiveVersion, ArchiveRecoveryPending))\n                           else 'private_storage_unavailable')", "(getattr(error, 'reason', None) or 'private_storage_unavailable')", 'test_a_private_storage_refusal_keeps_the_general_reason'),
+            ('swap check after the writable open', "        self._verify()      # the file opened for writing is still the one checked and probed\n", "", 'test_a_file_swapped_in_after_the_probe_is_refused'),
         ]
         if os.name != 'nt':     # the sidecar fixtures are POSIX-only; without the probe, closing deletes the sidecars
             cases.append(('read-only probe', "        self._probe_version()\n", "", 'test_newer_wal_archive_with_its_sidecars_is_refused_untouched'))
+            cases.append(('torn probe read falls through', "        except (sqlite3.Error, ValueError, TypeError):\n            pass", "        except sqlite3.Error:\n            pass", 'test_a_torn_version_seen_by_the_probe_is_left_to_recovery'))
             cases.append(('waiting -wal refusal', "        if waiting:\n", "        if False:\n", 'test_changes_waiting_in_a_wal_file_are_left_untouched'))
         original = globals()['d']
         try:
