@@ -925,13 +925,32 @@ async function reserveTicket($, state, id) {
 }
 
 // A ticket stays with the command that reserved it. If the host answered two commands' first reads out of order, so
-// that a newer command in this copy reserved before an older one, the older one is overtaken once its own
-// reservation returns: it gives up and changes nothing (its ticket goes unused), and the newer command stands, as
-// the owner's later command. No command waits for another, and no ticket ever moves to another command.
+// that a newer command in this copy reserved before an older one and is still running, the older one gives way
+// once its own reservation returns, and the newer command stands as the owner's later one. An older reconnect then
+// changes nothing. An older opt-out is kept with its own ticket, and applies if the newer command ends without
+// deciding (a failed connect, say): it is committed then, under its own ticket, so it can never move above a newer
+// decision from another window. No command waits for another, and no ticket ever moves to another command.
 function reservedInOrder(state, decision, ticket) {
-  if (state.newestReservation > decision) return false;
-  if (ticket) state.newestReservation = Math.max(state.newestReservation, decision);
+  for (const running of state.runningReservations) if (running > decision) return false;
+  if (ticket) state.runningReservations.add(decision);
   return true;
+}
+
+// Called as each owner command ends: an opt-out that gave way to it (or to a newer command that has since ended)
+// applies now unless a newer decision did.
+function settleYieldedOptOut($, state, id, decision) {
+  state.runningReservations.delete(decision);
+  const yielded = UUID.test(id ?? '') ? state.yieldedOptOuts.get(id) : undefined;
+  if (!yielded || yielded.decision > decision) return;
+  for (const running of state.runningReservations) if (running > yielded.decision) return;   // that one settles it
+  state.yieldedOptOuts.delete(id);
+  if (state.appliedDecision > yielded.decision) return;
+  savePreference($,state,id,true,yielded.decision,yielded.ticket).then(saved => {
+    if (saved !== true || overtaken(state,yielded.decision)) return;
+    const data = state.data;
+    suspend($,state);
+    if (data && data.mode !== 'derived') save($,state,()=>{data.active = false;}).catch(() => {});
+  }).catch(() => {});
 }
 
 // Commits this decision at Motet: under its reserved ticket, or, for an opt-out only, under a new one when it has
@@ -1045,6 +1064,7 @@ async function deliverPendingOptOut($, state, id) {
   try {await operation; state.pendingRetryAt = 0;} catch { /* Told on a later contact. */ }
 }
 
+const YIELDED_OPT_OUT = 'A newer Motet command is still running; this disconnect applies if that one does not complete.';
 const NEWER_ELSEWHERE = 'A newer Motet command from another Claude window replaced this one; nothing was changed.';
 const OTHER_WINDOW = 'This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.';
 
@@ -1091,14 +1111,20 @@ async function ownerActivate($, state, response, id, decision, eligibilityEpoch)
 
 async function explicitDisconnect($, state) {
   const decision = reserveDecision(state);
+  let id = null;
   state.disconnecting += 1;
   invalidateEligibility(state);
   try {
-    const id = await $.session.id();
+    id = await $.session.id();
     if (overtaken(state,decision)) return false;
     // Its place in the owner's order at Motet, taken before anything else this command waits on.
     const ticket = UUID.test(id) ? await reserveTicket($,state,id) : null;
-    if (overtaken(state,decision) || !reservedInOrder(state,decision,ticket)) return false;
+    if (overtaken(state,decision)) return false;
+    if (!reservedInOrder(state,decision,ticket)) {
+      const earlier = state.yieldedOptOuts.get(id);
+      if (!earlier || earlier.decision < decision) state.yieldedOptOuts.set(id,{decision,ticket});
+      return 'yielded';
+    }
     const saved = UUID.test(id) ? await savePreference($,state,id,true,decision,ticket) : true;
     if (saved !== true) return saved;
     if (overtaken(state,decision)) return false;
@@ -1106,7 +1132,7 @@ async function explicitDisconnect($, state) {
     suspend($,state);
     if (data && data.mode !== 'derived') await save($,state,()=>{data.active = false;});
     return true;
-  } finally {state.disconnecting -= 1;}
+  } finally {state.disconnecting -= 1; settleYieldedOptOut($,state,id,decision);}
 }
 
 async function retryHeldReceipts($, state, id) {
@@ -1232,7 +1258,7 @@ export function register(on) {
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrants:new Set(),rejectedDecisionTokens:new Set(),newestReservation:0,rejectedIdentity:'',decision:0,appliedDecision:0,ownDecisions:new Map(),decisionProtocol:undefined,tickets:new Map(),serverOptedOut:new Set(),pendingRetryAt:0,preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrants:new Set(),rejectedDecisionTokens:new Set(),runningReservations:new Set(),yieldedOptOuts:new Map(),rejectedIdentity:'',decision:0,appliedDecision:0,ownDecisions:new Map(),decisionProtocol:undefined,tickets:new Map(),serverOptedOut:new Set(),pendingRetryAt:0,preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
     state.lifecycle += 1;
@@ -1278,18 +1304,20 @@ export function register(on) {
     if (e.command === 'watch-disconnect') {
       try {
         const done = await explicitDisconnect($,state);
-        return {text:done === true ? 'Motet disconnected. ' + LIMITATION : done === 'elsewhere' ? NEWER_ELSEWHERE : SUPERSEDED};
+        return {text:done === true ? 'Motet disconnected. ' + LIMITATION : done === 'elsewhere' ? NEWER_ELSEWHERE :
+          done === 'yielded' ? YIELDED_OPT_OUT : SUPERSEDED};
       }
       catch {return {text:'Motet disconnect could not be saved; readiness expires when its heartbeat stops.'};}
     }
     if (state.connecting || state.submitting || (state.connected && state.flight && ['pending','claimed','submitted','started'].includes(state.flight.phase))) return {text:'An existing Motet attempt is unresolved; nothing was resubmitted.'};
     state.connecting = true;
     const decision = reserveDecision(state);
+    let id = null;
     // A session.end, transition or opt-out that comes while this command waits on Motet changes this epoch, and
     // activation then refuses: an owner connect never connects a chat that has ended or changed conversation.
     const eligibilityEpoch = invalidateEligibility(state);
     try {
-      const id = await $.session.id();
+      id = await $.session.id();
       if (overtaken(state,decision)) return {text:SUPERSEDED};
       if (!UUID.test(id)) throw Error('Native identity unavailable.');
       // Its place in the owner's order at Motet, taken before anything else this command waits on (the folder,
@@ -1383,7 +1411,7 @@ export function register(on) {
       if (overtaken(state,decision)) return {text:SUPERSEDED};
       return {text:'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
     } catch {stop(state); return {text:CONNECT_FAILED};}
-    finally {state.connecting = false;}
+    finally {state.connecting = false; settleYieldedOptOut($,state,id,decision);}
   }).catch(($,e,next)=>{stop(state); return ['watch-connect','watch-disconnect','watch-status','watch-setup','watch-retry-receipts'].includes(e.command)?{text:'Motet command failed; no automatic request retry.'}:next(e);});
   on('prompt.submit',async($,e,next)=>{
     resume($,state).catch(()=>{});

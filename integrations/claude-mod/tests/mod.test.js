@@ -2915,9 +2915,10 @@ async function outOfOrderPair({foreignOptOutBetween}){
   return {motet,storage,h,older,newer};
 }
 
+const YIELDED_TEXT='A newer Motet command is still running; this disconnect applies if that one does not complete.';
 test('two commands in one copy whose identity reads finish out of order end on the owner\'s last command (R9-N1)',async()=>{
   const {motet,storage,older,newer}=await outOfOrderPair({foreignOptOutBetween:false});
-  assert.equal(older,SUPERSEDED_TEXT);
+  assert.equal(older,YIELDED_TEXT);
   assert.match(newer,/reconnect scheduled/);
   assert.equal(motet.optedOut,false);
   assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[1,false]]);
@@ -2926,13 +2927,50 @@ test('two commands in one copy whose identity reads finish out of order end on t
 
 test('an out-of-order pair cannot move the newer reconnect above another window\'s later disconnect (F5)',async()=>{
   const {motet,h,older,newer}=await outOfOrderPair({foreignOptOutBetween:true});
-  assert.equal(older,SUPERSEDED_TEXT);
+  assert.equal(older,YIELDED_TEXT);
   assert.equal(newer,OTHER_WINDOW_TEXT);
-  // Motet stays opted out: the reconnect kept its own ticket (1), older than the other window's opt-out (2).
-  assert.equal(motet.optedOut,true);assert.equal(motet.latest,2);
-  assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[2,true]]);
+  // Motet stays opted out: the reconnect kept its own ticket (1), older than the other window's opt-out (2); it was
+  // refused, so the disconnect that gave way to it then applied under its own ticket (3).
+  await h.wait(()=>motet.latest===3,'the yielded disconnect applied');
+  assert.equal(motet.optedOut,true);
+  assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[2,true],[3,true]]);
   assert.equal(motet.ready(),false);assert.equal((await statusOf(h)).connected,false);
   assert.equal(h.calls.filter(c=>c.url.endsWith('/register')&&c.response?.ok).length,0);
+});
+
+test('a disconnect that gave way to a newer connect still applies when that connect fails (R12-S1)',async()=>{
+  for(const when of ['connect fails before the disconnect reserves','connect fails after the disconnect gave way']){
+    const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const h=await harness({storage,claimed:false,root:'/fictional/project',fetch:(url,body,init)=>motet.fetch(url,body,init)});
+    assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+    await h.tick();assert.equal((await statusOf(h)).connected,true,when);
+    const idGate=latch(),cwdGate=latch(),id=h.$.session.id,cwd=h.$.session.cwd;let holdId=true,holdCwd=false;
+    h.$.session.id=async()=>{if(holdId){holdId=false;await idGate.hold();}return id();};
+    h.$.session.cwd=async()=>{if(holdCwd){holdCwd=false;await cwdGate.hold();}return cwd();};
+    const disconnecting=h.command('watch-disconnect');await bounded(idGate.entered,'disconnect at its identity read');
+    h.setCwd('/fictional/elsewhere');
+    let failed;
+    if(when.startsWith('connect fails before')){
+      failed=await h.command('watch-connect');
+      idGate.release();
+      assert.match((await disconnecting).text,/Motet disconnected/,when);
+    }else{
+      holdCwd=true;
+      const connecting=h.command('watch-connect');await bounded(cwdGate.entered,'connect reserved, at its folder');
+      idGate.release();
+      assert.equal((await disconnecting).text,YIELDED_TEXT,when);
+      cwdGate.release();failed=await connecting;
+      await h.wait(()=>motet.optedOut,'the yielded disconnect applied');
+    }
+    assert.match(failed.text,/outside its project folder/,when);
+    h.setCwd('/fictional/project');
+    await h.wait(()=>storage.get(PREF)?.disconnected===true,'stored opt-out');
+    assert.equal(motet.optedOut,true,when);assert.equal(motet.ready(),false,when);
+    // The applied disconnect ends this copy's connection too (it sends Motet's /disconnect for it).
+    await h.waitCall('/disconnect');
+    assert.equal((await statusOf(h)).connected,false,when);
+    const since=h.calls.length;await h.tick();await h.tick();assert.equal(motetCalls(h,since).length,0,when);
+  }
 });
 
 test('a command that gives up takes its own ticket with it, so an older opt-out cannot move above a later reconnect (R10-S1)',async()=>{
