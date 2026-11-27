@@ -124,7 +124,13 @@ Motet 0.2.0 upgrades the Deck Log to schema 5 the first time it starts, even if 
 
 **Motet 0.1.0 cannot use a schema 5 archive.** 0.1.0 refuses to open it: Memory shows **Storage unavailable**, its status line says "private storage unavailable", nothing is recorded, and saved Memory and Motet history cannot be read. In this case that message is not a permissions problem; it means the archive was upgraded by a newer Motet. 0.1.0 leaves the file unchanged, so starting 0.2.0 again brings everything back. 0.1.0 is already published and cannot be changed to explain this. Never change the schema version by hand: 0.1.0 would then open the archive but fail every write and turn recording off.
 
-Builds earlier than 0.1.0 used schema 3 and cannot open schema 4 or later. Whenever Motet finds an archive written by a newer Motet than itself, it leaves the file untouched, records nothing and shows the status "archive from newer motet".
+Builds earlier than 0.1.0 used schema 3 and cannot open schema 4 or later.
+
+From 0.2.0, Motet reads the archive's version through a read-only opening before it changes anything:
+
+- **Written by a newer Motet:** Motet leaves `deck-log.sqlite3` and any `-journal`, `-wal` or `-shm` file next to it exactly as they are, records nothing and shows the status "archive from newer motet".
+- **Changes waiting in a `-wal` file:** this Motet never writes in that mode, so the changes belong to whatever program last used the archive. Motet leaves every file as it is and shows "archive recovery pending". Start the program that last used the archive and stop it cleanly.
+- **A `-journal` file left by a write that stopped part-way (a crash, say):** unless the archive already shows a newer version, SQLite first undoes that unfinished write, as any SQLite program would. Motet then checks the version again before it changes anything else.
 
 To keep the option of going back with your existing Memory, stop Motet before upgrading and save a private copy of `deck-log.sqlite3` outside the repository. After a clean stop there should be no `-journal`, `-wal`, or `-shm` files next to it. If any remain, complete SQLite recovery with the old build and stop it cleanly before copying. Verify the copy matches the original byte for byte and passes SQLite `PRAGMA integrity_check`. Keep it under the same private permissions as the live archive.
 
