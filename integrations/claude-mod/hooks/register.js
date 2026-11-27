@@ -22,7 +22,9 @@ const WINDOWS_PATH = /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/?.][^\\/]*[\\/][^\\/]+)/;
 
 async function pathRules($) {
   try {
-    const platform = typeof $.session.info === 'function' ? (await $.session.info())?.platform : undefined;
+    // Called, never tested with typeof: the host refuses a module that reads a $ event as a value. A host without
+    // info() throws here, which counts as an unknown platform.
+    const platform = (await $.session.info())?.platform;
     return platform === 'windows' ? 'windows' : ['macos', 'linux', 'wsl'].includes(platform) ? 'posix' : 'unknown';
   } catch { return 'unknown'; }
 }
@@ -103,13 +105,12 @@ async function refusalKey($, state, id, project, config) {
 }
 
 async function sessionProject($) {
-  if (typeof $.session.root === 'function') {
-    let root = null;
-    try { root = await $.session.root(); } catch { /* fall back to the stricter current folder */ }
-    if (typeof root === 'string' && root) {
-      const cwd = await $.session.cwd();
-      return insideFolder(cwd, root, await pathRules($)) ? root : null;
-    }
+  // A host without root() throws here, like one whose root() fails: both keep the stricter current folder.
+  let root = null;
+  try { root = await $.session.root(); } catch { /* fall back to the stricter current folder */ }
+  if (typeof root === 'string' && root) {
+    const cwd = await $.session.cwd();
+    return insideFolder(cwd, root, await pathRules($)) ? root : null;
   }
   return $.session.cwd();
 }

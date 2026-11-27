@@ -2089,3 +2089,10 @@ test('bad large peer negotiation and oversized HTTP response never submit native
   assert.match(JSON.parse((await h.command('watch-status')).text).error,/connection interrupted/);
  }
 });
+
+test('the module calls every host API at its call site, so the official host loads it',async()=>{
+  // Claude Code refuses to load a module that reads a $ event as a value (typeof $.session.root, say): 0.6.4 did.
+  const {readFile}=await import('node:fs/promises');
+  const source=await readFile(new URL('../hooks/register.js',import.meta.url),'utf8');
+  assert.equal(/typeof\s+\$\./.test(source),false);
+});
