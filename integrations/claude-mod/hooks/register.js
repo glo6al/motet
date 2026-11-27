@@ -673,11 +673,18 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
 // (/clear, a resume), may still be repaired by its next event if its own start failed to register.
 function discardPendingResume(state) {
   state.lifecycle += 1;
+  state.transitionLifecycle = state.lifecycle;
 }
 
+// A reloaded module that never saw a real start, and resumed only after the transition command this end completes,
+// armed itself inside that transition: its timer is cancelled, so the chat stays off as if it had not resumed. A
+// timer it armed before that transition (after an earlier, cancelled one, say) survives, as a started one does.
 function endLifecycle(state, reason) {
+  const armedInTransition = !state.startSeen && state.resumed && state.timer &&
+    state.resumedLifecycle === state.transitionLifecycle;
   discardPendingResume(state);
   state.ended = !state.startSeen || !['clear','resume'].includes(reason);
+  if (armedInTransition) {state.timer.cancel(); state.timer = null; state.resumed = false;}
 }
 
 // Desktop evidence belongs only to this loaded runtime's exact native identity.
@@ -945,6 +952,7 @@ async function resume($, state) {
     clearRegistrationError(state);
     if (state.timer || state.ended || state.lifecycle !== lifecycle) return;
     state.resumed = true;
+    state.resumedLifecycle = lifecycle;
     startTimer($,state);
   } catch {state.error = REGISTRATION_FAILED;}
   finally {state.resuming = false;}
@@ -955,7 +963,7 @@ export function register(on) {
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrant:'',rejectedIdentity:'',lifecycle:0,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrant:'',rejectedIdentity:'',lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
     state.lifecycle += 1;

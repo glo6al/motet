@@ -424,3 +424,38 @@ for (const boundary of ['end','clear','cancelled resume']) test('official runtim
   const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
   expect(status.timer_ticks).toBe(3);expect(status.timer_resumed).toBe(false);
 });
+
+test('official runtime: a reloaded plugin that resumes between /clear and its session.end stays off until a real start',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let registrations=0,polls=0;
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,e.value);return{value:undefined}});
+  let commands=0;
+  on('command.register',()=>{commands++;return{value:undefined}});
+  on('turn.start',($,e)=>({turnId:e.turnId}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('session.end',($,e)=>({sessionId:e.sessionId}));on('command.run',()=>({text:'fictional transition'}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  await $.command.run({command:'clear',args:'',origin:{kind:'composer'}});
+  await $.turn.start({text:'fictional input inside the transition',turnId:'inside-turn'});
+  // Let that event's resume finish inside the transition: all five commands registered, then its timer installed.
+  for(let i=0;i<200&&commands<5;i++)await new Promise(r=>setTimeout(r,5));
+  expect(commands).toBe(5);
+  let status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.timer_installed).toBe(true);expect(status.timer_resumed).toBe(true);
+  await $.session.end({reason:'clear',sessionId:NATIVE});
+  await clock.advance(2000);await clock.advance(2000);
+  expect({registrations,polls}).toEqual({registrations:0,polls:0});
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  expect(registrations).toBe(1);expect(polls>0).toBe(true);
+  status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.timer_ticks).toBe(3);expect(status.timer_resumed).toBe(false);
+});

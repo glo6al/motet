@@ -2231,7 +2231,10 @@ test('a resume repairs a session.start whose command registration failed, and cl
 });
 
 // A resume still registering when the chat ends or changes conversation must not arm the module afterwards.
-// The host's session.end reason for each transition that goes through (reset and new are /clear's other names).
+// The session.end reason assumed for each transition that goes through. The host types name only clear ("a /clear
+// started a fresh one") and resume ("another took its place"); which reason /branch, /fork, /reset and /new end
+// with is not documented, so this table is an assumption. The test of /branch ending with 'other' below checks
+// that a different reason fails closed.
 const END_REASON={clear:'clear',reset:'clear',new:'clear',resume:'resume',branch:'resume',fork:'resume',logout:'logout',exit:'prompt_input_exit'};
 async function pendingResume(){
   const gate=latch();let first=true;
@@ -2292,6 +2295,60 @@ for(const command of TRANSITIONS){
     await h.tick();assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);
   });
 }
+
+for(const reason of ['clear','resume','prompt_input_exit','other']){
+  test(`a reloaded plugin that resumes between /clear and session.end (${reason}) is switched off by the end`,async()=>{
+    const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+    await h.command('clear');
+    await h.call('session.attach',{surface:'desktop',clientId:'fictional'});
+    await h.wait(()=>h.timers.length===1,'resume inside the transition');
+    assert.equal((await statusOf(h)).timer_resumed,true);
+    await h.call('session.end',{reason,sessionId:NATIVE});
+    assert.equal(liveTimers(h).length,0);await h.tick();
+    await lateEvents(h);
+    assert.equal(liveTimers(h).length,0);assert.equal(connections(h),0);
+    assert.equal((await statusOf(h)).timer_resumed,false);
+    await realStartArmsOneTimer(h);
+    assert.equal(h.timers.length,2);
+  });
+}
+
+test('a reloaded plugin that resumed after a cancelled /resume keeps its timer through a later /clear',async()=>{
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+  await h.command('resume');
+  await h.call('prompt.submit',{text:'fictional input after a cancelled picker'});
+  await h.wait(()=>h.timers.length===1,'resume after the cancelled transition');
+  await h.tick();assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);
+  await h.command('clear');await h.call('session.end',{reason:'clear',sessionId:NATIVE});
+  // It had resumed before this transition, so it goes on as a started plugin's timer does.
+  assert.equal(liveTimers(h).length,1);
+  h.setNative(ATTEMPT);await h.drive(()=>h.calls.filter(c=>c.url.endsWith('/register')).at(-1)?.body.native_id===ATTEMPT,'post-clear registration');
+  assert.equal(liveTimers(h).length,1);
+});
+
+test('/branch ending with an unexpected reason fails closed',async()=>{
+  // An unarmed (reloaded) plugin stays off.
+  const reloaded=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+  await reloaded.command('branch');await reloaded.call('session.end',{reason:'other',sessionId:NATIVE});
+  await lateEvents(reloaded);
+  assert.equal(reloaded.timers.length,0);assert.equal(connections(reloaded),0);
+  // A started plugin whose registration failed is not repaired, and a later real start arms exactly one timer.
+  let fail=true;
+  const failed=await harness({claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+    commandRegister:()=>{if(fail)throw Error('registration refused');}});
+  fail=false;
+  await failed.command('branch');await failed.call('session.end',{reason:'other',sessionId:NATIVE});
+  await lateEvents(failed);
+  assert.equal(failed.timers.length,0);
+  await failed.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  assert.equal(failed.timers.length,1);assert.equal(liveTimers(failed).length,1);
+  // A started plugin's running timer survives.
+  const started=await harness({claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+  await started.tick();
+  await started.command('branch');await started.call('session.end',{reason:'other',sessionId:NATIVE});
+  await lateEvents(started);
+  assert.equal(started.timers.length,1);assert.equal(liveTimers(started).length,1);
+});
 
 test('a real start whose registration failed is repaired after /clear by its next event, but not after an exit',async()=>{
   for(const [reason,repaired] of [['clear',true],['resume',true],['prompt_input_exit',false],['logout',false],['other',false]]){
