@@ -2994,6 +2994,46 @@ for(const ordering of ['later command ends before the disconnect resumes','disco
   }
 }
 
+test('a mistyped setup code leaves a healthy connection as it was (R13-S1)',async()=>{
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>{
+    if(url.endsWith('/setup'))return responseJSON({error:'Claude setup code is expired or used.',error_code:'access_denied'},403);
+    return motet.fetch(url,body,init);}});
+  await h.command('watch-connect');await h.tick();assert.equal((await statusOf(h)).connected,true);
+  const since=h.calls.length;
+  assert.match((await h.command('watch-setup','8793:fictional_mistyped_code')).text,/Motet connection failed/);
+  assert.equal(h.calls.slice(since).filter(c=>c.url.endsWith('/disconnect')).length,0);
+  assert.equal((await statusOf(h)).connected,true);
+  // The same connection goes on: the next tick polls it, with no new registration.
+  await h.tick();
+  assert.equal(h.calls.slice(since).filter(c=>c.url.endsWith('/register')).length,0);
+  assert(h.calls.slice(since).some(c=>c.url.endsWith('/poll')));
+  assert.equal(motet.ready(),true);
+});
+
+test('ordering state is kept per chat: a command for a chat that /clear replaced does not give way to the new chat\'s (R13-N1)',async()=>{
+  // Motet keeps decisions per chat: one ledger for each.
+  const first=ticketMotet(),second=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]),gate=latch();
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>(body.native_id===ATTEMPT?second:first).fetch(url,body,init)});
+  // A disconnect for the first chat has read its chat, and is slow to go on.
+  const id=h.$.session.id;let holdId=true;
+  h.$.session.id=async()=>{if(holdId){holdId=false;await gate.hold();return NATIVE;}return id();};
+  const disconnecting=h.command('watch-disconnect');await bounded(gate.entered,'first chat disconnect');
+  // The conversation is cleared; a connect for the new chat reserves and is held at its folder.
+  h.setNative(ATTEMPT);
+  const cwdGate=latch(),cwd=h.$.session.cwd;let holdCwd=true;
+  h.$.session.cwd=async()=>{if(holdCwd){holdCwd=false;await cwdGate.hold();}return cwd();};
+  const connecting=h.command('watch-connect');await bounded(cwdGate.entered,'new chat connect reserved');
+  gate.release();
+  // The first chat's disconnect does not give way to the other chat's command: it applies at once.
+  assert.match((await disconnecting).text,/Motet disconnected/);
+  assert.equal(storage.get('watch-owner-preferences-v1:'+NATIVE).disconnected,true);
+  cwdGate.release();
+  assert.match((await connecting).text,/reconnect scheduled/);
+  assert.equal(storage.get('watch-owner-preferences-v1:'+ATTEMPT).disconnected,false);
+  assert.equal(first.optedOut,true);assert.equal(second.optedOut,false);
+});
+
 test('a command that gives up takes its own ticket with it, so an older opt-out cannot move above a later reconnect (R10-S1)',async()=>{
   const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]),gate=latch();let holdPref=false;
   const h=await harness({storage,claimed:false,root:'/fictional/project',fetch:(url,body,init)=>motet.fetch(url,body,init),
