@@ -6895,8 +6895,9 @@ def start_messaging():
     Claude chats are messaged through the watch-owner plugin on macOS, Linux and Windows. Codex needs the Codex
     desktop app on a Mac; elsewhere the store reports it unavailable with that reason instead of failing.
     Attachment maintenance binds before the worker starts; a retained attachment guard that cannot be
-    enforced still keeps messaging off (fail closed). Windows has no attachment store yet, and even once it has one,
-    NATIVE_ATTACHMENT_DELIVERY_HOST keeps files sent to agent chats from being installed there."""
+    enforced still keeps messaging off (fail closed). On Windows the attachment store runs too, and files reach Claude
+    chats only (Codex delivery needs the Codex desktop app on a Mac); each send needs Git for Windows installed for
+    all users (attachments_windows_git)."""
     store = None
     try:
         store = MessagingStore(os.path.join(HOME, '.live-room'), os.path.join(HOME, '.codex', 'sessions'),

@@ -10,6 +10,7 @@ import hmac
 import json
 import math
 import os
+import pathlib
 import re
 import secrets
 import sqlite3
@@ -37,6 +38,9 @@ CANDIDATE_KEYS = frozenset(('kind', 'role', 'text', 'operation', 'operation_id',
 # Who wrote a user-role message (src/attribution.py). '' is a row saved before attributions were recorded.
 ATTRIBUTIONS = frozenset(('motet_delivery', 'agent_message', 'automatic', 'voice', 'unverified_user',
                           'unverified_user/exec_prompt', 'unverified_user/question_reply'))
+# 5 added events.attribution. Motet 0.1.0 writes schema 4 with 21 positional event values, so it must never see a
+# version-4 label on a 22-column table: it would open, then fail every write. 0.1.0 refuses any version above 4.
+SCHEMA_VERSION = 5
 EVENT_COLUMNS = ('id,record_key,slot,provider,chat_id,chat_name,project_id,project_name,source_ts,observed_ts,time_basis,'
                  'kind,role,text,operation,operation_id,phase,outcome,file_ref,redacted,certainty,attribution')
 SECRET = re.compile(r'(?i)(?:\b(?:api[_-]?key|password|passwd|secret|access[_-]?token|authorization)[\"\']?\s*[:=]|\bBearer\s+\S+|sk-(?:ant-)?[\w-]{12,}|gh[pousr]_[\w]{20,}|AKIA[A-Z0-9]{16}|-----BEGIN [^-]*PRIVATE KEY-----)')
@@ -122,6 +126,17 @@ def _error_summary(error, step):
     return ' '.join(summary.split())[:300]
 
 
+class UnsupportedArchiveVersion(ValueError):
+    """The archive was written by a newer Motet. It is left exactly as it is: nothing is read further or written."""
+    reason = 'archive_from_newer_motet'
+
+
+class ArchiveRecoveryPending(ValueError):
+    """The archive's `-wal` file holds changes not yet in the main file. This build never writes in WAL mode, so a newer
+    or other program wrote them; opening it here would fold them in. It is left exactly as it is."""
+    reason = 'archive_recovery_pending'
+
+
 class DeckLog(OfficerHistoryMixin):
     def __init__(self, state_dir, *, clock=time.time, limits=None):
         self.clock, self.limits = clock, dict(LIMITS, **(limits or {}))
@@ -169,9 +184,12 @@ class DeckLog(OfficerHistoryMixin):
             self._gap('offline_or_not_recording')
             self.thread = threading.Thread(target=self._writer, name='deck-log-writer', daemon=True)
             self.thread.start()
-        except (OSError, sqlite3.Error, ValueError, TypeError):
+        except (OSError, sqlite3.Error, ValueError, TypeError) as error:
             self.available = False
-            self.reason = 'private_storage_unavailable'
+            # Only the two archive refusals name their own reason; a private-storage refusal (which carries a Windows
+            # access-list reason of its own) stays the general storage reason the page and tests know.
+            self.reason = (error.reason if isinstance(error, (UnsupportedArchiveVersion, ArchiveRecoveryPending))
+                           else 'private_storage_unavailable')
             if self.db:
                 self.db.close()
                 self.db = None
@@ -221,10 +239,12 @@ class DeckLog(OfficerHistoryMixin):
                 fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
                 os.close(fd)
         self.file_identity = self._private(self.path)
+        self._probe_version()
         self.db = sqlite3.connect(self.path, timeout=0.1, check_same_thread=False)
+        self._verify()      # the file opened for writing is still the one checked and probed
         self.db.row_factory = sqlite3.Row
+        # Connection-only settings. The persistent journal mode is set in _schema, once the version is supported.
         self.db.execute('PRAGMA foreign_keys=ON')
-        self.db.execute('PRAGMA journal_mode=DELETE')
         self.db.execute('PRAGMA secure_delete=ON')
         self.db.execute('PRAGMA temp_store=MEMORY')
         self.db.execute('PRAGMA max_page_count=%d' % max(32, self.limits['bytes'] // self.db.execute('PRAGMA page_size').fetchone()[0]))
@@ -236,7 +256,47 @@ class DeckLog(OfficerHistoryMixin):
             if os.path.lexists(self.path + suffix):
                 self._private(self.path + suffix)
 
+    def _probe_version(self):
+        """Before the writable open: refuse an archive from a newer Motet, or one with changes waiting in a `-wal` file,
+        without writing a byte. The probe is SQLite's immutable read-only open: no locks, no sidecar files, no
+        recovery, the main file only. If it cannot read the version (a crash left a hot rollback journal that must be
+        rolled back first, say), the writable open recovers the archive as any SQLite reader would, and _schema checks
+        the version again before setting anything persistent."""
+        try:
+            waiting = os.lstat(self.path + '-wal').st_size > 0
+        except FileNotFoundError:
+            waiting = False
+        probe = None
+        try:
+            probe = sqlite3.connect(pathlib.Path(self.path).as_uri() + '?mode=ro&immutable=1', uri=True)
+            self._stored_version(probe)
+        except UnsupportedArchiveVersion:
+            raise
+        except (sqlite3.Error, ValueError, TypeError):
+            pass    # unreadable, or torn mid-commit: the writable open recovers it and checks the version again
+        finally:
+            if probe is not None:
+                probe.close()
+        if waiting:
+            raise ArchiveRecoveryPending('archive has changes waiting in its -wal file')
+
+    def _stored_version(self, db=None):
+        """Read-only: the archive's schema version before anything is created or changed. A missing settings table or
+        version is an archive from before versions were recorded (1)."""
+        db = self.db if db is None else db
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").fetchone():
+            return 1
+        row = db.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()
+        version = json.loads(row[0]) if row else 1
+        if type(version) is not int or version < 1:
+            raise ValueError('invalid archive schema')
+        if version > SCHEMA_VERSION:
+            raise UnsupportedArchiveVersion('archive schema %d is newer than this build supports' % version)
+        return version
+
     def _schema(self):
+        self._stored_version()
+        self.db.execute('PRAGMA journal_mode=DELETE')
         self.db.executescript('''
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS source_records(key TEXT PRIMARY KEY,stream TEXT NOT NULL,chat_id TEXT NOT NULL,project_id TEXT NOT NULL,source_ts REAL NOT NULL,observed_ts REAL NOT NULL,age_ts REAL NOT NULL);
@@ -248,8 +308,14 @@ class DeckLog(OfficerHistoryMixin):
         CREATE TABLE IF NOT EXISTS coverage(id INTEGER PRIMARY KEY,reason TEXT NOT NULL,started REAL NOT NULL,ended REAL NOT NULL,count INTEGER NOT NULL);
         ''')
         existing = {r['key']: json.loads(r['value']) for r in self.db.execute('SELECT * FROM settings')}
-        if existing.get('schema_version', 1) not in (1, 2, 3, 4):
+        if existing.get('schema_version', 1) not in range(1, SCHEMA_VERSION + 1):
             raise ValueError('unsupported archive schema')
+        if existing.get('schema_version') != SCHEMA_VERSION:
+            # Label first, in its own commit: each ALTER below commits at once, so an upgrade stopped part-way must
+            # leave a version 0.1.0 refuses, never a 22-column table still labelled 4. This build adds any missing
+            # column on its next open whatever the label says.
+            self._save_setting('schema_version', SCHEMA_VERSION)
+            self.db.commit()
         if 'certainty' not in {r[1] for r in self.db.execute('PRAGMA table_info(events)')}:
             self.db.execute("ALTER TABLE events ADD COLUMN certainty TEXT NOT NULL DEFAULT 'recorded'")
         if 'attribution' not in {r[1] for r in self.db.execute('PRAGMA table_info(events)')}:
@@ -264,7 +330,7 @@ class DeckLog(OfficerHistoryMixin):
         if type(generation) is not int or generation < 0:
             raise ValueError('invalid erasure generation')
         self._save_setting('erasure_generation', generation)
-        self._save_setting('schema_version', 4)
+        self._save_setting('schema_version', SCHEMA_VERSION)
         self._officer_schema()
         for key in DEFAULTS:
             if key in existing:

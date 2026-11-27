@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -14,6 +15,21 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 import deck_log as d
+
+# The published Motet 0.1.0 archive code (main 24c1861, src/deck_log.py), kept verbatim so cross-version tests run the
+# real released writer without needing git history. Its git blob ID proves the copy is unchanged.
+RELEASED_0_1_0 = pathlib.Path(__file__).resolve().parent / 'fixtures' / 'deck_log_0_1_0' / 'deck_log.py'
+RELEASED_0_1_0_BLOB = '1f0499f3c2a01bff9130b16af15c639fffaeccf1'
+
+
+def released_0_1_0():
+    import hashlib
+    data = RELEASED_0_1_0.read_bytes()
+    assert hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest() == RELEASED_0_1_0_BLOB, 'Motet 0.1.0 fixture changed'
+    spec = importlib.util.spec_from_file_location('deck_log_released_0_1_0', RELEASED_0_1_0)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class DeckTests(unittest.TestCase):
@@ -367,6 +383,336 @@ class DeckTests(unittest.TestCase):
         self.assertEqual(restored['text'], 'legacy evidence')
         self.assertEqual(restored['certainty'], 'recorded')
 
+    def cross_record(self, store, label, *, role='assistant', **extra):
+        """Offer one synthetic entry through whichever build `store` is, and say whether it was saved."""
+        status = store.status()
+        epoch = status['capture_epoch'] if status.get('recording') else store.configure(enabled=True)['capture_epoch']
+        if not store.status().get('recording'):
+            store.activate(epoch)
+        record = dict(key=store.opaque_identity('record', label), stream=store.opaque_identity('stream', 'fictional-log'),
+                      provider='codex', chat_id='x:chat-one', project_id=store.opaque_identity('project', 'Orchard'),
+                      source_ts=self.now, time_basis='source')
+        offered = store.offer_record(record, [dict(kind='message', role=role, text='entry ' + label, chat_name='Harbor',
+                                                   project_name='Orchard', source={'slot': '0'}, **extra)], capture_epoch=epoch)
+        return offered.get('status') == 'queued' and store.flush()
+
+    def stored_version(self, path):
+        database = sqlite3.connect(path)
+        try:
+            return json.loads(database.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()[0])
+        finally:
+            database.close()
+
+    def test_released_0_1_0_archive_upgrades_and_0_1_0_then_refuses_it_untouched(self):
+        old = released_0_1_0()
+        root = os.path.join(os.path.realpath(self.temp.name), 'cross-version')
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(store.available, store.reason)
+            excluded = store.opaque_identity('project', 'Fictional excluded')
+            store.configure(enabled=True, retention_days=14, excluded_projects=[excluded])
+            self.assertTrue(self.cross_record(store, 'from 0.1.0'), store.status())
+        finally:
+            store.close()
+        self.assertEqual(self.stored_version(os.path.join(root, 'deck-log.sqlite3')), 4)
+        store = d.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(store.available, store.reason)
+            self.assertEqual(self.stored_version(store.path), 5)
+            self.assertEqual(store.status()['settings']['retention_days'], 14)
+            self.assertEqual(store.status()['settings']['excluded_projects'], [excluded])
+            self.assertEqual([e['text'] for e in store.search()['events']], ['entry from 0.1.0'])
+            self.assertNotIn('attribution', store.search()['events'][0])
+            self.assertTrue(self.cross_record(store, 'from this build', role='user', attribution='voice'), store.status())
+        finally:
+            store.close()
+        before = pathlib.Path(root, 'deck-log.sqlite3').read_bytes()
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            # 0.1.0 accepts only schemas 1 to 4, so it refuses the whole archive at open instead of failing each write.
+            self.assertFalse(store.available)
+            self.assertEqual(store.reason, 'private_storage_unavailable')
+            self.assertFalse(store.status()['recording'])
+            self.assertEqual(store.search()['search_mode'], 'unavailable')
+            store.configure(enabled=True)
+            self.assertEqual(store.delete(all=True), dict(ok=False, reason='private_storage_unavailable'))
+        finally:
+            store.close()
+        self.assertEqual(pathlib.Path(root, 'deck-log.sqlite3').read_bytes(), before)
+        store = d.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(store.available, store.reason)
+            self.assertEqual(sorted(e['text'] for e in store.search()['events']), ['entry from 0.1.0', 'entry from this build'])
+            self.assertEqual(store.status()['settings']['retention_days'], 14)
+        finally:
+            store.close()
+
+    def test_unreleased_22_column_schema_4_archive_is_relabelled_so_0_1_0_stops_cleanly(self):
+        """Builds before this fix added events.attribution but kept the schema-4 label; 0.1.0 then lost every write."""
+        old = released_0_1_0()
+        root = os.path.join(os.path.realpath(self.temp.name), 'unreleased')
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(self.cross_record(store, 'first'))
+        finally:
+            store.close()
+        database = sqlite3.connect(os.path.join(root, 'deck-log.sqlite3'))
+        try:
+            database.execute("ALTER TABLE events ADD COLUMN attribution TEXT NOT NULL DEFAULT ''")
+            database.commit()
+        finally:
+            database.close()
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(store.available)
+            self.assertFalse(self.cross_record(store, 'lost'), 'the reported hazard: 0.1.0 opens but cannot write')
+            self.assertEqual(store.status()['reason'], 'storage_full_or_unavailable')
+        finally:
+            store.close()
+        store = d.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(store.available, store.reason)
+            self.assertEqual(self.stored_version(store.path), 5)
+            self.assertEqual([e['text'] for e in store.search()['events']], ['entry first'])
+            self.assertTrue(self.cross_record(store, 'second'), store.status())
+        finally:
+            store.close()
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertFalse(store.available)
+        finally:
+            store.close()
+
+    def test_upgrade_stopped_after_the_column_is_added_still_shuts_out_0_1_0(self):
+        """The ALTER commits at once; an error before the rest of the upgrade commits must not leave label 4."""
+        old = released_0_1_0()
+        root = os.path.join(os.path.realpath(self.temp.name), 'stopped-upgrade')
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(self.cross_record(store, 'before'))
+        finally:
+            store.close()
+        path = os.path.join(root, 'deck-log.sqlite3')
+        with patch.object(d.DeckLog, '_officer_schema', side_effect=sqlite3.OperationalError('fictional disk error')):
+            store = d.DeckLog(root, clock=lambda: self.now)
+            try:
+                self.assertFalse(store.available)
+            finally:
+                store.close()
+        database = sqlite3.connect(path)
+        try:
+            self.assertIn('attribution', [r[1] for r in database.execute('PRAGMA table_info(events)')])
+        finally:
+            database.close()
+        self.assertEqual(self.stored_version(path), 5)
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertFalse(store.available, 'the reported hazard: 0.1.0 would open it and lose every write')
+        finally:
+            store.close()
+        store = d.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(store.available, store.reason)
+            self.assertEqual([e['text'] for e in store.search()['events']], ['entry before'])
+            self.assertTrue(self.cross_record(store, 'after'), store.status())
+        finally:
+            store.close()
+
+    def test_newer_archive_is_refused_before_anything_is_written(self):
+        self.offer(candidates=[self.prose('kept as it is')])
+        self.store.close()
+        database = sqlite3.connect(self.store.path)
+        try:
+            database.execute("UPDATE settings SET value='6' WHERE key='schema_version'")
+            database.execute('DROP TABLE erase_floors')   # a newer layout this build would otherwise "repair"
+            database.commit()
+        finally:
+            database.close()
+        before = pathlib.Path(self.store.path).read_bytes()
+        self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertFalse(self.store.available)
+        self.assertEqual(self.store.reason, 'archive_from_newer_motet')
+        self.assertFalse(self.store.status()['recording'])
+        self.assertFalse(self.store.configure(enabled=True)['available'])
+        self.assertEqual(self.store.delete(all=True), dict(ok=False, reason='archive_from_newer_motet'))
+        self.assertEqual(self.store.offer_record(self.record(), [self.prose()], capture_epoch=self.epoch)['status'], 'ignored')
+        self.store.close()
+        self.assertEqual(pathlib.Path(self.store.path).read_bytes(), before)
+        for suffix in ('-journal', '-wal', '-shm'):
+            self.assertFalse(os.path.exists(self.store.path + suffix))
+
+    SIDECARS = ('', '-journal', '-wal', '-shm')
+
+    def archive_files(self):
+        """Every byte of the archive and of each SQLite sidecar next to it, by suffix."""
+        return {s: pathlib.Path(self.store.path + s).read_bytes() for s in self.SIDECARS if os.path.exists(self.store.path + s)}
+
+    def closed_archive(self, version, *, wal=False):
+        """This build's archive with one entry, then relabelled and closed cleanly by plain SQLite."""
+        self.offer(candidates=[self.prose('kept as it is')])
+        self.store.close()
+        database = sqlite3.connect(self.store.path)
+        try:
+            database.execute("UPDATE settings SET value=? WHERE key='schema_version'", (str(version),))
+            database.execute('CREATE TABLE fixture_spill(x BLOB)')
+            database.commit()
+            if wal:
+                self.assertEqual(database.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+        finally:
+            database.close()
+        self.assertEqual(sorted(self.archive_files()), [''])
+
+    def keep_as_left(self, during):
+        """Hold the archive open in plain SQLite, run `during`, copy the files as they are on disk at that moment,
+        let SQLite finish and close, then put the copies back: the archive as a stopped program would leave it."""
+        database = sqlite3.connect(self.store.path, isolation_level=None)
+        try:
+            during(database)
+            saved = {s: self.store.path + s + '.fixture' for s in self.SIDECARS if os.path.exists(self.store.path + s)}
+            for suffix, copy in saved.items():
+                shutil.copy2(self.store.path + suffix, copy)
+            if database.in_transaction:
+                database.execute('ROLLBACK')
+        finally:
+            database.close()
+        for suffix, copy in saved.items():
+            os.replace(copy, self.store.path + suffix)
+        return sorted(saved)
+
+    def spill(self, database):
+        """An unfinished transaction big enough that SQLite writes pages to the main file: a hot rollback journal."""
+        database.execute('PRAGMA cache_size=2')
+        database.execute('BEGIN')
+        for _ in range(100):
+            database.execute('INSERT INTO fixture_spill VALUES (?)', (os.urandom(3000),))
+
+    def refused_untouched(self, reason):
+        before = self.archive_files()
+        self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertFalse(self.store.available)
+        self.assertEqual(self.store.reason, reason)
+        self.assertFalse(self.store.configure(enabled=True)['available'])
+        self.assertEqual(self.store.delete(all=True), dict(ok=False, reason=reason))
+        self.store.close()
+        self.assertEqual(self.archive_files(), before, 'every byte of the archive and its sidecars is kept')
+
+    def test_newer_wal_archive_is_refused_untouched(self):
+        self.closed_archive(6, wal=True)
+        self.assertEqual(pathlib.Path(self.store.path).read_bytes()[18:20], b'\2\2')
+        self.refused_untouched('archive_from_newer_motet')
+        self.assertEqual(pathlib.Path(self.store.path).read_bytes()[18:20], b'\2\2', 'still in WAL mode')
+
+    @unittest.skipIf(os.name == 'nt', 'the fixture copies files SQLite holds open, with POSIX modes')
+    def test_newer_wal_archive_with_its_sidecars_is_refused_untouched(self):
+        self.closed_archive(6, wal=True)
+        left = self.keep_as_left(lambda database: database.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall())
+        self.assertEqual(left, ['', '-shm', '-wal'])
+        self.assertEqual(os.path.getsize(self.store.path + '-wal'), 0)
+        self.refused_untouched('archive_from_newer_motet')
+
+    @unittest.skipIf(os.name == 'nt', 'the fixture copies files SQLite holds open, with POSIX modes')
+    def test_changes_waiting_in_a_wal_file_are_left_untouched(self):
+        """This build never writes in WAL mode; changes waiting in a -wal file belong to whatever wrote them."""
+        self.closed_archive(5, wal=True)
+        def write(database):
+            database.execute('PRAGMA wal_autocheckpoint=0')
+            database.execute('INSERT INTO fixture_spill VALUES (x\'00\')')
+        self.assertEqual(self.keep_as_left(write), ['', '-shm', '-wal'])
+        self.assertGreater(os.path.getsize(self.store.path + '-wal'), 0)
+        self.refused_untouched('archive_recovery_pending')
+
+    @unittest.skipIf(os.name == 'nt', 'the fixture copies files SQLite holds open, with POSIX modes')
+    def test_newer_archive_with_a_hot_journal_is_refused_untouched(self):
+        self.closed_archive(6)
+        self.assertEqual(self.keep_as_left(self.spill), ['', '-journal'])
+        self.refused_untouched('archive_from_newer_motet')
+
+    @unittest.skipIf(os.name == 'nt', 'the fixture copies files SQLite holds open, with POSIX modes')
+    def test_a_hot_journal_is_rolled_back_then_the_archive_opens(self):
+        """The rule for a crash: SQLite rolls the unfinished write back, as any reader would, then the version is checked."""
+        self.closed_archive(5)
+        self.assertEqual(self.keep_as_left(self.spill), ['', '-journal'])
+        self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertTrue(self.store.available, self.store.reason)
+        self.assertEqual([e['text'] for e in self.store.search()['events']], ['kept as it is'])
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM fixture_spill').fetchone()[0], 0)
+        self.assertFalse(os.path.exists(self.store.path + '-journal'))
+
+    def test_the_schema_check_still_refuses_when_the_probe_cannot_read(self):
+        """Behind the read-only probe, the writable open checks the version before setting the journal mode."""
+        self.closed_archive(6, wal=True)
+        before = pathlib.Path(self.store.path).read_bytes()
+        with patch.object(d.DeckLog, '_probe_version', lambda store: None):
+            self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertEqual(self.store.reason, 'archive_from_newer_motet')
+        self.store.close()
+        after = pathlib.Path(self.store.path).read_bytes()
+        self.assertEqual(after[18:20], b'\2\2', 'the journal mode was not changed')
+        self.assertEqual(after, before)
+
+    def test_a_private_storage_refusal_keeps_the_general_reason(self):
+        """A Windows access-list refusal carries its own reason word; the page is still told storage is unavailable."""
+        import private_storage
+        self.store.close()
+        refusal = private_storage.PrivateStorageError('private storage unavailable', 'access')
+        with patch.object(d.DeckLog, '_private', side_effect=refusal):
+            self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertFalse(self.store.available)
+        self.assertEqual(self.store.reason, 'private_storage_unavailable')
+
+    def test_a_file_swapped_in_after_the_probe_is_refused(self):
+        """The writable open must reach the very file whose privacy was checked and whose version was probed."""
+        self.offer(candidates=[self.prose('kept as it is')])
+        self.store.close()
+        probe = d.DeckLog._probe_version
+        def probe_then_swap(store):
+            probe(store)
+            copy = store.path + '.swap'
+            shutil.copyfile(store.path, copy)
+            os.chmod(copy, 0o644)
+            os.replace(copy, store.path)
+        with patch.object(d.DeckLog, '_probe_version', probe_then_swap):
+            self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertFalse(self.store.available)
+        self.assertEqual(self.store.reason, 'private_storage_unavailable')
+
+    def test_the_probe_itself_refuses_a_newer_archive(self):
+        """Runs on every system, Windows included: the read-only probe reads the version and refuses on its own."""
+        self.closed_archive(6)
+        bare = d.DeckLog.__new__(d.DeckLog)
+        bare.path = self.store.path
+        with self.assertRaises(d.UnsupportedArchiveVersion):
+            bare._probe_version()
+        database = sqlite3.connect(self.store.path)
+        try:
+            database.execute("UPDATE settings SET value='5' WHERE key='schema_version'")
+            database.commit()
+        finally:
+            database.close()
+        self.assertIsNone(bare._probe_version())
+        self.assertEqual(sorted(self.archive_files()), [''])
+
+    @unittest.skipIf(os.name == 'nt', 'the fixture copies files SQLite holds open, with POSIX modes')
+    def test_a_torn_version_seen_by_the_probe_is_left_to_recovery(self):
+        """Mid-commit, the main file can hold a half-written settings page; rolling the journal back repairs it."""
+        self.closed_archive(5)
+        def torn(database):
+            database.execute('PRAGMA cache_size=2')
+            database.execute('BEGIN')
+            database.execute("UPDATE settings SET value='{torn' WHERE key='schema_version'")
+            for _ in range(100):
+                database.execute('INSERT INTO fixture_spill VALUES (?)', (os.urandom(3000),))
+        self.assertEqual(self.keep_as_left(torn), ['', '-journal'])
+        seen = sqlite3.connect(pathlib.Path(self.store.path).as_uri() + '?mode=ro&immutable=1', uri=True)
+        try:
+            self.assertEqual(seen.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()[0], '{torn')
+        finally:
+            seen.close()
+        self.store = d.DeckLog(self.root, clock=lambda: self.now)
+        self.assertTrue(self.store.available, self.store.reason)
+        self.assertEqual(self.stored_version(self.store.path), 5)
+        self.assertEqual([e['text'] for e in self.store.search()['events']], ['kept as it is'])
+
     def test_certainty_persists_independently_of_outcome(self):
         operation = self.store.opaque_identity('operation', 'qualified-operation')
         self.offer(candidates=[dict(kind='run', operation='run', operation_id=operation, phase='result', outcome='success', certainty='probably', source={'slot': '0'})])
@@ -617,7 +963,18 @@ class MutationTests(unittest.TestCase):
             ('erased record ledger', "if self.db.execute('SELECT 1 FROM erased_records WHERE key=?', (record['key'],)).fetchone():", 'if False:', 'test_delete_barrier_scope_fts_cleanup_and_no_resurrection'),
             ('future-clock age', "age = min(record['source_ts'], observed)", "age = record['source_ts']", 'test_retention_source_age_future_clock_cannot_extend'),
             ('certainty preservation', "int(redacted), c.get('certainty', 'recorded')", "int(redacted), 'recorded'", 'test_certainty_persists_independently_of_outcome'),
+            ('schema version bump', 'SCHEMA_VERSION = 5', 'SCHEMA_VERSION = 4', 'test_released_0_1_0_archive_upgrades_and_0_1_0_then_refuses_it_untouched'),
+            ('relabel unreleased layout', 'SCHEMA_VERSION = 5', 'SCHEMA_VERSION = 4', 'test_unreleased_22_column_schema_4_archive_is_relabelled_so_0_1_0_stops_cleanly'),
+            ('label before the column', "self._save_setting('schema_version', SCHEMA_VERSION)\n            self.db.commit()", 'pass', 'test_upgrade_stopped_after_the_column_is_added_still_shuts_out_0_1_0'),
+            ('newer version gate', "        self._stored_version()\n        self.db.execute('PRAGMA journal_mode=DELETE')", "        self.db.execute('PRAGMA journal_mode=DELETE')", 'test_the_schema_check_still_refuses_when_the_probe_cannot_read'),
+            ('newer version reason', "    reason = 'archive_from_newer_motet'", "    reason = 'private_storage_unavailable'", 'test_newer_archive_is_refused_before_anything_is_written'),
+            ('only archive refusals name a reason', "(error.reason if isinstance(error, (UnsupportedArchiveVersion, ArchiveRecoveryPending))\n                           else 'private_storage_unavailable')", "(getattr(error, 'reason', None) or 'private_storage_unavailable')", 'test_a_private_storage_refusal_keeps_the_general_reason'),
+            ('swap check after the writable open', "        self._verify()      # the file opened for writing is still the one checked and probed\n", "", 'test_a_file_swapped_in_after_the_probe_is_refused'),
         ]
+        if os.name != 'nt':     # the sidecar fixtures are POSIX-only; without the probe, closing deletes the sidecars
+            cases.append(('read-only probe', "        self._probe_version()\n", "", 'test_newer_wal_archive_with_its_sidecars_is_refused_untouched'))
+            cases.append(('torn probe read falls through', "        except (sqlite3.Error, ValueError, TypeError):\n            pass", "        except sqlite3.Error:\n            pass", 'test_a_torn_version_seen_by_the_probe_is_left_to_recovery'))
+            cases.append(('waiting -wal refusal', "        if waiting:\n", "        if False:\n", 'test_changes_waiting_in_a_wal_file_are_left_untouched'))
         original = globals()['d']
         try:
             for label, before, after, method in cases:

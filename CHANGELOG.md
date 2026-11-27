@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.0 — Unreleased
+
+Changes since 0.1.0 and its follow-up fixes.
+
+### Upgrading from 0.1.0
+
+1. Stop Motet. If you might go back to 0.1.0 and keep your Memory, save a copy of the Memory archive now, as [rolling back the Memory archive](docs/MOTET.md#rolling-back-the-memory-archive) describes. 0.2.0 upgrades it the first time it starts.
+2. Update and start the Motet server first.
+3. Then update the Claude plugin to 0.6.4 in Claude Code's plugin manager ([plugin guide](integrations/claude-mod/README.md)).
+4. Fully restart every open Claude chat: close it and open it again. Reloading the plugin alone is not enough for 0.6.4.
+5. If you use Motet file reading, replace your policy with this release's one. Keep `usdLimit`, `scopeId` and `scopeRevision` exactly as they were, so your budget carries forward ([Motet file reading](docs/MOTET_FILE_READING.md)).
+
+### Going back to 0.1.0
+
+- **Memory.** 0.1.0 cannot open the upgraded archive. It shows Memory as "Storage unavailable" and records nothing. Restore the copy you saved, or start 0.1.0 with fresh Memory. Never change the archive's version number by hand ([steps](docs/MOTET.md#rolling-back-the-memory-archive)).
+- **Agent-to-agent bridge.** Do not run 0.1.0 against a message database that holds bridge messages, and do not go back while bridge requests are unresolved. The supported way back is to keep 0.2.0 and its database and switch the bridge off ([bridge rollback](docs/PEER_BRIDGE.md#rollback-and-privacy), [completion and reconnects](docs/PEER_BRIDGE.md#completion-and-reconnects), [clearing a stuck request](docs/bridge/RECOVERY.md)).
+- **Chats Motet started.** Close Claude chats that Motet started before going back. 0.1.0 refuses the messages Motet worded for them ([messaging](docs/MESSAGING.md#asking-an-agent)).
+
+### What is new
+
+- **Windows does much more.** Besides watching, Motet now answers, and it can message Claude chats through the plugin, answer Allow and Deny, run the bridge with Claude chats as recipients, start a Claude chat from New chat, read a PDF or PNG, send files to Claude chats (with Git for Windows), and show previews with their files. All of this is checked by automated tests only, not yet on a real PC. Codex messaging and file sending stay Mac-only ([Windows](docs/WINDOWS.md), [trial guide](docs/WINDOWS_TRIAL.md)).
+- **Linux:** Claude messaging, and the bridge with Claude chats as recipients, checked by automated tests.
+- **Who wrote it.** Each message records who wrote it. Motet no longer describes a message it, another chat or an automatic prompt wrote as yours ([messaging](docs/MESSAGING.md#asking-an-agent)).
+- **Claude plugin 0.6.4.** A Claude chat keeps receiving messages after it moves into a subfolder of its own project.
+- **Codex.** Controls and New chat now work with Codex Desktop `26.1103.60933`, build `25894`. Sending files to Codex still needs `26.1029.61003`, build `24614`. Large Codex records are read instead of withholding the reply, and an idle Codex chat gives a truthful reason.
+- **Plan approvals** go to the agent's app instead of offering Allow.
+- **Memory** refuses an archive from a newer Motet and leaves it unchanged.
+- **Motet file reading** accepts this release's policy from 2026-11-24 to 2026-12-24.
+- Stop for chats Motet started: entry added when it merges.
+
 ## 0.1.0 — 2026-11-18
 
 Published commit: [295f8de](https://github.com/glo6al/motet/commit/295f8dec9e81745d1c43bb6e7fcd5204bb325921).

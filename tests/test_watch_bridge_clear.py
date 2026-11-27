@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 import tempfile
 import sys
@@ -22,6 +23,15 @@ TID = '11111111-1111-4111-8111-111111111111'
 PUBLIC = '6fa01ff3-20e4-47c5-91fd-6d77a48c70d7'
 AGENT = 'x:22222222-2222-4222-8222-222222222222'
 KEY = 'fictional-owner-test-key'
+RECOVERY = Path(__file__).resolve().parents[1] / 'docs' / 'bridge' / 'RECOVERY.md'
+
+
+def recovery_commands():
+    """The guide's inspect and retire commands as argument lists, without the interpreter and script path."""
+    blocks = re.findall(r'```sh\n(.*?)```', RECOVERY.read_text(encoding='utf-8'), re.S)
+    commands = [shlex.split(block.replace('\\\n', ' ')) for block in blocks]
+    assert all(c[:2] == ['python3', 'scripts/watch_bridge_clear.py'] for c in commands), commands
+    return [c[2:] for c in commands]
 
 
 class WindowsRefusalTests(unittest.TestCase):
@@ -199,6 +209,18 @@ class ClearTests(unittest.TestCase):
         self.assertNotEqual(public, tid)
         self.assertIsNone(db.execute('SELECT 1 FROM shared_bridge_requests WHERE client_id=?', (rejected,)).fetchone())
         with patch.multiple(server, MESSAGING=self.store, KEY=KEY, PORT=self.port):
+            # The guide's own inspect command, with this refusal's ID and this test server's port.
+            inspect, retire = recovery_commands()
+            shown = inspect[inspect.index('--request-id') + 1]
+            documented = [public if part == shown else part for part in inspect]
+            documented[documented.index('--port') + 1] = str(self.port)
+            before = life.get(db, tid)['execution']
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main(documented + ['--state-dir', str(self.state)]), 0)
+            documented_view = json.loads(out.getvalue())
+            self.assertEqual((documented_view['request_id'], documented_view['transport_id']), (public, tid))
+            self.assertEqual(life.get(db, tid)['execution'], before)
             selector = ('--request-id', public)
             with patch.object(cli, 'owner_request', wraps=cli.owner_request) as request:
                 result, out, err = self.run_cli(selector=selector)
@@ -208,6 +230,11 @@ class ClearTests(unittest.TestCase):
             view = json.loads(out)
             self.assertEqual((view['request_id'], view['transport_id'], view['agent'], view['eligible']),
                              (public, tid, target['agent_id'], True))
+            # The guide's retire command differs from its inspect command only by the recipient and --apply.
+            self.assertEqual(retire[:len(inspect)], inspect)
+            self.assertEqual(len(retire), len(inspect) + 3)
+            self.assertEqual((retire[len(inspect)], retire[-1]), ('--expected-agent', '--apply'))
+            self.assertRegex(retire[-2], r'\Ax:[0-9a-f-]{36}\Z')
             with patch.object(cli, 'owner_request', wraps=cli.owner_request) as request:
                 result, out, err = self.run_cli('--apply', '--expected-agent', view['agent'], selector=selector)
                 self.assertEqual(result, 0)
@@ -218,6 +245,24 @@ class ClearTests(unittest.TestCase):
             applied = json.loads(out)
             self.assertEqual((applied['request_id'], applied['transport_id'], applied['provider_outcome']),
                              (public, tid, 'unknown'))
+
+    def test_recovery_guide_names_the_id_a_busy_refusal_shows(self):
+        """The guide's examples take the bracketed ID from a busy or recovery error with --request-id."""
+        text = RECOVERY.read_text(encoding='utf-8')
+        commands = recovery_commands()
+        self.assertEqual(len(commands), 2)
+        shown = re.search(r'Busy with request \(([0-9a-f-]{36})\)', text).group(1)
+        self.assertIn('Earlier delivery requires recovery for this recipient (%s)' % shown, text)
+        for command in commands:
+            self.assertEqual(command[command.index('--request-id') + 1], shown)
+            self.assertNotIn('--transport-id', command)
+        self.assertEqual(commands[1][-1], '--apply')
+        # The older per-chat endpoints put the transport ID in brackets; the guide says so in their own words.
+        legacy = (Path(__file__).resolve().parents[1] / 'src' / 'peer_lifecycle.py').read_text(encoding='utf-8')
+        for words in ('Earlier delivery requires recovery for this recipient (', 'This recipient has an active request ('):
+            self.assertIn("'" + words + "' + tid + ')", legacy)
+            self.assertIn('"' + words + '…)"', text)
+        self.assertIn('is the transport ID, so pass it with `--transport-id`', text)
 
     def test_apply_requires_exact_identity_before_network(self):
         for extra in [('--apply',), ('--transport-id', '11111111'), ('--expected-agent','x:invalid'), ('--port','70000')]:
