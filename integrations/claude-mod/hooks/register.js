@@ -834,15 +834,52 @@ async function supervisor($, state) {
   } finally {state.supervising = false;}
 }
 
+// The owner's connection decisions for this chat (/watch-connect, /watch-setup, /watch-disconnect) take effect in
+// the order they were made. Each command reserves its place when it starts, before anything is awaited; a command
+// that a newer one has overtaken changes nothing from then on, so an older connect or setup that finishes late
+// cannot clear a later opt-out, nor a late disconnect undo a later reconnect.
+function reserveDecision(state) {
+  state.decision += 1;
+  return state.decision;
+}
+
+const latestDecision = (state, decision) => state.decision === decision;
+
+// Preference writes run one at a time in decision order, and each is checked again just before it is written, so a
+// slow write cannot land after a newer one. The stored decided_at keeps the order across a plugin reload, when an
+// earlier copy of the plugin may still finish a command: a write never replaces a decision made later. A stored
+// time more than ten minutes ahead cannot come from such a copy (its commands end within a minute or two) and
+// means the clock was set back, so it does not lock the owner out.
+const DECISION_SKEW_MS = 10 * 60 * 1000;
+async function savePreference($, state, id, disconnected, decision, decidedAt) {
+  const operation = state.preferenceWrites.then(async () => {
+    if (!latestDecision(state,decision)) return false;
+    const stored = await $.store.get(preferenceKey(id));
+    if (typeof stored?.decided_at === 'number' && stored.decided_at > decidedAt &&
+        stored.decided_at - decidedAt <= DECISION_SKEW_MS) return false;
+    if (!latestDecision(state,decision)) return false;
+    await $.store.set(preferenceKey(id),{version:1,disconnected,decided_at:decidedAt});
+    return latestDecision(state,decision);
+  });
+  state.preferenceWrites = operation.catch(() => {});
+  return operation;
+}
+
+const SUPERSEDED = 'A newer Motet command replaced this one; nothing was changed.';
+
 async function explicitDisconnect($, state) {
+  const decision = reserveDecision(state);
   state.disconnecting += 1;
   invalidateEligibility(state);
   try {
+    const decidedAt = await $.clock.now();
     const id = await $.session.id();
-    if (UUID.test(id)) await $.store.set(preferenceKey(id),{version:1,disconnected:true});
+    if (UUID.test(id) && !await savePreference($,state,id,true,decision,decidedAt)) return false;
+    if (!latestDecision(state,decision)) return false;
     const data = state.data;
     suspend($,state);
     if (data && data.mode !== 'derived') await save($,state,()=>{data.active = false;});
+    return true;
   } finally {state.disconnecting -= 1;}
 }
 
@@ -955,8 +992,8 @@ async function resume($, state) {
   state.resuming = true;
   try {
     await registerCommands($);
-    clearRegistrationError(state);
     if (state.timer || !ownsLifecycle(state,lifecycle)) return;
+    clearRegistrationError(state);
     state.resumed = true;
     state.resumedLifecycle = lifecycle;
     startTimer($,state);
@@ -969,7 +1006,7 @@ export function register(on) {
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrant:'',rejectedIdentity:'',lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrant:'',rejectedIdentity:'',decision:0,preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
     state.lifecycle += 1;
@@ -986,11 +1023,11 @@ export function register(on) {
       state.timer?.cancel();
       state.timer = null;
       await registerCommands($);
-      clearRegistrationError(state);
       // A later start, a session.end or a transition command that came while this start was registering owns the
       // module now: this start installs nothing. After a /clear or a resume, a started module is then repaired by
       // its next event, as after a start that failed to register; after an exit it stays off.
       if (!ownsLifecycle(state,lifecycle)) return next(e);
+      clearRegistrationError(state);
       startTimer($,state);
       // A resume that installed its timer while this start was registering is replaced: this timer is the start's.
       state.resumed = false;
@@ -1013,16 +1050,19 @@ export function register(on) {
     if (!owner) return {text:'Motet connection commands require direct owner input.'};
     if (e.command === 'watch-retry-receipts') return retryHeldReceipts($,state,e.args.trim());
     if (e.command === 'watch-disconnect') {
-      try {await explicitDisconnect($,state); return {text:'Motet disconnected. ' + LIMITATION};}
+      try {return {text:await explicitDisconnect($,state) ? 'Motet disconnected. ' + LIMITATION : SUPERSEDED};}
       catch {return {text:'Motet disconnect could not be saved; readiness expires when its heartbeat stops.'};}
     }
     if (state.connecting || state.submitting || (state.connected && state.flight && ['pending','claimed','submitted','started'].includes(state.flight.phase))) return {text:'An existing Motet attempt is unresolved; nothing was resubmitted.'};
     state.connecting = true;
+    const decision = reserveDecision(state);
     // A session.end, transition or opt-out that comes while this command waits on Motet changes this epoch, and
     // activation then refuses: an owner connect never connects a chat that has ended or changed conversation.
     const eligibilityEpoch = invalidateEligibility(state);
     try {
+      const decidedAt = await $.clock.now();
       const id = await $.session.id(), project = await sessionProject($);
+      if (!latestDecision(state,decision)) return {text:SUPERSEDED};
       if (!UUID.test(id)) throw Error('Native identity unavailable.');
       if (project === null) return {text:'This chat is working outside its project folder. Return to the project folder and try again.'};
       const pair = e.args.trim() ? pairing(e.args) : null;
@@ -1031,16 +1071,22 @@ export function register(on) {
         if (!pair) return {text:'Use the exact /watch-setup command from Motet.'};
         const config = await post($,state,'setup',{code:pair.code},{port:pair.port,anonymous:true});
         if (!globalConfiguration(config) || config.port !== pair.port) throw Error('Invalid Motet setup response.');
+        // The one-use code is spent: its grant is kept even if a /watch-disconnect came meanwhile, and the setup is
+        // never repeated. (No second connect or setup can run in this copy while this one does.)
         await $.store.set(GLOBAL_KEY,config);
         state.rejectedGrant = ''; state.rejectedIdentity = '';
-        await $.store.set(preferenceKey(id),{version:1,disconnected:false});
+        // A later decision about this chat stands: the grant serves the other chats, and this one stays as it is.
+        if (!await savePreference($,state,id,false,decision,decidedAt)) {
+          state.config = config; state.retryAt = 0; state.failures = 0;
+          return {text:'Motet automatic connections authorized. Your later Motet command in this chat still stands, so this chat was left as it is. ' + LIMITATION};
+        }
         suspend($,state);
         state.data = null; state.key = null; state.config = config; state.receiptOnly = false;
         state.flight = null; state.envelope = null; state.bound.clear();
         state.retryAt = 0; state.failures = 0;
         return {text:'Motet automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
       }
-      await $.store.set(preferenceKey(id),{version:1,disconnected:false});
+      if (!await savePreference($,state,id,false,decision,decidedAt)) return {text:SUPERSEDED};
       state.rejectedIdentity = ''; state.retryAt = 0; state.failures = 0;
       stop(state);
       if (pair) {
@@ -1048,6 +1094,7 @@ export function register(on) {
         state.data = {native_id:id,project,port:pair.port,requests:{},active:false};
         const response = await post($,state,'enroll',{code:pair.code,native_id:id,project},{anonymous:true});
         if (typeof response.token !== 'string' || response.token.length < 16 || !UUID.test(response.enrollment_id)) throw Error('Invalid enrollment.');
+        if (!latestDecision(state,decision)) return {text:SUPERSEDED};
         state.data.token = response.token; state.data.enrollment_id = response.enrollment_id;
         state.flight = null; state.envelope = null; state.bound.clear();
         await activate($,state,response,eligibilityEpoch);
@@ -1067,9 +1114,11 @@ export function register(on) {
           return {text:state.receiptOnly ? 'Motet reconnected this chat to report its earlier replies; it then moves to this project folder. ' + LIMITATION :
             'Motet connected to this existing chat. ' + LIMITATION};
         }
+        if (!latestDecision(state,decision)) return {text:SUPERSEDED};
         state.data = null; state.key = null;
         if (stored?.native_id === id) return {text:"This chat's manual Motet pairing is for a folder outside this project, so it was not reconnected. Pair this chat again from Motet."};
       }
+      if (!latestDecision(state,decision)) return {text:SUPERSEDED};
       return {text:'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
     } catch {stop(state); return {text:'Motet connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.'};}
     finally {state.connecting = false;}

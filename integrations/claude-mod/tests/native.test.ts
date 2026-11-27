@@ -515,3 +515,42 @@ test('official runtime: an earlier session.start that finishes late cannot repla
   // The later start's facts and its single timer stand.
   expect(status.startup_interactive).toBe(true);expect(status.timer_ticks).toBe(3);expect(registrations).toBe(1);
 });
+
+// An older owner command that finishes after a later /watch-disconnect leaves the chat disconnected.
+for (const older of ['watch-connect','watch-setup']) test('official runtime: a delayed /'+older+' does not undo a later /watch-disconnect',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const pref='watch-owner-preferences-v1:'+NATIVE,config={version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793};
+  const values=new Map<string,any>(older==='watch-connect'?[['watch-owner-global-v1',config]]:[]);
+  let release=()=>{},entered=()=>{},holdIdentity=false,registrations=0,polls=0,setups=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',async()=>{if(holdIdentity){holdIdentity=false;entered();await held;}return{value:NATIVE}});
+  on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',async($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/setup')){setups++;entered();await held;data=config;}
+    else if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  if(older==='watch-connect')holdIdentity=true;
+  const pending=$.command.run({command:older,args:older==='watch-setup'?'8793:fictional_setup_code_1234':'',origin:{kind:'composer'}});await inside;
+  const disconnected=await $.command.run({command:'watch-disconnect',args:'',origin:{kind:'composer'}});
+  expect(disconnected.text.includes('Motet disconnected')).toBe(true);expect(values.get(pref).disconnected).toBe(true);
+  release();const result=await pending;
+  expect(values.get(pref).disconnected).toBe(true);
+  if(older==='watch-setup'){expect(values.get('watch-owner-global-v1')).toEqual(config);expect(setups).toBe(1);expect(result.text.includes('left as it is')).toBe(true);}
+  else expect(result.text).toBe('A newer Motet command replaced this one; nothing was changed.');
+  const before=registrations+polls;
+  await clock.advance(2000);await clock.advance(2000);
+  expect(registrations+polls).toBe(before);
+  // A fresh owner reconnect still works.
+  await $.command.run({command:'watch-connect',args:'',origin:{kind:'composer'}});
+  expect(values.get(pref).disconnected).toBe(false);
+  await clock.advance(2000);await clock.advance(2000);
+  expect(registrations).toBe(1);expect(polls>0).toBe(true);
+});

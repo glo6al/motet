@@ -2425,6 +2425,109 @@ test('an owner /watch-connect waiting on Motet when the chat ends does not conne
   }
 });
 
+// The owner's decisions take effect in the order made: an older connect or setup that finishes late never clears
+// a later /watch-disconnect, and a delayed preference write never reverses a newer one.
+const PREF='watch-owner-preferences-v1:'+NATIVE;
+const SUPERSEDED_TEXT='A newer Motet command replaced this one; nothing was changed.';
+const registrationsSince=(h,since)=>h.calls.slice(since).filter(c=>c.url.endsWith('/register')||c.url.endsWith('/poll')).length;
+function holdIdentityOnce(h){
+  const gate=latch(),original=h.$.session.id;let hold=true;
+  h.$.session.id=async()=>{if(hold){hold=false;await gate.hold();}return original();};
+  return gate;
+}
+async function staysDisconnectedAfterReload(storage){
+  const reloaded=await harness({start:false,storage,claimed:false,fetch:globalFetch});
+  await reloaded.call('prompt.submit',{text:'fictional input after reload'});await reloaded.wait(()=>reloaded.timers.length===1,'resumed timer');
+  await reloaded.tick();await reloaded.tick();
+  assert.equal(connections(reloaded),0);
+  // A fresh owner reconnect still works.
+  assert.match((await reloaded.command('watch-connect')).text,/reconnect scheduled/);
+  assert.equal(storage.get(PREF).disconnected,false);
+  await reloaded.tick();assert.equal(reloaded.calls.filter(c=>c.url.endsWith('/register')).length,1);
+}
+
+test('an older /watch-connect that finishes after a later /watch-disconnect leaves the chat disconnected',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await harness({storage,claimed:false,fetch:globalFetch});
+  const gate=holdIdentityOnce(h);
+  const connecting=h.command('watch-connect');await bounded(gate.entered,'connect reading identity');
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+  assert.equal(storage.get(PREF).disconnected,true);
+  const since=h.calls.length;
+  gate.release();
+  assert.equal((await connecting).text,SUPERSEDED_TEXT);
+  assert.equal(storage.get(PREF).disconnected,true);
+  await h.tick();await h.tick();assert.equal(registrationsSince(h,since),0);
+  await staysDisconnectedAfterReload(storage);
+});
+
+test('an older /watch-setup that finishes after a later /watch-disconnect keeps its grant and leaves the chat disconnected',async()=>{
+  const storage=new Map();const gate=latch();let setups=0;
+  const h=await harness({storage,claimed:false,fetch:async(url,body)=>{
+    if(url.endsWith('/setup')){setups++;await gate.hold();return responseJSON(CONFIG);}return globalFetch(url,body);}});
+  const setting=h.command('watch-setup','8793:fictional_setup_code_1234');await bounded(gate.entered,'setup in flight');
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+  gate.release();
+  assert.match((await setting).text,/authorized.*left as it is/);
+  assert.deepEqual(storage.get(GLOBAL_KEY),CONFIG);assert.equal(storage.get(PREF).disconnected,true);
+  await h.tick();await h.tick();assert.equal(connections(h),0);assert.equal(setups,1,'the one-use setup is never repeated');
+  await staysDisconnectedAfterReload(storage);
+});
+
+test('a delayed preference write cannot reverse a newer owner decision, in either order',async()=>{
+  // The connect's write is slow; the later disconnect's write waits for it and lands last.
+  {
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);const gate=latch();let holdPref=false;
+    const h=await harness({storage,claimed:false,fetch:globalFetch,storeSet:async key=>{if(key===PREF&&holdPref){holdPref=false;await gate.hold();}}});
+    await h.command('watch-disconnect');
+    holdPref=true;
+    const connecting=h.command('watch-connect');await bounded(gate.entered,'connect preference write');
+    const disconnecting=h.command('watch-disconnect');
+    gate.release();
+    assert.equal((await connecting).text,SUPERSEDED_TEXT);assert.match((await disconnecting).text,/Motet disconnected/);
+    assert.equal(storage.get(PREF).disconnected,true);
+    const since=h.calls.length;await h.tick();await h.tick();assert.equal(registrationsSince(h,since),0);
+  }
+  // The disconnect's write is slow; the later connect's write waits for it and lands last.
+  {
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);const gate=latch();let holdPref=false;
+    const h=await harness({storage,claimed:false,fetch:globalFetch,storeSet:async key=>{if(key===PREF&&holdPref){holdPref=false;await gate.hold();}}});
+    holdPref=true;
+    const disconnecting=h.command('watch-disconnect');await bounded(gate.entered,'disconnect preference write');
+    const connecting=h.command('watch-connect');
+    gate.release();
+    assert.equal((await disconnecting).text,SUPERSEDED_TEXT);assert.match((await connecting).text,/reconnect scheduled/);
+    assert.equal(storage.get(PREF).disconnected,false);
+    await h.tick();assert(h.calls.some(c=>c.url.endsWith('/register')));
+  }
+});
+
+test('a decision saved later by another copy of the plugin stands, unless its time is far ahead of the clock',async()=>{
+  for(const [ahead,stands] of [[1000,true],[60*60*1000,false]]){
+    const storage=new Map([[GLOBAL_KEY,CONFIG],[PREF,{version:1,disconnected:true,decided_at:100000+ahead}]]);
+    const h=await harness({storage,claimed:false,fetch:globalFetch});
+    const result=(await h.command('watch-connect')).text;
+    if(stands){assert.equal(result,SUPERSEDED_TEXT);assert.equal(storage.get(PREF).disconnected,true);}
+    else{assert.match(result,/reconnect scheduled/);assert.equal(storage.get(PREF).disconnected,false);assert.equal(storage.get(PREF).decided_at,100000);}
+  }
+});
+
+test('an older start that registers successfully late does not clear a newer start\'s registration failure',async()=>{
+  const first=latch(),repair=latch();let calls=0,fail=false,holdRepair=false;
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+    commandRegister:()=>{calls++;if(calls===1)return first.hold();if(holdRepair){holdRepair=false;return repair.hold();}if(fail)throw Error('registration refused');}});
+  const older=h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:false});
+  await bounded(first.entered,'older start registering');
+  fail=true;await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  fail=false;
+  first.release();await older;for(let i=0;i<5;i++)await yieldWhileHeld();
+  assert.equal(h.timers.length,0);
+  holdRepair=true;
+  // The status command starts a repair, held here, so the error is read before anything could repair it.
+  assert.equal((await statusOf(h)).error,'Motet command registration failed.');
+  repair.release();await h.wait(()=>h.timers.length===1,'repair');
+});
+
 test('a real start whose registration failed is repaired after /clear by its next event, but not after an exit',async()=>{
   for(const [reason,repaired] of [['clear',true],['resume',true],['prompt_input_exit',false],['logout',false],['other',false]]){
     let fail=true;
