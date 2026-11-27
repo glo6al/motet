@@ -1851,9 +1851,10 @@ class ManagedClaude:
         A supervisor started by an older Motet knows only 'shutdown' (it refuses 'stop' without acting on it). It
         is given that instead. Its records then word the denied request and the failed messages as Motet shutting
         down; status() says them as the owner's stop, since the stop record shows whose it was. On a Mac that
-        shutdown signals Claude alone, so Claude's tree is seen first (``_tree_before_legacy``), and whatever of it
-        is still running afterwards is recorded as surviving: the stop is then not confirmed. On Windows that
-        shutdown ends the job."""
+        shutdown signals Claude alone, so Claude's tree is seen first (``_tree_before_legacy``). Afterwards its end
+        is known only once Claude's process group is seen to have ended (``_still_running``); whatever of the tree
+        still runs outside the group is recorded as surviving, and anything less is recorded as unknown: the stop is
+        then not confirmed. On Windows that shutdown ends the job."""
         answered = False
         try:
             self._request(run_id, 'stop', dict(requestId=request_id, by='owner'), seconds=STOP_SECONDS)
@@ -1897,36 +1898,53 @@ class ManagedClaude:
         return confirmed
 
     def _tree_before_legacy(self, run_id):
-        """POSIX: the identities of Claude's verified tree, seen before an older supervisor's shutdown, or None if
-        it could not be seen: no Claude verified as this chat's (it may have ended, or not be recognisable) means
-        nothing of its tree was seen, never that there is none. Windows: [] (the job ends it all)."""
-        if ps.WIN or not self._real_processes():
+        """POSIX: ``(root, members)``, Claude's verified process (its own group's leader) and its tree as seen before
+        an older supervisor's shutdown, or None if it could not be seen: no Claude verified as this chat's (it may
+        have ended, or not be recognisable) means nothing of its tree was seen, never that there is none. A test
+        without real process work has no process table, so nothing is seen there either. Windows: [] (the job ends
+        it all)."""
+        if ps.WIN:
             return []
+        if not self._real_processes():
+            return None
         try:
             import managed_process_tree as tree
             _, root, _ = self._verified_claude(self._run_dir(run_id))
-            return list(tree.members(tree.table(), root, {}).values()) if root is not None else None
+            return (root, tree.members(tree.table(), root, {})) if root is not None else None
         except Exception:
             return None
 
     def _still_running(self, before):
-        """``[pid, start]`` of the processes seen in ``before`` that still run (None if unknown). Seen, never
-        signalled."""
+        """After an older supervisor's shutdown: ``[pid, start]`` of what of Claude's tree still runs, or None if
+        that is unknown. Seen, never signalled.
+
+        POSIX: the evidence is the end of Claude's process group, as the supervisor's own stop has it
+        (managed_process_tree.end): the whole process table is read, and no live process, whoever's, may be left in
+        the group whose ID was Claude's (verified before the shutdown). A program Claude started after the first
+        look is in that group unless it left it, so it is seen. Then what is left is what of the tree runs outside
+        the group (a program in a session of its own), as the supervisor would report it; those are looked for
+        again by identity until they have gone. Neither Claude's absence nor the end of what the first look saw is
+        evidence. While Claude or anything in its group still runs when the wait is over, unknown: a later look by
+        identity alone would miss what the group starts in the meantime. Windows: [] (the job ended it all)."""
         if before is None:
             return None
         if not before:
             return []
         import managed_process_tree as tree
-        for _ in range(30):                          # the older supervisor waits up to 3 s for Claude itself
+        root, known = before
+        known = dict(known)
+        for attempt in range(30):                    # the older supervisor waits up to 3 s for Claude itself
             try:
-                left = tree.running(tree.table(), before)
+                rows = tree.table()
             except tree.TreeError:
                 return None
-            if not left:
-                return []
-            time.sleep(.1)
-        left = sorted([row.pid, row.start] for row in left.values())
-        return left if len(left) <= 64 else None          # past the cap nothing could be checked
+            known.update(tree.members(rows, root, known))
+            if not any(tree.alive(row) and row.pgid == root.pid for row in rows.values()):
+                left = sorted([row.pid, row.start] for row in tree.running(rows, known.values()).values())
+                return left if len(left) <= 64 else None          # past the cap nothing could be checked
+            if attempt < 29:
+                time.sleep(.1)
+        return None
 
     def _record_seen_survivors(self, run_id, survivors):
         with self._registry() as db:

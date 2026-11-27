@@ -1465,7 +1465,9 @@ class Fixture(unittest.TestCase):
         self.waiting(run_id)
         self.refused_commands = ('stop',)
         request = uid()
-        self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['ownerStop']['outcome'], 'stopped')
+        # POSIX: this fixture has no process table, so the tree was not seen at all (``legacy_tree`` below).
+        self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['ownerStop']['outcome'],
+                         'stopped' if managed.ps.WIN else 'unconfirmed')
         self.assertEqual([c for _, c, _ in self.commands if c in ('stop', 'shutdown')], ['stop', 'shutdown'])
         self.assertEqual(self.stops()[-1], dict(requestId=request))
         # The older supervisor recorded its own shutdown; the stop record says whose it was.
@@ -1484,6 +1486,119 @@ class Fixture(unittest.TestCase):
                          managed.OWNER_STOP_ERROR)
         shown = self.manager.owner_snapshot()['requests'][0]           # what the page lists for the message
         self.assertEqual((shown['state'], shown['error']), ('failed', managed.OWNER_STOP_ERROR))
+
+    # An older supervisor (no 'stop', only 'shutdown') on POSIX: the tree's end is known only from its process group
+    # seen ended in the whole table, never from Claude's absence or from the first look's processes having gone.
+
+    def legacy_tree(self, reads, root, *, shutdown=None):
+        """The legacy stop with real process work on fictional process tables: ``reads`` are what ``ps`` shows, in
+        turn (the last again and again); ``root`` is the verified Claude, or None. Nothing may be signalled."""
+        import managed_process_tree as tree
+        reads = list(reads)
+        seen = []
+
+        def table():
+            seen.append(True)
+            read = reads.pop(0) if len(reads) > 1 else reads[0]
+            if isinstance(read, Exception):
+                raise read
+            return dict(read)
+        if shutdown is not None:
+            plain = self.request
+
+            def request(path, command, params):
+                if command == 'shutdown':
+                    return shutdown(path, command, params)
+                return plain(path, command, params)
+            self.manager._test = replace(self.manager._test, request=request)
+        self.manager._test = replace(self.manager._test, real_processes=True)
+        self.refused_commands = ('stop',)
+        native = dict(pid=500, nativeId='fictional', claimedAt=999.0, startedAt=1001.0, executable='/fictional')
+        trap = AssertionError('a process was signalled')
+        with patch.object(managed.ManagedClaude, '_verified_claude',
+                          staticmethod(lambda run_dir: (native, root, lambda row: False))), \
+                patch.object(tree, 'table', table), patch.object(managed.time, 'sleep', lambda seconds: None), \
+                patch.object(managed.os, 'kill', side_effect=trap), patch.object(managed.os, 'killpg', side_effect=trap):
+            run_id, agent = self.start()
+            result = self.manager.stop(run_id, uid(), 'c:' + agent)
+            later = self.manager.status(run_id)['ownerStop']
+        return result, later, self.stored_stop(run_id), seen
+
+    def process(self, pid, pgid, start, ppid=1, stat='S'):
+        if managed.ps.WIN:                       # read when the test runs: the Windows simulation reruns these
+            self.skipTest('POSIX process groups')
+        import managed_process_tree as tree
+        return tree.Process(pid, ppid, pgid, os.getuid(), stat, start, 'fictional-%d' % pid)
+
+    def test_a_legacy_stop_without_a_verified_claude_stays_unconfirmed(self):
+        child = self.process(501, 500, 1002.0)                   # visible in Claude's group after the shutdown
+        result, later, record, _ = self.legacy_tree([{501: child}], None)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertIsNone(record['survivors'], 'nothing was seen: unknown, never an empty list')
+        self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+
+    def test_a_legacy_stop_misses_no_child_started_after_the_first_look(self):
+        root = self.process(500, 500, 1000.0, ppid=400)
+        late = self.process(501, 500, 1003.0, ppid=1)            # started after the first look; Claude has gone
+        result, later, record, _ = self.legacy_tree([{500: root}, {501: late}], root)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertIsNone(record['survivors'], 'its group never ended within the wait: unknown')
+        self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+
+    def test_a_legacy_stop_whose_claude_ended_first_and_supervisor_went_stays_unconfirmed(self):
+        # Claude ended just before the shutdown (no verified Claude), the older supervisor then stopped answering,
+        # and its exit ledger is still readable.
+        if managed.ps.WIN:
+            self.skipTest('POSIX process groups')
+        calls = []
+        self.dependencies = replace(self.dependencies, unsupervised=lambda run_dir: calls.append(run_dir) or True)
+        self.manager._test = self.dependencies
+
+        def shutdown(path, command, params):
+            snapshot = self.snapshots[path.name]
+            snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=0, incarnation=snapshot['incarnation']))
+            self.disconnected = True
+            raise OSError('fictional: the older supervisor went')
+        result, later, record, _ = self.legacy_tree([{}], None, shutdown=shutdown)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertEqual(calls, [], 'the exited ledger is taken as Claude ended; it says nothing about its tree')
+        self.assertIsNone(record['survivors'])
+        self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+
+    def test_a_legacy_stop_is_confirmed_once_its_group_is_seen_ended(self):
+        root = self.process(500, 500, 1000.0, ppid=400)
+        child = self.process(501, 500, 1002.0, ppid=500)
+        detached = self.process(502, 502, 1002.5, ppid=500)      # a session of its own: outside the group
+        unrelated = self.process(900, 900, 50.0)
+        result, later, record, seen = self.legacy_tree(
+            [{500: root, 501: child, 502: detached, 900: unrelated},       # the first look
+             {501: child._replace(ppid=1), 502: detached._replace(ppid=1), 900: unrelated},   # Claude has gone
+             {502: detached._replace(ppid=1), 900: unrelated}], root)      # its group has ended
+        self.assertEqual((result['ownerStop']['outcome'], record['survivors']), ('unconfirmed', [[502, 1002.5]]),
+                         'the program outside the group is seen, not signalled')
+        self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+        self.assertGreaterEqual(len(seen), 3)
+        import managed_process_tree as tree
+        with patch.object(tree, 'table', lambda: {900: unrelated}):
+            self.assertEqual(self.manager.status(result['runId'])['ownerStop']['outcome'], 'stopped',
+                             'confirmed once that program has gone')
+
+    def test_a_legacy_stop_whose_claude_is_left_a_zombie_has_ended(self):
+        root = self.process(500, 500, 1000.0, ppid=400)
+        result, later, record, _ = self.legacy_tree([{500: root}, {500: root._replace(stat='Z')}], root)
+        self.assertEqual((result['ownerStop']['outcome'], 'survivors' in record), ('stopped', False),
+                         'a zombie has ended, and nothing else is in its group')
+        self.assertIs(later['claudeEnded'], False)
+
+    def test_a_legacy_stop_with_an_unreadable_table_or_a_group_that_never_ends_is_unknown(self):
+        import managed_process_tree as tree
+        root = self.process(500, 500, 1000.0, ppid=400)
+        for reads in ([{500: root}, tree.TreeError('fictional')],            # ps could not be read
+                      [{500: root}]):                                       # Claude itself still runs after 3 s
+            with self.subTest(reads=reads):
+                result, later, record, _ = self.legacy_tree(reads, root)
+                self.assertEqual(result['ownerStop']['outcome'], 'unconfirmed')
+                self.assertIsNone(record['survivors'])
 
     def test_a_shutdown_without_an_owners_stop_keeps_its_own_words(self):
         run_id, native = self.start()

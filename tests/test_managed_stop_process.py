@@ -13,7 +13,8 @@ Checked: Stop through the route ends Claude and its group, and the supervisor th
 SIGTERM is ended by SIGKILL; a process in a session of its own is never signalled and keeps the stop unconfirmed until
 it is gone; without its supervisor nothing is signalled and the end is never confirmed (the whole tree cannot be seen);
 a bystander whose command line names the run is never adopted as its supervisor; a recorded process ID that now names
-another process is never signalled; an older supervisor's shutdown leaves the stop unconfirmed while its tree runs.
+another process is never signalled; an older supervisor's shutdown leaves the stop unconfirmed while its tree runs,
+and for good once its group was not seen ending (the identities first seen having gone are no evidence).
 Only the group signal is ever sent. No real Claude is started; fictional names only.
 
 Run: python3 tests/test_managed_stop_process.py
@@ -324,7 +325,10 @@ class MacStopTests(unittest.TestCase):
             self.assertTrue(alive(self.started[name]), name + ' is seen, not signalled')
         self.assertEqual(self.supervisors[-1].wait(timeout=30), 0)
         self.end_ourselves('grandchild', 'detached')
-        self.assertEqual(manager.status(run_id)['ownerStop']['outcome'], 'stopped', 'confirmed once they are gone')
+        # Claude's group did not end while Motet waited, so what it started meanwhile cannot all be known: the end
+        # of the processes first seen is no evidence. Unknown for good, and with Claude gone nothing more to try.
+        stop = manager.status(run_id)['ownerStop']
+        self.assertEqual((stop['outcome'], stop['claudeEnded']), ('unconfirmed', True))
 
 
 @unittest.skipIf(os.name == 'nt', 'POSIX process groups and ps')
