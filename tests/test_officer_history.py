@@ -54,7 +54,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(entries[0]['actual_model'], 'actual-model')
         self.assertEqual(entries[0]['selected_model'], 'selected-model')
         self.assertTrue(entries[0]['read_only'])
-        self.assertEqual(json.loads(self.store.db.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()[0]), 4)
+        self.assertEqual(json.loads(self.store.db.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()[0]), 5)
 
     def test_pending_restart_unknown(self):
         self.begin(); self.store.close(); self.store = DeckLog(self.root, clock=lambda: self.now)
