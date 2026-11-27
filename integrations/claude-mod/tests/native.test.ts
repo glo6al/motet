@@ -346,3 +346,39 @@ test('official host lifecycle v2 reconnect retains bound turn and observes addit
   expect(completed.length).toBe(1);expect(completed[0].outcome).toBe('withheld');expect(completed[0].answer).toBe('');
   expect(submissions.length).toBe(1);
 });
+
+test('official runtime: a reloaded module that gets no session.start resumes its commands and one heartbeat on its first event',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const config={version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793};
+  const values=new Map([['watch-owner-global-v1',config]]);const registrations=[];const polls=[];const commands=[];
+  on('session.id',()=>({value:NATIVE}));
+  on('session.cwd',()=>({value:'/fictional/project'}));
+  on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));
+  on('store.keys',()=>({value:[...values.keys()]}));
+  on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return {value:undefined};});
+  on('command.register',($,e)=>{commands.push(e.name);return {value:undefined};});
+  on('turn.start',($,e)=>({turnId:e.turnId}));
+  on('http.fetch',($,e)=>{
+    const body=JSON.parse(e.init.body);let data;
+    const session={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,peer_protocol:1};
+    if(e.url.endsWith('/register')){
+      registrations.push(body);
+      data={...session,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:body.client_id,connection_seq:body.connection_seq};
+    }else if(e.url.endsWith('/poll')){polls.push(body);data={...session,claim:null,requests:[]};}
+    else throw Error('unexpected reload fixture path');
+    return {value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  // No $.session.start: the module was loaded again into a session that is already running.
+  await clock.advance(2000);await clock.advance(2000);
+  expect(registrations.length).toBe(0);expect(commands.length).toBe(0);
+  await $.turn.start({text:'fictional owner prompt',turnId:'owner-turn'});
+  await $.turn.start({text:'another fictional prompt',turnId:'owner-turn-2'});
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  expect(commands).toEqual(['watch-setup','watch-connect','watch-status','watch-retry-receipts','watch-disconnect']);
+  expect(registrations.length).toBe(1);expect(polls.length>0).toBe(true);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.start_seen).toBe(false);expect(status.timer_resumed).toBe(true);expect(status.connected).toBe(true);
+  // One timer: three periods after the resume were three supervisor dispatches, not six.
+  expect(status.timer_ticks).toBe(3);
+});

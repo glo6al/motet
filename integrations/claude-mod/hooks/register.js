@@ -890,14 +890,52 @@ async function completeRecoveredTurns($, state) {
   }
 }
 
+async function registerCommands($) {
+  await $.command.register({name:'watch-setup',description:'Authorize automatic Motet connections once for your local Claude chats.',argumentHint:'<port:setup-code>',immediate:true});
+  await $.command.register({name:'watch-connect',description:'Reconnect this chat, or use a legacy Motet pairing code.',argumentHint:'[port:pair-code]',immediate:true});
+  await $.command.register({name:'watch-status',description:'Show Motet connection status without secrets.',immediate:true});
+  await $.command.register({name:'watch-retry-receipts',description:'Retry held receipts in this original Motet enrollment.',argumentHint:'<request-id>',immediate:true});
+  await $.command.register({name:'watch-disconnect',description:'Keep this chat disconnected until explicit reconnect.',immediate:true});
+}
+
+// The one supervisor timer: any earlier one is cancelled first, so at most one ever runs.
+function startTimer($, state) {
+  state.timer?.cancel();
+  state.timer = $.clock.every(2000,()=>{
+    // Count actual dispatch before any supervisor gate, never imply installation is dispatch.
+    state.timerTicks = Math.min(Number.MAX_SAFE_INTEGER,state.timerTicks + 1);
+    return supervisor($,state);
+  });
+}
+
+// A plugin reload in a live chat runs register() again, and its old timer stops, but the host may not send this
+// module a new session.start (it does so for a changed module only). The first event the reloaded module sees
+// then puts back its commands and its timer. It proves nothing about the chat: no startup facts are invented, so
+// eligibility still needs current Desktop evidence, and every tick keeps the same checks (the opt-out, identity,
+// folder rules, receipts only). A session.start before or after this wins and keeps one timer.
+async function resume($, state) {
+  if (state.timer || state.resuming) return;
+  const starts = state.starts;
+  state.resuming = true;
+  try {
+    await registerCommands($);
+    if (state.timer || state.starts !== starts) return;
+    state.resumed = true;
+    startTimer($,state);
+  } catch {state.error = 'Motet command registration failed.';}
+  finally {state.resuming = false;}
+}
+
 export function register(on) {
   const state = {clientId:crypto.randomUUID(),sequence:-1,data:null,key:null,config:null,generation:null,connected:false,epoch:0,eligibilityEpoch:0,desktopBinding:null,disconnecting:0,
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrant:'',rejectedIdentity:'',startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrant:'',rejectedIdentity:'',starts:0,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
+    state.starts += 1;
+    state.resumed = false;
     state.interactive = e.isInteractive === true;
     state.startSeen = true;
     state.startupInteractive = typeof e.isInteractive === 'boolean' ? e.isInteractive : null;
@@ -907,20 +945,13 @@ export function register(on) {
     try {
       state.timer?.cancel();
       state.timer = null;
-      await $.command.register({name:'watch-setup',description:'Authorize automatic Motet connections once for your local Claude chats.',argumentHint:'<port:setup-code>',immediate:true});
-      await $.command.register({name:'watch-connect',description:'Reconnect this chat, or use a legacy Motet pairing code.',argumentHint:'[port:pair-code]',immediate:true});
-      await $.command.register({name:'watch-status',description:'Show Motet connection status without secrets.',immediate:true});
-      await $.command.register({name:'watch-retry-receipts',description:'Retry held receipts in this original Motet enrollment.',argumentHint:'<request-id>',immediate:true});
-      await $.command.register({name:'watch-disconnect',description:'Keep this chat disconnected until explicit reconnect.',immediate:true});
-      state.timer = $.clock.every(2000,()=>{
-        // Count actual dispatch before any supervisor gate, never imply installation is dispatch.
-        state.timerTicks = Math.min(Number.MAX_SAFE_INTEGER,state.timerTicks + 1);
-        return supervisor($,state);
-      });
+      await registerCommands($);
+      startTimer($,state);
     } catch {state.error = 'Motet command registration failed.';}
     return next(e);
   });
   on('command.run',async($,e,next)=>{
+    if (!['exit','logout'].includes(e.command)) resume($,state).catch(()=>{});
     if (TRANSITIONS.has(e.command)) {invalidateEligibility(state); suspend($,state); return next(e);}
     const owner = ['composer','bridge'].includes(e.origin?.kind);
     if (e.command === 'watch-status') {
@@ -995,14 +1026,17 @@ export function register(on) {
     finally {state.connecting = false;}
   }).catch(($,e,next)=>{stop(state); return ['watch-connect','watch-disconnect','watch-status','watch-setup','watch-retry-receipts'].includes(e.command)?{text:'Motet command failed; no automatic request retry.'}:next(e);});
   on('prompt.submit',async($,e,next)=>{
+    resume($,state).catch(()=>{});
     try {await observeInput($,state,e);} catch { /* Native input is never blocked. */ }
     return next(e);
   });
   on('session.receive',async($,e,next)=>{
+    resume($,state).catch(()=>{});
     try {await observeInput($,state,e);} catch { /* Native input is never blocked. */ }
     return next(e);
   });
   on('turn.start',async($,e,next)=>{
+    resume($,state).catch(()=>{});
     try {
       const request = state.flight, data = state.data, eligibility = state.eligibilityEpoch;
       if (request && data && request.kind!=='peer_reply_notice' && !request.turn_id && e.agentId === undefined &&
@@ -1017,6 +1051,7 @@ export function register(on) {
     return next(e);
   });
   on('turn.complete',async($,e,next)=>{
+    resume($,state).catch(()=>{});
     try {
       if (e.agentId !== undefined || !turnIdentifier(e.turnId)) return next(e);
       const bound = state.bound.get(e.turnId), request = bound?.request, data=state.data, eligibility=state.eligibilityEpoch;
@@ -1043,5 +1078,6 @@ export function register(on) {
     } catch { /* Retained completion can replay without a new prompt. */ }
     return next(e);
   });
+  on('session.attach',async($,e,next)=>{resume($,state).catch(()=>{}); return next(e);});
   on('session.end',async($,e,next)=>{invalidateEligibility(state); suspend($,state); return next(e);});
 }

@@ -92,6 +92,7 @@ export function publicStatus(state, owner, now) {
     pending:state.flight?.request_id || null, setup:!!state.config, registration:state.connected?'connected':'waiting', error:state.error || '', limitation:LIMITATION,
     start_seen:state.startSeen === true, startup_interactive:typeof state.startupInteractive === 'boolean' ? state.startupInteractive : null,
     startup_surface:surfaceRoster([state.startupSurface])?.[0] ?? null, timer_installed:!!state.timer,
+    timer_resumed:state.resumed === true,
     timer_ticks:Number.isSafeInteger(state.timerTicks) && state.timerTicks >= 0 ? state.timerTicks : 0,
     current_surfaces:surfaceRoster(state.currentSurfaces),
     deferred_receipts:owner ? deferredReceiptStatus(state,now,conflicts) : null,

@@ -33,17 +33,17 @@ function observationBus(summary=()=> ''){
   return {wait,notify(){for(const check of [...listeners])check();},get pending(){return listeners.size;}};
 }
 
-async function harness({storage=new Map(), claimed=true, submit, fetch, nativeId=NATIVE, project='/fictional/project', storeSet, startup={surface:'desktop',isInteractive:true}, surfaces=['desktop'], surfaceRead, root, platform='macos', folderProtocol=true}={}) {
-  const hooks=new Map(),timers=[],calls=[],submissions=[],settlements=[],passed=[],stores=[];
+async function harness({storage=new Map(), claimed=true, submit, fetch, nativeId=NATIVE, project='/fictional/project', storeSet, startup={surface:'desktop',isInteractive:true}, surfaces=['desktop'], surfaceRead, root, platform='macos', folderProtocol=true, start=true, commandRegister}={}) {
+  const hooks=new Map(),timers=[],registeredCommands=[],calls=[],submissions=[],settlements=[],passed=[],stores=[];
   const bus=observationBus(()=>JSON.stringify({calls:calls.length,submissions:submissions.length,stores:stores.length}));
   let failIdentity=false,failSurfaces=false,roster=surfaces;
   let native=nativeId,cwd=project,now=100000,failStore=false,generation=GENERATION,rootDir=root;
   const claim={request_id:REQUEST,attempt_id:ATTEMPT,native_id:nativeId,generation:GENERATION,envelope:ENVELOPE,expires_at:1000};
   const response=()=>({version:1,native_id:native,generation,heartbeat_interval_ms:2000,lease_seconds:12,...(folderProtocol?{folder_protocol:1}:{})});
-  const $={session:{id:async()=>{if(failIdentity)throw Error('identity unavailable');return native;},cwd:async()=>cwd,...(root===undefined?{}:{root:async()=>{if(rootDir instanceof Error)throw rootDir;return rootDir;}}),...(platform===null?{}:{info:async()=>({platform})}),surfaces:async()=>{if(failSurfaces)throw Error('private surface read failure /fictional/private');return surfaceRead?surfaceRead():roster;}},command:{register:async()=>{}},
+  const $={session:{id:async()=>{if(failIdentity)throw Error('identity unavailable');return native;},cwd:async()=>cwd,...(root===undefined?{}:{root:async()=>{if(rootDir instanceof Error)throw rootDir;return rootDir;}}),...(platform===null?{}:{info:async()=>({platform})}),surfaces:async()=>{if(failSurfaces)throw Error('private surface read failure /fictional/private');return surfaceRead?surfaceRead():roster;}},command:{register:async spec=>{if(commandRegister)await commandRegister(spec);registeredCommands.push(spec.name);bus.notify();}},
     store:{get:async key=>storage.has(key)?copy(storage.get(key)):undefined,keys:async()=>[...storage.keys()],
       set:async(key,value)=>{if(failStore)throw Error('disk');if(storeSet)await storeSet(key,copy(value));storage.set(key,copy(value));stores.push({key,value:copy(value)});bus.notify();}},
-    clock:{now:async()=>now,every:(delay,fn)=>{const timer={delay,fn,cancelled:false,cancel(){this.cancelled=true;}};timers.push(timer);return timer;}},
+    clock:{now:async()=>now,every:(delay,fn)=>{const timer={delay,fn,cancelled:false,cancel(){this.cancelled=true;}};timers.push(timer);bus.notify();return timer;}},
     prompt:{submit:async value=>{
       submissions.push(value);bus.notify();
       try{const result=submit?await submit(value):{text:value.text};settlements.push({value,result});bus.notify();return result;}
@@ -94,8 +94,8 @@ async function harness({storage=new Map(), claimed=true, submit, fetch, nativeId
       await new Promise(resolve=>setImmediate(resolve));
     }
   };
-  await call('session.start',{cwd,...startup});
-  return {$,storage,claim,calls,submissions,settlements,timers,passed,stores,command,call,waitForEvent,waitCall,waitAck,ownData,drive,tick,
+  if(start)await call('session.start',{cwd,...startup});
+  return {$,storage,claim,calls,submissions,settlements,timers,registeredCommands,passed,stores,command,call,waitForEvent,waitCall,waitAck,ownData,drive,tick,
     wait:(predicate,label)=>bus.wait(predicate,label),
     waitSubmission:(count=1)=>bus.wait(()=>submissions.length>=count&&submissions[count-1],'native submission '+count),
     waitSettlement:(count=1)=>bus.wait(()=>settlements.length>=count&&settlements[count-1],'native settlement '+count),
@@ -2088,6 +2088,102 @@ test('bad large peer negotiation and oversized HTTP response never submit native
   assert.equal(h.submissions.length,0);
   assert.match(JSON.parse((await h.command('watch-status')).text).error,/connection interrupted/);
  }
+});
+
+// A /reload-plugins in a live chat runs register() again and stops the old timer, but the host may not send the
+// reloaded module a session.start. These start the harness without one.
+const COMMANDS=['watch-setup','watch-connect','watch-status','watch-retry-receipts','watch-disconnect'];
+const liveTimers=h=>h.timers.filter(t=>!t.cancelled);
+const statusOf=async h=>JSON.parse((await h.command('watch-status')).text);
+
+test('a reloaded module with no session.start puts back its commands and one timer, then registers and polls',async()=>{
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+    submit:()=>{throw Error('a resumed plugin must not submit input by itself')}});
+  assert.equal(h.timers.length,0);assert.deepEqual(h.registeredCommands,[]);
+  // Several events arrive together: only one resume runs, and only one timer is installed.
+  await Promise.all([h.call('prompt.submit',{text:'fictional owner prompt'}),h.call('turn.start',{text:'fictional owner prompt',turnId:'owner-turn'}),
+    h.call('session.receive',{text:'fictional delivery'}),h.call('session.attach',{surface:'desktop',clientId:'fictional-client'})]);
+  await h.wait(()=>h.timers.length===1,'resumed timer');
+  await h.call('turn.complete',{turnId:'owner-turn',answer:'fictional',isAborted:false,reason:'answer'});
+  await h.call('prompt.submit',{text:'another fictional prompt'});
+  for(let i=0;i<5;i++)await yieldWhileHeld();
+  assert.equal(h.timers.length,1);assert.equal(liveTimers(h).length,1);assert.equal(h.timers[0].delay,2000);
+  assert.deepEqual(h.registeredCommands,COMMANDS);
+  // The events passed through unchanged.
+  assert.deepEqual(h.passed.map(p=>p.name).sort(),['prompt.submit','prompt.submit','session.attach','session.receive','turn.complete','turn.start']);
+  let status=await statusOf(h);
+  assert.equal(status.start_seen,false);assert.equal(status.startup_interactive,null);assert.equal(status.startup_surface,null);
+  assert.equal(status.timer_installed,true);assert.equal(status.timer_resumed,true);assert.equal(status.connected,false);
+  await h.tick();await h.tick();
+  assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);
+  assert.equal(h.calls.find(c=>c.url.endsWith('/register')).body.native_id,NATIVE);
+  assert(h.calls.some(c=>c.url.endsWith('/poll')),'heartbeat resumed');
+  status=await statusOf(h);assert.equal(status.connected,true);assert.equal(status.timer_ticks,2);
+  assert.equal(h.timers.length,1);assert.equal(h.submissions.length,0);
+});
+
+test('a resumed module keeps the opt-out: a disconnected chat stays disconnected until the owner reconnects',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG],['watch-owner-preferences-v1:'+NATIVE,{version:1,disconnected:true}]]);
+  const h=await harness({start:false,storage,claimed:false,fetch:globalFetch});
+  await h.call('prompt.submit',{text:'fictional owner prompt'});await h.wait(()=>h.timers.length===1,'resumed timer');
+  await h.tick();await h.tick();await h.tick();
+  assert.equal(h.calls.length,0);assert.equal((await statusOf(h)).connected,false);
+  await h.command('watch-connect');await h.tick();
+  assert(h.calls.some(c=>c.url.endsWith('/register')));assert.equal(h.timers.length,1);
+});
+
+test('a resumed module invents no startup facts: without Desktop evidence it waits, as a headless start does',async()=>{
+  const h=await harness({start:false,surfaces:[],claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+  await h.call('turn.start',{text:'fictional',turnId:'turn-a'});await h.wait(()=>h.timers.length===1,'resumed timer');
+  await h.tick();await h.tick();assert.equal(h.calls.length,0);
+  h.setSurfaces(['desktop']);await h.tick();
+  assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);
+});
+
+test('a resumed module never resubmits an attempt left unfinished before the reload',async()=>{
+  const h=await harness();await h.enroll();await h.tick();await h.waitSubmission();await h.waitAck('submitted');
+  const reloaded=await harness({start:false,storage:h.storage,claimed:false});
+  await reloaded.call('prompt.submit',{text:'fictional owner prompt'});await reloaded.wait(()=>reloaded.timers.length===1,'resumed timer');
+  await reloaded.tick();await reloaded.waitForEvent('unknown');
+  assert.equal(reloaded.submissions.length,0);
+});
+
+test('session.start after a resume replaces its timer and leaves exactly one',async()=>{
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
+  await h.call('prompt.submit',{text:'fictional owner prompt'});await h.wait(()=>h.timers.length===1,'resumed timer');
+  await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:false});
+  assert.equal(h.timers.length,2);assert.equal(h.timers[0].cancelled,true);assert.equal(liveTimers(h).length,1);
+  const status=await statusOf(h);assert.equal(status.start_seen,true);assert.equal(status.timer_resumed,false);
+  await h.call('prompt.submit',{text:'later fictional prompt'});await h.call('turn.start',{text:'later',turnId:'turn-b'});
+  for(let i=0;i<5;i++)await yieldWhileHeld();
+  assert.equal(h.timers.length,2);assert.equal(liveTimers(h).length,1);
+  await h.tick();assert(h.calls.some(c=>c.url.endsWith('/register')));
+});
+
+test('a session.start that arrives while a resume is still registering wins, and no second timer appears',async()=>{
+  const gate=latch();let first=true;
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+    commandRegister:()=>{if(first){first=false;return gate.hold();}}});
+  await h.call('prompt.submit',{text:'fictional owner prompt'});
+  await bounded(gate.entered,'resume registering');
+  await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  assert.equal(h.timers.length,1);
+  gate.release();
+  for(let i=0;i<5;i++)await yieldWhileHeld();
+  assert.equal(h.timers.length,1);assert.equal(liveTimers(h).length,1);
+  assert.equal((await statusOf(h)).timer_resumed,false);
+});
+
+test('a resume whose command registration fails tries again on a later event',async()=>{
+  let fail=true;
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+    commandRegister:()=>{if(fail)throw Error('registration refused');}});
+  await h.call('prompt.submit',{text:'fictional owner prompt'});
+  for(let i=0;i<5;i++)await yieldWhileHeld();
+  assert.equal(h.timers.length,0);assert.equal((await statusOf(h)).error,'Motet command registration failed.');
+  fail=false;
+  await h.call('turn.start',{text:'fictional',turnId:'turn-c'});await h.wait(()=>h.timers.length===1,'resumed timer');
+  assert.equal(liveTimers(h).length,1);
 });
 
 test('the module calls every host API at its call site, so the official host loads it',async()=>{
