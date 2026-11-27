@@ -756,6 +756,8 @@ async function supervisor($, state) {
       state.data = null; state.key = null; state.bound.clear();
       state.retryAt = 0; state.failures = 0;
       if (preference?.disconnected === true && UUID.test(id)) await deliverPendingOptOut($,state,id).catch(() => {});
+      // Off because of a disconnect this copy did not make: say so, so /watch-status explains it.
+      if (preference?.disconnected === true && UUID.test(id) && !state.ownDecisions.has(id) && !state.error) state.error = STORED_OFF;
       if (preference?.disconnected === true || !UUID.test(id)) return;
     }
     const surfaces = await readSurfaces($,state,eligibilityEpoch);
@@ -854,6 +856,7 @@ async function supervisor($, state) {
     if (error.code === 'decision_superseded' && UUID.test(decidedFor ?? '')) {
       state.serverOptedOut.add(decidedFor);
       state.decisionReads.delete(decidedFor);
+      recordSuperseded(state,decidedFor);
       state.error = OTHER_WINDOW;
       return;
     }
@@ -1070,6 +1073,23 @@ function settleYieldedOptOut($, state, id, decision) {
   }
 }
 
+// What Motet did with this copy's own decision for a chat, kept the same way on every path (a command's commit, a
+// pending opt-out told later, a recovered ticket, a pairing). Committed: the copy holds the ticket and the Motet
+// that issued it, and nothing stays pending. Refused because a newer decision exists: the copy drops its own
+// decision for the chat, so from then on it follows Motet and the shared record.
+function recordCommitted(state, id, seq, port) {
+  state.tickets.set(id, seq);
+  state.ticketPorts.set(id, port);
+  state.ownCommands.delete(id);
+}
+
+function recordSuperseded(state, id) {
+  state.ownDecisions.delete(id);
+  state.tickets.delete(id);
+  state.ticketPorts.delete(id);
+  state.ownCommands.delete(id);
+}
+
 // Commits this decision at Motet under the ticket its command reserved, on the Motet that issued it. A decision with
 // no ticket is not committed: Motet then decides by the chat's current decision. Answers the ticket number, null
 // where Motet does not order this decision, or 'superseded' when a decision with a newer ticket was committed.
@@ -1100,7 +1120,7 @@ async function savePreference($, state, id, disconnected, decision, ticket = nul
     else {
       try {
         const result = await commitDecision($,state,id,disconnected,ticket);
-        if (result === 'superseded') return 'elsewhere';
+        if (result === 'superseded') {recordSuperseded(state,id); return 'elsewhere';}
         seq = result;
       } catch {pending = disconnected;}
     }
@@ -1109,9 +1129,12 @@ async function savePreference($, state, id, disconnected, decision, ticket = nul
       ...pending ? {pending:true,command_id:commandId(state,decision),...ticket ? {decision_seq:ticket.seq,decision_port:ticket.port} : {}} : {}});
     state.appliedDecisions.set(id, Math.max(state.appliedDecisions.get(id) ?? 0, decision));
     state.ownDecisions.set(id, disconnected);
-    const kept = seq ?? (pending && ticket ? ticket.seq : null);
-    if (kept) state.tickets.set(id, kept); else state.tickets.delete(id);
-    if (pending) state.ownCommands.set(id, commandId(state,decision)); else state.ownCommands.delete(id);
+    if (seq) recordCommitted(state,id,seq,ticket.port);
+    else {
+      state.ticketPorts.delete(id);
+      if (pending && ticket) state.tickets.set(id, ticket.seq); else state.tickets.delete(id);
+      if (pending) state.ownCommands.set(id, commandId(state,decision)); else state.ownCommands.delete(id);
+    }
     if (!disconnected) state.serverOptedOut.delete(id);
     return true;
   });
@@ -1180,7 +1203,8 @@ async function currentPreference($, state, id) {
   if (ticket && Number.isSafeInteger(stored?.decision_seq)) wins = ticket > stored.decision_seq;
   else wins = own === true && stored?.disconnected !== true;
   if (!wins) return stored;
-  const record = {version:1,disconnected:own,writer:state.clientId,...ticket ? {decision_seq:ticket} : {},
+  const record = {version:1,disconnected:own,writer:state.clientId,
+    ...ticket ? {decision_seq:ticket,...state.ticketPorts.has(id) ? {decision_port:state.ticketPorts.get(id)} : {}} : {},
     ...own && (!ticket || state.ownCommands.has(id)) ? {pending:true,...state.ownCommands.has(id) ? {command_id:state.ownCommands.get(id)} : {}} : {}};
   const operation = state.preferenceWrites.then(() =>
     state.ownDecisions.get(id) === own && state.tickets.get(id) === ticket ? $.store.set(preferenceKey(id),record) : undefined);
@@ -1237,9 +1261,20 @@ async function deliverPendingOptOut($, state, id) {
     }
     if (!ticket) return;
     const committed = await commitDecision($,state,id,true,ticket);
-    // A decision with a newer ticket won at Motet: this opt-out is no longer the owner's latest, there.
-    if (committed === 'superseded') await $.store.set(preferenceKey(id),{...current,pending:undefined,command_id:undefined});
-    else if (committed) await $.store.set(preferenceKey(id),{...current,pending:undefined,command_id:undefined,decision_seq:committed,decision_port:ticket.port});
+    if (committed === 'superseded') {
+      // A decision with a newer ticket won at Motet: this opt-out is no longer the owner's latest. The copy follows
+      // Motet from now on, and the record says what Motet holds, or at least carries this opt-out's own ticket, so
+      // every copy can see a newer one is in force. It is never left as an opt-out with no ticket.
+      recordSuperseded(state,id);
+      state.decisionReads.delete(id);
+      const latest = await motetDecision($,state,id).catch(() => null);
+      await $.store.set(preferenceKey(id), latest && latest.seq > ticket.seq ?
+        {version:1,disconnected:latest.optedOut,writer:'motet',decision_seq:latest.seq,decision_port:latest.port} :
+        {version:1,disconnected:true,writer:current.writer,decision_seq:ticket.seq,decision_port:ticket.port});
+    } else if (committed) {
+      if (current.writer === state.clientId && state.ownDecisions.get(id) === true) recordCommitted(state,id,committed,ticket.port);
+      await $.store.set(preferenceKey(id),{version:1,disconnected:true,writer:current.writer,decision_seq:committed,decision_port:ticket.port});
+    }
   });
   state.preferenceWrites = operation.catch(() => {});
   try {await operation; state.pendingRetryAt = 0;} catch { /* Told on a later contact. */ }
@@ -1265,6 +1300,7 @@ async function motetDecision($, state, id) {
 }
 
 const YIELDED_OPT_OUT = 'A newer Motet command is still running; this disconnect applies if that one does not complete.';
+const STORED_OFF = 'This chat is disconnected (by /watch-disconnect, here or in another Claude window). Run /watch-connect to reconnect it.';
 const UNPLACED = 'Motet could not confirm when this command was given, so nothing was changed. Run it again.';
 const UNREACHABLE = 'Motet could not be reached to place this command, so nothing was changed. Try again.';
 const PAIRING_REFUSED = 'Motet did not accept this pairing code, so nothing was changed. Get a fresh code from Motet.';
@@ -1474,7 +1510,7 @@ export function register(on) {
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrants:new Set(),rejectedDecisionTokens:new Set(),runningReservations:new Map(),yieldedOptOuts:new Map(),rejectedIdentity:'',decision:0,appliedDecisions:new Map(),ownDecisions:new Map(),decisionProtocol:undefined,tickets:new Map(),serverOptedOut:new Set(),pendingRetryAt:0,reservationChain:Promise.resolve(),pendingCommands:0,decisionReads:new Map(),ownCommands:new Map(),preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrants:new Set(),rejectedDecisionTokens:new Set(),runningReservations:new Map(),yieldedOptOuts:new Map(),rejectedIdentity:'',decision:0,appliedDecisions:new Map(),ownDecisions:new Map(),decisionProtocol:undefined,tickets:new Map(),ticketPorts:new Map(),serverOptedOut:new Set(),pendingRetryAt:0,reservationChain:Promise.resolve(),pendingCommands:0,decisionReads:new Map(),ownCommands:new Map(),preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
     state.lifecycle += 1;
@@ -1582,7 +1618,7 @@ export function register(on) {
           response = await post($,state,'enroll',{code:pair.code,native_id:id,project,
             ...state.decisionProtocol === 1 && ticket && ticket.port === pair.port ? {decision_seq:ticket.seq} : {}},{port:pair.port,anonymous:true});
         } catch (error) {
-          if (error.code === 'decision_superseded') return {text:OTHER_WINDOW};
+          if (error.code === 'decision_superseded') {recordSuperseded(state,id); return {text:OTHER_WINDOW};}
           if (error.status === 403) return {text:PAIRING_REFUSED};
           throw error;
         }
@@ -1630,7 +1666,7 @@ export function register(on) {
               ...state.decisionProtocol === 1 && state.tickets.has(id) ? {decision_seq:state.tickets.get(id)} : {}});
           } catch (error) {
             // Motet refused it before any connection existed: a newer opt-out came from another window or copy.
-            if (error.code === 'decision_superseded') {stop(state); return {text:OTHER_WINDOW};}
+            if (error.code === 'decision_superseded') {stop(state); recordSuperseded(state,id); return {text:OTHER_WINDOW};}
             throw error;
           }
           const refusal = await ownerActivate($,state,response,id,decision,eligibilityEpoch);

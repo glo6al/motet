@@ -3195,6 +3195,48 @@ test('a disconnect whose place Motet cannot confirm still takes effect here and 
   assert.equal(h.calls.slice(since).filter(c=>c.url.endsWith('/poll')||c.url.endsWith('/register')).length,0);
 });
 
+// A window's own disconnect, once Motet has placed it (late, because Motet was restarting or unreachable), carries
+// its ticket like any other decision: a newer reconnect from another window then stands, in that window, in the
+// window that disconnected, and in a freshly loaded copy (R3-B1). Both ways the disconnect could go pending.
+for(const how of ['cannot be placed','unreachable']){
+  test(`a window's late-placed disconnect does not undo another window's newer reconnect (${how}) (R3-B1)`,async()=>{
+    const settle=async(n=10)=>{for(let i=0;i<n;i++)await new Promise(r=>setImmediate(r));};
+    const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);let down=0;
+    const a=await harness({storage,claimed:false,fetch:(url,body,init)=>{
+      if(down>0&&url.endsWith('/decision')){down--;throw Error('connection refused');}return motet.fetch(url,body,init);}});
+    await a.command('watch-connect');await a.tick();
+    // Window A disconnects while Motet restarts (both early attempts refused, then back: cannot be placed), or while
+    // Motet cannot be reached at all.
+    down=how==='cannot be placed'?2:1000;
+    assert.match((await a.command('watch-disconnect')).text,/Motet disconnected/);
+    assert.equal(storage.get(PREF).pending,true);
+    down=0;a.setNow(200000);await a.tick();await settle();
+    assert.equal(motet.optedOut,true,'A told Motet its opt-out');
+    assert.equal(storage.get(PREF).pending,undefined);assert(Number.isSafeInteger(storage.get(PREF).decision_seq));
+    // The owner then reconnects in window B.
+    const b=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+    assert.match((await b.command('watch-connect')).text,/reconnect scheduled/);
+    for(let i=0,now=300000;i<6;i++){now+=40000;a.setNow(now);b.setNow(now);await a.tick();await settle();await b.tick();await settle();}
+    assert.equal(motet.optedOut,false,'Motet holds the newer reconnect');
+    assert.equal(storage.get(PREF).disconnected,false,'the shared record follows the newer reconnect');
+    assert(Number.isSafeInteger(storage.get(PREF).decision_seq));
+    assert.equal((await statusOf(b)).connected,true,'B stays connected');
+    // A freshly loaded copy on the same store connects too.
+    const c=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+    for(let i=0,now=600000;i<3;i++){now+=40000;c.setNow(now);await c.tick();await settle();}
+    assert.equal(motet.optedOut,false);assert(c.calls.some(x=>x.url.endsWith('/poll')||x.url.endsWith('/register')));
+  });
+}
+
+test('a copy kept off by a disconnect it did not make says so in /watch-status',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG],[PREF,{version:1,disconnected:true,writer:'fictional-other-window'}]]);
+  const h=await harness({storage,claimed:false,fetch:globalFetch});
+  await h.tick();
+  const status=await statusOf(h);
+  assert.equal(status.connected,false);
+  assert.equal(status.error,'This chat is disconnected (by /watch-disconnect, here or in another Claude window). Run /watch-connect to reconnect it.');
+});
+
 test('a /watch-disconnect that changes nothing keeps the chat\'s Desktop evidence',async()=>{
   const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
   const h=await harness({startup:{surface:null,isInteractive:false},surfaces:['desktop'],storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
