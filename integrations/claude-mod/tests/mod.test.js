@@ -2914,6 +2914,30 @@ test('two commands in one copy whose identity reads finish out of order keep the
   assert.equal(storage.get(PREF).disconnected,false);
 });
 
+test('a command that gives up takes its own ticket with it, so an older opt-out cannot move above a later reconnect (R10-S1)',async()=>{
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]),gate=latch();let holdPref=false;
+  const h=await harness({storage,claimed:false,root:'/fictional/project',fetch:(url,body,init)=>motet.fetch(url,body,init),
+    storeSet:async key=>{if(holdPref&&key===PREF){holdPref=false;await gate.hold();}}});
+  // 1. An opt-out commits ticket 1 at Motet; its local write is held, so later writes queue behind it.
+  holdPref=true;
+  const first=h.command('watch-disconnect');await bounded(gate.entered,'first opt-out write');
+  assert.equal(motet.latest,1);
+  // 2. Disconnect A reserves ticket 2 and queues.
+  const a=h.command('watch-disconnect');
+  await h.wait(()=>motet.issued===2,'A reserved');
+  // 3. Another window's connect commits ticket 3.
+  motet.fetch('/decision',{opted_out:false});
+  assert.equal(motet.latest,3);
+  // 4. Connect B reserves ticket 4, then gives up: this chat is working outside its project folder.
+  h.setCwd('/fictional/elsewhere');
+  assert.match((await h.command('watch-connect')).text,/outside its project folder/);
+  assert.equal(motet.issued,4);
+  h.setCwd('/fictional/project');
+  gate.release();await first;
+  assert.equal((await a).text,'A newer Motet command from another Claude window replaced this one; nothing was changed.');
+  assert.equal(motet.optedOut,false);assert.equal(motet.latest,3);
+});
+
 test('a reconnect retries a reservation that failed once, and one that could not reserve is not placed at Motet (R9-N2)',async()=>{
   // A single failed reservation is retried, and the reconnect is committed in its place.
   {

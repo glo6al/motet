@@ -927,7 +927,8 @@ async function reserveTicket($, state, id) {
 // The tickets one copy holds for a chat go to its commands in the order the owner gave them, whatever order the
 // host answered their first reads in: after each reservation they are dealt out again, lowest to the oldest
 // command. No command waits for another (an opt-out is never held up by an older command's slow read). A command
-// takes its ticket when it commits; one that gives up leaves its place, and the lowest ticket goes with it.
+// takes its ticket when it commits; one that gives up takes its own ticket with it, so no other command moves to a
+// later place than the one it was dealt.
 function deal(state, id, entries, tickets) {
   entries.sort((a, b) => a.decision - b.decision);
   tickets.sort((a, b) => a - b);
@@ -950,10 +951,11 @@ function takeTicket(state, id, decision) {
 }
 
 function dropTicket(state, id, decision) {
-  const entries = state.heldTickets.get(id) ?? [];
-  if (!entries.some(entry => entry.decision === decision)) return;
-  const tickets = entries.map(entry => entry.ticket).sort((a, b) => a - b).slice(1);
-  deal(state, id, entries.filter(entry => entry.decision !== decision), tickets);
+  const entries = state.heldTickets.get(id) ?? [], gone = entries.find(entry => entry.decision === decision);
+  if (!gone) return;
+  // The rest were dealt in order already, so dealing their own tickets again changes no one's.
+  const rest = entries.filter(entry => entry !== gone);
+  deal(state, id, rest, rest.map(entry => entry.ticket));
 }
 
 // Commits this decision at Motet: under its reserved ticket, or, for an opt-out only, under a new one when it has
