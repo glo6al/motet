@@ -1100,7 +1100,7 @@ class ManagedClaude:
                 _fail()
             clean['error'] = (OWNER_STOP_ERROR if clean.get('error') == 'owner_stop'
                               or owner_stop and clean.get('error') == 'shutdown'
-                              and terminal is not None and terminal >= owner_stop - 1 else
+                              and terminal is not None and terminal >= owner_stop else
                               'Managed delivery failed or is uncertain.' if clean.get('error') else '')
             reply = clean.get('reply', '')
             if type(reply) is not str:
@@ -1128,7 +1128,7 @@ class ManagedClaude:
                 _fail()
             clean.update(_permission_resolution(permission))
             if (owner_stop and clean['resolutionReason'] == 'shutdown'
-                    and (clean['resolvedAt'] is None or clean['resolvedAt'] >= owner_stop - 1)):
+                    and clean['resolvedAt'] is not None and clean['resolvedAt'] >= owner_stop):
                 clean['resolutionReason'] = 'owner_stop'
             clean['inputAvailable'] = permission.get('inputAvailable', permission.get('state') not in ('unsupported', 'rejected'))
             if type(clean['inputAvailable']) is not bool:
@@ -1144,11 +1144,14 @@ class ManagedClaude:
                 or exit_receipt.get('confirmed') is not True or type(exit_receipt.get('code')) is not int
                 or exit_receipt.get('incarnation') != row['incarnation'] or value['state'] != 'exited'):
             _fail()
-        survivors = value.get('treeSurvivors', [])
-        if survivors is not None and not _identities(survivors):
-            _fail()
-        return dict(runId=row['runId'], nativeId=row['nativeId'], incarnation=row['incarnation'],
-                    treeSurvivors=survivors,
+        # What of Claude's tree outlived the owner's stop, as the supervisor saw it while ending it: a list, or None
+        # (not seen completely). Absent: the supervisor has not seen it at all, which is no evidence either way.
+        tree = {}
+        if 'treeSurvivors' in value:
+            if value['treeSurvivors'] is not None and not _identities(value['treeSurvivors']):
+                _fail()
+            tree = dict(treeSurvivors=value['treeSurvivors'])
+        return dict(runId=row['runId'], nativeId=row['nativeId'], incarnation=row['incarnation'], **tree,
                     cwd=row['folder']['path'], state=value['state'], nativeExit=exit_receipt,
                     identityVerified=value.get('identityVerified') is True, messages=messages,
                     permissions=permissions, recoveryRequired=value['state'] == 'uncertain',
@@ -1208,8 +1211,8 @@ class ManagedClaude:
                 current['occupied'] = False
             self._save(db, current)
             stop, pending = self._stop_reconciled(db, run_id, snapshot)
-            if stop is not None and stop['outcome'] == 'stopped' and not snapshot['nativeExit']:
-                self._stopped_without_receipt(snapshot, stop)
+            if stop is not None and snapshot['state'] == 'exited' and not snapshot['nativeExit']:
+                self._stopped_without_receipt(snapshot, stop)     # Claude has ended, whatever else still runs
             for message in snapshot['messages']:
                 old = db.execute('SELECT run,source,digest,data FROM messages WHERE id=?', (message['requestId'],)).fetchone()
                 if old and old[:3] == (run_id, message['source'], message.get('digest')):
@@ -1615,7 +1618,7 @@ class ManagedClaude:
         return self.status(run_id)
 
     # The owner's stop of a chat Motet started. Both its record and each stop request are rows of the registry's
-    # ``operations`` table: the record (one per run) under an ID derived from the run (STOP_RECORD), each request under
+    # ``operations`` table: the record (one per run) under 'owner-stop-record:<run>', each request under
     # its own request ID (source 'stop'), so a request ID is acted on once and cannot be reused for a message or a
     # permission decision. No table is added: the registry's tables are exactly the ones the attachment namespace
     # fence checks, and an older Motet reads these rows as operations it never asks about. They live in the private
@@ -1624,7 +1627,9 @@ class ManagedClaude:
 
     @classmethod
     def _stop_record_id(cls, run_id):
-        return str(uuid.uuid5(uuid.UUID(run_id), 'watch-' + cls.STOP_RECORD + '-v1'))
+        """Not a UUID: every request ID (a message's, a decision's, a stop's, an attachment's) must be one, so no
+        request can ever claim, or be refused by, this row's ID."""
+        return cls.STOP_RECORD + ':' + run_id
 
     @classmethod
     def _stop_record(cls, db, run_id):
@@ -1675,8 +1680,8 @@ class ManagedClaude:
         before = dict(record)
         pending = None
         if snapshot['state'] == 'exited':
-            if snapshot.get('evidenceAvailable') is True:
-                record['survivors'] = _merged(record.get('survivors', []), snapshot.get('treeSurvivors', []))
+            if snapshot.get('evidenceAvailable') is True and 'treeSurvivors' in snapshot:
+                record['survivors'] = _merged(record.get('survivors', []), snapshot['treeSurvivors'])
             survivors = record.get('survivors', None)
             if not active:
                 if 'survivors' in record and survivors == []:
@@ -1715,7 +1720,8 @@ class ManagedClaude:
                 message.update(state='failed', error=OWNER_STOP_ERROR)
         for permission in snapshot['permissions']:
             if permission.get('decision') is None and permission.get('state') in ('pending', 'unknown'):
-                permission.update(state='cancelled', resolutionReason='native_exit', resolvedAt=stop['stoppedAt'],
+                permission.update(state='cancelled', resolutionReason='native_exit',
+                                  resolvedAt=stop['stoppedAt'] or stop['lastAttemptAt'],
                                   canAllow=False, canDeny=False)
 
     @staticmethod
@@ -1770,7 +1776,7 @@ class ManagedClaude:
             if agent != 'c:' + row['nativeId'] or not row['nativeReceipt']:
                 _fail('not_managed', 404)
         self.status(run_id)               # the chat's own state now, before deciding whether it has already ended
-        act = claimed = False
+        act = claimed = already = False
         try:
             with self._registry(reservation_id=request_id) as db:
                 row = self._row(db, run_id)
@@ -1782,8 +1788,18 @@ class ManagedClaude:
                 record = self._stop_record(db, run_id)
                 with self._lock:
                     busy = run_id in self._stopping
-                if old or busy or record is not None and record['outcome'] == 'stopped':
-                    pass
+                if old:
+                    already = bool(json.loads(db.execute('SELECT data FROM operations WHERE id=?',
+                                                         (request_id,)).fetchone()[0]).get('already'))
+                elif busy or record is not None and record['outcome'] == 'stopped':
+                    # Accepted without acting (already stopped, or a stop is being carried out): the ID is bound to
+                    # this run all the same, so it can never name another run or operation later.
+                    if db.execute('SELECT count(*) FROM operations').fetchone()[0] >= MAX_MESSAGES:
+                        _fail('capacity', 429)
+                    already = not busy
+                    db.execute('INSERT INTO operations VALUES (?,?,?,?)', (request_id, run_id, digest, json.dumps(
+                        dict(requestId=request_id, runId=run_id, source='stop', by='owner', digest=digest,
+                             at=time.time(), already=already))))
                 elif record is None and not row['occupied'] and row['state'] == 'exited':
                     _fail('already_ended')
                 else:
@@ -1804,7 +1820,6 @@ class ManagedClaude:
                 with self._lock:
                     self._stopping.discard(run_id)
             raise
-        already = not act and not old and record is not None and record['outcome'] == 'stopped'
         if act:
             try:
                 self._end(run_id, request_id)
@@ -1866,7 +1881,9 @@ class ManagedClaude:
                 self._save(db, row)
                 record = self._stop_record(db, run_id)
                 if record is not None and record['outcome'] != 'stopped' and 'survivors' not in record:
-                    record['survivors'] = []              # Motet saw nothing of Claude's left (its own evidence)
+                    # Windows: the job ended everything in it. POSIX: Claude was not seen ending, so what it started
+                    # cannot all be seen (a program that left its group and lost its parent is invisible): unknown.
+                    record['survivors'] = [] if ps.WIN else None
                     self._save_stop(db, record)
         return confirmed
 

@@ -109,9 +109,6 @@ class FakeTransport:
             raise TimeoutError()
         return self.code
 
-    def leftovers(self):
-        return self.left
-
     def end_tree(self, gentle=3, firm=2):
         # The owner's stop: the whole tree ends, or (stubborn) something in it is still running after SIGKILL.
         self.ends += 1
@@ -547,20 +544,33 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(snapshot['treeSurvivors'])
         self.assertIsNone(managed.read_snapshot(self.run)['treeSurvivors'])
 
-    def test_a_stop_after_claude_ended_by_itself_still_looks_at_its_group(self):
+    def test_a_stop_after_claude_ended_by_itself_records_its_tree_as_unseen(self):
         runner = self.runner()
         self.transport.code = 0
         runner.step()                                      # Claude's own exit, recorded before the stop arrives
-        self.transport.left = [[4343, 1900000000.0]]
         self.assertEqual(runner.stop(uid())['state'], 'exited')
         self.assertEqual(self.transport.ends, 0, 'nothing is signalled')
-        self.assertEqual(runner.snapshot()['treeSurvivors'], [[4343, 1900000000.0]])
+        self.assertIsNone(runner.snapshot()['treeSurvivors'], 'what it started can no longer all be seen')
+
+    def test_a_stop_whose_wait_fails_keeps_its_tree_unseen_through_the_late_exit_and_a_retry(self):
+        runner = self.runner()
+        self.transport.stubborn = True                     # the tree end's wait for Claude fails
+        self.assertEqual(runner.stop(uid())['state'], 'unknown')
+        self.assertIsNone(runner.snapshot()['treeSurvivors'])
+        self.transport.code = 0
+        runner.step()                                      # Claude exits later
+        self.assertIsNone(runner.snapshot()['treeSurvivors'], 'the late exit is no evidence about the tree')
+        self.assertEqual(runner.stop(uid())['state'], 'exited')   # Try again with Claude already reaped
+        self.assertIsNone(runner.snapshot()['treeSurvivors'], 'nor is a retry after it')
 
     def test_more_survivors_than_are_kept_are_recorded_as_unseeable(self):
         self.assertIsNone(self.stopped_with([[n, 1.0] for n in range(1, 66)])['treeSurvivors'])
 
     def test_a_tree_seen_to_end_records_no_survivors(self):
-        self.assertNotIn('treeSurvivors', self.stopped_with([]))
+        self.assertEqual(self.stopped_with([])['treeSurvivors'], [])
+
+    def test_before_any_stop_the_tree_is_not_reported(self):
+        self.assertNotIn('treeSurvivors', self.runner().snapshot())
 
     def test_an_unconfirmed_owner_stop_keeps_the_supervisor_listening_for_another_try(self):
         runner = self.runner()

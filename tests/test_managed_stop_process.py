@@ -11,7 +11,7 @@ the stop goes through the real route.
 
 Checked: Stop through the route ends Claude and its group, and the supervisor then ends; a Claude that ignores
 SIGTERM is ended by SIGKILL; a process in a session of its own is never signalled and keeps the stop unconfirmed until
-it is gone; without its supervisor nothing is signalled, and the end is confirmed only once nothing is seen running;
+it is gone; without its supervisor nothing is signalled and the end is never confirmed (the whole tree cannot be seen);
 a bystander whose command line names the run is never adopted as its supervisor; a recorded process ID that now names
 another process is never signalled; an older supervisor's shutdown leaves the stop unconfirmed while its tree runs.
 Only the group signal is ever sent. No real Claude is started; fictional names only.
@@ -240,7 +240,7 @@ class MacStopTests(unittest.TestCase):
         self.end_ourselves('detached')
         self.assertEqual(manager.status(run_id)['ownerStop']['outcome'], 'stopped', 'confirmed once it is gone')
 
-    def test_without_its_supervisor_nothing_is_signalled_and_the_end_is_confirmed_only_when_seen(self):
+    def test_without_its_supervisor_nothing_is_signalled_and_the_end_is_never_confirmed(self):
         manager, run_id, native = self.start('fictional-linger')
         supervisor = self.supervisors[-1]
         supervisor.kill()
@@ -252,7 +252,9 @@ class MacStopTests(unittest.TestCase):
             self.assertTrue(alive(pid), name + ' is not signalled without its supervisor')
         self.end_ourselves('claude', 'grandchild')
         result = manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)           # Try again
-        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'stopped'))
+        # Claude is seen gone and its slot is released, but without its supervisor nothing showed the whole tree
+        # ending (a program that left its group and lost its parent would be invisible): never "stopped".
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
         with manager._registry() as db:
             self.assertFalse(manager._row(db, run_id)['occupied'])
 
@@ -278,7 +280,7 @@ class MacStopTests(unittest.TestCase):
             self.assertIsNone(bystander.poll(), 'never adopted from its command line, lock held')
         finally:
             os.close(held)                                           # and later released
-        self.assertEqual(manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)['ownerStop']['outcome'], 'stopped')
+        manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)
         self.assertIsNone(bystander.poll(), 'never adopted from its command line, lock released')
 
     def test_a_process_id_that_names_another_process_is_never_signalled(self):
@@ -353,7 +355,7 @@ class ProcessTreeTests(unittest.TestCase):
         self.assertEqual(groups, [signal.SIGTERM], 'only the group is ever signalled')
         self.assertEqual(left, {}, 'the replacement is not the recorded process: neither signalled nor counted')
 
-    def test_claude_already_reaped_its_group_is_reported_not_signalled(self):
+    def test_claude_already_reaped_its_tree_is_unknown_and_not_signalled(self):
         script = ("import subprocess, sys\n"
                   "a = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
                   "print(a.pid, flush=True)\n")
@@ -367,8 +369,8 @@ class ProcessTreeTests(unittest.TestCase):
         with mock.patch.object(runner.os, 'killpg', side_effect=AssertionError('a reaped group was signalled')):
             code, survivors = transport.end_tree(gentle=.2, firm=.2)
         self.assertEqual(code, 0)
-        self.assertEqual([pid for pid, _ in survivors], [child])
-        self.assertTrue(alive(child))
+        self.assertIsNone(survivors, 'what it started can no longer all be seen: unknown, never an empty tree')
+        self.assertTrue(alive(child), 'and nothing was signalled')
 
     def test_an_unreadable_process_table_signals_nothing(self):
         def broken(*args, **kwargs):

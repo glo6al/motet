@@ -408,7 +408,8 @@ class ManagedFixture:
         return dict(runId=path.name, nativeId=manifest['nativeId'], incarnation=manifest['incarnation'],
                     cwd=self.folder.path, state='exited' if ended else 'ready',
                     nativeExit=dict(confirmed=True, code=-15, incarnation=manifest['incarnation']) if ended else None,
-                    identityVerified=True, messages=list(self.messages.values()), permissions=[])
+                    identityVerified=True, messages=list(self.messages.values()), permissions=[],
+                    **(dict(treeSurvivors=[]) if ended else {}))     # the stop saw the whole tree end
 
     def request(self, path, command, params):
         self.calls.append(command)

@@ -269,6 +269,22 @@ class NamespaceTests(unittest.TestCase):
                     self.assertEqual(captured(lambda: native_action(root, namespace, uid()))[0], 'ok')
                     self.assertEqual(captured(lambda: manager.action('enqueue', run_id, uid()))[0], 'ok')
 
+    def test_the_stop_record_never_holds_an_id_another_operation_can_hold(self):
+        manager = ManagedFixture(self.root, self.namespace)
+        run, other = manager.start(), manager.start()
+        key = manager.manager._stop_record_id(run)
+        with self.assertRaises(Exception) as refused:         # an attachment operation cannot hold it
+            native_action(self.root, self.namespace, key)
+        self.assertIn('invalid_uuid', str(refused.exception))
+        taken = uid()                                    # native first, then a stop with its own fresh ID
+        self.assertEqual(captured(lambda: native_action(self.root, self.namespace, taken))[0], 'ok')
+        agent = 'c:' + manager.manager.status(run)['nativeId']
+        self.assertEqual(manager.manager.stop(run, uid(), agent)['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(manager.manager.status(run)['ownerStop']['outcome'], 'stopped', 'status stays usable')
+        self.assertEqual(captured(lambda: manager.action('enqueue', other, uid()))[0], 'ok', 'and so does the fence')
+        with self.assertRaises(Exception):
+            native_action(self.root, self.namespace, key)
+
     def test_real_process_orderings_for_stop(self):
         """Stop and an owner attachment operation race for one request ID through the real fence, in separate
         processes and both orders: the second refuses, issues no command and writes nothing."""

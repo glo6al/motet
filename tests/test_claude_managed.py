@@ -283,8 +283,8 @@ class Fixture(unittest.TestCase):
             else:
                 snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=-15,
                                                                 incarnation=snapshot['incarnation']))
-                if getattr(self, 'survivors', []) != []:
-                    snapshot['treeSurvivors'] = self.survivors      # what of Claude's tree outlived it
+                if command == 'stop':
+                    snapshot['treeSurvivors'] = getattr(self, 'survivors', [])   # what of Claude's tree outlived it
             return dict(requestId=params['requestId'], state='exited' if not getattr(self, 'stubborn', False)
                         else 'unknown')
         return copy.deepcopy(snapshot)
@@ -1268,6 +1268,111 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.manager.stop(run_id, request, 'c:' + native)['already'], 'the replay, as the original')
         self.assertTrue(self.manager.stop(run_id, uid(), 'c:' + native)['already'], 'a new request: already stopped')
 
+    # Logos, round 2.
+
+    def test_the_stop_record_has_an_id_no_request_can_hold(self):
+        run_id, native = self.start()
+        key = self.manager._stop_record_id(run_id)
+        self.assertFalse(managed.canonical_uuid(key))
+        for attempt in (lambda: self.manager.enqueue(run_id, key, 'owner', 'Fictional note.'),
+                        lambda: self.manager.decide(run_id, uid(), key, 'deny'),
+                        lambda: self.manager.stop(run_id, key, 'c:' + native)):
+            with self.assertRaises(managed.ManagedError) as raised:
+                attempt()
+            self.assertEqual(raised.exception.code, 'invalid_request')
+        # The key an earlier build derived (a UUID) is an ordinary request ID now: a decision may hold it, and the
+        # stop and status stay usable.
+        old_key = str(uuid.uuid5(uuid.UUID(run_id), 'watch-owner-stop-record-v1'))
+        self.manager.decide(run_id, uid(), old_key, 'deny')
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped')
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.stop(run_id, old_key, 'c:' + native)
+        self.assertEqual(raised.exception.code, 'request_conflict', 'that ID is the decision\u2019s')
+
+    def test_claude_ending_by_itself_between_the_check_and_the_stop_is_never_called_stopped(self):
+        run_id, native = self.start()
+        plain = self.request
+
+        def raced(path, command, params):
+            if command == 'stop':
+                snapshot = self.snapshots[path.name]   # Claude ends by itself just before the stop reaches the supervisor
+                snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=0,
+                                                               incarnation=snapshot['incarnation']),
+                                treeSurvivors=None)    # which can no longer see all it started
+                return dict(requestId=params['requestId'], state='exited')
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=raced)
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'unconfirmed')
+
+    def test_a_natural_exit_seen_only_in_the_ledger_is_no_evidence_about_the_tree(self):
+        run_id, native = self.start()
+        self.snapshots[run_id].update(state='exited', nativeExit=dict(
+            confirmed=True, code=0, incarnation=self.snapshots[run_id]['incarnation']))
+        self.disconnected = True                       # its supervisor has gone; the ledger alone says it exited
+        plain_status = self.manager.status
+        calls = {'n': 0}
+
+        def late(run):                                 # the exit lands just after the pre-admission check
+            calls['n'] += 1
+            return {} if calls['n'] == 1 else plain_status(run)
+        with patch.object(self.manager, 'status', side_effect=late):
+            result = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+
+    def test_compatibility_words_are_only_for_what_this_stop_did(self):
+        run_id, native = self.start()
+        self.refused_commands = ('stop',)
+        self.manager.stop(run_id, uid(), 'c:' + native)
+        asked = self.stored_stop(run_id)['requestedAt']
+        snapshot = self.snapshots[run_id]
+        base = dict(tool='Write', input={}, state='shutdown', canAllow=False, canDeny=False, createdAt=1900000000,
+                    expiresAt=1900000120, decision='deny', decisionState='written', resolutionReason='shutdown',
+                    inputAvailable=True)
+        snapshot['permissions'] = [dict(base, id=uid(), resolvedAt=None), dict(base, id=uid(), resolvedAt=asked - .5),
+                                   dict(base, id=uid(), resolvedAt=asked + 1)]
+        failed = dict(requestId=uid(), source='owner', text='x', digest='0' * 64, state='failed', nativeEcho=False,
+                      reply='', error='shutdown', createdAt=1)
+        snapshot['messages'] = [dict(failed, requestId=uid()), dict(failed, requestId=uid(), terminalAt=asked - .5),
+                                dict(failed, requestId=uid(), terminalAt=asked + 1)]
+        shown = self.manager.status(run_id)
+        self.assertEqual([p['resolutionReason'] for p in shown['permissions']], ['shutdown', 'shutdown', 'owner_stop'],
+                         'unknown or earlier times keep their own words')
+        self.assertEqual([m['error'] for m in shown['messages']],
+                         ['Managed delivery failed or is uncertain.'] * 2 + [managed.OWNER_STOP_ERROR])
+
+    def test_an_acknowledged_request_id_is_bound_even_when_nothing_was_done(self):
+        run_a, native_a = self.start()
+        run_b, native_b = self.start()
+        self.manager.stop(run_a, uid(), 'c:' + native_a)
+        reused = uid()
+        self.assertTrue(self.manager.stop(run_a, reused, 'c:' + native_a)['already'])
+        for manager in (self.manager, self.make()):               # and after a restart
+            for attempt in (lambda: manager.stop(run_b, reused, 'c:' + native_b),
+                            lambda: manager.enqueue(run_b, reused, 'owner', 'Fictional note.'),
+                            lambda: manager.decide(run_b, uid(), reused, 'deny')):
+                with self.assertRaises(managed.ManagedError) as raised:
+                    attempt()
+                self.assertIn(raised.exception.code, ('request_conflict', 'managed_not_ready'))
+            self.assertTrue(manager.stop(run_a, reused, 'c:' + native_a)['already'], 'its replay answers as it did')
+        self.assertEqual(len(self.stops()), 1, 'B was never asked to stop')
+
+    def test_a_request_id_accepted_while_a_stop_was_running_is_bound_too(self):
+        run_id, native = self.start()
+        other_run, other = self.start()
+        plain, during = self.request, []
+
+        def slow(path, command, params):
+            if command == 'stop' and not during:
+                during.append(uid())
+                self.manager.stop(run_id, during[0], 'c:' + native)
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=slow)
+        self.manager.stop(run_id, uid(), 'c:' + native)
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.stop(other_run, during[0], 'c:' + other)
+        self.assertEqual(raised.exception.code, 'request_conflict')
+
     def test_a_stop_never_seen_with_evidence_is_not_called_stopped(self):
         run_id, native = self.start()
         self.disconnected = True                                  # neither the supervisor nor its ledger answers
@@ -1351,7 +1456,7 @@ class Fixture(unittest.TestCase):
             self.make().status(other_run)                                       # a malformed record fails closed
         with self.assertRaises(managed.ManagedError) as raised:                # its ID is no request's to reuse
             self.manager.stop(run_id, self.manager._stop_record_id(run_id), 'c:' + native)
-        self.assertEqual(raised.exception.code, 'request_conflict')
+        self.assertEqual(raised.exception.code, 'invalid_request', 'not even a valid request ID')
 
     def test_an_older_supervisor_gets_its_shutdown_said_as_the_owners_stop(self):
         run_id, native = self.start()
@@ -1396,7 +1501,10 @@ class Fixture(unittest.TestCase):
         self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: ends.append(run_dir) or True)
         result = self.manager.stop(run_id, uid(), 'c:' + native)
         self.assertEqual([Path(path).name for path in ends], [run_id, run_id])
-        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'stopped'))
+        # Claude is seen ended. Windows: the job ended all it started. POSIX: what it started cannot all be seen
+        # without its supervisor (nothing proves the whole tree ended), so the stop stays unconfirmed.
+        self.assertEqual((result['state'], result['ownerStop']['outcome']),
+                         ('exited', 'stopped' if managed.ps.WIN else 'unconfirmed'))
         snapshot = self.manager.status(run_id)
         self.assertEqual([m['state'] for m in snapshot['messages']], ['failed'])
         self.assertEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)

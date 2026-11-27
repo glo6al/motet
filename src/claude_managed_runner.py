@@ -357,8 +357,8 @@ def _snapshot(db, manifest, disconnected=False, server_time=None):
             'identityVerified': bool(_meta(db, 'identityVerified', False)),
             'messages': messages, 'permissions': permissions, 'timeoutSeconds': PERMISSION_SECONDS,
             'serverTime': time.time() if server_time is None else server_time, 'evidenceAvailable': True}
-    if _meta(db, 'treeSurvivors', []) != []:
-        snapshot['treeSurvivors'] = _meta(db, 'treeSurvivors')          # None: the tree could not be seen
+    if _meta(db, 'treeSurvivors', 'unseen') != 'unseen':
+        snapshot['treeSurvivors'] = _meta(db, 'treeSurvivors')    # [] all ended; a list; None: not seen completely
     # Preserve all current approval evidence. Drop only older terminal previews
     # when JSON escaping would exceed the response budget; full rows stay durable.
     while len(_json(snapshot).encode('utf-8')) > MAX_RESPONSE - 1024:
@@ -683,7 +683,9 @@ class NativeTransport:
         import managed_process_tree as tree
         pid = self.process.pid
         if self.process.returncode is not None:
-            return self.process.returncode, self.leftovers()
+            # Claude was already reaped: what it started can no longer all be seen (its group is not pinned, and a
+            # program that left the group has lost its link to it). Unknown, never an empty tree.
+            return self.process.returncode, None
         try:
             root = tree.table().get(pid)
         except tree.TreeError:
@@ -703,20 +705,6 @@ class NativeTransport:
             self._group_signal(signal.SIGKILL)
             survivors = None
         return self.process.wait(timeout=firm), survivors
-
-    def leftovers(self):
-        """Once Claude has ended and been reaped: the ``[pid, start]`` of what is still running in its process group,
-        seen, never signalled (its group's ID is no longer pinned). None if it cannot be seen. Windows: [] (the job
-        ended everything in it)."""
-        if self.job is not None:
-            return []
-        import managed_process_tree as tree
-        try:
-            rows = tree.table()
-        except tree.TreeError:
-            return None
-        return sorted([row.pid, row.start] for row in rows.values()
-                      if row.pgid == self.process.pid and row.uid == os.getuid() and tree.alive(row))
 
     def _group_signal(self, number):
         """Signal Claude's process group, only while Claude is still this supervisor's unreaped child."""
@@ -1307,18 +1295,17 @@ class Runner:
                         break
                     with contextlib.suppress(RunnerError):
                         self._decide_native(row['id'], 'deny', None, 'shutdown', resolution_reason='owner_stop')
+                # Unknown until the tree is seen to end: a wait that fails below leaves it unknown, never empty.
+                self._survivors(None)
                 try:
                     code, survivors = self.transport.end_tree()
                     self._survivors(survivors)
                     self._exit(code)
                 except (OSError, TimeoutError, subprocess.TimeoutExpired):
                     self._uncertain()
-            else:
-                # Claude had already ended by itself: its group is looked at all the same (seen, never signalled).
-                try:
-                    self._survivors(self.transport.leftovers())
-                except (OSError, AttributeError):
-                    self._survivors(None)
+            elif _meta(self.db, 'treeSurvivors', 'unseen') == 'unseen':
+                # Claude had already ended by itself: what it started cannot all be seen any more. Unknown.
+                self._survivors(None)
             state = 'exited' if _meta(self.db, 'nativeExit') else 'unknown'
             self.awaiting_retry = state != 'exited'
             with self.db:
