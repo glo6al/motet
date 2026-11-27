@@ -51,6 +51,7 @@ class FakeTransport:
         self.starts = self.terminates = self.ends = 0
         self.stubborn = False
         self.survivors = []
+        self.left = []
         self.claims_seen = []
 
     def start(self):
@@ -107,6 +108,9 @@ class FakeTransport:
         if self.code is None:
             raise TimeoutError()
         return self.code
+
+    def leftovers(self):
+        return self.left
 
     def end_tree(self, gentle=3, firm=2):
         # The owner's stop: the whole tree ends, or (stubborn) something in it is still running after SIGKILL.
@@ -542,6 +546,18 @@ class RunnerTests(unittest.TestCase):
         snapshot = self.stopped_with(None)
         self.assertIsNone(snapshot['treeSurvivors'])
         self.assertIsNone(managed.read_snapshot(self.run)['treeSurvivors'])
+
+    def test_a_stop_after_claude_ended_by_itself_still_looks_at_its_group(self):
+        runner = self.runner()
+        self.transport.code = 0
+        runner.step()                                      # Claude's own exit, recorded before the stop arrives
+        self.transport.left = [[4343, 1900000000.0]]
+        self.assertEqual(runner.stop(uid())['state'], 'exited')
+        self.assertEqual(self.transport.ends, 0, 'nothing is signalled')
+        self.assertEqual(runner.snapshot()['treeSurvivors'], [[4343, 1900000000.0]])
+
+    def test_more_survivors_than_are_kept_are_recorded_as_unseeable(self):
+        self.assertIsNone(self.stopped_with([[n, 1.0] for n in range(1, 66)])['treeSurvivors'])
 
     def test_a_tree_seen_to_end_records_no_survivors(self):
         self.assertNotIn('treeSurvivors', self.stopped_with([]))

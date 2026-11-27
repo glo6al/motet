@@ -297,7 +297,7 @@ def _message(row):
     return {'requestId': row['id'], 'source': row['source'], 'text': row['text'] or '',
             'digest': row['digest'], 'state': row['state'], 'nativeEcho': bool(row['native_echo']),
             'reply': row['reply'] or '', 'replyTruncated': bool(row['reply_truncated']),
-            'error': row['error'], 'createdAt': row['created_at']}
+            'error': row['error'], 'createdAt': row['created_at'], 'terminalAt': row['terminal_at']}
 
 
 def _decision_receipt(row):
@@ -683,12 +683,7 @@ class NativeTransport:
         import managed_process_tree as tree
         pid = self.process.pid
         if self.process.returncode is not None:
-            try:
-                rows = tree.table()
-            except tree.TreeError:
-                return self.process.returncode, None
-            return self.process.returncode, sorted([row.pid, row.start] for row in rows.values()
-                                                   if row.pgid == pid and row.uid == os.getuid() and tree.alive(row))
+            return self.process.returncode, self.leftovers()
         try:
             root = tree.table().get(pid)
         except tree.TreeError:
@@ -708,6 +703,20 @@ class NativeTransport:
             self._group_signal(signal.SIGKILL)
             survivors = None
         return self.process.wait(timeout=firm), survivors
+
+    def leftovers(self):
+        """Once Claude has ended and been reaped: the ``[pid, start]`` of what is still running in its process group,
+        seen, never signalled (its group's ID is no longer pinned). None if it cannot be seen. Windows: [] (the job
+        ended everything in it)."""
+        if self.job is not None:
+            return []
+        import managed_process_tree as tree
+        try:
+            rows = tree.table()
+        except tree.TreeError:
+            return None
+        return sorted([row.pid, row.start] for row in rows.values()
+                      if row.pgid == self.process.pid and row.uid == os.getuid() and tree.alive(row))
 
     def _group_signal(self, number):
         """Signal Claude's process group, only while Claude is still this supervisor's unreaped child."""
@@ -1300,18 +1309,27 @@ class Runner:
                         self._decide_native(row['id'], 'deny', None, 'shutdown', resolution_reason='owner_stop')
                 try:
                     code, survivors = self.transport.end_tree()
-                    with self.db:
-                        # What of Claude's tree outlived its end (None: it could not be seen). Never empty unless
-                        # every process of the tree was seen to end; the owner's stop is confirmed only then.
-                        _set(self.db, 'treeSurvivors', survivors[:64] if survivors is not None else None)
+                    self._survivors(survivors)
                     self._exit(code)
                 except (OSError, TimeoutError, subprocess.TimeoutExpired):
                     self._uncertain()
+            else:
+                # Claude had already ended by itself: its group is looked at all the same (seen, never signalled).
+                try:
+                    self._survivors(self.transport.leftovers())
+                except (OSError, AttributeError):
+                    self._survivors(None)
             state = 'exited' if _meta(self.db, 'nativeExit') else 'unknown'
             self.awaiting_retry = state != 'exited'
             with self.db:
                 self.db.execute('UPDATE shutdowns SET state=? WHERE id=?', (state, requestId))
             return {'requestId': requestId, 'state': state, 'nativeExit': _meta(self.db, 'nativeExit')}
+
+    def _survivors(self, survivors):
+        """Record what of Claude's tree outlived its end (None: it could not be seen, or more than 64 did). Never
+        empty unless every process of the tree was seen to end; the owner's stop is confirmed only then."""
+        with self.db:
+            _set(self.db, 'treeSurvivors', survivors if survivors is not None and len(survivors) <= 64 else None)
 
     def exchange(self, connection):
         """One bounded, authenticated command; secrets never appear in replies."""

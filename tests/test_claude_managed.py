@@ -273,7 +273,7 @@ class Fixture(unittest.TestCase):
             reason = 'owner_stop' if command == 'stop' else 'shutdown'
             for message in snapshot['messages']:
                 if message['state'] == 'queued':
-                    message.update(state='failed', error=reason)
+                    message.update(state='failed', error=reason, terminalAt=1_900_000_100)
             for permission in snapshot['permissions']:
                 if permission['state'] == 'pending':
                     permission.update(state='shutdown', decision='deny', decisionState='written',
@@ -1196,6 +1196,42 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.manager.stop(other_run, uid(), 'c:' + other)['ownerStop']['outcome'], 'unconfirmed')
         self.assertEqual(self.manager.status(other_run)['ownerStop']['outcome'], 'unconfirmed')
 
+    def test_survivors_are_kept_by_motet_so_an_unreadable_ledger_never_makes_the_stop_stopped(self):
+        run_id, native = self.start()
+        running = {'now': True}
+        self.manager._test = replace(self.dependencies, alive=lambda identities: running['now'])
+        self.survivors = [[4242, 1900000000.0]]
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'unconfirmed')
+        # The supervisor has gone; its ledger cannot be read for one status: a snapshot without evidence.
+        self.disconnected = True
+        reader = self.manager._test.read_snapshot
+        self.manager._test = replace(self.manager._test, read_snapshot=lambda path: (_ for _ in ()).throw(OSError()))
+        lost = self.manager.status(run_id)
+        self.assertFalse(lost['evidenceAvailable'])
+        self.assertEqual((lost['state'], lost['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.manager._test = replace(self.manager._test, read_snapshot=reader)         # readable again
+        self.snapshots[run_id].pop('treeSurvivors')                                    # even if it said nothing
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'unconfirmed', 'the survivor runs')
+        running['now'] = False
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped')
+
+    def test_a_stop_never_seen_with_evidence_is_not_called_stopped(self):
+        run_id, native = self.start()
+        self.disconnected = True                                  # neither the supervisor nor its ledger answers
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: False,
+                                     read_snapshot=lambda path: (_ for _ in ()).throw(OSError()))
+        self.manager.stop(run_id, uid(), 'c:' + native)
+        with self.manager._registry() as db:                      # the slot was released some other way
+            row = self.manager._row(db, run_id)
+            row.update(state='exited', occupied=False)
+            self.manager._save(db, row)
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'unconfirmed')
+
+    def test_past_the_kept_survivors_nothing_is_confirmed(self):
+        self.assertIsNone(managed._merged([[n, 1.0] for n in range(1, 40)], [[n, 1.0] for n in range(40, 70)]))
+        self.assertEqual(managed._merged([[2, 1.0]], [[1, 1.0], [2, 1.0]]), [[1, 1.0], [2, 1.0]])
+        self.assertIsNone(managed._merged([], None))
+
     def test_a_stop_whose_admission_did_not_commit_can_be_tried_again(self):
         run_id, native = self.start()
         failing = {'armed': True}
@@ -1276,11 +1312,14 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.snapshots[run_id]['permissions'][0]['resolutionReason'], 'shutdown')
         earlier = dict(self.snapshots[run_id]['permissions'][0], id=uid(), resolvedAt=1_000_000_000)
         self.snapshots[run_id]['permissions'].append(earlier)    # a denial from before the owner asked keeps its words
+        failed = dict(self.snapshots[run_id]['messages'][0], requestId=uid(), terminalAt=1_000_000_000)
+        self.snapshots[run_id]['messages'].append(failed)       # and so does a message failed before then
         snapshot = self.manager.status(run_id)
         self.assertEqual((snapshot['permissions'][0]['resolutionReason'], snapshot['permissions'][0]['decision']),
                          ('owner_stop', 'deny'))
         self.assertEqual(snapshot['permissions'][1]['resolutionReason'], 'shutdown')
         self.assertEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)
+        self.assertEqual(snapshot['messages'][1]['error'], 'Managed delivery failed or is uncertain.')
         self.assertEqual(self.manager.lookup_message(snapshot['messages'][0]['requestId'])['error'],
                          managed.OWNER_STOP_ERROR)
         shown = self.manager.owner_snapshot()['requests'][0]           # what the page lists for the message

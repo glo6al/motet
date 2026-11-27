@@ -228,6 +228,15 @@ def _identities(value):
                     and type(item[1]) in (int, float) and math.isfinite(item[1]) for item in value))
 
 
+def _merged(first, second):
+    """Two lists of ``[pid, start]`` identities as one, or None if either is None (unseeable) or together they pass
+    the 64 kept: past the cap nothing could be checked, so nothing is confirmed."""
+    if first is None or second is None:
+        return None
+    out = sorted({(item[0], item[1]) for item in first} | {(item[0], item[1]) for item in second})
+    return [list(item) for item in out] if len(out) <= 64 else None
+
+
 def _permission_time(value):
     if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
         _fail()
@@ -1082,12 +1091,16 @@ class ManagedClaude:
             if (not isinstance(message, dict) or not canonical_uuid(message.get('requestId'))
                     or message.get('state') not in PUBLIC_STATES or message.get('source') not in MESSAGE_SOURCES):
                 _fail()
-            clean = {k: message.get(k) for k in ('requestId', 'source', 'text', 'digest', 'state', 'nativeEcho', 'reply', 'error', 'createdAt', 'replyTruncated') if k in message}
+            clean = {k: message.get(k) for k in ('requestId', 'source', 'text', 'digest', 'state', 'nativeEcho', 'reply', 'error', 'createdAt', 'replyTruncated', 'terminalAt') if k in message}
             if type(clean.get('text', '')) is not str or len(clean.get('text', '')) > 8000:
                 _fail()
             # Error strings are runner allowlisted; enforce our own public mapping.
+            terminal = clean.get('terminalAt')
+            if terminal is not None and (type(terminal) not in (int, float) or not math.isfinite(terminal)):
+                _fail()
             clean['error'] = (OWNER_STOP_ERROR if clean.get('error') == 'owner_stop'
-                              or owner_stop and clean.get('error') == 'shutdown' else
+                              or owner_stop and clean.get('error') == 'shutdown'
+                              and terminal is not None and terminal >= owner_stop - 1 else
                               'Managed delivery failed or is uncertain.' if clean.get('error') else '')
             reply = clean.get('reply', '')
             if type(reply) is not str:
@@ -1194,13 +1207,22 @@ class ManagedClaude:
             if snapshot['nativeExit']:
                 current['occupied'] = False
             self._save(db, current)
-            stop = self._stop_reconciled(db, run_id, snapshot)
+            stop, pending = self._stop_reconciled(db, run_id, snapshot)
             if stop is not None and stop['outcome'] == 'stopped' and not snapshot['nativeExit']:
                 self._stopped_without_receipt(snapshot, stop)
             for message in snapshot['messages']:
                 old = db.execute('SELECT run,source,digest,data FROM messages WHERE id=?', (message['requestId'],)).fetchone()
                 if old and old[:3] == (run_id, message['source'], message.get('digest')):
                     db.execute('UPDATE messages SET data=? WHERE id=?', (json.dumps(_keep_author(old[3], message)), message['requestId']))
+        if pending and not self._survivors_running(pending):
+            # Seen outside the registry's locks (``ps`` can take seconds); applied only to the record as it was read.
+            with self._registry() as db:
+                current = self._stop_record(db, run_id)
+                if current == stop:
+                    current.update(outcome='stopped', stoppedAt=time.time())
+                    current.pop('survivors', None)
+                    self._save_stop(db, current)
+                    stop = current
         snapshot['ownerStop'] = self._public_stop(stop, row['nativeId'])
         snapshot['queued'] = sum(message['state'] == 'queued' for message in snapshot['messages'])
         if stop is not None and self.stop_observer is not None:
@@ -1634,31 +1656,40 @@ class ManagedClaude:
                    record['runId'], cls.STOP_RECORD, json.dumps(record, ensure_ascii=True)))
 
     def _stop_reconciled(self, db, run_id, snapshot):
-        """The run's stop record, brought up to date with ``snapshot``: a confirmed exit makes a stop that was being
-        carried out, or could not be confirmed, a stopped one (at the time it is first seen); a stop recorded as being
-        carried out that no thread here is carrying out (Motet restarted part-way) could not be confirmed."""
+        """The run's stop record brought up to date with ``snapshot``, and the survivors still to be looked for:
+        ``(record, pending)``.
+
+        Survivors (``[pid, start]`` of what of Claude's tree outlived Claude) are copied into the record itself the
+        first time a snapshot with evidence shows them, so they are never lost to a later unreadable ledger; a
+        snapshot without evidence adds nothing. The stop becomes ``stopped`` only when Claude has exited, the record
+        holds survivors seen with evidence, and none of them runs: an empty list at once; a non-empty one once
+        ``ps`` (run by the caller outside the registry's locks: ``pending``) no longer shows any. Unseeable survivors
+        (None) never become stopped. While this process is carrying the stop out, it stays ``stopping``. A stop
+        recorded as being carried out that no thread here is carrying out (Motet restarted part-way) could not be
+        confirmed."""
         record = self._stop_record(db, run_id)
         if record is None or record['outcome'] == 'stopped':
-            return record
+            return record, None
         with self._lock:
             active = run_id in self._stopping
+        before = dict(record)
+        pending = None
         if snapshot['state'] == 'exited':
-            # Claude has ended; the stop is confirmed only once nothing of its tree is seen running.
-            survivors = snapshot.get('treeSurvivors', [])
-            seen = record.get('survivors', [])
-            if survivors is None or seen is None or self._survivors_running(survivors + seen):
-                if active or record['outcome'] == 'unconfirmed':
-                    return record
-                record['outcome'] = 'unconfirmed'
-            else:
-                record.update(outcome='stopped', stoppedAt=time.time())
-                record.pop('survivors', None)
+            if snapshot.get('evidenceAvailable') is True:
+                record['survivors'] = _merged(record.get('survivors', []), snapshot.get('treeSurvivors', []))
+            survivors = record.get('survivors', None)
+            if not active:
+                if 'survivors' in record and survivors == []:
+                    record.update(outcome='stopped', stoppedAt=time.time())
+                    record.pop('survivors')
+                else:
+                    record['outcome'] = 'unconfirmed'
+                    pending = survivors or None
         elif record['outcome'] == 'stopping' and not active:
             record['outcome'] = 'unconfirmed'
-        else:
-            return record
-        self._save_stop(db, record)
-        return record
+        if record != before:
+            self._save_stop(db, record)
+        return record, pending
 
     def _survivors_running(self, identities):
         """Whether any of these ``[pid, start]`` identities of Claude's tree is still running. Seen, never signalled;
@@ -1773,7 +1804,7 @@ class ManagedClaude:
                 with self._lock:
                     self._stopping.discard(run_id)
             raise
-        already = not act and record is not None and record['outcome'] == 'stopped'
+        already = not act and not old and record is not None and record['outcome'] == 'stopped'
         if act:
             try:
                 self._end(run_id, request_id)
@@ -1833,6 +1864,10 @@ class ManagedClaude:
                 row = self._row(db, run_id)
                 row.update(state='exited', occupied=False)
                 self._save(db, row)
+                record = self._stop_record(db, run_id)
+                if record is not None and record['outcome'] != 'stopped' and 'survivors' not in record:
+                    record['survivors'] = []              # Motet saw nothing of Claude's left (its own evidence)
+                    self._save_stop(db, record)
         return confirmed
 
     def _tree_before_legacy(self, run_id):
@@ -1863,13 +1898,14 @@ class ManagedClaude:
             if not left:
                 return []
             time.sleep(.1)
-        return sorted([row.pid, row.start] for row in left.values())[:64]
+        left = sorted([row.pid, row.start] for row in left.values())
+        return left if len(left) <= 64 else None          # past the cap nothing could be checked
 
     def _record_seen_survivors(self, run_id, survivors):
         with self._registry() as db:
             record = self._stop_record(db, run_id)
             if record is not None and record['outcome'] != 'stopped':
-                record['survivors'] = survivors
+                record['survivors'] = _merged(record.get('survivors', []), survivors)
                 self._save_stop(db, record)
 
     @staticmethod
