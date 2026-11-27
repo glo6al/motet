@@ -2174,6 +2174,21 @@ test('a session.start that arrives while a resume is still registering wins, and
   assert.equal((await statusOf(h)).timer_resumed,false);
 });
 
+test('a successful registration leaves any other error in place',async()=>{
+  let offline=true;
+  const h=await harness({claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),
+    fetch:(url,body)=>{if(url.endsWith('/register')&&offline)throw Error('offline');return globalFetch(url,body);}});
+  await h.tick();
+  const interrupted='Motet connection interrupted; existing attempts are never resubmitted.';
+  assert.equal((await statusOf(h)).error,interrupted);
+  // Both registration paths succeed here; neither clears the connection error.
+  await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  assert.equal((await statusOf(h)).error,interrupted);
+  assert.equal(liveTimers(h).length,1);
+  offline=false;h.setNow(200000);await h.tick();
+  assert.equal((await statusOf(h)).error,'');
+});
+
 test('a session.start that finishes after a resume installed its timer replaces it and is not reported as resumed',async()=>{
   const gate=latch();let holdStart=false;
   const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
@@ -2216,35 +2231,89 @@ test('a resume repairs a session.start whose command registration failed, and cl
 });
 
 // A resume still registering when the chat ends or changes conversation must not arm the module afterwards.
-for(const boundary of ['session.end',...TRANSITIONS]){
-  test(`a resume pending across ${boundary} installs nothing, late events do not re-arm, and session.start does`,async()=>{
-    const gate=latch();let first=true;
-    const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
-      commandRegister:()=>{if(first){first=false;return gate.hold();}}});
-    await h.call('prompt.submit',{text:'fictional owner input'});
-    await bounded(gate.entered,'resume registering');
-    // Native input is forwarded while the registration is held.
-    assert(h.passed.some(p=>p.name==='prompt.submit'));
-    if(boundary==='session.end')await h.call('session.end',{reason:'exit',sessionId:NATIVE});
-    else await h.command(boundary);
-    gate.release();
-    for(let i=0;i<5;i++)await yieldWhileHeld();
-    assert.equal(h.timers.length,0);await h.tick();await h.tick();
-    // Late events after the boundary start nothing.
-    await h.call('turn.complete',{turnId:'late-fictional-turn',answer:'fictional',isAborted:false,reason:'answer'});
-    await h.call('prompt.submit',{text:'late fictional input'});await h.call('session.attach',{surface:'desktop',clientId:'fictional'});
-    await h.command('watch-status');
-    for(let i=0;i<5;i++)await yieldWhileHeld();
+// The host's session.end reason for each transition that goes through (reset and new are /clear's other names).
+const END_REASON={clear:'clear',reset:'clear',new:'clear',resume:'resume',branch:'resume',fork:'resume',logout:'logout',exit:'prompt_input_exit'};
+async function pendingResume(){
+  const gate=latch();let first=true;
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+    commandRegister:()=>{if(first){first=false;return gate.hold();}}});
+  await h.call('prompt.submit',{text:'fictional owner input'});
+  await bounded(gate.entered,'resume registering');
+  // Native input is forwarded while the registration is held.
+  assert(h.passed.some(p=>p.name==='prompt.submit'));
+  return {h,gate};
+}
+const lateEvents=async h=>{
+  await h.call('turn.complete',{turnId:'late-fictional-turn',answer:'fictional',isAborted:false,reason:'answer'});
+  await h.call('prompt.submit',{text:'late fictional input'});await h.call('session.attach',{surface:'desktop',clientId:'fictional'});
+  await h.command('watch-status');
+  for(let i=0;i<5;i++)await yieldWhileHeld();
+};
+const connections=h=>h.calls.filter(c=>c.url.endsWith('/register')||c.url.endsWith('/poll')).length;
+async function realStartArmsOneTimer(h){
+  await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  assert.equal(liveTimers(h).length,1);
+  await h.tick();await h.tick();
+  assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);assert(h.calls.some(c=>c.url.endsWith('/poll')));
+  assert.equal((await statusOf(h)).timer_resumed,false);
+}
+
+test('a resume pending across session.end installs nothing, late events do not re-arm, and session.start does',async()=>{
+  const {h,gate}=await pendingResume();
+  await h.call('session.end',{reason:'prompt_input_exit',sessionId:NATIVE});
+  gate.release();for(let i=0;i<5;i++)await yieldWhileHeld();
+  assert.equal(h.timers.length,0);await h.tick();
+  await lateEvents(h);
+  assert.equal(h.timers.length,0);assert.equal(connections(h),0);
+  await realStartArmsOneTimer(h);
+});
+
+for(const command of TRANSITIONS){
+  test(`a resume pending across /${command} installs nothing; once the host ends the session late events do not re-arm`,async()=>{
+    const {h,gate}=await pendingResume();
+    await h.command(command);
+    gate.release();for(let i=0;i<5;i++)await yieldWhileHeld();
+    assert.equal(h.timers.length,0);await h.tick();assert.equal(connections(h),0);
+    await h.call('session.end',{reason:END_REASON[command],sessionId:NATIVE});
+    await lateEvents(h);
+    assert.equal(h.timers.length,0);assert.equal(connections(h),0);
+    await realStartArmsOneTimer(h);
+  });
+
+  test(`a cancelled /${command} (no session.end) leaves the chat able to resume on its next event`,async()=>{
+    const {h,gate}=await pendingResume();
+    await h.command(command);
+    gate.release();for(let i=0;i<5;i++)await yieldWhileHeld();
     assert.equal(h.timers.length,0);
-    assert.equal(h.calls.filter(c=>c.url.endsWith('/register')||c.url.endsWith('/poll')).length,0);
-    // A genuine start arms it again, with exactly one timer.
-    await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+    await h.call('prompt.submit',{text:'fictional input in the same chat'});
+    await h.wait(()=>h.timers.length===1,'resume after a cancelled transition');
+    await lateEvents(h);
     assert.equal(h.timers.length,1);assert.equal(liveTimers(h).length,1);
-    await h.tick();await h.tick();
-    assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);assert(h.calls.some(c=>c.url.endsWith('/poll')));
-    assert.equal((await statusOf(h)).timer_resumed,false);
+    await h.tick();assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);
   });
 }
+
+test('a real start whose registration failed is repaired after /clear by its next event, but not after an exit',async()=>{
+  for(const [reason,repaired] of [['clear',true],['resume',true],['prompt_input_exit',false],['logout',false],['other',false]]){
+    let fail=true;
+    const h=await harness({claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+      commandRegister:()=>{if(fail)throw Error('registration refused');}});
+    assert.equal(h.timers.length,0,reason);
+    fail=false;
+    if(reason==='clear')await h.command('clear');
+    await h.call('session.end',{reason,sessionId:NATIVE});
+    await h.call('prompt.submit',{text:'fictional input after '+reason});
+    if(repaired){
+      await h.wait(()=>h.timers.length===1,'repair after '+reason);
+      for(let i=0;i<5;i++)await yieldWhileHeld();
+      assert.equal(liveTimers(h).length,1,reason);assert.deepEqual(h.registeredCommands,COMMANDS,reason);
+      assert.equal((await statusOf(h)).error,'',reason);
+    }else{
+      for(let i=0;i<5;i++)await yieldWhileHeld();
+      assert.equal(h.timers.length,0,reason);assert.deepEqual(h.registeredCommands,[],reason);
+    }
+  }
+});
 
 test('a late event after session.end, with no resume pending, does not arm a module that never started',async()=>{
   const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch});
@@ -2278,9 +2347,30 @@ test('a session.start after a lifecycle end keeps a running timer single and res
 // `typeof $.session.root`. This lexical check covers the forms of that mistake (typeof, typeof(...), optional calls,
 // bracket access, aliasing, destructuring, spreading); `claude plugin validate`, run below when it is installed, is
 // the host's own complete check.
+// Blanks comments, keeping line numbers, and leaves strings and template literals (with their ${} code) as they
+// are: a '//' inside a string is not a comment. Regular expression literals are read as code, which holds while
+// they contain no quote, backtick or '//'; the check below that every comment was removed would catch one that did.
+function withoutComments(text){
+  let out='',i=0;const modes=[];                                    // a stack: "'", '"', '`', or '{' for ${ ... }
+  while(i<text.length){
+    const c=text[i],next=text[i+1],mode=modes.at(-1);
+    if(mode==="'"||mode==='"'){out+=c;if(c==='\\'){out+=next??'';i+=2;continue;}if(c===mode||c==='\n')modes.pop();i++;continue;}
+    if(mode==='`'){
+      out+=c;if(c==='\\'){out+=next??'';i+=2;continue;}
+      if(c==='`')modes.pop();else if(c==='$'&&next==='{'){out+=next;modes.push('{');i+=2;continue;}
+      i++;continue;
+    }
+    if(c==='/'&&next==='/'){while(i<text.length&&text[i]!=='\n'){out+=' ';i++;}continue;}
+    if(c==='/'&&next==='*'){const close=text.indexOf('*/',i+2),stop=close<0?text.length:close+2;out+=text.slice(i,stop).replace(/[^\n]/g,' ');i=stop;continue;}
+    if(c==="'"||c==='"'||c==='`')modes.push(c);
+    else if(c==='{'&&mode==='{')modes.push('{');
+    else if(c==='}'&&mode==='{')modes.pop();
+    out+=c;i++;
+  }
+  return out;
+}
 function hostApiMisuse(text){
-  // Comments are prose: drop them, keeping line numbers. A '//' after ':' is a URL inside a string, not a comment.
-  const source=text.replace(/\/\*[\s\S]*?\*\//g,comment=>comment.replace(/[^\n]/g,' ')).replace(/(^|[^:\\])\/\/.*$/gm,'$1');
+  const source=withoutComments(text);
   const problems=[];
   for(const match of source.matchAll(/(?<![\w$])\$(?![\w$])/g)){
     const at=match.index,after=source.slice(at+1),before=source.slice(0,at);
@@ -2301,12 +2391,14 @@ test('the module calls every host API at its call site, so the official host loa
   for(const file of ['../hooks/register.js','../hooks/protocol.js']){
     const source=await readFile(new URL(file,import.meta.url),'utf8');
     assert.deepEqual(hostApiMisuse(source),[],file);
+    // The scanner kept its place through every string and regular expression: no comment text is left over.
+    assert.equal(/\/\/ |\/\*/.test(withoutComments(source).replace(/'[^'\n]*'|"[^"\n]*"/g,'')),false,file);
   }
   for(const bad of ["typeof $.session.root === 'function'","typeof($.session.info)","await $.session.root?.()","$['session'].id()",
     "const id = $.session.id;","const {session} = $;","f(...$)","x = $;","$?.session.id()","$.session","$.session.id.call(null)",
-    "typeof $.session.root // a trailing comment"])
+    "typeof $.session.root // a trailing comment","const u='a//b'; typeof $.session.root","const t=`x ${typeof $.session.root}`"])
     assert.notDeepEqual(hostApiMisuse('async function f($){ '+bad+' }'),[],bad);
-  for(const good of ["await $.session.root()","post($,state,'x')","async ($, e, next) => next(e)","/^[a-f0-9]{64}$/.test(x)","await $.clock.every (2000, f)"])
+  for(const good of ["// typeof $.session.root in a comment","/* $.session */ await $.session.id()","const u='http://x'; await $.session.id()","await $.session.root()","post($,state,'x')","async ($, e, next) => next(e)","/^[a-f0-9]{64}$/.test(x)","await $.clock.every (2000, f)"])
     assert.deepEqual(hostApiMisuse('async function f($){ '+good+' }'),[],good);
 });
 
@@ -2314,8 +2406,11 @@ test('claude plugin validate accepts the module, where Claude Code is installed'
   const {execFile}=await import('node:child_process');
   const run=args=>new Promise(resolve=>execFile('claude',args,{timeout:120000},(error,stdout,stderr)=>resolve({error,output:String(stdout)+String(stderr)})));
   const version=await run(['--version']);
-  if(version.error){t.skip('Claude Code is not installed here; the lexical check above still runs.');return;}
+  // Skip only where Claude Code is missing; any other failure to run it is a failure.
+  if(version.error?.code==='ENOENT'){t.skip('Claude Code is not installed here; the lexical check above still runs.');return;}
+  assert.equal(version.error,null,version.output);
   const {fileURLToPath}=await import('node:url');
   const result=await run(['plugin','validate',fileURLToPath(new URL('..',import.meta.url))]);
+  assert.equal(result.error,null,result.output);
   assert.match(result.output,/Validation passed/,result.output);
 });

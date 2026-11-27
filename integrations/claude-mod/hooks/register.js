@@ -666,10 +666,18 @@ async function connectDerived($, state, id, project, config, eligibilityEpoch) {
   await activate($,state,response,eligibilityEpoch);
 }
 
-// Ends the current lifecycle for lazy resumes: a pending one installs nothing, and none starts until session.start.
-function endLifecycle(state) {
+// A transition command (clear, resume, exit, ...) may still be cancelled, as a /resume picker can be, so it only
+// discards a resume that is pending: the conversation has not changed yet. session.end is the host's word that it
+// did. Then a pending resume installs nothing, and a module that never saw a real start (a reload) starts no
+// resume until session.start. A module that did see one, and whose process goes on under a new conversation
+// (/clear, a resume), may still be repaired by its next event if its own start failed to register.
+function discardPendingResume(state) {
   state.lifecycle += 1;
-  state.ended = true;
+}
+
+function endLifecycle(state, reason) {
+  discardPendingResume(state);
+  state.ended = !state.startSeen || !['clear','resume'].includes(reason);
 }
 
 // Desktop evidence belongs only to this loaded runtime's exact native identity.
@@ -925,9 +933,9 @@ function startTimer($, state) {
 // then puts back its commands and its timer. It proves nothing about the chat: no startup facts are invented, so
 // eligibility still needs current Desktop evidence, and every tick keeps the same checks (the opt-out, identity,
 // folder rules, receipts only). A session.start before or after this wins and keeps one timer.
-// A resume belongs to the lifecycle it began in. session.start, session.end and every transition command (clear,
-// resume, exit, ...) end that lifecycle, so a resume still registering then installs nothing. After an end or a
-// transition, later events start no resume at all: only a genuine session.start arms the module again.
+// A resume belongs to the lifecycle it began in: session.start, session.end and every transition command change it,
+// so a resume still registering then installs nothing. A transition command starts no resume itself, and after
+// session.end later events start none either, except to repair a started module (see endLifecycle).
 async function resume($, state) {
   if (state.timer || state.resuming || state.ended) return;
   const lifecycle = state.lifecycle;
@@ -971,7 +979,7 @@ export function register(on) {
     return next(e);
   });
   on('command.run',async($,e,next)=>{
-    if (TRANSITIONS.has(e.command)) {endLifecycle(state); invalidateEligibility(state); suspend($,state); return next(e);}
+    if (TRANSITIONS.has(e.command)) {discardPendingResume(state); invalidateEligibility(state); suspend($,state); return next(e);}
     resume($,state).catch(()=>{});
     const owner = ['composer','bridge'].includes(e.origin?.kind);
     if (e.command === 'watch-status') {
@@ -1099,5 +1107,5 @@ export function register(on) {
     return next(e);
   });
   on('session.attach',async($,e,next)=>{resume($,state).catch(()=>{}); return next(e);});
-  on('session.end',async($,e,next)=>{endLifecycle(state); invalidateEligibility(state); suspend($,state); return next(e);});
+  on('session.end',async($,e,next)=>{endLifecycle(state,e.reason); invalidateEligibility(state); suspend($,state); return next(e);});
 }

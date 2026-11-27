@@ -22,6 +22,7 @@ See also `docs/bridge/RECOVERY.md` and `docs/PEER_BRIDGE.md`.
 - **Old uncertain rows.** A row can end `unknown` with an empty error after a gap, a temporary failure and a read.
 - **Older plugins.** Subfolder receiving needs plugin 0.6.4 or later in each Claude chat, and Claude Code 2.1.323 loads only 0.6.5 of those (BR-046).
 - **Reloaded terminal chats.** After `/reload-plugins`, a terminal chat that Claude does not start again cannot show the plugin it is interactive, so it stays disconnected until the chat restarts. Claude Desktop chats reconnect by themselves (BR-046).
+- **Reloaded chat changed before its first event.** A reloaded chat that ends, is cleared or switches conversation before its first event stays disconnected until it restarts, and `/watch-connect` is not available in it until then (BR-046).
 - **Downgrade.** Downgrading is unsafe against the current ledger. Do not run an older build on it.
 - **Receipt discard.** The receipt-discard command is not built, and timed automatic clear is off.
 - **Sender connections.** Sender MCP connections must reconnect to get new guidance.
@@ -34,9 +35,9 @@ See also `docs/bridge/RECOVERY.md` and `docs/PEER_BRIDGE.md`.
 
 ### BR-046 · 27 Nov 2026
 
-A Claude chat stopped receiving after the plugin was reloaded in it, and stayed unreachable. Two causes. First, Claude Code refused to load plugin 0.6.4 at all ("hooks module did not load"), because it tested two optional Claude features with `typeof $.session.root` and `typeof $.session.info`; the plugin now calls them and keeps the same fallbacks. Second, a reload stops the plugin's heartbeat, and Claude does not always start a reloaded plugin again, which was the only place the heartbeat and the `/watch-*` commands were set up. Plugin 0.6.5 puts them back on the first event the reloaded plugin sees, with every startup check kept and nothing resubmitted.
+A Claude chat stopped receiving after the plugin was reloaded in it, and stayed unreachable. Two causes. First, Claude Code refused to load plugin 0.6.4 at all ("hooks module did not load"), because it tested two optional Claude features with `typeof $.session.root` and `typeof $.session.info`; the plugin now calls them and keeps the same fallbacks. Second, a reload stops the plugin's heartbeat, and Claude does not always start a reloaded plugin again, which was the only place the heartbeat and the `/watch-*` commands were set up. Plugin 0.6.5 puts them back on the first event the reloaded plugin sees, with every startup check kept and nothing resubmitted. A resume still pending when the chat ends or is cleared installs nothing, and after that only a real start arms the plugin again.
 
-- Commits: 237ad38, d28ba9b
+- Commits: 237ad38, d28ba9b, d2ca47b, efda421, plus the review follow-up (a cancelled `/resume` no longer disconnects the chat, and a failed start registration is repaired after `/clear`)
 - Kind: root cause
 - Related: BR-044 (added the feature checks that the host refused), BR-025 and BR-014 (receipts and completions across reloads and reconnects, a different failure)
 - Area: claude-delivery

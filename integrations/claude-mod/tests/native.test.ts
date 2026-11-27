@@ -380,7 +380,7 @@ test('official runtime: a reloaded module that gets no session.start resumes its
 });
 
 // A resume still registering when the chat ends or is cleared must stay inactive, while native input still passes.
-for (const boundary of ['end','clear']) test('official runtime: a pending reload resume stays inactive after '+boundary,async($,on)=>{
+for (const boundary of ['end','clear','cancelled resume']) test('official runtime: a pending reload resume stays inactive after '+boundary,async($,on)=>{
   const clock=mock.clock(on,{now:100000});
   const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
   let release=()=>{},entered=()=>{},first=true,forwarded=false,registrations=0,polls=0;
@@ -401,13 +401,22 @@ for (const boundary of ['end','clear']) test('official runtime: a pending reload
     return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
   });
   const input=$.turn.start({text:'fictional input',turnId:'fixture-turn'});await inside;
-  if(boundary==='end')await $.session.end({reason:'exit',sessionId:NATIVE});
-  else await $.command.run({command:'clear',args:'',origin:{kind:'composer'}});
+  if(boundary==='end')await $.session.end({reason:'prompt_input_exit',sessionId:NATIVE});
+  else await $.command.run({command:boundary==='clear'?'clear':'resume',args:'',origin:{kind:'composer'}});
   release();await input;await clock.advance(2000);await clock.advance(2000);
   expect(forwarded).toBe(true);expect({registrations,polls}).toEqual({registrations:0,polls:0});
-  // A late event does not re-arm it; a genuine start does, with one heartbeat.
+  // The host ends the session when /clear goes through; a /resume picker that is cancelled ends nothing.
+  if(boundary==='clear')await $.session.end({reason:'clear',sessionId:NATIVE});
   await $.turn.complete({turnId:'late-fixture-turn',answer:'fictional',isAborted:false,reason:'answer',durationMs:1});
   await clock.advance(2000);await clock.advance(2000);
+  if(boundary==='cancelled resume'){
+    // The same chat goes on, so its next event resumes it, with one heartbeat.
+    expect(registrations).toBe(1);expect(polls>0).toBe(true);
+    const resumed=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+    expect(resumed.timer_resumed).toBe(true);expect(resumed.timer_ticks).toBe(2);
+    return;
+  }
+  // After an end, a late event does not re-arm it; a genuine start does, with one heartbeat.
   expect({registrations,polls}).toEqual({registrations:0,polls:0});
   await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
   await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
