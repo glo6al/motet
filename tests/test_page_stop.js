@@ -10,6 +10,13 @@ assert.ok(controllerStart>0&&controllerEnd>controllerStart,'managed controller s
 const controllerSource=html.slice(controllerStart,controllerEnd);
 assert.ok(html.includes('id="deskStopChat"'));assert.doesNotMatch(html,/id="deskStopChat"[^>]*title=/,'the menu item has no explainer tooltip');
 const tick=()=>new Promise(r=>setImmediate(r));
+/* The notice's buttons draw as drawn: their rules carry #compactDesk, so a theme's '#compactDesk button' rule cannot
+   outrank them; the notice's two actions sit 6px apart (8px in the menu). The unconfirmed label is the quiet pair. */
+{const cssStart=html.indexOf('/* Stop for a chat Motet started: a divider'),css=html.slice(cssStart,html.indexOf('html.workspace #officer.docked #responseCard',cssStart));assert.ok(cssStart>0&&css.length>200);
+ for(const cls of ['workspace-managed-stop-retry','workspace-managed-stop-copy']){const rules=css.split('\n').filter(l=>l.includes(cls));assert.ok(rules.length);for(const rule of rules)for(const sel of rule.split('{')[0].split(','))if(sel.includes(cls))assert.ok(sel.includes('#compactDesk'),sel)}
+ assert.ok(css.includes('html.workspace #compactDesk .workspace-managed-notice .workspace-managed-stop-actions{gap:6px}'));
+ assert.match(css,/#deskStopConfirm \.workspace-stop-actions,[^{]*\{display:flex;align-items:center;gap:8px/);
+ assert.ok(html.includes('html.workspace body.stepped #workspaceTop #deskStatus[data-workspace-state=unsure]{color:#9b4b16;background:#fff0df}')||/#workspaceTop #deskStatus\[data-workspace-state=unsure\]\{color:#9b4b16;background:#fff0df\}/.test(html),'the top bar draws unsure as the quiet pair');}
 
 const CLEO='c:11111111-1111-4111-8111-111111111111',RUN='22222222-2222-4222-8222-222222222222',PERM='33333333-3333-4333-8333-333333333333';
 const PLAIN='c:99999999-9999-4999-8999-999999999999',CODEX='x:fictional-codex';
@@ -44,23 +51,25 @@ async function menuAndConfirm(code){
   api.workspaceManagedStopMenuPaint(h.cleo);assert.equal($('#deskStopArea').hidden,false);assert.equal($('#deskStopChat').hidden,false);assert.equal($('#deskStopConfirm').hidden,true);
   api.workspaceManagedStopMenuPaint(h.plain);assert.equal($('#deskStopArea').hidden,true,'the item is hidden for an ordinary chat');
   api.MCP.stopConfirm=CLEO;api.workspaceManagedStopMenuPaint(h.cleo);const confirm=$('#deskStopConfirm');assert.equal($('#deskStopChat').hidden,true,'the confirm step replaces the item');assert.equal(confirm.hidden,false);
-  assert.equal(text(confirm.children[0]),'Stop Cleo? It ends now, part-way through its work. Dov and Neri, which it started, stop with it.');
-  assert.equal(text(confirm.children[1]),'It cannot be started again. Its history stays here. Its waiting request is denied. 2 queued messages are not delivered.');
-  const [cancel,go]=confirm.children[2].children;assert.equal(text(cancel),'Cancel');assert.equal(text(go),'Stop');assert.equal(go.className,'workspace-stop-go');
+  assert.equal(confirm.children.length,2,'one paragraph, then Cancel and Stop: no second grey line');
+  assert.equal(text(confirm.children[0]),'Stop Cleo? Dov and Neri stop with it. Its waiting request is denied. 2 queued messages are not delivered. It can\u2019t be started again.');
+  const [cancel,go]=confirm.children[1].children;assert.equal(text(cancel),'Cancel');assert.equal(text(go),'Stop');assert.equal(go.className,'workspace-stop-go');
   cancel.onclick();assert.equal(api.MCP.stopConfirm,null);assert.equal($('#deskStopChat').hidden,false,'Cancel returns to the item');assert.equal(h.stops.length,0);
   const words=(kids,status)=>{const agents={[CLEO]:h.cleo};kids.forEach((name,i)=>{agents['k'+i]={id:'k'+i,name,sub:true,parent:CLEO,turn:'in'}});return api.workspaceManagedStopWords(h.cleo,status,agents)};
-  assert.equal(words([],null).lead,' It ends now, part-way through its work.');assert.equal(words([],null).note,'It cannot be started again. Its history stays here.');
-  assert.equal(words(['Dov'],null).lead,' It ends now, part-way through its work. Dov, which it started, stops with it.');
-  assert.equal(words(['Ada','Bo','Cy'],null).lead,' It ends now, part-way through its work. Ada, Bo and Cy, which it started, stop with it.');
-  assert.equal(words([],{permissions:[],queued:1}).note,'It cannot be started again. Its history stays here. 1 queued message is not delivered.');
-  assert.equal(words([],{permissions:[{state:'pending',resolutionReason:null}],queued:0}).note,'It cannot be started again. Its history stays here. Its waiting request is denied.');
-  assert.equal(words([],{permissions:[{state:'cancelled',resolutionReason:'turn_ended'}],queued:0}).note,'It cannot be started again. Its history stays here.','a resolved request is not waiting');
+  const CANT=' It can\u2019t be started again.';
+  assert.equal(words([],null).lead,CANT);assert.equal(words([],null).note,undefined,'no second paragraph');
+  assert.equal(words(['Dov'],null).lead,' Dov stops with it.'+CANT);
+  assert.equal(words(['Ada','Bo','Cy'],null).lead,' Ada, Bo and Cy stop with it.'+CANT);
+  assert.equal(words([],{permissions:[],queued:1}).lead,' 1 queued message is not delivered.'+CANT);
+  assert.equal(words([],{permissions:[{state:'pending',resolutionReason:null}],queued:0}).lead,' Its waiting request is denied.'+CANT);
+  assert.equal(words([],{permissions:[{state:'cancelled',resolutionReason:'turn_ended'}],queued:0}).lead,CANT,'a resolved request is not waiting');
+  for(const gone of ['It ends now','which it started','Its history stays here'])assert.ok(!controllerSource.includes(gone),gone);
   return h;
 }
 
 async function stoppedFlow(code){
   const h=harness(code),{api,$}=h;await ready(h);
-  api.MCP.stopConfirm=CLEO;api.workspaceManagedStopMenuPaint(h.cleo);const go=$('#deskStopConfirm').children[2].children[1];go.onclick();go.onclick();
+  api.MCP.stopConfirm=CLEO;api.workspaceManagedStopMenuPaint(h.cleo);const go=$('#deskStopConfirm').children[1].children[1];go.onclick();go.onclick();
   assert.equal(api.workspaceManagedStopBegin(h.cleo),false,'a stop in flight is not sent again');assert.equal(h.stops.length,1,'a double click sends one stop');
   assert.deepEqual(h.stops[0],{runId:RUN,requestId:'55555555-5555-4555-8555-555555555555',agent:CLEO});
   api.workspaceManagedDeskPaint(h.cleo);api.workspaceManagedComposerPaint();
@@ -88,7 +97,7 @@ async function unconfirmedFlow(code){
   h.status.state='uncertain';h.status.recoveryRequired=true;h.status.ownerStop=record;h.status.capabilities={permissions:false};h.status.permissions=[];
   h.reply().resolve({schemaVersion:1,requestId:h.reply().requestId,runId:RUN,agent:CLEO,state:'uncertain',ownerStop:record,already:false});await tick();await tick();await tick();
   api.workspaceManagedDeskPaint(h.cleo);api.workspaceManagedComposerPaint();const host=api.MCP.noticeHost;
-  assert.equal(api.workspaceManagedStatusPill(h.cleo),'may still be running');assert.equal(api.workspaceManagedStopPillState(h.cleo),'waiting');
+  assert.equal(api.workspaceManagedStatusPill(h.cleo),'may still be running');assert.equal(api.workspaceManagedStopPillState(h.cleo),'unsure','the quiet label, not the filled needs-you one');
   assert.equal(host.hidden,false);assert.equal(host.children.length,2,'the title and its two actions, nothing else');const [title,row]=host.children;
   assert.equal(text(title),'Motet could not confirm that Cleo stopped.');assert.doesNotMatch(text(host),/asked it to stop|did not answer|history stays|paused/);
   const [retry,copy]=row.children;assert.equal(text(retry),'Try again');assert.equal(text(copy),'Copy the Terminal command');
@@ -119,9 +128,9 @@ function statusShapes(h){
 
 function stage(){
   const clock=x=>'t'+x,controller=new Map(['managedStopped','workspaceStopNote','workspaceManagedStopValid','workspaceManagedStopNewer'].map(n=>[n,fn(n)]));
-  const code=[...controller.values(),fn('need'),fn('stateOf'),fn('workspaceFilterMatch')].join('\n');
-  const A={},c={A,clock,dur:x=>x+'s',DOING:{},median:()=>0,PINS:{},order:[],dismissed:[],Date};
-  const api=vm.runInNewContext(code+';({managedStopped,workspaceStopNote,stateOf,need,workspaceFilterMatch,workspaceManagedStopNewer})',c);
+  const code=[...controller.values(),fn('need'),fn('stateOf'),fn('workspaceFilterMatch'),fn('captionOf')].join('\n');
+  const A={},c={A,clock,dur:x=>x+'s',DOING:{},median:()=>0,PINS:{},order:[],dismissed:[],Date,STEADY:false,did:()=>'handed off: log search',one:x=>x,plain:x=>x};
+  const api=vm.runInNewContext(code+';({managedStopped,workspaceStopNote,stateOf,need,workspaceFilterMatch,workspaceManagedStopNewer,captionOf})',c);
   const base=(id,extra={})=>({id,name:id,calls:{},perms:{},asks:{},last:900,turn:'in',...extra});
   A[CLEO]=base(CLEO,{calls:{s:{kind:'spawn',ts:950}},perms:{p:{tool:'Shell',text:'x'}}});A[DOV]=base(DOV,{sub:true,parent:CLEO});A[NERI]=base(NERI,{sub:true,parent:DOV});A[ORIN]=base(ORIN,{soft:true,parent:CLEO});A[PLAIN]=base(PLAIN);c.order.push(CLEO,DOV,NERI,ORIN,PLAIN);
   assert.equal(api.stateOf(A[CLEO],1000).label,'waiting on you','before a stop the chat waits on its request');assert.ok(api.need(A[CLEO]));
@@ -144,6 +153,15 @@ function stage(){
   assert.deepEqual([...label],['handed off: log search · started t950 · stopped before a result',false,true]);
   const live=vm.runInNewContext(html.slice(start,end)+';label',{it:{e:{kind:'spawn',done:false},ts:950},a:base('c:live'),STEADY:false,singleLine:true,managedStopped:api.managedStopped,workspaceStepRunning:e=>!e.done,workspaceStepLabel:()=> 'handed off: log search',clock});
   assert.equal(live,'handed off: log search · started t950, no result yet','a running chat keeps its open step');
+  /* the extra status after the words: never 'no result yet' after 'stopped before a result' */
+  const statusLine=html.split('\n').find(l=>l.startsWith('    const status=STEADY||running'));assert.ok(statusLine);
+  const extra=halted=>vm.runInNewContext(statusLine.replace('const status=','status=')+';status',{STEADY:false,running:false,halted,e:{},workspaceStepExtraStatus:()=> 'no result yet'});
+  assert.equal(extra(true),'','a stopped chat\u2019s step (and a sub-agent\u2019s) ends at stopped before a result');assert.equal(extra(false),'no result yet');
+  /* the stopped chat's monitor caption on the stage says it once, without no result yet */
+  A[CLEO].cur={kind:'spawn',done:false};const cap=api.captionOf(A[CLEO],1000);
+  assert.equal(cap.meaning,'a step stopped before a result');assert.equal(cap.line,'last: handed off: log search');
+  assert.doesNotMatch(cap.meaning+' '+cap.line,/no result/);
+  A[PLAIN].managedStop=null;A[PLAIN].turn='ended';A[PLAIN].cur={kind:'spawn',done:false};assert.equal(api.captionOf(A[PLAIN],1000).meaning,'a step with no result yet','a chat not stopped is unchanged');
 }
 
 (async()=>{
