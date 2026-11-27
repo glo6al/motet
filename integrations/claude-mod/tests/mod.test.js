@@ -2502,14 +2502,52 @@ test('a delayed preference write cannot reverse a newer owner decision, in eithe
   }
 });
 
-test('a decision saved later by another copy of the plugin stands, unless its time is far ahead of the clock',async()=>{
-  for(const [ahead,stands] of [[1000,true],[60*60*1000,false]]){
-    const storage=new Map([[GLOBAL_KEY,CONFIG],[PREF,{version:1,disconnected:true,decided_at:100000+ahead}]]);
+test('owner decisions follow their order, not the clock: a clock set back never refuses an opt-out or a reconnect',async()=>{
+  // Connect, then disconnect with the clock 60 s earlier: the chat ends disconnected.
+  {
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);
     const h=await harness({storage,claimed:false,fetch:globalFetch});
-    const result=(await h.command('watch-connect')).text;
-    if(stands){assert.equal(result,SUPERSEDED_TEXT);assert.equal(storage.get(PREF).disconnected,true);}
-    else{assert.match(result,/reconnect scheduled/);assert.equal(storage.get(PREF).disconnected,false);assert.equal(storage.get(PREF).decided_at,100000);}
+    h.setNow(160000);assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+    h.setNow(100000);assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+    assert.equal(storage.get(PREF).disconnected,true);
+    const since=h.calls.length;await h.tick();await h.tick();assert.equal(registrationsSince(h,since),0);
   }
+  // Disconnect, then connect with the clock 60 s earlier: the chat reconnects.
+  {
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const h=await harness({storage,claimed:false,fetch:globalFetch});
+    h.setNow(160000);assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+    h.setNow(100000);assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+    assert.equal(storage.get(PREF).disconnected,false);
+    await h.tick();assert(h.calls.some(c=>c.url.endsWith('/register')));
+  }
+});
+
+test('a record written by another copy is followed until this copy decides, and then this copy\'s decision stands',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG],[PREF,{version:1,disconnected:true,writer:'fictional-earlier-copy'}]]);
+  const h=await harness({storage,claimed:false,fetch:globalFetch});
+  await h.tick();await h.tick();assert.equal(connections(h),0);
+  // The owner's reconnect in the live copy is the newest decision.
+  assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+  assert.equal(storage.get(PREF).disconnected,false);assert.notEqual(storage.get(PREF).writer,'fictional-earlier-copy');
+  await h.tick();assert(h.calls.some(c=>c.url.endsWith('/register')));
+});
+
+test('an earlier copy\'s connect that lands after the reloaded copy\'s disconnect is written back on the next tick',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]);const gate=latch();let holdPref=false;
+  const old=await harness({storage,claimed:false,fetch:globalFetch,storeSet:async key=>{if(key===PREF&&holdPref){holdPref=false;await gate.hold();}}});
+  await old.command('watch-disconnect');
+  holdPref=true;
+  const connecting=old.command('watch-connect');await bounded(gate.entered,'old copy preference write');
+  // The plugin is reloaded: the old copy's timer has stopped, and the live copy receives the owner's commands.
+  const live=await harness({start:false,storage,claimed:false,fetch:globalFetch});
+  await live.call('prompt.submit',{text:'fictional input after reload'});await live.wait(()=>live.timers.length===1,'resumed timer');
+  assert.match((await live.command('watch-disconnect')).text,/Motet disconnected/);
+  gate.release();await connecting;
+  assert.equal(storage.get(PREF).disconnected,false,'the old copy wrote last');
+  await live.tick();
+  assert.equal(storage.get(PREF).disconnected,true);
+  await live.tick();await live.tick();assert.equal(connections(live),0);
 });
 
 test('an older start that registers successfully late does not clear a newer start\'s registration failure',async()=>{

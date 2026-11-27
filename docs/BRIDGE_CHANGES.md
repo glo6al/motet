@@ -23,6 +23,7 @@ See also `docs/bridge/RECOVERY.md` and `docs/PEER_BRIDGE.md`.
 - **Older plugins.** Subfolder receiving needs plugin 0.6.4 or later in each Claude chat, and Claude Code 2.1.323 loads only 0.6.5 of those (BR-046).
 - **Reloaded terminal chats.** After `/reload-plugins`, a terminal chat that Claude does not start again cannot show the plugin it is interactive, so it stays disconnected until the chat restarts. Claude Desktop chats reconnect by themselves (BR-046).
 - **Reloaded chat changed before its first event.** A reloaded chat that ends, is cleared or switches conversation before its first event stays disconnected until it restarts, and `/watch-connect` is not available in it until then (BR-046).
+- **Setup in two plugin copies.** Two `/watch-setup` commands in two copies of the plugin around a reload can store the grant in either order: the stored grant record has a fixed shape and the store cannot compare and set (BR-046).
 - **Downgrade.** Downgrading is unsafe against the current ledger. Do not run an older build on it.
 - **Receipt discard.** The receipt-discard command is not built, and timed automatic clear is off.
 - **Sender connections.** Sender MCP connections must reconnect to get new guidance.

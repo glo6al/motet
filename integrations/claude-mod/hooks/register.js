@@ -723,7 +723,7 @@ async function supervisor($, state) {
     const raw = await $.store.get(GLOBAL_KEY);
     checkEligibility(state,eligibilityEpoch);
     const config = globalConfiguration(raw) ? raw : null;
-    const preference = UUID.test(id) ? await $.store.get(preferenceKey(id)) : null;
+    const preference = UUID.test(id) ? await currentPreference($,state,id) : null;
     checkEligibility(state,eligibilityEpoch);
     const changed = state.data && (id !== state.data.native_id || project !== state.data.project && !state.receiptOnly ||
       (state.data.mode === 'derived' && configurationId(config) !== configurationId(state.config)));
@@ -835,34 +835,48 @@ async function supervisor($, state) {
 }
 
 // The owner's connection decisions for this chat (/watch-connect, /watch-setup, /watch-disconnect) take effect in
-// the order they were made. Each command reserves its place when it starts, before anything is awaited; a command
-// that a newer one has overtaken changes nothing from then on, so an older connect or setup that finishes late
-// cannot clear a later opt-out, nor a late disconnect undo a later reconnect.
+// the order they were made, by a counter, never by the clock (which can be set back). Each command takes its number
+// when it starts, before anything is awaited. A decision takes effect when its preference is written; once a newer
+// one has, an older command changes nothing more, so an older connect or setup that finishes late cannot clear a
+// later opt-out, nor a late disconnect undo a later reconnect. A newer command that gives up without deciding (a
+// bad code, a failed setup) overtakes nothing, so an opt-out always takes effect unless a newer decision did.
 function reserveDecision(state) {
   state.decision += 1;
   return state.decision;
 }
 
-const latestDecision = (state, decision) => state.decision === decision;
+const overtaken = (state, decision) => state.appliedDecision > decision;
 
-// Preference writes run one at a time in decision order, and each is checked again just before it is written, so a
-// slow write cannot land after a newer one. The stored decided_at keeps the order across a plugin reload, when an
-// earlier copy of the plugin may still finish a command: a write never replaces a decision made later. A stored
-// time more than ten minutes ahead cannot come from such a copy (its commands end within a minute or two) and
-// means the clock was set back, so it does not lock the owner out.
-const DECISION_SKEW_MS = 10 * 60 * 1000;
-async function savePreference($, state, id, disconnected, decision, decidedAt) {
+// Preference writes run one at a time, and a write is skipped when a newer decision was already written, so a slow
+// write cannot land after a newer one. Each record names the copy of the plugin that wrote it. The answer is whether
+// this decision still stands once the writes queued behind it have run.
+async function savePreference($, state, id, disconnected, decision) {
   const operation = state.preferenceWrites.then(async () => {
-    if (!latestDecision(state,decision)) return false;
-    const stored = await $.store.get(preferenceKey(id));
-    if (typeof stored?.decided_at === 'number' && stored.decided_at > decidedAt &&
-        stored.decided_at - decidedAt <= DECISION_SKEW_MS) return false;
-    if (!latestDecision(state,decision)) return false;
-    await $.store.set(preferenceKey(id),{version:1,disconnected,decided_at:decidedAt});
-    return latestDecision(state,decision);
+    if (overtaken(state,decision)) return false;
+    await $.store.set(preferenceKey(id),{version:1,disconnected,writer:state.clientId});
+    state.appliedDecision = decision;
+    state.ownDecisions.set(id, disconnected);
+    return true;
   });
   state.preferenceWrites = operation.catch(() => {});
-  return operation;
+  if (!await operation) return false;
+  await state.preferenceWrites;
+  return !overtaken(state,decision);
+}
+
+// After a plugin reload only the live copy receives owner commands, so its own latest decision is the newest one.
+// An earlier copy may still finish a command and write over it (the store cannot compare and set): the supervisor
+// then writes this copy's decision back, and follows it, before it connects anything.
+async function currentPreference($, state, id) {
+  const stored = await $.store.get(preferenceKey(id));
+  if (!state.ownDecisions.has(id)) return stored;
+  if ((stored?.disconnected === true) !== state.ownDecisions.get(id) || stored?.writer !== state.clientId) {
+    const operation = state.preferenceWrites.then(() =>
+      $.store.set(preferenceKey(id),{version:1,disconnected:state.ownDecisions.get(id),writer:state.clientId}));
+    state.preferenceWrites = operation.catch(() => {});
+    try {await operation;} catch { /* The decision still holds here; the next tick writes it again. */ }
+  }
+  return {version:1,disconnected:state.ownDecisions.get(id)};
 }
 
 const SUPERSEDED = 'A newer Motet command replaced this one; nothing was changed.';
@@ -872,10 +886,9 @@ async function explicitDisconnect($, state) {
   state.disconnecting += 1;
   invalidateEligibility(state);
   try {
-    const decidedAt = await $.clock.now();
     const id = await $.session.id();
-    if (UUID.test(id) && !await savePreference($,state,id,true,decision,decidedAt)) return false;
-    if (!latestDecision(state,decision)) return false;
+    if (UUID.test(id) && !await savePreference($,state,id,true,decision)) return false;
+    if (overtaken(state,decision)) return false;
     const data = state.data;
     suspend($,state);
     if (data && data.mode !== 'derived') await save($,state,()=>{data.active = false;});
@@ -1006,7 +1019,7 @@ export function register(on) {
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrant:'',rejectedIdentity:'',decision:0,preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrant:'',rejectedIdentity:'',decision:0,appliedDecision:0,ownDecisions:new Map(),preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
     state.lifecycle += 1;
@@ -1060,9 +1073,8 @@ export function register(on) {
     // activation then refuses: an owner connect never connects a chat that has ended or changed conversation.
     const eligibilityEpoch = invalidateEligibility(state);
     try {
-      const decidedAt = await $.clock.now();
       const id = await $.session.id(), project = await sessionProject($);
-      if (!latestDecision(state,decision)) return {text:SUPERSEDED};
+      if (overtaken(state,decision)) return {text:SUPERSEDED};
       if (!UUID.test(id)) throw Error('Native identity unavailable.');
       if (project === null) return {text:'This chat is working outside its project folder. Return to the project folder and try again.'};
       const pair = e.args.trim() ? pairing(e.args) : null;
@@ -1076,7 +1088,7 @@ export function register(on) {
         await $.store.set(GLOBAL_KEY,config);
         state.rejectedGrant = ''; state.rejectedIdentity = '';
         // A later decision about this chat stands: the grant serves the other chats, and this one stays as it is.
-        if (!await savePreference($,state,id,false,decision,decidedAt)) {
+        if (!await savePreference($,state,id,false,decision)) {
           state.config = config; state.retryAt = 0; state.failures = 0;
           return {text:'Motet automatic connections authorized. Your later Motet command in this chat still stands, so this chat was left as it is. ' + LIMITATION};
         }
@@ -1086,7 +1098,7 @@ export function register(on) {
         state.retryAt = 0; state.failures = 0;
         return {text:'Motet automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
       }
-      if (!await savePreference($,state,id,false,decision,decidedAt)) return {text:SUPERSEDED};
+      if (!await savePreference($,state,id,false,decision)) return {text:SUPERSEDED};
       state.rejectedIdentity = ''; state.retryAt = 0; state.failures = 0;
       stop(state);
       if (pair) {
@@ -1094,7 +1106,7 @@ export function register(on) {
         state.data = {native_id:id,project,port:pair.port,requests:{},active:false};
         const response = await post($,state,'enroll',{code:pair.code,native_id:id,project},{anonymous:true});
         if (typeof response.token !== 'string' || response.token.length < 16 || !UUID.test(response.enrollment_id)) throw Error('Invalid enrollment.');
-        if (!latestDecision(state,decision)) return {text:SUPERSEDED};
+        if (overtaken(state,decision)) return {text:SUPERSEDED};
         state.data.token = response.token; state.data.enrollment_id = response.enrollment_id;
         state.flight = null; state.envelope = null; state.bound.clear();
         await activate($,state,response,eligibilityEpoch);
@@ -1114,11 +1126,11 @@ export function register(on) {
           return {text:state.receiptOnly ? 'Motet reconnected this chat to report its earlier replies; it then moves to this project folder. ' + LIMITATION :
             'Motet connected to this existing chat. ' + LIMITATION};
         }
-        if (!latestDecision(state,decision)) return {text:SUPERSEDED};
+        if (overtaken(state,decision)) return {text:SUPERSEDED};
         state.data = null; state.key = null;
         if (stored?.native_id === id) return {text:"This chat's manual Motet pairing is for a folder outside this project, so it was not reconnected. Pair this chat again from Motet."};
       }
-      if (!latestDecision(state,decision)) return {text:SUPERSEDED};
+      if (overtaken(state,decision)) return {text:SUPERSEDED};
       return {text:'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
     } catch {stop(state); return {text:'Motet connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.'};}
     finally {state.connecting = false;}

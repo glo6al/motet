@@ -554,3 +554,30 @@ for (const older of ['watch-connect','watch-setup']) test('official runtime: a d
   await clock.advance(2000);await clock.advance(2000);
   expect(registrations).toBe(1);expect(polls>0).toBe(true);
 });
+
+test('official runtime: a record an earlier copy writes over this copy\'s opt-out is written back before any connect',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const pref='watch-owner-preferences-v1:'+NATIVE;
+  const values=new Map<string,any>([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let registrations=0,polls=0;
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await $.command.run({command:'watch-disconnect',args:'',origin:{kind:'composer'}});
+  const own=values.get(pref);expect(own.disconnected).toBe(true);
+  // An earlier copy of the plugin, still finishing a /watch-connect after the reload, writes last.
+  values.set(pref,{version:1,disconnected:false,writer:'fictional-earlier-copy'});
+  await clock.advance(2000);
+  expect(values.get(pref)).toEqual(own);
+  await clock.advance(2000);await clock.advance(2000);
+  expect({registrations,polls}).toEqual({registrations:0,polls:0});
+});
