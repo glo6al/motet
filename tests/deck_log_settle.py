@@ -7,6 +7,7 @@ but working writer is always given the time it needs, up to a high ceiling
 that still bounds a real hang.
 """
 import os
+import sys
 import time
 
 # No observable writer progress for this long means it is stuck.
@@ -14,11 +15,23 @@ STALL_SECONDS = 60.0 if os.name == 'nt' else 30.0
 # Absolute bound for one wait, even while the writer keeps moving.
 CEILING_SECONDS = 900.0
 SLICE_SECONDS = 0.25
+IDLE_POLL_SECONDS = 0.01
 
 
 def _snapshot(history):
     with history.wake:
         return (len(history.queue), history.inflight, getattr(history, '_writer_step', None))
+
+
+def _writer_idle(thread):
+    # An empty queue alone does not prove the last record was saved: a writer
+    # that crashes on it still takes it off the queue and clears its in-flight
+    # count before the thread ends. A healthy writer always goes back to
+    # waiting for work in DeckLog._writer; a crashed one never does. So only a
+    # writer seen parked in that wait has finished cleanly.
+    frame = sys._current_frames().get(thread.ident)
+    return bool(frame is not None and frame.f_code.co_name == 'wait' and frame.f_back is not None
+                and frame.f_back.f_code.co_name == '_writer')
 
 
 def _describe(history, label, started, extra):
@@ -33,10 +46,12 @@ def _describe(history, label, started, extra):
 def settle(history, label='Fictional archive', *, stall=None, ceiling=None, slice_seconds=SLICE_SECONDS):
     """Return '' once every queued record is saved, otherwise a diagnostic.
 
-    Progress is any change in the queue length, the in-flight count or the
-    writer's current step. A reported reason, an unavailable archive, a closed
-    archive or a dead writer fails at once; no progress for `stall` seconds or
-    more than `ceiling` seconds in total fails with the last observed state.
+    Success means an empty queue, nothing in flight, and a live writer that
+    has gone back to waiting for work. Progress is any change in the queue
+    length, the in-flight count or the writer's current step. A reported
+    reason, an unavailable archive, a closed archive (drained or not) or a dead
+    writer fails at once; no progress for `stall` seconds or more than
+    `ceiling` seconds in total fails with the last observed state.
     """
     stall = STALL_SECONDS if stall is None else stall
     ceiling = CEILING_SECONDS if ceiling is None else ceiling
@@ -45,22 +60,28 @@ def settle(history, label='Fictional archive', *, stall=None, ceiling=None, slic
     while True:
         state = _snapshot(history)
         now = time.monotonic()
+        drained = not state[0] and not state[1]
         if history.reason or not history.available:
             return _describe(history, label, started, 'reported a failure')
-        if not state[0] and not state[1]:
-            return ''
         if history.closed:
-            return _describe(history, label, started, 'was closed with records still pending')
+            return _describe(history, label, started, 'was closed before its records were confirmed saved'
+                             if drained else 'was closed with records still pending')
         thread = getattr(history, 'thread', None)
         if thread is None or not thread.is_alive():
             return _describe(history, label, started, 'has no running writer')
+        if drained and _writer_idle(thread):
+            return ''
         if state != seen:
             seen, changed = state, now
         elif now - changed >= stall:
-            return _describe(history, label, started, 'made no progress for %gs' % stall)
+            return _describe(history, label, started, 'has an empty queue but its writer did not return to waiting for %gs' % stall
+                             if drained else 'made no progress for %gs' % stall)
         if now - started >= ceiling:
             return _describe(history, label, started, 'was still saving at the %gs ceiling' % ceiling)
-        history.flush(slice_seconds)
+        if drained:
+            time.sleep(IDLE_POLL_SECONDS)
+        else:
+            history.flush(slice_seconds)
 
 
 def close(history, label='Fictional archive', *, stall=None, timeout=2.0):

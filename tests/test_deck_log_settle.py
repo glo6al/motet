@@ -122,6 +122,52 @@ class SettleTests(unittest.TestCase):
         with self.store.wake:
             self.store.queue.clear()
 
+    def test_writer_crash_on_the_final_record_is_not_success(self):
+        def fatal(*args):
+            raise ValueError('fictional writer crash')
+        with patch.object(self.store, '_write', fatal), patch.object(threading, 'excepthook', lambda args: None):
+            self.queue(1)
+            self.store.thread.join(5)
+            self.assertFalse(self.store.thread.is_alive())
+            problem = settle.settle(self.store, 'Lost archive', stall=10, ceiling=10)
+        self.assertIn('Lost archive has no running writer', problem)
+        self.assertIn('queued=0, inflight=0', problem)
+        self.assertIn('writer_alive=False', problem)
+        self.assertEqual(self.saved(), 0)
+
+    def test_crashing_writer_still_alive_after_its_last_record_is_not_success(self):
+        # The thread is held between giving up the record and ending, the
+        # moment an empty queue and a live thread could look like success.
+        hooked, finish = threading.Event(), threading.Event()
+        def fatal(*args):
+            raise ValueError('fictional writer crash')
+        def hold(args):
+            hooked.set()
+            finish.wait(10)
+        self.addCleanup(finish.set)
+        with patch.object(self.store, '_write', fatal), patch.object(threading, 'excepthook', hold):
+            self.queue(1)
+            self.assertTrue(hooked.wait(5))
+            self.assertTrue(self.store.thread.is_alive())
+            problem = settle.settle(self.store, 'Dying archive', stall=0.5, ceiling=10)
+            finish.set()
+            self.store.thread.join(5)
+        self.assertIn('Dying archive has an empty queue but its writer did not return to waiting for 0.5s', problem)
+        self.assertIn('queued=0, inflight=0', problem)
+        self.assertEqual(self.saved(), 0)
+
+    def test_closed_and_drained_archive_fails_at_once(self):
+        self.queue(2)
+        self.assertEqual(settle.settle(self.store, stall=5, ceiling=10), '')
+        with self.store.wake:
+            self.store.closed = True
+        self.store.thread.join(5)
+        started = time.monotonic()
+        problem = settle.settle(self.store, 'Finished archive', stall=10, ceiling=10)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn('Finished archive was closed before its records were confirmed saved', problem)
+        self.assertIn('queued=0, inflight=0', problem)
+
     def test_closed_with_records_pending_fails_at_once(self):
         entered = threading.Event()
         with patch.object(self.store, '_write', self.blocked_writer(entered)):
