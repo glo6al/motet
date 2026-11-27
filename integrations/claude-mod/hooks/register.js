@@ -1197,6 +1197,32 @@ async function forgetGrant($, config) {
   if (configurationId(await $.store.get(grantKey(config))) === configurationId(config)) await $.store.delete(grantKey(config));
 }
 
+// Another copy can deliver this copy's pending disconnect. Once its exact key is gone and the shared record
+// contains an ordered result, stop asserting the old unticketed decision from memory. A legacy delivery removes
+// the key without an ordered result, so its own opt-out still stands. Failed reads never establish delivery.
+async function reconcileOwnPending($, state, id, stored) {
+  const command = state.ownCommands.get(id);
+  if (!command || state.ownDecisions.get(id) !== true) return stored;
+  const key = pendingPrefix(id) + command;
+  if (await $.store.get(key) !== undefined) return stored;
+  stored = await $.store.get(preferenceKey(id));
+  if (stored?.version !== 1 || typeof stored.disconnected !== 'boolean' || stored.pending === true ||
+      !Number.isSafeInteger(stored.decision_seq) || stored.decision_seq < 1 ||
+      !Number.isInteger(stored?.decision_port) || stored.decision_port < 1 || stored.decision_port > 65535) return stored;
+  const operation = state.preferenceWrites.then(() => {
+    // A newer local command may have completed during either read; only retire the captured command.
+    if (state.ownCommands.get(id) !== command || state.ownDecisions.get(id) !== true) return false;
+    recordSuperseded(state,id);
+    const pending = state.pendingOptOuts.get(id);
+    pending?.delete(key);
+    if (pending?.size === 0) state.pendingOptOuts.delete(id);
+    return true;
+  });
+  state.preferenceWrites = operation.catch(() => {});
+  // Reconciliation can queue a preference write of its own, so it must run outside the operation above.
+  return await operation ? $.store.get(preferenceKey(id)) : stored;
+}
+
 // The preference this copy follows. Another copy of the plugin (an earlier one still finishing a command after a
 // reload) or another Claude window of this chat may have written the shared record since this copy's own decision.
 // Where both carry Motet tickets, the newer ticket wins, as at Motet, and this copy's decision is written back only
@@ -1204,7 +1230,7 @@ async function forgetGrant($, config) {
 // asserted: this copy's own opt-out is written back and followed before anything connects, while a foreign opt-out
 // over this copy's reconnect stands, since it may be a newer decision made in another window. Both fail closed.
 async function currentPreference($, state, id) {
-  const stored = await $.store.get(preferenceKey(id));
+  const stored = await reconcileOwnPending($,state,id,await $.store.get(preferenceKey(id)));
   // An owner disconnect not yet told to Motet holds, whatever the shared record says, until it is delivered.
   const pending = await pendingOptOuts($,id);
   const held = value => !pending.length || value?.disconnected === true ? value :

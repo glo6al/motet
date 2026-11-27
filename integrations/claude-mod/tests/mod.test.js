@@ -3273,6 +3273,140 @@ for(const how of ['cannot be placed','unreachable']){
   });
 }
 
+// Another window may deliver a pending disconnect while its originating window stays open. The origin must
+// learn that delivery, including a refusal for a newer decision, rather than reasserting its old pending choice.
+for(const outcome of ['committed','superseded']){
+  test(`another window's ${outcome} delivery of a pending disconnect lets the origin follow a newer reconnect (F11)`,async()=>{
+    let unavailable=true;
+    const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const fetch=(url,body,init)=>motet.fetch(url,body,init);
+    const pendingKeys=()=>[...storage.keys()].filter(key=>key.startsWith('watch-owner-pending-v1:'+NATIVE+':'));
+    const a=await harness({storage,claimed:false,fetch:(url,body,init)=>{
+      // In the committed case Motet is unavailable throughout the command. In the superseded case the reservation
+      // succeeds, but its commit cannot reach Motet, so the pending record keeps the original ticket.
+      if(unavailable&&url.endsWith('/decision')&&(outcome==='committed'||body.opted_out===true))throw Error('Motet temporarily unavailable');
+      return fetch(url,body,init);
+    }});
+    assert.match((await a.command('watch-disconnect')).text,/^Motet disconnected/);
+    assert.equal(storage.get(PREF).pending,true);
+    assert.equal(pendingKeys().length,1);
+    unavailable=false;
+    const b=await harness({storage,claimed:false,fetch});
+    if(outcome==='superseded'){
+      // The owner reconnects before B delivers A's older ticket; delivery is then refused as superseded.
+      assert.match((await b.command('watch-connect')).text,/reconnect scheduled/);
+    }
+    await b.tick();
+    assert.equal(pendingKeys().length,0,"B delivered and removed A's pending entry");
+    if(outcome==='committed'){
+      assert.equal(motet.optedOut,true);
+      assert.match((await b.command('watch-connect')).text,/reconnect scheduled/);
+    }else assert(motet.refused.includes('commit'),"A's older pending decision was superseded");
+    const reconnect=motet.latest;
+    assert.equal(motet.optedOut,false);
+    // Advance beyond the 30-second decision-read cache repeatedly. No reload, held write, or special overlap is
+    // involved: A and B take ordinary heartbeat turns after B handled A's pending decision.
+    for(const now of [160000,220000,280000]){
+      a.setNow(now);b.setNow(now);
+      for(let tick=0;tick<2;tick++){await a.tick();await b.tick();}
+      assert.equal(storage.get(PREF).disconnected,false,'A must not resurrect its delivered opt-out');
+      assert.equal(storage.get(PREF).decision_seq,reconnect);
+      assert.equal(storage.get(PREF).pending,undefined);
+      assert.deepEqual(pendingKeys(),[]);
+      assert.equal(motet.latest,reconnect,'no later decision was invented');
+      assert.equal(motet.optedOut,false);
+      assert.equal((await statusOf(a)).connected,true,'the originating window follows the reconnect');
+      assert.equal((await statusOf(b)).connected,true,'the reconnecting window stays connected');
+    }
+    const c=await harness({storage,claimed:false,fetch});c.setNow(340000);
+    await c.tick();await c.tick();
+    assert.equal((await statusOf(c)).connected,true,'a fresh copy follows the same durable reconnect');
+    assert.equal(storage.get(PREF).disconnected,false);
+    assert.deepEqual(pendingKeys(),[]);
+  });
+}
+
+// Arrange a delivered foreign opt-out without making its originating window run a heartbeat yet.
+async function externallyDeliveredPending({legacy=false}={}){
+  let down=true;
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]),motet=ticketMotet();
+  const fetch=(url,body,init)=>legacy?globalFetch(url,body,init):motet.fetch(url,body,init);
+  const a=await harness({storage,claimed:false,fetch:(url,body,init)=>{
+    if(down&&url.endsWith('/decision'))throw Error('Motet temporarily unavailable');
+    return fetch(url,body,init);
+  }});
+  await a.command('watch-disconnect');
+  const key=[...storage.keys()].find(key=>key.startsWith('watch-owner-pending-v1:'+NATIVE+':'));
+  assert(key);
+  down=false;
+  const b=await harness({storage,claimed:false,fetch});await b.tick();
+  assert.equal(storage.has(key),false);
+  await b.command('watch-connect');
+  return {a,b,key,storage,motet,setDown(value){down=value;}};
+}
+
+test('foreign legacy delivery without an ordered result preserves the origin opt-out (F11)',async()=>{
+  const {a,b,storage}=await externallyDeliveredPending({legacy:true});
+  assert.equal(storage.get(PREF).decision_seq,undefined);
+  const since=a.calls.length;
+  a.setNow(200000);await a.tick();await b.tick();
+  assert.equal(storage.get(PREF).disconnected,true,'an older Motet cannot order a foreign reconnect above this opt-out');
+  assert.equal((await statusOf(a)).connected,false);
+  assert.equal(motetCalls(a,since).length,0);
+});
+
+test('a failed read of the exact pending key does not establish foreign delivery (F11)',async()=>{
+  const {a,key,storage}=await externallyDeliveredPending();
+  const get=a.$.store.get;let fail=true,failedReads=0;
+  a.$.store.get=async name=>{
+    if(fail&&name===key){failedReads++;throw Error('stored pending result unreadable');}
+    return get(name);
+  };
+  const since=a.calls.length;a.setNow(200000);await a.tick();
+  assert.equal(failedReads,1,'the exact missing-key read was attempted');
+  assert.equal((await statusOf(a)).connected,false);
+  assert.equal(motetCalls(a,since).length,0,'a failed read cannot permit a connection');
+  fail=false;a.setNow(260000);await a.tick();await a.tick();
+  assert.equal((await statusOf(a)).connected,true,'recovery follows the successful ordered read');
+  assert.equal(storage.get(PREF).disconnected,false);
+});
+
+for(const [label,change] of [
+  ['pending',record=>({...record,pending:true})],
+  ['zero ticket',record=>({...record,decision_seq:0})],
+  ['missing port',record=>({...record,decision_port:undefined})]
+]){
+  test(`foreign delivery needs a non-pending positive ticket and its Motet port (${label}) (F11)`,async()=>{
+    const {a,storage}=await externallyDeliveredPending();
+    storage.set(PREF,change(storage.get(PREF)));
+    const since=a.calls.length;a.setNow(200000);await a.tick();
+    assert.equal((await statusOf(a)).connected,false);
+    assert.equal(storage.get(PREF).disconnected,true,'an unordered record cannot retire the local opt-out');
+    assert.equal(motetCalls(a,since).length,0);
+  });
+}
+
+test('a newer local disconnect survives an inspection of its already delivered predecessor (F11)',async()=>{
+  const {a,key,storage,setDown}=await externallyDeliveredPending();
+  const get=a.$.store.get,gate=latch();let hold=true;
+  a.$.store.get=async name=>{
+    if(hold&&name===key){hold=false;const missing=await get(name);await gate.hold();return missing;}
+    return get(name);
+  };
+  a.setNow(200000);const inspecting=a.tick();await bounded(gate.entered,'old pending key inspected');
+  setDown(true);
+  assert.match((await a.command('watch-disconnect')).text,/^Motet disconnected/);
+  const newer=[...storage.keys()].filter(name=>name.startsWith('watch-owner-pending-v1:'+NATIVE+':'));
+  assert.equal(newer.length,1);assert.notEqual(newer[0],key);
+  gate.release();await inspecting;await a.tick();
+  assert.equal(storage.has(newer[0]),true,'the newer undelivered command remains durable');
+  assert.equal(storage.get(PREF).disconnected,true);
+  assert.equal((await statusOf(a)).connected,false);
+  setDown(false);a.setNow(260000);await a.tick();
+  assert.equal(storage.has(newer[0]),false,'the newer command is delivered after recovery');
+  assert.equal(storage.get(PREF).disconnected,true);
+});
+
 test('a copy kept off by a disconnect it did not make says so in /watch-status',async()=>{
   const storage=new Map([[GLOBAL_KEY,CONFIG],[PREF,{version:1,disconnected:true,writer:'fictional-other-window'}]]);
   const h=await harness({storage,claimed:false,fetch:globalFetch});
