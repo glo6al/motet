@@ -19,6 +19,7 @@ import uuid
 
 LEASE, PAIR_TTL, TTL, RETENTION = 12, 300, 900, 86400
 RESERVATION_TTL = 86400           # how long a reservation's answer can be asked for again
+RESERVATION_LIMIT = 4096          # the most reservations kept; the oldest go first
 COMMAND_ID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9]{1,15}$')
 TRANSPORT = 'claude_mod'
 PEER_UNAVAILABLE = 'Agent receiving requires explicit Motet setup and a compatible live official plugin in this exact Claude chat.'
@@ -346,6 +347,7 @@ class ClaudeMod:
         # same ticket back, so a lost answer and a retry never give an old command a newer place.
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_reservations (
             command_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, created REAL NOT NULL)''')
+        self.db.execute('CREATE INDEX IF NOT EXISTS claude_mod_reservations_created ON claude_mod_reservations(created)')
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_setup_codes (
             code_hash TEXT PRIMARY KEY, expires REAL NOT NULL)''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_grants (
@@ -554,6 +556,9 @@ class ClaudeMod:
         if command_id is not None:
             self.db.execute('INSERT INTO claude_mod_reservations (command_id,seq,created) VALUES (?,?,?)',
                             (command_id, issued, time.time()))
+            # Bounded: past the limit the oldest are forgotten (a forgotten command can then only be placed afresh).
+            self.db.execute('DELETE FROM claude_mod_reservations WHERE command_id IN (SELECT command_id FROM '
+                            'claude_mod_reservations ORDER BY created DESC, seq DESC LIMIT -1 OFFSET ?)', (RESERVATION_LIMIT,))
         return issued
 
     def _valid_ticket(self, seq):

@@ -1386,6 +1386,22 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(ask(dict(reserve=True, command_id=uid() + ':2'))[0], 200)
         self.assertIsNone(self.store.db.execute('SELECT 1 FROM claude_mod_reservations WHERE command_id=?', (command,)).fetchone())
 
+    def test_reservations_are_capped_and_the_oldest_go_first(self):
+        _, grant = self.global_setup(); token = grant['grant']
+        with patch.object(mod, 'RESERVATION_LIMIT', 5):
+            commands = [uid() + ':%d' % n for n in range(8)]
+            seqs = []
+            for command in commands:
+                status, value = self.http('/claude-mod/decision', dict(reserve=True, command_id=command), token=token)
+                self.assertEqual(status, 200, value); seqs.append(value['decision_seq'])
+            kept = [r[0] for r in self.store.db.execute('SELECT command_id FROM claude_mod_reservations ORDER BY seq')]
+            self.assertEqual(kept, commands[-5:])
+            # The newest still answer with their own ticket; the forgotten ones can only be recovered no more.
+            status, again = self.http('/claude-mod/decision', dict(reserve=True, command_id=commands[-1]), token=token)
+            self.assertEqual(again['decision_seq'], seqs[-1])
+            status, gone = self.http('/claude-mod/decision', dict(reserve=True, command_id=commands[0], recover=True), token=token)
+            self.assertEqual((status, gone['error_code']), (409, 'not_reserved'))
+
     def test_a_chat_s_latest_decision_can_be_read(self):
         _, grant = self.global_setup(); token = grant['grant']
         status, value = self.http('/claude-mod/decision', dict(native_id=self.sid, query=True), token=token)

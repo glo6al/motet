@@ -816,9 +816,9 @@ async function supervisor($, state) {
         // The place this attempt is made from, taken before any network call: a refusal is remembered for it only.
         attempt = await refusalKey($,state,id,project,config);
         checkEligibility(state,eligibilityEpoch);
-        const grantKeys = await $.store.keys();
+        const grantsBefore = await storedGrants($);
         await connectDerived($,state,id,earlier ?? project,config,eligibilityEpoch);
-        pruneGrants($,config,Array.isArray(grantKeys) ? grantKeys : []).catch(() => {});
+        pruneGrants($,config,grantsBefore).catch(() => {});
         // Another copy's grant worked where the shared one was refused: share it, so the other chats use it too.
         if (configurationId(config) !== configurationId(raw)) await $.store.set(GLOBAL_KEY,config).catch(() => {});
       } else {
@@ -1061,7 +1061,7 @@ function settleYieldedOptOut($, state, id, decision) {
     if (blocked) continue;
     state.yieldedOptOuts.delete(chat);
     if (overtaken(state,yielded.decision,chat)) continue;
-    savePreference($,state,chat,true,yielded.decision,yielded.ticket).then(saved => {
+    savePreference($,state,chat,true,yielded.decision,yielded.ticket,{offline:yielded.offline === true}).then(saved => {
       if (saved !== true || overtaken(state,yielded.decision,chat)) return;
       const data = state.data;
       suspend($,state);
@@ -1137,12 +1137,23 @@ async function currentGrant($, state, raw) {
 }
 
 // Motet holds one active grant, so once it accepts one, every other copy's stored grant is revoked: those stored
-// before this registration are removed, so the per-copy keys do not pile up across reloads. One written meanwhile,
-// by a setup that may be newer, is kept.
-async function pruneGrants($, accepted, keysBefore) {
-  for (const key of keysBefore.filter(key => typeof key === 'string' && key.startsWith(grantPrefix)).slice(0, 4096)) {
+// before this registration, and unchanged since, are removed, so the per-copy keys do not pile up across reloads.
+// One written or rewritten meanwhile, by a setup that may be newer, is kept.
+async function storedGrants($) {
+  const keys = await $.store.keys(), grants = new Map();
+  if (!Array.isArray(keys) || keys.length > 4096) return grants;
+  for (const key of keys.filter(key => typeof key === 'string' && key.startsWith(grantPrefix)).slice(0, 64)) {
     const value = await $.store.get(key);
-    if (globalConfiguration(value) && value.grant_id !== accepted.grant_id) await $.store.delete(key);
+    if (globalConfiguration(value)) grants.set(key, value.grant_id);
+  }
+  return grants;
+}
+
+async function pruneGrants($, accepted, before) {
+  for (const [key, grantId] of before) {
+    if (grantId === accepted.grant_id) continue;
+    const value = await $.store.get(key);
+    if (globalConfiguration(value) && value.grant_id === grantId) await $.store.delete(key);
   }
 }
 
@@ -1315,15 +1326,18 @@ async function explicitDisconnect($, state) {
     id = await $.session.id();
     if (overtaken(state,decision,id)) return result = false;
     const placement = UUID.test(id) ? await placeCommand($,state,id,decision,early) : {ticket:null};
-    if (placement.unplaced) return result = 'unplaced';
+    // A disconnect always takes effect here. One whose place Motet cannot confirm, or that cannot reach Motet, is
+    // kept pending and told to Motet later, under the ticket Motet gives it then: placing an opt-out when Motet first
+    // hears of it can only beat a reconnect made at about the same moment, the safe way round for an opt-out.
+    const offline = placement.unreachable === true || placement.unplaced === true;
     const ticket = placement.ticket;
     if (overtaken(state,decision,id)) return result = false;
     if (!reservedInOrder(state,decision,ticket,id)) {
       const earlier = state.yieldedOptOuts.get(id);
-      if (!earlier || earlier.decision < decision) state.yieldedOptOuts.set(id,{decision,ticket});
+      if (!earlier || earlier.decision < decision) state.yieldedOptOuts.set(id,{decision,ticket,offline});
       return result = 'yielded';
     }
-    const saved = UUID.test(id) ? await savePreference($,state,id,true,decision,ticket,{offline:placement.unreachable === true}) : true;
+    const saved = UUID.test(id) ? await savePreference($,state,id,true,decision,ticket,{offline}) : true;
     if (saved !== true) return result = saved;
     if (overtaken(state,decision,id)) return result = false;
     const data = state.data;
@@ -1507,7 +1521,7 @@ export function register(on) {
       try {
         const done = await explicitDisconnect($,state);
         return {text:done === true ? 'Motet disconnected. ' + LIMITATION : done === 'elsewhere' ? NEWER_ELSEWHERE :
-          done === 'yielded' ? YIELDED_OPT_OUT : done === 'unplaced' ? UNPLACED : SUPERSEDED};
+          done === 'yielded' ? YIELDED_OPT_OUT : SUPERSEDED};
       }
       catch {return {text:'Motet disconnect could not be saved; readiness expires when its heartbeat stops.'};}
     }
