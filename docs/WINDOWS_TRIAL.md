@@ -5,7 +5,21 @@ stand-in for Claude Code; this trial uses the real Claude Code 2.1.323 and check
 
 - Code under test: the latest `dev` branch.
 - Time: about 45 minutes, most of it the install and the Defender scan.
-- Everything here stays on your PC. Nothing is sent anywhere unless you paste it into the issue yourself.
+- What you collect stays on your PC: the output you paste into your text file is not sent anywhere unless you
+  paste it into the issue yourself.
+
+**What goes over the network.** The trial itself is not offline:
+
+- It downloads software: Python and Git for Windows if you do not have them, the Motet `dev` branch from GitHub,
+  and the Claude Code installer script and Claude Code 2.1.323 from Anthropic (step 5).
+- You sign in to Claude Code with your own account (step 6).
+- The trial chats (steps 16 to 24) are real Claude Code chats. As with any Claude Code chat, their instructions,
+  what Claude reads in the trial folder, and Claude's replies go to Anthropic under your account, and use its
+  normal allowance. Claude Code may also send Anthropic its usual usage data and look for updates.
+- Depending on your settings, Microsoft Defender may check the new Claude Code program with Microsoft's cloud
+  service when it scans it.
+
+Use only the throwaway trial folder, so no real project's files are read.
 
 Use a normal PowerShell window (not "Run as administrator") for every step. Keep a text file open and paste each
 step's output into it under the step number.
