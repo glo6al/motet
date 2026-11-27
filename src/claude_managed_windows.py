@@ -3,8 +3,9 @@ nothing and loads no Win32 call.
 
 POSIX keeps its own way (claude_managed.spawn_runner and claude_managed_runner.NativeTransport): the supervisor
 starts in a new session so it outlives the server, Claude starts in its own session, the pipes are non-blocking
-under a selector, and Shutdown sends Claude SIGTERM and waits. If the supervisor dies, Claude is left running and
-its outcome becomes uncertain; it is never adopted.
+under a selector, and Shutdown sends Claude SIGTERM and waits; the owner's Stop ends Claude's process group
+(managed_process_tree). If the supervisor dies, Claude is left running and its outcome becomes uncertain; it is never
+adopted or signalled, and the owner's Stop then confirms its end only once nothing of it is seen running.
 
 Windows differs in four ways:
 

@@ -16,7 +16,8 @@ fictional executable, its pin and the supervisor's spawn). A whole managed start
 - the supervisor, and Claude in its kill-on-close job;
 - the named-pipe control channel and the native claim;
 - one message with one permission (Allow) and its reply;
-- Stop, after which nothing the fictional Claude started is still running.
+- Stop, after which nothing the fictional Claude started is still running; and the owner's Stop through its route
+  (/api/managed-claude/runs/<run>/stop), after which no process is left either.
 A supervisor that is killed takes Claude and everything it started with it.
 
 The fictional "claude.exe" is pip's own console-script launcher (distlib) with a Python script appended, as pip
@@ -611,6 +612,44 @@ class WindowsEndToEndTests(unittest.TestCase):
         self.assertEqual(self.supervisors[-1].wait(timeout=30), 0)       # the supervisor ends after the exit
         with manager._registry() as db:
             self.assertFalse(manager._row(db, run_id)['occupied'])      # its slot is released
+
+    def test_stop_through_the_route_leaves_no_process(self):
+        """The owner's Stop, through the real route on this server's loopback port: Claude, its launcher and its
+        grandchild end (the whole job), the supervisor ends, the slot is released, and a second Stop only answers
+        with the record."""
+        import http.client
+        import threading
+        manager, run_id, processes = self.start()
+        agent = 'c:' + manager.status(run_id)['nativeId']
+        httpd = server.Server(('127.0.0.1', 0), server.H)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        replies = []
+        with mock.patch.object(server, 'CLAUDE_MANAGED', manager), mock.patch.object(server, 'MESSAGING', None), \
+                mock.patch.object(server, 'PORT', httpd.server_port), mock.patch.object(server, 'KEY', 'fictional-owner'):
+            thread.start()
+            try:
+                for _ in range(2):
+                    connection = http.client.HTTPConnection('127.0.0.1', httpd.server_port, timeout=60)
+                    connection.request('POST', '/api/managed-claude/runs/%s/stop' % run_id,
+                                       json.dumps({'requestId': str(uuid.uuid4()), 'agent': agent}),
+                                       {'X-Live-Room-Key': 'fictional-owner', 'Content-Type': 'application/json'})
+                    response = connection.getresponse()
+                    replies.append((response.status, json.loads(response.read())))
+                    connection.close()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join()
+        (status, first), (again_status, again) = replies
+        self.assertEqual(status, 200, first)
+        self.assertEqual((first['state'], first['ownerStop']['outcome'], first['already']), ('exited', 'stopped', False))
+        self.assert_tree_gone(processes)
+        self.assertEqual(self.supervisors[-1].wait(timeout=30), 0)
+        with manager._registry() as db:
+            self.assertFalse(manager._row(db, run_id)['occupied'])
+        self.assertEqual(again_status, 200, again)
+        self.assertTrue(again['already'])
+        self.assertEqual(again['ownerStop'], first['ownerStop'])
 
     def test_a_supervisor_that_is_killed_takes_claude_and_all_it_started(self):
         manager, run_id, processes = self.start()

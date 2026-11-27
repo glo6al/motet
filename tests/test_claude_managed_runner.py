@@ -48,7 +48,10 @@ class FakeTransport:
         self.frames = collections.deque()
         self.writes = []
         self.code = None
-        self.starts = self.terminates = 0
+        self.starts = self.terminates = self.ends = 0
+        self.stubborn = False
+        self.survivors = []
+        self.left = []
         self.claims_seen = []
 
     def start(self):
@@ -105,6 +108,14 @@ class FakeTransport:
         if self.code is None:
             raise TimeoutError()
         return self.code
+
+    def end_tree(self, gentle=3, firm=2):
+        # The owner's stop: the whole tree ends, or (stubborn) something in it is still running after SIGKILL.
+        self.ends += 1
+        if self.stubborn:
+            raise TimeoutError()
+        self.code = -9
+        return self.code, self.survivors
 
     def close(self):
         pass
@@ -492,6 +503,96 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.shutdown(request), receipt)
         self.assertEqual(self.transport.terminates, 1)
         self.assertEqual([m['state'] for m in runner.snapshot()['messages']], ['unknown', 'failed'])
+
+    def test_owner_stop_is_said_as_the_owners_and_ends_the_tree_once_per_request(self):
+        runner = self.runner()
+        self.send(runner)
+        self.send(runner, 'unsent')
+        self.transport.permission()
+        runner.step()
+        request = uid()
+        receipt = runner.command('stop', {'requestId': request, 'by': 'owner'})
+        self.assertEqual(receipt['state'], 'exited')
+        self.assertEqual((self.transport.ends, self.transport.terminates), (1, 0))
+        snapshot = runner.snapshot()
+        permission = snapshot['permissions'][0]
+        self.assertEqual((permission['decision'], permission['resolutionReason'], permission['decisionState']),
+                         ('deny', 'owner_stop', 'written'))
+        denial = self.transport.decisions[0]['response']['response']
+        self.assertEqual(denial, {'behavior': 'deny',
+                                  'message': 'The owner stopped this chat in Motet, so this request was denied.'})
+        self.assertEqual([(m['state'], m['error']) for m in snapshot['messages']],
+                         [('unknown', 'native_exited'), ('failed', 'owner_stop')])
+        self.assertEqual(runner.stop(request), receipt)
+        self.assertEqual(self.transport.ends, 1, 'a replayed request ID does not act again')
+        for params in ({'requestId': uid()}, {'requestId': uid(), 'by': 'motet'}, {'requestId': uid(), 'by': 'owner', 'x': 1}):
+            self.assert_error('invalid_request', lambda: runner.command('stop', params))
+
+    def stopped_with(self, survivors):
+        runner = self.runner()
+        self.transport.survivors = survivors
+        self.assertEqual(runner.stop(uid())['state'], 'exited')             # Claude itself ended
+        return runner.snapshot()
+
+    def test_what_outlives_claude_is_recorded_never_dropped(self):
+        snapshot = self.stopped_with([[4242, 1900000000.0]])
+        self.assertEqual(snapshot['treeSurvivors'], [[4242, 1900000000.0]])
+        self.assertEqual(managed.read_snapshot(self.run)['treeSurvivors'], [[4242, 1900000000.0]])
+
+    def test_a_tree_that_could_not_be_seen_is_recorded_as_such(self):
+        snapshot = self.stopped_with(None)
+        self.assertIsNone(snapshot['treeSurvivors'])
+        self.assertIsNone(managed.read_snapshot(self.run)['treeSurvivors'])
+
+    def test_a_stop_after_claude_ended_by_itself_records_its_tree_as_unseen(self):
+        runner = self.runner()
+        self.transport.code = 0
+        runner.step()                                      # Claude's own exit, recorded before the stop arrives
+        self.assertEqual(runner.stop(uid())['state'], 'exited')
+        self.assertEqual(self.transport.ends, 0, 'nothing is signalled')
+        self.assertIsNone(runner.snapshot()['treeSurvivors'], 'what it started can no longer all be seen')
+
+    def test_a_stop_whose_wait_fails_keeps_its_tree_unseen_through_the_late_exit_and_a_retry(self):
+        runner = self.runner()
+        self.transport.stubborn = True                     # the tree end's wait for Claude fails
+        self.assertEqual(runner.stop(uid())['state'], 'unknown')
+        self.assertIsNone(runner.snapshot()['treeSurvivors'])
+        self.transport.code = 0
+        runner.step()                                      # Claude exits later
+        self.assertIsNone(runner.snapshot()['treeSurvivors'], 'the late exit is no evidence about the tree')
+        self.assertEqual(runner.stop(uid())['state'], 'exited')   # Try again with Claude already reaped
+        self.assertIsNone(runner.snapshot()['treeSurvivors'], 'nor is a retry after it')
+
+    def test_more_survivors_than_are_kept_are_recorded_as_unseeable(self):
+        self.assertIsNone(self.stopped_with([[n, 1.0] for n in range(1, 66)])['treeSurvivors'])
+
+    def test_a_tree_seen_to_end_records_no_survivors(self):
+        self.assertEqual(self.stopped_with([])['treeSurvivors'], [])
+
+    def test_before_any_stop_the_tree_is_not_reported(self):
+        self.assertNotIn('treeSurvivors', self.runner().snapshot())
+
+    def test_an_unconfirmed_owner_stop_keeps_the_supervisor_listening_for_another_try(self):
+        runner = self.runner()
+        self.transport.stubborn = True
+        receipt = runner.stop(uid())
+        self.assertEqual(receipt['state'], 'unknown')
+        self.assertEqual(runner.snapshot()['state'], 'uncertain')
+
+        class Endpoint:
+            calls = 0
+
+            def accept(endpoint, seconds):
+                endpoint.calls += 1
+                if endpoint.calls == 3:
+                    self.transport.stubborn = False
+                    self.assertEqual(runner.stop(uid())['state'], 'exited')       # the owner's Try again
+                return None
+        endpoint = Endpoint()
+        self.assertEqual(managed._serve_loop(runner, endpoint), 0)
+        self.assertEqual(endpoint.calls, 3, 'it listened after the unconfirmed stop, until the exit was recorded')
+        self.assertEqual(self.transport.ends, 2)
+        self.assertTrue(runner.snapshot()['nativeExit']['confirmed'])
 
     def test_read_only_snapshot_is_uncertain_without_exit_no_file_changes(self):
         runner = self.runner()

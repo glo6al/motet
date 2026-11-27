@@ -153,6 +153,25 @@ class ManagedIntegrationTests(unittest.TestCase):
         with self.assertRaises(fixture.managed.ManagedError):
             manager.can_observe(uid(), self.source)
 
+    def test_the_owners_stop_reaches_the_agent_row_and_survives_a_restart(self):
+        with patch.object(server, 'MANAGED_STOPS', {}):
+            server.load_managed_stops(self.manager)
+            server.describe(self.aid, False, name='Fictional orchard')
+            self.manager.stop(self.run, uid(), self.aid)
+            stop = server.AGENTS[self.aid]['managed_stop']
+            self.assertEqual(stop['outcome'], 'stopped')
+            self.assertEqual(set(stop), {'outcome', 'requestedAt', 'lastAttemptAt', 'stoppedAt'})
+            rows = [e for e in server.LOG if e['kind'] == 'agent' and e['agent'] == self.aid]
+            self.assertEqual(rows[-1]['managed_stop'], stop, 'the room is told at once')
+        # A restart: nothing in memory, the record read back from the registry, and the row carries it from the
+        # first time the agent's log describes it.
+        with patch.object(server, 'MANAGED_STOPS', {}), patch.object(server, 'AGENTS', {}):
+            server.load_managed_stops(self.native.make())
+            server.describe(self.aid, True, name='Fictional orchard')
+            self.assertEqual(server.AGENTS[self.aid]['managed_stop'], stop)
+            server.describe('c:' + uid(), True, name='Another chat')
+            self.assertEqual([aid for aid, row in server.AGENTS.items() if 'managed_stop' in row], [self.aid])
+
     def test_reserved_managed_identity_and_children_not_observed_before_admission(self):
         self.assertFalse(server.managed_source_allowed(str(self.source), server.ClaudeTail))
         child = self.native.root / self.ident / 'subagents' / 'agent-fictional.jsonl'

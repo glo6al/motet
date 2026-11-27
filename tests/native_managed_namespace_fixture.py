@@ -387,6 +387,7 @@ class ManagedFixture:
         self.turns = []
         self.messages = {}
         self.decisions = {}
+        self.stopped = set()
         self.request_failure = request_failure
         project = self.root / 'project'
         info = project.stat()
@@ -403,9 +404,12 @@ class ManagedFixture:
 
     def snapshot(self, path):
         manifest = json.loads((path / 'manifest.json').read_bytes())
+        ended = path.name in self.stopped
         return dict(runId=path.name, nativeId=manifest['nativeId'], incarnation=manifest['incarnation'],
-                    cwd=self.folder.path, state='ready', nativeExit=None, identityVerified=True,
-                    messages=list(self.messages.values()), permissions=[])
+                    cwd=self.folder.path, state='exited' if ended else 'ready',
+                    nativeExit=dict(confirmed=True, code=-15, incarnation=manifest['incarnation']) if ended else None,
+                    identityVerified=True, messages=list(self.messages.values()), permissions=[],
+                    **(dict(treeSurvivors=[]) if ended else {}))     # the stop saw the whole tree end
 
     def request(self, path, command, params):
         self.calls.append(command)
@@ -422,6 +426,9 @@ class ManagedFixture:
             value = dict(params, state='written')
             self.decisions[params['requestId']] = value
             return value
+        if command == 'stop':                     # the owner's stop: the fictional Claude's exit is recorded
+            self.stopped.add(path.name)
+            return dict(requestId=params['requestId'], state='exited')
         require(command == 'status')
         return self.snapshot(path)
 
@@ -435,6 +442,8 @@ class ManagedFixture:
             return self.manager.enqueue(run_id, request_id, 'owner', 'Fictional note.')
         if kind == 'decide':
             return self.manager.decide(run_id, permission, request_id, decision)
+        if kind == 'stop':                        # the owner's stop of this chat
+            return self.manager.stop(run_id, request_id, 'c:' + self.manager.status(run_id)['nativeId'])
         require(kind == 'new_chat' and Adapter.first_request_id(run_id) == request_id)
         return Adapter(self.manager).start_managed_work_once(
             run_id, 'Fictional note.', lambda: self.claims.append(request_id), self.turns.append)

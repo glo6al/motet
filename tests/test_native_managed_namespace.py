@@ -269,6 +269,62 @@ class NamespaceTests(unittest.TestCase):
                     self.assertEqual(captured(lambda: native_action(root, namespace, uid()))[0], 'ok')
                     self.assertEqual(captured(lambda: manager.action('enqueue', run_id, uid()))[0], 'ok')
 
+    def test_the_stop_record_never_holds_an_id_another_operation_can_hold(self):
+        manager = ManagedFixture(self.root, self.namespace)
+        run, other = manager.start(), manager.start()
+        key = manager.manager._stop_record_id(run)
+        with self.assertRaises(Exception) as refused:         # an attachment operation cannot hold it
+            native_action(self.root, self.namespace, key)
+        self.assertIn('invalid_uuid', str(refused.exception))
+        taken = uid()                                    # native first, then a stop with its own fresh ID
+        self.assertEqual(captured(lambda: native_action(self.root, self.namespace, taken))[0], 'ok')
+        agent = 'c:' + manager.manager.status(run)['nativeId']
+        self.assertEqual(manager.manager.stop(run, uid(), agent)['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(manager.manager.status(run)['ownerStop']['outcome'], 'stopped', 'status stays usable')
+        self.assertEqual(captured(lambda: manager.action('enqueue', other, uid()))[0], 'ok', 'and so does the fence')
+        with self.assertRaises(Exception):
+            native_action(self.root, self.namespace, key)
+
+    def test_real_process_orderings_for_stop(self):
+        """Stop and an owner attachment operation race for one request ID through the real fence, in separate
+        processes and both orders: the second refuses, issues no command and writes nothing."""
+        for first in ('native', 'managed'):
+            with self.subTest(first=first):
+                root, namespace = self.case()
+                manager = ManagedFixture(root, namespace)
+                run_id, request = manager.start(), uid()
+                active = self.context.Value('i', 0)
+                second = 'native' if first == 'managed' else 'managed'
+                left, right = (self.worker(role=role, kind='stop', root=root, operation=request, run_id=run_id,
+                                           active=active, gated=role == first) for role in (first, second))
+                self.assertTrue(left[1].wait(WAIT) and right[1].wait(WAIT))
+                left[2].set()
+                self.assertTrue(left[4].wait(WAIT))
+                self.assertEqual(active.value, ROLE[first])
+                self.assert_parent_lock_held(root)
+                right[2].set()
+                self.assertTrue(right[3].wait(WAIT))
+                if second == 'native':
+                    self.assertEqual(self.result(right), (UNAVAILABLE, [], [], [], False))
+                left[5].set()
+                winning, calls, _, _, wrote = self.result(left)
+                self.assertEqual(winning[0], 'ok')
+                self.assertTrue(wrote)
+                if first == 'native':
+                    losing, calls, _, _, wrote = self.result(right)
+                    self.assertEqual(losing, CONFLICT)
+                    self.assertNotIn('stop', calls, 'the refused Stop asked nothing of the supervisor')
+                    self.assertFalse(wrote)
+                    self.assertTrue(self.present(root, LINKS, request))
+                    self.assertFalse(self.present(root, 'operations', request, managed=True))
+                    self.assertIsNone(manager.manager.status(run_id)['ownerStop'])
+                else:
+                    self.assertEqual(calls.count('stop'), 1)
+                    self.assertTrue(self.present(root, 'operations', request, managed=True))
+                    self.assertFalse(self.present(root, LINKS, request))
+                    self.assertEqual(captured(lambda: native_action(root, namespace, request)), CONFLICT)
+                self.assertEqual(active.value, 0)
+
     def test_real_process_commit_loss_both_sides(self):
         for kind in ('native', 'enqueue', 'decide'):
             for fault in ('before', 'after'):
@@ -320,6 +376,33 @@ class NamespaceTests(unittest.TestCase):
         self.assertEqual(captured(lambda: reopened.action('enqueue', run, request)), ('ok', 'unknown'))
         self.assertEqual(captured(lambda: native_action(self.root, self.namespace, request)), CONFLICT)
         self.assertEqual(reopened.calls, [])
+
+    def test_the_owners_stop_leaves_the_registry_the_fence_checks(self):
+        manager = ManagedFixture(self.root, self.namespace)
+        run, other = manager.start(), manager.start()
+        native = manager.manager.status(run)['nativeId']
+        stop = manager.manager.stop(run, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual(stop['outcome'], 'stopped')
+        # The fence checks the registry holds exactly its own tables on every reserved action; the stop's record and
+        # request are operations rows, so actions on other chats still pass it, also after a reopen.
+        self.assertEqual(captured(lambda: manager.action('enqueue', other, uid()))[0], 'ok')
+        reopened = ManagedFixture(self.root, self.namespace)
+        reopened.stopped = manager.stopped                  # the same fictional supervisors, already ended
+        self.assertEqual(reopened.manager.status(run)['ownerStop'], stop)
+        self.assertEqual(captured(lambda: reopened.action('decide', other, uid(), uid())), ('ok', 'written'))
+
+    def test_a_stop_request_id_goes_through_the_reservation_check(self):
+        manager = ManagedFixture(self.root, self.namespace)
+        run = manager.start()
+        agent = 'c:' + manager.manager.status(run)['nativeId']
+        taken = uid()
+        self.assertEqual(captured(lambda: native_action(self.root, self.namespace, taken))[0], 'ok')
+        self.assertEqual(captured(lambda: manager.manager.stop(run, taken, agent)), CONFLICT)
+        self.assertNotIn('stop', manager.calls, 'nothing was asked of the supervisor')
+        self.assertIsNone(manager.manager.status(run)['ownerStop'], 'and nothing was recorded')
+        request = uid()
+        self.assertEqual(manager.manager.stop(run, request, agent)['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(captured(lambda: native_action(self.root, self.namespace, request)), CONFLICT)
 
     def test_process_exit_after_commit_requires_exact_recovery(self):
         for kind in ('native', 'enqueue', 'decide'):

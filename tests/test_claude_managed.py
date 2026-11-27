@@ -265,6 +265,28 @@ class Fixture(unittest.TestCase):
             return copy.deepcopy(message)
         if command == 'decision':
             return dict(params, state='decided', token='must not escape')
+        if command in ('stop', 'shutdown') and command in getattr(self, 'refused_commands', ()):
+            managed._fail('managed_not_ready')        # an older supervisor refusing a command it does not know
+        if command in ('stop', 'shutdown'):
+            # The fictional supervisor's stop: the owner's denial of each waiting request, each queued message
+            # failed, and Claude's exit recorded; or, when told to be stubborn, an end it could not confirm.
+            reason = 'owner_stop' if command == 'stop' else 'shutdown'
+            for message in snapshot['messages']:
+                if message['state'] == 'queued':
+                    message.update(state='failed', error=reason, terminalAt=1_900_000_100)
+            for permission in snapshot['permissions']:
+                if permission['state'] == 'pending':
+                    permission.update(state='shutdown', decision='deny', decisionState='written',
+                                      resolutionReason=reason, resolvedAt=1_900_000_100, canAllow=False, canDeny=False)
+            if getattr(self, 'stubborn', False):
+                snapshot['state'] = 'uncertain'
+            else:
+                snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=-15,
+                                                                incarnation=snapshot['incarnation']))
+                if command == 'stop':
+                    snapshot['treeSurvivors'] = getattr(self, 'survivors', [])   # what of Claude's tree outlived it
+            return dict(requestId=params['requestId'], state='exited' if not getattr(self, 'stubborn', False)
+                        else 'unknown')
         return copy.deepcopy(snapshot)
 
     def read_snapshot(self, path):
@@ -1038,6 +1060,762 @@ class Fixture(unittest.TestCase):
         self.assertEqual(retained['text'], '')
         self.manager.enqueue(run_id, request, 'owner', 'hello')
         self.assertEqual(len([c for c in self.commands if c[1] == 'enqueue']), 1)
+
+    # The owner's stop of a chat Motet started (ManagedClaude.stop).
+
+    def waiting(self, run_id):
+        """A queued message and a waiting permission request in the fictional chat."""
+        self.manager.enqueue(run_id, uid(), 'owner', 'Fictional queued note.')
+        permission = dict(id=uid(), tool='Write', input={'content': 'fictional'}, state='pending', canAllow=True,
+                          canDeny=True, createdAt=1900000000, expiresAt=1900000120, decision=None,
+                          resolutionReason=None, decisionState=None, resolvedAt=None, inputAvailable=True)
+        self.snapshots[run_id]['permissions'].append(permission)
+        return permission
+
+    def stops(self):
+        return [params for _, command, params in self.commands if command in ('stop', 'shutdown')]
+
+    def test_stop_denies_the_waiting_request_fails_the_queue_and_records_the_owner(self):
+        run_id, native = self.start()
+        self.waiting(run_id)
+        before = self.manager.status(run_id)
+        self.assertEqual((before['ownerStop'], before['queued']), (None, 1))
+        request = uid()
+        result = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertEqual(self.stops(), [dict(requestId=request, by='owner')])
+        self.assertEqual((result['state'], result['already'], result['agent']), ('exited', False, 'c:' + native))
+        stop = result['ownerStop']
+        self.assertEqual((stop['by'], stop['outcome']), ('owner', 'stopped'))
+        self.assertGreaterEqual(stop['stoppedAt'], stop['requestedAt'])
+        self.assertIn('--session-id ' + native, stop['terminalCommand'])
+        snapshot = self.manager.status(run_id)
+        self.assertEqual((snapshot['queued'], snapshot['messages'][0]['state'], snapshot['messages'][0]['error']),
+                         (0, 'failed', managed.OWNER_STOP_ERROR))
+        permission = snapshot['permissions'][0]
+        self.assertEqual((permission['decision'], permission['resolutionReason'], permission['canAllow']),
+                         ('deny', 'owner_stop', False))
+        with self.manager._registry() as db:
+            self.assertFalse(self.manager._row(db, run_id)['occupied'])          # its slot is released
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.enqueue(run_id, uid(), 'owner', 'After the stop.')
+        self.assertEqual(raised.exception.code, 'managed_not_ready')
+        self.assertFalse(self.manager.owner_capabilities('c:' + native)['actions']['queue']['available'])
+
+    def test_stop_is_acted_on_once_per_request_and_once_stopped(self):
+        run_id, native = self.start()
+        request = uid()
+        first = self.manager.stop(run_id, request, 'c:' + native)
+        replay = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertEqual(replay['ownerStop'], first['ownerStop'])
+        again = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertTrue(again['already'])
+        self.assertEqual(again['ownerStop'], first['ownerStop'])
+        self.assertEqual(len(self.stops()), 1, 'a replay or a stopped chat never asks the supervisor again')
+
+    def test_a_second_stop_while_one_is_carried_out_does_nothing(self):
+        run_id, native = self.start()
+        plain, during = self.request, []
+
+        def slow(path, command, params):
+            if command == 'stop' and not during:
+                # A double click with its own request ID arrives while the supervisor is ending Claude (the registry
+                # is not held then, so this nested call is what another request thread would do).
+                during.append(self.manager.stop(run_id, uid(), 'c:' + native))
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=slow)
+        first = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual(during[0]['ownerStop']['outcome'], 'stopping')
+        self.assertFalse(during[0]['already'])
+        self.assertEqual(first['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_stop_refuses_other_chats_and_reused_request_ids(self):
+        run_id, native = self.start()
+        for run, agent in ((run_id, 'c:' + uid()), (run_id, 'x:' + native), (uid(), 'c:' + native)):
+            with self.subTest(agent=agent), self.assertRaises(managed.ManagedError) as raised:
+                self.manager.stop(run, uid(), agent)
+            self.assertEqual((raised.exception.code, raised.exception.status), ('not_managed', 404))
+        message = uid()
+        self.manager.enqueue(run_id, message, 'owner', 'Fictional note.')
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.stop(run_id, message, 'c:' + native)
+        self.assertEqual(raised.exception.code, 'request_conflict')
+        request = uid()
+        self.manager.stop(run_id, request, 'c:' + native)
+        for reuse in (lambda: self.manager.decide(run_id, uid(), request, 'deny'),
+                      lambda: self.manager.enqueue(run_id, request, 'owner', 'Fictional note.')):
+            with self.assertRaises(managed.ManagedError) as raised:
+                reuse()
+            self.assertIn(raised.exception.code, ('request_conflict', 'managed_not_ready'))
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_a_chat_that_ended_by_itself_is_not_called_stopped(self):
+        run_id, native = self.start()
+        # Claude ended by itself (code 0); the registry still holds it as ready and occupied when Stop arrives.
+        self.snapshots[run_id].update(state='exited', nativeExit=dict(
+            confirmed=True, code=0, incarnation=self.snapshots[run_id]['incarnation']))
+        with self.manager._registry() as db:
+            stale = self.manager._row(db, run_id)
+        self.assertEqual((stale['state'], stale['occupied']), ('ready', True))
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual(raised.exception.code, 'already_ended')
+        self.assertIsNone(self.manager.status(run_id)['ownerStop'])
+        self.assertEqual(self.stops(), [])
+
+    def test_an_unconfirmed_stop_is_recorded_and_try_again_asks_again(self):
+        run_id, native = self.start()
+        self.stubborn = True
+        first = self.manager.stop(run_id, uid(), 'c:' + native)
+        stop = first['ownerStop']
+        self.assertEqual(stop['outcome'], 'unconfirmed')
+        self.assertIsNone(stop['stoppedAt'])
+        self.stubborn = False
+        again = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual(len(self.stops()), 2, 'Try again asks the supervisor again')
+        self.assertEqual(again['outcome'], 'stopped')
+        self.assertEqual(again['requestedAt'], stop['requestedAt'])
+        self.assertGreaterEqual(again['lastAttemptAt'], stop['lastAttemptAt'])
+
+    def test_what_outlived_claude_keeps_the_stop_unconfirmed_until_it_is_gone(self):
+        run_id, native = self.start()
+        running = {'now': True}
+        seen = []
+        self.manager._test = replace(self.dependencies,
+                                     alive=lambda identities: seen.append(identities) or running['now'])
+        self.survivors = [[4242, 1900000000.0]]
+        result = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'),
+                         'Claude ended, but something it started is still running')
+        self.assertEqual(seen[-1], [[4242, 1900000000.0]])
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'unconfirmed')
+        running['now'] = False
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped')
+        other_run, other = self.start()
+        self.survivors = None                                     # the tree could not be seen at all
+        self.assertEqual(self.manager.stop(other_run, uid(), 'c:' + other)['ownerStop']['outcome'], 'unconfirmed')
+        self.assertEqual(self.manager.status(other_run)['ownerStop']['outcome'], 'unconfirmed')
+
+    def test_survivors_are_kept_by_motet_so_an_unreadable_ledger_never_makes_the_stop_stopped(self):
+        run_id, native = self.start()
+        running = {'now': True}
+        self.manager._test = replace(self.dependencies, alive=lambda identities: running['now'])
+        self.survivors = [[4242, 1900000000.0]]
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'unconfirmed')
+        # The supervisor has gone; its ledger cannot be read for one status: a snapshot without evidence.
+        self.disconnected = True
+        reader = self.manager._test.read_snapshot
+        self.manager._test = replace(self.manager._test, read_snapshot=lambda path: (_ for _ in ()).throw(OSError()))
+        lost = self.manager.status(run_id)
+        self.assertFalse(lost['evidenceAvailable'])
+        self.assertEqual((lost['state'], lost['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.manager._test = replace(self.manager._test, read_snapshot=reader)         # readable again
+        self.snapshots[run_id].pop('treeSurvivors')                                    # even if it said nothing
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'unconfirmed', 'the survivor runs')
+        running['now'] = False
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped')
+
+    def unconfirmed_with_a_survivor(self):
+        run_id, native = self.start()
+        self.manager._test = replace(self.dependencies, alive=lambda identities: True)
+        self.survivors = [[4242, 1900000000.0]]
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'unconfirmed')
+        return run_id, native
+
+    def stored_stop(self, run_id):
+        with self.manager._registry() as db:
+            return self.manager._stop_record(db, run_id)
+
+    def test_a_record_rewritten_during_the_survivor_check_is_not_overwritten_by_its_stale_result(self):
+        run_id, native = self.unconfirmed_with_a_survivor()
+        inside, again = [], []
+
+        def alive(identities):
+            if inside:
+                return True                          # the nested status's own check: the survivor still runs
+            inside.append(True)
+            # Try again lands while ps is being read. Claude has ended, so it is accepted without acting.
+            again.append(self.manager.stop(run_id, uid(), 'c:' + native))
+            with self.manager._registry() as db:     # and the record is rewritten meanwhile, as an attempt would
+                record = self.manager._stop_record(db, run_id)
+                record.update(attempts=record['attempts'] + 1, lastAttemptAt=record['lastAttemptAt'] + 1)
+                self.manager._save_stop(db, record)
+            return False                             # the stale read: nothing running
+        self.manager._test = replace(self.dependencies, alive=alive)
+        self.manager.status(run_id)
+        record = self.stored_stop(run_id)
+        self.assertTrue(again[0]['already'])
+        self.assertEqual(record['attempts'], 2)
+        self.assertNotEqual(record['outcome'], 'stopped', 'the stale result was not applied')
+        self.assertEqual(record['survivors'], [[4242, 1900000000.0]])
+
+    def test_a_retry_after_claude_ended_cannot_lose_what_is_known_of_its_tree(self):
+        run_id, native = self.unconfirmed_with_a_survivor()       # Claude ended; a program it started still runs
+        asked = len(self.stops())
+        self.survivors = None                                     # what a new attempt would now record
+        request = uid()
+        again = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertTrue(again['already'], 'accepted without acting')
+        self.assertEqual(len(self.stops()), asked, 'the supervisor is not asked again')
+        record = self.stored_stop(run_id)
+        self.assertEqual((record['outcome'], record['attempts'], record['survivors']),
+                         ('unconfirmed', 1, [[4242, 1900000000.0]]))
+        self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['already'], True, 'its replay too')
+        with self.assertRaises(managed.ManagedError):
+            self.manager.enqueue(run_id, request, 'owner', 'Fictional note.')         # and the ID is bound
+        self.manager._test = replace(self.dependencies, alive=lambda identities: False)
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped', 'still confirmed by itself')
+
+    def test_a_survivor_merged_during_the_survivor_check_is_not_lost_to_its_stale_result(self):
+        run_id, native = self.unconfirmed_with_a_survivor()
+
+        def alive(identities):
+            if identities == [[4242, 1900000000.0]]:
+                with self.manager._registry() as db:     # another status merges new evidence while ps is read
+                    record = self.manager._stop_record(db, run_id)
+                    record['survivors'] = managed._merged(record['survivors'], [[5353, 1900000001.0]])
+                    self.manager._save_stop(db, record)
+                return False                             # the stale read: the old list's survivor has gone
+            return True
+        self.manager._test = replace(self.dependencies, alive=alive)
+        self.manager.status(run_id)
+        record = self.stored_stop(run_id)
+        self.assertEqual(record['outcome'], 'unconfirmed', 'the stale result was not applied')
+        self.assertIn([5353, 1900000001.0], record['survivors'])
+
+    def test_a_replay_answers_as_the_original_did(self):
+        run_id, native = self.start()
+        request = uid()
+        first = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertFalse(first['already'])
+        self.assertFalse(self.manager.stop(run_id, request, 'c:' + native)['already'], 'the replay, as the original')
+        self.assertTrue(self.manager.stop(run_id, uid(), 'c:' + native)['already'], 'a new request: already stopped')
+
+    # Logos, round 2.
+
+    def test_the_stop_record_has_an_id_no_request_can_hold(self):
+        run_id, native = self.start()
+        key = self.manager._stop_record_id(run_id)
+        self.assertFalse(managed.canonical_uuid(key))
+        for attempt in (lambda: self.manager.enqueue(run_id, key, 'owner', 'Fictional note.'),
+                        lambda: self.manager.decide(run_id, uid(), key, 'deny'),
+                        lambda: self.manager.stop(run_id, key, 'c:' + native)):
+            with self.assertRaises(managed.ManagedError) as raised:
+                attempt()
+            self.assertEqual(raised.exception.code, 'invalid_request')
+        # The key an earlier build derived (a UUID) is an ordinary request ID now: a decision may hold it, and the
+        # stop and status stay usable.
+        old_key = str(uuid.uuid5(uuid.UUID(run_id), 'watch-owner-stop-record-v1'))
+        self.manager.decide(run_id, uid(), old_key, 'deny')
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped')
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.stop(run_id, old_key, 'c:' + native)
+        self.assertEqual(raised.exception.code, 'request_conflict', 'that ID is the decision\u2019s')
+
+    def test_claude_ending_by_itself_between_the_check_and_the_stop_is_never_called_stopped(self):
+        run_id, native = self.start()
+        plain = self.request
+
+        def raced(path, command, params):
+            if command == 'stop':
+                snapshot = self.snapshots[path.name]   # Claude ends by itself just before the stop reaches the supervisor
+                snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=0,
+                                                               incarnation=snapshot['incarnation']),
+                                treeSurvivors=None)    # which can no longer see all it started
+                return dict(requestId=params['requestId'], state='exited')
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=raced)
+        stop = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((stop['outcome'], stop['claudeEnded']), ('unconfirmed', True), 'Claude has gone: no buttons')
+
+    def test_a_natural_exit_seen_only_in_the_ledger_is_no_evidence_about_the_tree(self):
+        run_id, native = self.start()
+        self.snapshots[run_id].update(state='exited', nativeExit=dict(
+            confirmed=True, code=0, incarnation=self.snapshots[run_id]['incarnation']))
+        self.disconnected = True                       # its supervisor has gone; the ledger alone says it exited
+        plain_status = self.manager.status
+        calls = {'n': 0}
+
+        def late(run):                                 # the exit lands just after the pre-admission check
+            calls['n'] += 1
+            return {} if calls['n'] == 1 else plain_status(run)
+        with patch.object(self.manager, 'status', side_effect=late):
+            result = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertIs(result['ownerStop']['claudeEnded'], True, 'Claude ended by itself: nothing more to try')
+
+    def test_compatibility_words_are_only_for_what_this_stop_did(self):
+        run_id, native = self.start()
+        self.refused_commands = ('stop',)
+        self.manager.stop(run_id, uid(), 'c:' + native)
+        asked = self.stored_stop(run_id)['requestedAt']
+        snapshot = self.snapshots[run_id]
+        base = dict(tool='Write', input={}, state='shutdown', canAllow=False, canDeny=False, createdAt=1900000000,
+                    expiresAt=1900000120, decision='deny', decisionState='written', resolutionReason='shutdown',
+                    inputAvailable=True)
+        snapshot['permissions'] = [dict(base, id=uid(), resolvedAt=None), dict(base, id=uid(), resolvedAt=asked - .5),
+                                   dict(base, id=uid(), resolvedAt=asked + 1)]
+        failed = dict(requestId=uid(), source='owner', text='x', digest='0' * 64, state='failed', nativeEcho=False,
+                      reply='', error='shutdown', createdAt=1)
+        snapshot['messages'] = [dict(failed, requestId=uid()), dict(failed, requestId=uid(), terminalAt=asked - .5),
+                                dict(failed, requestId=uid(), terminalAt=asked + 1)]
+        shown = self.manager.status(run_id)
+        self.assertEqual([p['resolutionReason'] for p in shown['permissions']], ['shutdown', 'shutdown', 'owner_stop'],
+                         'unknown or earlier times keep their own words')
+        self.assertEqual([m['error'] for m in shown['messages']],
+                         ['Managed delivery failed or is uncertain.'] * 2 + [managed.OWNER_STOP_ERROR])
+
+    def test_an_acknowledged_request_id_is_bound_even_when_nothing_was_done(self):
+        run_a, native_a = self.start()
+        run_b, native_b = self.start()
+        self.manager.stop(run_a, uid(), 'c:' + native_a)
+        reused = uid()
+        self.assertTrue(self.manager.stop(run_a, reused, 'c:' + native_a)['already'])
+        for manager in (self.manager, self.make()):               # and after a restart
+            for attempt in (lambda: manager.stop(run_b, reused, 'c:' + native_b),
+                            lambda: manager.enqueue(run_b, reused, 'owner', 'Fictional note.'),
+                            lambda: manager.decide(run_b, uid(), reused, 'deny')):
+                with self.assertRaises(managed.ManagedError) as raised:
+                    attempt()
+                self.assertIn(raised.exception.code, ('request_conflict', 'managed_not_ready'))
+            self.assertTrue(manager.stop(run_a, reused, 'c:' + native_a)['already'], 'its replay answers as it did')
+        self.assertEqual(len(self.stops()), 1, 'B was never asked to stop')
+
+    def test_a_request_id_accepted_while_a_stop_was_running_is_bound_too(self):
+        run_id, native = self.start()
+        other_run, other = self.start()
+        plain, during = self.request, []
+
+        def slow(path, command, params):
+            if command == 'stop' and not during:
+                during.append(uid())
+                self.manager.stop(run_id, during[0], 'c:' + native)
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=slow)
+        self.manager.stop(run_id, uid(), 'c:' + native)
+        with self.assertRaises(managed.ManagedError) as raised:
+            self.manager.stop(other_run, during[0], 'c:' + other)
+        self.assertEqual(raised.exception.code, 'request_conflict')
+
+    def test_a_stop_never_seen_with_evidence_is_not_called_stopped(self):
+        run_id, native = self.start()
+        self.disconnected = True                                  # neither the supervisor nor its ledger answers
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: False,
+                                     read_snapshot=lambda path: (_ for _ in ()).throw(OSError()))
+        self.manager.stop(run_id, uid(), 'c:' + native)
+        with self.manager._registry() as db:                      # the slot was released some other way
+            row = self.manager._row(db, run_id)
+            row.update(state='exited', occupied=False)
+            self.manager._save(db, row)
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'unconfirmed')
+
+    def test_past_the_kept_survivors_nothing_is_confirmed(self):
+        self.assertIsNone(managed._merged([[n, 1.0] for n in range(1, 40)], [[n, 1.0] for n in range(40, 70)]))
+        self.assertEqual(managed._merged([[2, 1.0]], [[1, 1.0], [2, 1.0]]), [[1, 1.0], [2, 1.0]])
+        self.assertIsNone(managed._merged([], None))
+
+    def test_a_stop_whose_admission_did_not_commit_can_be_tried_again(self):
+        run_id, native = self.start()
+        failing = {'armed': True}
+        connect = sqlite3.connect
+
+        class Connection(sqlite3.Connection):
+            wrote = False
+
+            def execute(self, sql, *args):
+                if sql.startswith('INSERT INTO operations'):
+                    self.wrote = True
+                return super().execute(sql, *args)
+
+            def commit(self):
+                if self.wrote and failing['armed']:
+                    failing['armed'] = False
+                    raise sqlite3.OperationalError('fictional lost commit')
+                return super().commit()
+
+        with patch.object(managed.sqlite3, 'connect', lambda *a, **k: connect(*a, factory=Connection, **k)):
+            with self.assertRaises(managed.ManagedError):
+                self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual(self.stops(), [], 'nothing was asked of the supervisor')
+        self.assertIsNone(self.manager.status(run_id)['ownerStop'], 'and nothing was recorded')
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'stopped',
+                         'a fresh request is carried out: the failed one left no claim behind')
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_a_stop_that_fails_after_its_admission_is_not_repeated_by_its_replay(self):
+        run_id, native = self.start()
+        plain = self.request
+
+        def lost(path, command, params):
+            if command == 'stop':
+                plain(path, command, params)
+                raise RuntimeError('fictional lost reply')
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=lost)
+        request = uid()
+        first = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertEqual(first['ownerStop']['outcome'], 'stopped')
+        self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['ownerStop'], first['ownerStop'])
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_the_record_survives_a_restart_and_a_stop_cut_short_is_unconfirmed(self):
+        run_id, native = self.start()
+        stop = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        restarted = self.make()
+        self.assertEqual(restarted.status(run_id)['ownerStop'], stop)
+        self.assertEqual(restarted.stop_facts(), {'c:' + native: {key: stop[key] for key in
+                         ('outcome', 'requestedAt', 'lastAttemptAt', 'stoppedAt')}})
+        other_run, other = self.start()
+        with self.manager._registry() as db:         # Motet ended part-way through a stop: nothing carries it on
+            self.manager._save_stop(db, dict(runId=other_run, by='owner', outcome='stopping', requestedAt=1900000000,
+                                             lastAttemptAt=1900000000, stoppedAt=None, attempts=1))
+        self.assertEqual(self.make().status(other_run)['ownerStop']['outcome'], 'unconfirmed')
+        with self.manager._registry() as db:
+            # No table is added: the attachment namespace fence requires exactly the registry's own tables.
+            self.assertEqual({row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")},
+                             {'runs', 'messages', 'operations'})
+            db.execute('UPDATE operations SET data=? WHERE id=?', (json.dumps({'runId': other_run}),
+                                                                    self.manager._stop_record_id(other_run)))
+        with self.assertRaises(managed.ManagedError):
+            self.make().status(other_run)                                       # a malformed record fails closed
+        with self.assertRaises(managed.ManagedError) as raised:                # its ID is no request's to reuse
+            self.manager.stop(run_id, self.manager._stop_record_id(run_id), 'c:' + native)
+        self.assertEqual(raised.exception.code, 'invalid_request', 'not even a valid request ID')
+
+    def test_an_older_supervisor_gets_its_shutdown_said_as_the_owners_stop(self):
+        run_id, native = self.start()
+        self.waiting(run_id)
+        self.refused_commands = ('stop',)
+        request = uid()
+        # POSIX: this fixture has no process table, so the tree was not seen at all (``legacy_tree`` below).
+        self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['ownerStop']['outcome'],
+                         'stopped' if managed.ps.WIN else 'unconfirmed')
+        self.assertEqual([c for _, c, _ in self.commands if c in ('stop', 'shutdown')], ['stop', 'shutdown'])
+        self.assertEqual(self.stops()[-1], dict(requestId=request))
+        # The older supervisor recorded its own shutdown; the stop record says whose it was.
+        self.assertEqual(self.snapshots[run_id]['permissions'][0]['resolutionReason'], 'shutdown')
+        earlier = dict(self.snapshots[run_id]['permissions'][0], id=uid(), resolvedAt=1_000_000_000)
+        self.snapshots[run_id]['permissions'].append(earlier)    # a denial from before the owner asked keeps its words
+        failed = dict(self.snapshots[run_id]['messages'][0], requestId=uid(), terminalAt=1_000_000_000)
+        self.snapshots[run_id]['messages'].append(failed)       # and so does a message failed before then
+        snapshot = self.manager.status(run_id)
+        self.assertEqual((snapshot['permissions'][0]['resolutionReason'], snapshot['permissions'][0]['decision']),
+                         ('owner_stop', 'deny'))
+        self.assertEqual(snapshot['permissions'][1]['resolutionReason'], 'shutdown')
+        self.assertEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)
+        self.assertEqual(snapshot['messages'][1]['error'], 'Managed delivery failed or is uncertain.')
+        self.assertEqual(self.manager.lookup_message(snapshot['messages'][0]['requestId'])['error'],
+                         managed.OWNER_STOP_ERROR)
+        shown = self.manager.owner_snapshot()['requests'][0]           # what the page lists for the message
+        self.assertEqual((shown['state'], shown['error']), ('failed', managed.OWNER_STOP_ERROR))
+
+    # An older supervisor (no 'stop', only 'shutdown') on POSIX: the tree's end is known only from its process group
+    # seen ended in the whole table, never from Claude's absence or from the first look's processes having gone.
+
+    def legacy_tree(self, reads, root, *, shutdown=None):
+        """The legacy stop with real process work on fictional process tables: ``reads`` are what ``ps`` shows, in
+        turn (the last again and again); ``root`` is the verified Claude, or None. Nothing may be signalled."""
+        import managed_process_tree as tree
+        reads = list(reads)
+        seen = []
+
+        def table():
+            seen.append(True)
+            read = reads.pop(0) if len(reads) > 1 else reads[0]
+            if isinstance(read, Exception):
+                raise read
+            return dict(read)
+        if shutdown is not None:
+            plain = self.request
+
+            def request(path, command, params):
+                if command == 'shutdown':
+                    return shutdown(path, command, params)
+                return plain(path, command, params)
+            self.manager._test = replace(self.manager._test, request=request)
+        self.manager._test = replace(self.manager._test, real_processes=True)
+        self.refused_commands = ('stop',)
+        native = dict(pid=500, nativeId='fictional', claimedAt=999.0, startedAt=1001.0, executable='/fictional')
+        trap = AssertionError('a process was signalled')
+        with patch.object(managed.ManagedClaude, '_verified_claude',
+                          staticmethod(lambda run_dir: (native, root, lambda row: False))), \
+                patch.object(tree, 'table', table), patch.object(managed.time, 'sleep', lambda seconds: None), \
+                patch.object(managed.os, 'kill', side_effect=trap), patch.object(managed.os, 'killpg', side_effect=trap):
+            run_id, agent = self.start()
+            result = self.manager.stop(run_id, uid(), 'c:' + agent)
+            later = self.manager.status(run_id)['ownerStop']
+        return result, later, self.stored_stop(run_id), seen
+
+    def process(self, pid, pgid, start, ppid=1, stat='S'):
+        if managed.ps.WIN:                       # read when the test runs: the Windows simulation reruns these
+            self.skipTest('POSIX process groups')
+        import managed_process_tree as tree
+        return tree.Process(pid, ppid, pgid, os.getuid(), stat, start, 'fictional-%d' % pid)
+
+    def test_a_legacy_stop_without_a_verified_claude_stays_unconfirmed(self):
+        child = self.process(501, 500, 1002.0)                   # visible in Claude's group after the shutdown
+        result, later, record, _ = self.legacy_tree([{501: child}], None)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertIsNone(record['survivors'], 'nothing was seen: unknown, never an empty list')
+        self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+
+    def test_a_legacy_stop_misses_no_child_started_after_the_first_look(self):
+        root = self.process(500, 500, 1000.0, ppid=400)
+        late = self.process(501, 500, 1003.0, ppid=1)            # started after the first look; Claude has gone
+        result, later, record, _ = self.legacy_tree([{500: root}, {501: late}], root)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertIsNone(record['survivors'], 'its group never ended within the wait: unknown')
+        self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+
+    def test_a_legacy_stop_whose_claude_ended_first_and_supervisor_went_stays_unconfirmed(self):
+        # Claude ended just before the shutdown (no verified Claude), the older supervisor then stopped answering,
+        # and its exit ledger is still readable.
+        if managed.ps.WIN:
+            self.skipTest('POSIX process groups')
+        calls = []
+        self.dependencies = replace(self.dependencies, unsupervised=lambda run_dir: calls.append(run_dir) or True)
+        self.manager._test = self.dependencies
+
+        def shutdown(path, command, params):
+            snapshot = self.snapshots[path.name]
+            snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=0, incarnation=snapshot['incarnation']))
+            self.disconnected = True
+            raise OSError('fictional: the older supervisor went')
+        result, later, record, _ = self.legacy_tree([{}], None, shutdown=shutdown)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertEqual(calls, [], 'the exited ledger is taken as Claude ended; it says nothing about its tree')
+        self.assertIsNone(record['survivors'])
+        self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+
+    def test_a_legacy_stop_is_confirmed_once_its_group_is_seen_ended(self):
+        root = self.process(500, 500, 1000.0, ppid=400)
+        child = self.process(501, 500, 1002.0, ppid=500)
+        detached = self.process(502, 502, 1002.5, ppid=500)      # a session of its own: outside the group
+        unrelated = self.process(900, 900, 50.0)
+        result, later, record, seen = self.legacy_tree(
+            [{500: root, 501: child, 502: detached, 900: unrelated},       # the first look
+             {501: child._replace(ppid=1), 502: detached._replace(ppid=1), 900: unrelated},   # Claude has gone
+             {502: detached._replace(ppid=1), 900: unrelated}], root)      # its group has ended
+        self.assertEqual((result['ownerStop']['outcome'], record['survivors']), ('unconfirmed', [[502, 1002.5]]),
+                         'the program outside the group is seen, not signalled')
+        self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+        self.assertGreaterEqual(len(seen), 3)
+        import managed_process_tree as tree
+        with patch.object(tree, 'table', lambda: {900: unrelated}):
+            self.assertEqual(self.manager.status(result['runId'])['ownerStop']['outcome'], 'stopped',
+                             'confirmed once that program has gone')
+
+    def test_a_legacy_stop_whose_claude_is_left_a_zombie_has_ended(self):
+        root = self.process(500, 500, 1000.0, ppid=400)
+        result, later, record, _ = self.legacy_tree([{500: root}, {500: root._replace(stat='Z')}], root)
+        self.assertEqual((result['ownerStop']['outcome'], 'survivors' in record), ('stopped', False),
+                         'a zombie has ended, and nothing else is in its group')
+        self.assertIs(later['claudeEnded'], False)
+
+    def test_a_legacy_stop_with_an_unreadable_table_or_a_group_that_never_ends_is_unknown(self):
+        import managed_process_tree as tree
+        root = self.process(500, 500, 1000.0, ppid=400)
+        for reads in ([{500: root}, tree.TreeError('fictional')],            # ps could not be read
+                      [{500: root}]):                                       # Claude itself still runs after 3 s
+            with self.subTest(reads=reads):
+                result, later, record, _ = self.legacy_tree(reads, root)
+                self.assertEqual(result['ownerStop']['outcome'], 'unconfirmed')
+                self.assertIsNone(record['survivors'])
+
+    def test_a_shutdown_without_an_owners_stop_keeps_its_own_words(self):
+        run_id, native = self.start()
+        self.waiting(run_id)
+        self.manager.shutdown(run_id, uid())
+        snapshot = self.manager.status(run_id)
+        self.assertEqual(snapshot['permissions'][0]['resolutionReason'], 'shutdown')
+        self.assertNotEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)
+
+    def test_without_its_supervisor_the_stop_is_motets_own_and_verified(self):
+        run_id, native = self.start()
+        permission = self.waiting(run_id)
+        self.disconnected = True
+        ends = []
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: ends.append(run_dir) or False)
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'unconfirmed')
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: ends.append(run_dir) or True)
+        result = self.manager.stop(run_id, uid(), 'c:' + native)
+        self.assertEqual([Path(path).name for path in ends], [run_id, run_id])
+        # Claude is seen ended. Windows: the job ended all it started. POSIX: what it started cannot all be seen
+        # without its supervisor (nothing proves the whole tree ended), so the stop stays unconfirmed.
+        self.assertEqual((result['state'], result['ownerStop']['outcome']),
+                         ('exited', 'stopped' if managed.ps.WIN else 'unconfirmed'))
+        snapshot = self.manager.status(run_id)
+        self.assertEqual([m['state'] for m in snapshot['messages']], ['failed'])
+        self.assertEqual(snapshot['messages'][0]['error'], managed.OWNER_STOP_ERROR)
+        ended = snapshot['permissions'][0]
+        self.assertEqual((ended['id'], ended['resolutionReason'], ended['decision'], ended['canAllow']),
+                         (permission['id'], 'native_exit', None, False))
+        with self.manager._registry() as db:
+            row = self.manager._row(db, run_id)
+        self.assertEqual((row['state'], row['occupied']), ('exited', False))
+
+    # claudeEnded: the stop is unconfirmed, but Claude itself has exited, so neither Try again nor the Terminal
+    # command (which names Claude alone) can change the outcome; the page then offers neither.
+
+    def test_claude_ended_when_only_what_claude_started_keeps_the_stop_unconfirmed(self):
+        run_id, native = self.unconfirmed_with_a_survivor()       # Claude ended; something it started still runs
+        stop = self.manager.status(run_id)['ownerStop']
+        self.assertEqual((stop['outcome'], stop['claudeEnded']), ('unconfirmed', True))
+        again = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((again['outcome'], again['claudeEnded']), ('unconfirmed', True), 'Try again changes nothing')
+        self.manager._test = replace(self.dependencies, alive=lambda identities: False)
+        gone = self.manager.status(run_id)['ownerStop']               # each status read looks at the survivor again
+        self.assertEqual((gone['outcome'], gone['claudeEnded']), ('stopped', False))
+        other_run, other = self.start()
+        self.survivors = None                                     # the tree could not be seen at all
+        unseen = self.manager.stop(other_run, uid(), 'c:' + other)['ownerStop']
+        self.assertEqual((unseen['outcome'], unseen['claudeEnded']), ('unconfirmed', True))
+        self.assertIs(self.manager.status(other_run)['ownerStop']['claudeEnded'], True)
+
+    def test_claude_ended_without_its_supervisor(self):
+        run_id, native = self.start()
+        self.disconnected = True
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: False)
+        unseen = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((unseen['outcome'], unseen['claudeEnded']), ('unconfirmed', False),
+                         'Claude was not seen ending: it may still be running')
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: True)
+        result = self.manager.stop(run_id, uid(), 'c:' + native)
+        if managed.ps.WIN:                                        # the job ended everything in it
+            self.assertEqual((result['ownerStop']['outcome'], result['ownerStop']['claudeEnded']), ('stopped', False))
+        else:                                                     # Claude ended; what it started cannot all be seen
+            self.assertEqual((result['state'], result['ownerStop']['outcome'], result['ownerStop']['claudeEnded']),
+                             ('exited', 'unconfirmed', True))
+            self.assertIs(self.manager.status(run_id)['ownerStop']['claudeEnded'], True)
+
+    def test_claude_ended_on_windows_too(self):
+        # The same field on Windows: the job leaves nothing once its supervisor has gone (stopped), and a Claude that
+        # ended by itself just before the stop leaves its tree unseen (unconfirmed, nothing more to try). Only the
+        # stop's own decisions see Windows here; the fixture's storage stays this machine's.
+        real = managed.ps
+
+        class Windows:
+            WIN = True
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+        run_id, native = self.start()
+        other_run, other = self.start()
+        with patch.object(managed, 'ps', Windows()):
+            self.disconnected = True
+            self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: True)
+            stop = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+            self.assertEqual((stop['outcome'], stop['claudeEnded']), ('stopped', False))
+            self.assertIn('Stop-Process', stop['terminalCommand'])
+            self.disconnected = False
+            self.manager._test = self.dependencies
+            self.survivors = None
+            unseen = self.manager.stop(other_run, uid(), 'c:' + other)['ownerStop']
+            self.assertEqual((unseen['outcome'], unseen['claudeEnded']), ('unconfirmed', True))
+
+    def windows_legacy(self, shutdown):
+        """A stop given to an older Windows supervisor (no 'stop'), whose answer to 'shutdown' is ``shutdown``'s;
+        the stop's own decisions see Windows, the fixture's storage stays this machine's."""
+        real = managed.ps
+
+        class Windows:
+            WIN = True
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+        plain = self.request
+
+        def request(path, command, params):
+            return shutdown(path, command, params) if command == 'shutdown' else plain(path, command, params)
+        run_id, native = self.start()
+        self.refused_commands = ('stop',)
+        self.manager._test = replace(self.dependencies, request=request, unsupervised=lambda run_dir: False)
+        with patch.object(managed, 'ps', Windows()):
+            result = self.manager.stop(run_id, uid(), 'c:' + native)
+            later = self.manager.status(run_id)['ownerStop']
+        self.refused_commands = ()
+        self.manager._test = self.dependencies
+        return result, later, self.stored_stop(run_id)
+
+    def exited(self, path):
+        snapshot = self.snapshots[path.name]
+        snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=0, incarnation=snapshot['incarnation']))
+
+    def test_an_older_windows_supervisor_confirms_the_job_ended_only_by_its_answer(self):
+        def silent(path, command, params):                        # Claude's exit reaches the ledger; no answer
+            self.exited(path)
+            raise OSError('fictional: no answer')
+
+        def unsure(path, command, params):                        # it answers unknown, then Claude ends by itself
+            self.exited(path)
+            return dict(requestId=params['requestId'], state='unknown')
+
+        def ended(path, command, params):                         # it ended the job and says so
+            self.exited(path)
+            return dict(requestId=params['requestId'], state='exited')
+        for shutdown in (silent, unsure):
+            with self.subTest(shutdown=shutdown.__name__):
+                result, later, record = self.windows_legacy(shutdown)
+                self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+                self.assertIsNone(record['survivors'], 'nothing showed the job ended: unknown')
+                self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+        result, later, record = self.windows_legacy(ended)
+        self.assertEqual((result['ownerStop']['outcome'], later['claudeEnded']), ('stopped', False))
+        # The supervisor's own stop on Windows ends the job and is confirmed as before.
+        real = managed.ps
+
+        class Windows:
+            WIN = True
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+        run_id, native = self.start()
+        with patch.object(managed, 'ps', Windows()):
+            modern = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((modern['outcome'], modern['claudeEnded']), ('stopped', False))
+
+    def test_claude_ended_is_false_while_claude_may_still_run(self):
+        run_id, native = self.start()
+        self.stubborn = True                                      # the supervisor could not confirm Claude ended
+        stop = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((stop['outcome'], stop['claudeEnded']), ('unconfirmed', False))
+        self.assertIs(self.manager.status(run_id)['ownerStop']['claudeEnded'], False)
+        self.refused_commands = ('stop',)                         # an older supervisor, just as stubborn
+        legacy = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((legacy['outcome'], legacy['claudeEnded']), ('unconfirmed', False))
+        self.stubborn, self.refused_commands = False, ()
+        other_run, other = self.start()
+        with self.manager._registry() as db:                      # Motet ended part-way through a stop
+            self.manager._save_stop(db, dict(runId=other_run, by='owner', outcome='stopping', requestedAt=1900000000,
+                                             lastAttemptAt=1900000000, stoppedAt=None, attempts=1))
+        cut = self.make().status(other_run)['ownerStop']
+        self.assertEqual((cut['outcome'], cut['claudeEnded']), ('unconfirmed', False))
+
+    def test_claude_ended_is_never_true_on_a_stopped_or_stopping_record(self):
+        run_id, native = self.start()
+        plain, during = self.request, []
+
+        def slow(path, command, params):
+            if command == 'stop' and not during:
+                during.append(self.manager.status(run_id)['ownerStop'])      # read while the stop is carried out
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=slow)
+        stopped = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((during[0]['outcome'], during[0]['claudeEnded']), ('stopping', False))
+        self.assertEqual((stopped['outcome'], stopped['claudeEnded']), ('stopped', False))
+        self.assertIs(self.manager.status(run_id)['ownerStop']['claudeEnded'], False)
+        self.assertIs(self.make().status(run_id)['ownerStop']['claudeEnded'], False, 'after a restart too')
+        exited = self.manager._public_stop(self.stored_stop(run_id), native, True)
+        self.assertIs(exited['claudeEnded'], False)
+        stopping = dict(self.stored_stop(run_id), outcome='stopping', stoppedAt=None)
+        self.assertIs(self.manager._public_stop(stopping, native, True)['claudeEnded'], False)
+
+    def test_terminal_command_names_the_session_not_a_process(self):
+        native = uid()
+        command = managed.ManagedClaude.terminal_command(native)
+        self.assertIn('--session-id ' + native, command)
+        self.assertNotRegex(command.replace(native, ''), r'(^|\s)\d+($|\s)')     # no process ID in it
 
 
 from new_chat_types import NewChatError
