@@ -989,6 +989,7 @@ async function deliverPendingOptOut($, state, id) {
 const OTHER_WINDOW = 'This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.';
 
 const SUPERSEDED = 'A newer Motet command replaced this one; nothing was changed.';
+const ENDED_SUPERSEDED = 'A newer Motet command replaced this one; the connection Motet had just made for it was ended.';
 
 const CONNECT_FAILED = 'Motet connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.';
 
@@ -1023,7 +1024,8 @@ async function ownerActivate($, state, response, id, decision, eligibilityEpoch)
       post($,state,'disconnect',identityBody(state,data,response.generation),{port:data.port,token:data.token}).catch(() => {});
     }
     stop(state);
-    return refusal;
+    // Motet did connect for this command, and that connection was just ended: say so, rather than "nothing changed".
+    return refusal.text === SUPERSEDED ? {text:ENDED_SUPERSEDED} : refusal;
   }
 }
 

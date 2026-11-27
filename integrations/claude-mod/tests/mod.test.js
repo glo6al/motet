@@ -2603,7 +2603,7 @@ test('a disconnect that comes while a manual connect is on its way ends the conn
     assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/,path);
     const since=h.calls.length;
     gate.release();
-    assert.equal((await connecting).text,SUPERSEDED_TEXT,path);
+    assert.equal((await connecting).text,'A newer Motet command replaced this one; the connection Motet had just made for it was ended.',path);
     const ended=await h.waitCall('/disconnect',()=>true,{since,settled:true});
     assert.equal(ended.body.generation,GENERATION,path);
     assert.equal((await statusOf(h)).connected,false,path);
@@ -2754,6 +2754,28 @@ test('with tickets, an earlier copy\'s late connect record is written back by th
   await live.wait(()=>live.timers.length===1,'live timer');await live.tick();
   assert.equal(storage.get(PREF).disconnected,true);assert.equal(storage.get(PREF).decision_seq,motet.optedOutSeq);
   await live.tick();assert.equal(motetCalls(live).length,0);
+});
+
+test('the opt-out holds at Motet even when the copy that made it is gone before it could repair the shared record',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]),motet=ticketMotet(),gate=latch();let holdPref=false;
+  const fetch=(url,body)=>motet.fetch(url,body);
+  const a=await harness({storage,claimed:false,fetch,storeSet:async(key,value)=>{if(holdPref&&key===PREF&&value.disconnected===false){holdPref=false;await gate.hold();}}});
+  holdPref=true;
+  const connecting=a.command('watch-connect');await bounded(gate.entered,'copy A preference write held after its ticket');
+  for(const timer of a.timers)timer.cancel();
+  const b=await harness({start:false,storage,claimed:false,fetch});
+  assert.match((await b.command('watch-disconnect')).text,/Motet disconnected/);
+  gate.release();await connecting;
+  assert.equal(storage.get(PREF).disconnected,false,'copy A wrote last');
+  // Copy B goes away (another reload, or the process exits) before any repair tick; copy C starts on the same store.
+  for(const timer of b.timers)timer.cancel();
+  const c=await harness({storage,claimed:false,fetch});
+  for(let i=0,now=100000;i<4;i++){await c.tick();now+=60000;c.setNow(now);}
+  // Motet refused C's registration under the older decision: no membership, no lease, no poll; C then waits.
+  assert.deepEqual(motet.refused,['register']);assert.equal(motet.ready(),false);
+  assert.equal(c.calls.filter(c=>c.url.endsWith('/poll')).length,0);
+  assert.equal(c.calls.filter(c=>c.url.endsWith('/register')).length,1);
+  assert.equal((await statusOf(c)).error,OTHER_WINDOW_TEXT);
 });
 
 test('an opt-out made while Motet is unreachable is kept pending and told to Motet on the next contact',async()=>{
