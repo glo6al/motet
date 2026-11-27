@@ -229,3 +229,4 @@ The local service assumes a trusted OS account. Its database and credential file
 - [Claude Code MCP configuration](https://code.claude.com/docs/en/mcp)
 - [Claude channels](https://code.claude.com/docs/en/channels)
 - [MCP stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+- [Bridge change log](BRIDGE_CHANGES.md)

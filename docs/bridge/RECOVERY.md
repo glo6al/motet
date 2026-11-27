@@ -36,3 +36,5 @@ If the response is lost, the retirement outcome is unknown. Inspect the same tra
 The CLI reads only the existing private owner key from the default Motet state directory (or `--state-dir`). It does not print the key or place it in arguments. It connects to loopback only, with no proxies, redirects, retries, provider calls, or offline database fallback. The owner key is required; the shared MCP credential cannot clear requests. The command currently requires a POSIX host with a private key file.
 
 Retirement preserves immutable admission, launch and deduplication records. Pruned payloads remain absent. Stale tracker writes cannot restore withheld replies. The existing offline recovery utility is separate and remains available for reviewed maintenance; this command never invokes it.
+
+See `docs/BRIDGE_CHANGES.md` for the history of bridge changes and known open causes.
