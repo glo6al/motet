@@ -14,7 +14,7 @@ See also `docs/bridge/RECOVERY.md` and `docs/PEER_BRIDGE.md`.
 
 ## Open causes
 
-- **Codex log format.** Codex owns the format. Records over 32 MiB and malformed records still withhold the reply, by design. A refusal text and a narrower `--history` are the only help for malformed metadata (a workaround).
+- **Codex log format.** Codex owns the format. Records over 32 MiB and malformed records still withhold the reply, by design. Malformed native metadata can leave discovery incomplete. `docs/PEER_BRIDGE.md` ("Directory scope and availability") gives the workarounds: narrow `--history` or exclude the provider with `--providers`. A malformed Codex title index needs repair or regeneration through native Codex tooling; narrowing history does not repair it.
 - **Idle Codex chats.** A Codex chat quiet for more than two hours counts as `unverified`, and sends are refused. The same refusal also covers an unfinished scan, an unreadable process list and an unknown chat.
 - **Refused messages are not stored.** A refused message leaves no record that could be retried.
 - **Replayed start receipt.** A replayed start receipt resets a hold's age, so the bell can come back. Not fixed.
@@ -24,6 +24,7 @@ See also `docs/bridge/RECOVERY.md` and `docs/PEER_BRIDGE.md`.
 - **Downgrade.** Downgrading is unsafe against the current ledger. Do not run an older build on it.
 - **Receipt discard.** The receipt-discard command is not built, and timed automatic clear is off.
 - **Sender connections.** Sender MCP connections must reconnect to get new guidance.
+- **Older managed supervisor.** A managed Claude chat started by an older Motet refuses messages that Motet words. Those messages stay unresolved, and 32 of them fill that chat's unresolved allowance until it restarts. See `docs/MESSAGING.md`.
 - **Windows.** Tested by CI only so far. Codex recipients, offline recovery and the clear command stay off there.
 - **Repeated rules in several copies.** Wrapper matching and folder comparison live in more than one place and have drifted before. Record size now has one shared limit.
 - **Timing in tests.** Tests that guess machine speed turned the development branch red three times.
@@ -52,7 +53,8 @@ Codex replies were withheld because compacted records of 7 to 15 MB exceeded the
 
 - Commits: 6ae5b26, 91e7612
 - Kind: root cause
-- Same cause as: BR-001, BR-015, BR-018, BR-025, BR-032
+- Same cause as: BR-001, BR-015, BR-018, BR-032
+- Related: BR-025 (compaction-format and upgrade recovery, a different failure)
 - Area: codex-records
 
 ### BR-042 · 25 Nov 2026
@@ -142,7 +144,8 @@ Verifies that a proven turn end settles a request end to end, including after an
 
 - Commits: 960afdd
 - Kind: mitigation
-- Same cause as: BR-001, BR-018, BR-025
+- Same cause as: BR-001, BR-018
+- Related: BR-025 (compaction-format and upgrade recovery, a different failure)
 - Area: codex-records
 
 ### BR-031 · 19 Nov 2026
@@ -195,11 +198,11 @@ Review follow-ups to the previous entry. Untyped errors stranded a receipt for g
 
 ### BR-025 · 19 Nov 2026
 
-Fixes four lock causes: Claude submission receipts lost after a reload, a Codex upgrade check that stopped tracking after a compacted record, folders not made canonical, and legacy marker-only answers refused. Adds an optional inbox for another provider.
+Fixes four lock causes: Claude submission receipts lost after a reload, a Codex upgrade check that stopped tracking at an unknown or compacted record type (not a size problem), folders not made canonical, and legacy marker-only answers refused. Adds an optional inbox for another provider.
 
 - Commits: 08769f6
 - Kind: root cause
-- Same cause as: BR-001, BR-018
+- Related: BR-018 (compaction-format and upgrade recovery, not the 1,000,000-byte limit)
 - Area: codex-records
 
 ### BR-024 · 19 Nov 2026
@@ -266,7 +269,7 @@ A Codex chat was locked as "requires recovery" after an oversized log record. Tw
 Retires the automatic reply-ready notices from the 5 Nov entry. Agents now check `get_reply` at task checkpoints. The bridge no longer puts text into chats by itself. Published inside the release commit; the original commit is not in this history, and the reason for the reversal is not recorded in git.
 
 - Commits: 758f647
-- Kind: root cause
+- Kind: feature
 - Area: reply-return
 
 ### BR-016 · 12 Nov 2026
@@ -286,7 +289,7 @@ Old uncertain attempts blocked chats for good. Adds an offline recovery script. 
 
 ### BR-014 · 12 Nov 2026
 
-Completions were lost across Claude reconnects and Codex log rollovers. The plugin now follows a verified continuation. Also adds the `capacity_error` hold that keeps a chat with an uncertain request from receiving more.
+Completions were lost across Claude reconnects and Codex log rollovers. Two repairs: the Claude plugin keeps completion evidence across reconnects, and the Codex reader (`tracking_source()` in `src/codex_transcript.py`) follows a verified continuation. Also adds the `capacity_error` hold that keeps a chat with an uncertain request from receiving more.
 
 - Commits: 70e6378
 - Kind: root cause
@@ -294,7 +297,7 @@ Completions were lost across Claude reconnects and Codex log rollovers. The plug
 
 ### BR-013 · 12 Nov 2026
 
-Older Python (3.9) and Windows compatibility: an empty query no longer breaks the server, offline recovery refuses non-POSIX systems cleanly, and a broker timestamp no longer assumes an earlier read.
+Older Python (3.9) and Windows compatibility: an empty query no longer breaks the Antigravity broker, offline recovery refuses non-POSIX systems cleanly, and the Antigravity metadata refresh no longer assumes an earlier read, so its throttle runs only after a first metadata read.
 
 - Commits: a19b590
 - Kind: root cause
