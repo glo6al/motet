@@ -24,12 +24,14 @@ import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server
 import officer_capabilities
 import officer_request
 from deck_log import DeckLog
 from officer_request import BudgetPolicy, RequestBudget
 from officer_messaging import MessagingStore
+import deck_log_settle
 
 MODEL = 'claude-haiku-5-5'
 SCOPE = {'sources': ['retained'], 'chat_ids': [], 'project_ids': []}
@@ -91,7 +93,7 @@ class OfficerCapabilityTests(unittest.TestCase):
     def tearDown(self):
         if self.http:
             self.http.shutdown(); self.http_thread.join(2); self.http.server_close()
-        self.history.close()
+        deck_log_settle.close(self.history)
         self.env_patch.stop(); self.routing_patch.stop(); self.model_patch.stop()
         for name, value in self.saved.items():
             setattr(server, name, value)
@@ -115,9 +117,14 @@ class OfficerCapabilityTests(unittest.TestCase):
         self.assertEqual(out['status'], 'queued')
         batch = 20 if os.name == 'nt' else 100
         if self.number % batch == 0:
-            self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10),
-                            f'Fictional archive at {self.number}: {self.history.reason!r}, '
-                            f'queued={len(self.history.queue)}, inflight={self.history.inflight}')
+            self.settle_archive(f'Fictional archive at {self.number}')
+
+    def settle_archive(self, label='Fictional archive'):
+        # Waits while the real writer keeps saving; fails on a reported
+        # failure or a stalled writer, never on this machine's speed.
+        problem = deck_log_settle.settle(self.history, label)
+        if problem:
+            self.fail(problem)
 
     def test_fixture_admission_cannot_race_the_writers_nonblocking_gate(self):
         attempted, release = threading.Event(), threading.Event()
@@ -148,7 +155,7 @@ class OfficerCapabilityTests(unittest.TestCase):
             if contender.ident is not None:
                 contender.join(5)
         self.assertFalse(contender.is_alive())
-        self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))
+        self.settle_archive()
         self.assertEqual(self.history.dropped, 0)
 
     def test_fixture_waits_for_gate_while_direct_capture_still_drops(self):
@@ -186,7 +193,7 @@ class OfficerCapabilityTests(unittest.TestCase):
                 seeder.join(5)
         self.assertFalse(seeder.is_alive())
         self.assertEqual(errors, [])
-        self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))
+        self.settle_archive()
         with self.history.lock:
             self.assertEqual(self.history.db.execute('SELECT count(*) FROM events').fetchone()[0], 1)
         self.assertEqual(self.history.dropped, 1, 'Only the direct nonblocking capture was dropped.')
@@ -207,13 +214,13 @@ class OfficerCapabilityTests(unittest.TestCase):
                 for index in range(3):
                     self.add('Quiet critical decision: preserve old session rows.' if index == 1 else 'Quiet migration detail ' + str(index),
                              chat='x:demo-bram', name='Bram', stamp=start + 600 + index)
-                self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))
+                self.settle_archive()
             finally:
                 with self.history.lock:
                     self.history.db.execute(f'PRAGMA synchronous={synchronous}')
         else:
             self.add('Fictional saved progress: pricing review needs a rounding correction.')
-            self.assertTrue(self.history.flush(30 if os.name == 'nt' else 10))
+            self.settle_archive()
 
     def query(self, **changes):
         value = {'scope': copy.deepcopy(SCOPE), 'view': 'overview', 'limit': 20}
@@ -337,7 +344,7 @@ class OfficerCapabilityTests(unittest.TestCase):
                 self.assertEqual(len(self.calls), 2)
 
     def test_json_final_cannot_claim_a_reference_not_supplied_in_prior_call(self):
-        self.seed(); self.add('Unread second saved observation.'); self.assertTrue(self.history.flush(5))
+        self.seed(); self.add('Unread second saved observation.'); self.settle_archive()
         unread = next(event for event in self.history.search()['events'] if 'Unread second' in event['text'])
         def model(body):
             if len(self.calls) == 1:
@@ -394,7 +401,7 @@ class OfficerCapabilityTests(unittest.TestCase):
 
     def test_aliases_stay_stable_across_pages_expand_and_publish_canonical_refs(self):
         self.seed(); self.add('A middle contextual observation.'); self.add('A later contextual observation.')
-        self.assertTrue(self.history.flush(5))
+        self.settle_archive()
         seen = {}
         def model(body):
             if len(self.calls) == 1:

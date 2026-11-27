@@ -36,7 +36,7 @@ class AnswerAssessmentTests(unittest.TestCase):
         f = self.f
         f.add('REMOVED_ALPHA: owner private decision.', chat='x:demo-ada', name='Ada')
         f.add('SURVIVING_BETA: report still available.', chat='x:demo-bram', name='Bram')
-        self.assertTrue(f.history.flush(10))
+        f.settle_archive()
         def model(body):
             if len(f.calls) == 1:
                 return message([tool('evidence_query', f.query())])
@@ -95,7 +95,7 @@ class AnswerAssessmentTests(unittest.TestCase):
         f = self.f
         f.add('Earlier removed material.', chat='x:demo-ada', name='Ada')
         f.add('Fresh surviving report.', chat='x:demo-bram', name='Bram')
-        f.history.flush(10)
+        f.settle_archive()
         def model(body):
             if len(f.calls) == 1:
                 f.history.delete(chat_id='x:demo-ada')

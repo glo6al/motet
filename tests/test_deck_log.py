@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 import deck_log as d
+import deck_log_settle
 
 
 class DeckTests(unittest.TestCase):
@@ -28,7 +29,7 @@ class DeckTests(unittest.TestCase):
         self.number = 0
 
     def tearDown(self):
-        self.store.close()
+        deck_log_settle.close(self.store)
         self.temp.cleanup()
 
     def record(self, *, chat='x:chat-one', provider='codex', project=None, ts=None, key=None):
@@ -84,7 +85,9 @@ class DeckTests(unittest.TestCase):
                 release.set()
             # Disk and ACL checks may be slow; queueing above must not depend
             # on them completing. Still verify every real write is persisted.
-            self.assertTrue(self.store.flush(30))
+            problem = deck_log_settle.settle(self.store, 'Burst archive')
+            if problem:
+                self.fail(problem)
         self.assertEqual(len(self.store.search(limit=100)['events']), 60)
         self.assertEqual(self.store.status()['dropped'], 0)
 
