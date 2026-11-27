@@ -20,7 +20,8 @@ See also `docs/bridge/RECOVERY.md` and `docs/PEER_BRIDGE.md`.
 - **Replayed start receipt.** A replayed start receipt resets a hold's age, so the bell can come back. Not fixed.
 - **Mixed input.** A native message arriving at the end of a bound Claude turn withholds the reply. This is a correct refusal, with a possible refinement.
 - **Old uncertain rows.** A row can end `unknown` with an empty error after a gap, a temporary failure and a read.
-- **Older plugins.** Subfolder receiving needs plugin 0.6.4 in each Claude chat.
+- **Older plugins.** Subfolder receiving needs plugin 0.6.4 or later in each Claude chat, and Claude Code 2.1.323 loads only 0.6.5 of those (BR-046).
+- **Reloaded terminal chats.** After `/reload-plugins`, a terminal chat that Claude does not start again cannot show the plugin it is interactive, so it stays disconnected until the chat restarts. Claude Desktop chats reconnect by themselves (BR-046).
 - **Downgrade.** Downgrading is unsafe against the current ledger. Do not run an older build on it.
 - **Receipt discard.** The receipt-discard command is not built, and timed automatic clear is off.
 - **Sender connections.** Sender MCP connections must reconnect to get new guidance.
@@ -30,6 +31,15 @@ See also `docs/bridge/RECOVERY.md` and `docs/PEER_BRIDGE.md`.
 - **Timing in tests.** Tests that guess machine speed turned the development branch red three times.
 
 ## Entries, newest first
+
+### BR-046 · 27 Nov 2026
+
+A Claude chat stopped receiving after the plugin was reloaded in it, and stayed unreachable. Two causes. First, Claude Code refused to load plugin 0.6.4 at all ("hooks module did not load"), because it tested two optional Claude features with `typeof $.session.root` and `typeof $.session.info`; the plugin now calls them and keeps the same fallbacks. Second, a reload stops the plugin's heartbeat, and Claude does not always start a reloaded plugin again, which was the only place the heartbeat and the `/watch-*` commands were set up. Plugin 0.6.5 puts them back on the first event the reloaded plugin sees, with every startup check kept and nothing resubmitted.
+
+- Commits: 237ad38, d28ba9b
+- Kind: root cause
+- Related: BR-044 (added the feature checks that the host refused), BR-025 and BR-014 (receipts and completions across reloads and reconnects, a different failure)
+- Area: claude-delivery
 
 ### BR-045 · 26 Nov 2026
 
