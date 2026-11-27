@@ -2893,7 +2893,9 @@ test('a pending opt-out refused for a revoked grant is told through the next cre
   assert.equal([...storage.values()].some(v=>v?.grant===A.grant&&v!==storage.get(GLOBAL_KEY)),false,'the refused grant\'s copies are dropped');
 });
 
-test('two commands in one copy whose identity reads finish out of order keep the owner\'s order at Motet (R9-N1)',async()=>{
+// Two commands in one copy whose identity reads finish out of order: the newer command reserved first. Tickets stay
+// with the command that reserved them; the older one gives up once its own reservation returns.
+async function outOfOrderPair({foreignOptOutBetween}){
   const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
   const h=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
   // The older command (a disconnect) has a slow identity read; the newer one (a connect) is then held at its folder.
@@ -2904,14 +2906,33 @@ test('two commands in one copy whose identity reads finish out of order keep the
   holdCwd=true;
   const connecting=h.command('watch-connect');await bounded(cwdGate.entered,'newer command reserved, at its folder');
   assert.equal(motet.issued,1,'the newer command reserved first');
+  if(foreignOptOutBetween)assert.equal(motet.fetch('/decision',{opted_out:true}).status,200);  // another window's later disconnect
   idGate.release();
-  assert.match((await disconnecting).text,/Motet disconnected/);
+  const older=(await disconnecting).text;
   cwdGate.release();
-  assert.match((await connecting).text,/reconnect scheduled/);
-  // The owner's latest command, the connect, holds the later ticket and wins.
-  assert.equal(motet.optedOut,false);assert.equal(motet.latest,2);
-  assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[1,true],[2,false]]);
+  const newer=(await connecting).text;
+  await h.tick();
+  return {motet,storage,h,older,newer};
+}
+
+test('two commands in one copy whose identity reads finish out of order end on the owner\'s last command (R9-N1)',async()=>{
+  const {motet,storage,older,newer}=await outOfOrderPair({foreignOptOutBetween:false});
+  assert.equal(older,SUPERSEDED_TEXT);
+  assert.match(newer,/reconnect scheduled/);
+  assert.equal(motet.optedOut,false);
+  assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[1,false]]);
   assert.equal(storage.get(PREF).disconnected,false);
+});
+
+test('an out-of-order pair cannot move the newer reconnect above another window\'s later disconnect (F5)',async()=>{
+  const {motet,h,older,newer}=await outOfOrderPair({foreignOptOutBetween:true});
+  assert.equal(older,SUPERSEDED_TEXT);
+  assert.equal(newer,OTHER_WINDOW_TEXT);
+  // Motet stays opted out: the reconnect kept its own ticket (1), older than the other window's opt-out (2).
+  assert.equal(motet.optedOut,true);assert.equal(motet.latest,2);
+  assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[2,true]]);
+  assert.equal(motet.ready(),false);assert.equal((await statusOf(h)).connected,false);
+  assert.equal(h.calls.filter(c=>c.url.endsWith('/register')&&c.response?.ok).length,0);
 });
 
 test('a command that gives up takes its own ticket with it, so an older opt-out cannot move above a later reconnect (R10-S1)',async()=>{
