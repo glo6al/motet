@@ -1215,6 +1215,59 @@ class Fixture(unittest.TestCase):
         running['now'] = False
         self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped')
 
+    def unconfirmed_with_a_survivor(self):
+        run_id, native = self.start()
+        self.manager._test = replace(self.dependencies, alive=lambda identities: True)
+        self.survivors = [[4242, 1900000000.0]]
+        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'unconfirmed')
+        return run_id, native
+
+    def stored_stop(self, run_id):
+        with self.manager._registry() as db:
+            return self.manager._stop_record(db, run_id)
+
+    def test_a_try_again_during_the_survivor_check_is_not_overwritten_by_its_stale_result(self):
+        run_id, native = self.unconfirmed_with_a_survivor()
+        inside = []
+
+        def alive(identities):
+            if inside:
+                return True                          # the new attempt's own checks: the survivor still runs
+            inside.append(True)
+            self.manager.stop(run_id, uid(), 'c:' + native)     # Try again lands while ps is being read
+            return False                             # the stale read: nothing running
+        self.manager._test = replace(self.dependencies, alive=alive)
+        self.manager.status(run_id)
+        record = self.stored_stop(run_id)
+        self.assertEqual(record['attempts'], 2)
+        self.assertNotEqual(record['outcome'], 'stopped', 'the stale result was not applied')
+        self.assertEqual(record['survivors'], [[4242, 1900000000.0]])
+
+    def test_a_survivor_merged_during_the_survivor_check_is_not_lost_to_its_stale_result(self):
+        run_id, native = self.unconfirmed_with_a_survivor()
+
+        def alive(identities):
+            if identities == [[4242, 1900000000.0]]:
+                with self.manager._registry() as db:     # another status merges new evidence while ps is read
+                    record = self.manager._stop_record(db, run_id)
+                    record['survivors'] = managed._merged(record['survivors'], [[5353, 1900000001.0]])
+                    self.manager._save_stop(db, record)
+                return False                             # the stale read: the old list's survivor has gone
+            return True
+        self.manager._test = replace(self.dependencies, alive=alive)
+        self.manager.status(run_id)
+        record = self.stored_stop(run_id)
+        self.assertEqual(record['outcome'], 'unconfirmed', 'the stale result was not applied')
+        self.assertIn([5353, 1900000001.0], record['survivors'])
+
+    def test_a_replay_answers_as_the_original_did(self):
+        run_id, native = self.start()
+        request = uid()
+        first = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertFalse(first['already'])
+        self.assertFalse(self.manager.stop(run_id, request, 'c:' + native)['already'], 'the replay, as the original')
+        self.assertTrue(self.manager.stop(run_id, uid(), 'c:' + native)['already'], 'a new request: already stopped')
+
     def test_a_stop_never_seen_with_evidence_is_not_called_stopped(self):
         run_id, native = self.start()
         self.disconnected = True                                  # neither the supervisor nor its ledger answers
