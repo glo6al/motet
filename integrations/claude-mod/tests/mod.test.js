@@ -2496,9 +2496,12 @@ test('a delayed preference write cannot reverse a newer owner decision, in eithe
     const h=await harness({storage,claimed:false,fetch:globalFetch,storeSet:async key=>{if(key===PREF&&holdPref){holdPref=false;await gate.hold();}}});
     holdPref=true;
     const disconnecting=h.command('watch-disconnect');await bounded(gate.entered,'disconnect preference write');
+    // The connect reads its folder just before it queues its preference write; from there to the queue is
+    // synchronous work and promise steps only, so one macrotask later it is queued behind the held write.
+    let folderRead;const reachedFolder=new Promise(resolve=>{folderRead=resolve;});
+    const cwd=h.$.session.cwd;h.$.session.cwd=async()=>{folderRead();return cwd();};
     const connecting=h.command('watch-connect');
-    // Let the connect reach its own preference write, queued behind the held one.
-    for(let i=0;i<10;i++)await yieldWhileHeld();
+    await bounded(reachedFolder,'connect reached its folder read');await new Promise(resolve=>setImmediate(resolve));
     gate.release();
     assert.equal((await disconnecting).text,SUPERSEDED_TEXT);assert.match((await connecting).text,/reconnect scheduled/);
     assert.equal(storage.get(PREF).disconnected,false);
@@ -2865,7 +2868,7 @@ test('once Motet has shown tickets, a refused decision request is an error, not 
     if(glitch&&url.endsWith('/decision')){glitch--;return responseJSON({error:'Invalid Claude mod service request.',error_code:'invalid_request'},403);}
     return motet.fetch(url,body,init);}});
   assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
-  glitch=2;   // both the reservation and the commit of the next disconnect
+  glitch=3;   // the reservation (tried twice) and the commit of the next disconnect
   assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
   // Not told yet, so kept pending; the next disconnect still uses tickets.
   assert.equal(h.storage.get(PREF).pending,true);
@@ -2888,6 +2891,57 @@ test('a pending opt-out refused for a revoked grant is told through the next cre
   const used=h.calls.filter(c=>c.url.endsWith('/decision')).map(c=>c.init.headers.Authorization);
   assert.deepEqual(used.slice(-2),['Bearer '+A.grant,'Bearer '+B.grant]);
   assert.equal([...storage.values()].some(v=>v?.grant===A.grant&&v!==storage.get(GLOBAL_KEY)),false,'the refused grant\'s copies are dropped');
+});
+
+test('two commands in one copy whose identity reads finish out of order keep the owner\'s order at Motet (R9-N1)',async()=>{
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+  // The older command (a disconnect) has a slow identity read; the newer one (a connect) is then held at its folder.
+  const idGate=latch(),cwdGate=latch(),id=h.$.session.id,cwd=h.$.session.cwd;let holdId=true,holdCwd=false;
+  h.$.session.id=async()=>{if(holdId){holdId=false;await idGate.hold();}return id();};
+  h.$.session.cwd=async()=>{if(holdCwd){holdCwd=false;await cwdGate.hold();}return cwd();};
+  const disconnecting=h.command('watch-disconnect');await bounded(idGate.entered,'older identity read');
+  holdCwd=true;
+  const connecting=h.command('watch-connect');await bounded(cwdGate.entered,'newer command reserved, at its folder');
+  assert.equal(motet.issued,1,'the newer command reserved first');
+  idGate.release();
+  assert.match((await disconnecting).text,/Motet disconnected/);
+  cwdGate.release();
+  assert.match((await connecting).text,/reconnect scheduled/);
+  // The owner's latest command, the connect, holds the later ticket and wins.
+  assert.equal(motet.optedOut,false);assert.equal(motet.latest,2);
+  assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[1,true],[2,false]]);
+  assert.equal(storage.get(PREF).disconnected,false);
+});
+
+test('a reconnect retries a reservation that failed once, and one that could not reserve is not placed at Motet (R9-N2)',async()=>{
+  // A single failed reservation is retried, and the reconnect is committed in its place.
+  {
+    let fail=1;const motet=ticketMotet();
+    const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>{
+      if(fail&&url.endsWith('/decision')&&body.reserve){fail--;throw Error('lost request');}return motet.fetch(url,body,init);}});
+    assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+    assert.deepEqual(motet.decisions.map(d=>d.opted_out),[false]);
+    await h.tick();assert.equal((await statusOf(h)).connected,true);
+  }
+  // With no reservation at all, a reconnect is not committed: an opt-out another window made stands at Motet.
+  {
+    const motet=ticketMotet();motet.fetch(`${'x'}/decision`,{opted_out:true});   // another window's opt-out
+    const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>{
+      if(url.endsWith('/decision')&&body.reserve)throw Error('Motet unreachable for reservations');return motet.fetch(url,body,init);}});
+    assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+    assert.equal(motet.optedOut,true);assert.equal(motet.decisions.length,1);
+    await h.tick();
+    const status=await statusOf(h);assert.equal(status.connected,false);assert.equal(status.error,OTHER_WINDOW_TEXT);
+  }
+  // An opt-out without a reservation is still committed: it can only make the chat safer.
+  {
+    const motet=ticketMotet();
+    const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>{
+      if(url.endsWith('/decision')&&body.reserve)throw Error('Motet unreachable for reservations');return motet.fetch(url,body,init);}});
+    assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+    assert.equal(motet.optedOut,true);
+  }
 });
 
 test('an opt-out made while Motet is unreachable is kept pending and told to Motet on the next contact',async()=>{
