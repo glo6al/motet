@@ -1226,7 +1226,7 @@ class ManagedClaude:
                     current.pop('survivors', None)
                     self._save_stop(db, current)
                     stop = current
-        snapshot['ownerStop'] = self._public_stop(stop, row['nativeId'])
+        snapshot['ownerStop'] = self._public_stop(stop, row['nativeId'], snapshot['state'] == 'exited')
         snapshot['queued'] = sum(message['state'] == 'queued' for message in snapshot['messages'])
         if stop is not None and self.stop_observer is not None:
             # Outside the registry's locks: the room puts the record on the agent's row (server.managed_stop_seen).
@@ -1733,12 +1733,21 @@ class ManagedClaude:
                     "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" % native_id)
         return "pkill -KILL -f -- '--session-id %s'" % native_id
 
-    def _public_stop(self, record, native_id):
+    def _public_stop(self, record, native_id, exited):
+        """The stop record as the page sees it. ``claudeEnded``: the stop is unconfirmed although Claude itself has
+        exited (``exited``: the snapshot's state, from Claude's exit receipt or the registry's confirmed exit), so
+        what keeps it unconfirmed is only what Claude started: seen still running, or not seen completely. Neither
+        Try again nor the Terminal command can change that outcome: a supervisor whose Claude has ended signals
+        nothing more (its own ``stop``), ``_end`` goes no further once the state is exited, and the command names
+        Claude alone, which has gone. Survivors seen running are looked at again on every status read, so such a
+        stop still becomes stopped by itself once they have gone. False on every other record: stopping, stopped,
+        and an unconfirmed stop whose Claude may still be running."""
         if record is None:
             return None
+        ended = record['outcome'] == 'unconfirmed' and exited is True
         return dict(by='owner', outcome=record['outcome'], requestedAt=record['requestedAt'],
                     lastAttemptAt=record['lastAttemptAt'], stoppedAt=record['stoppedAt'],
-                    terminalCommand=self.terminal_command(native_id))
+                    terminalCommand=self.terminal_command(native_id), claudeEnded=ended)
 
     def stop_facts(self):
         """Every recorded stop, by agent ('c:' + native ID), for the room: outcome and times only."""

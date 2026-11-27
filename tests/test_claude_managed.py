@@ -1303,7 +1303,8 @@ class Fixture(unittest.TestCase):
                 return dict(requestId=params['requestId'], state='exited')
             return plain(path, command, params)
         self.manager._test = replace(self.dependencies, request=raced)
-        self.assertEqual(self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']['outcome'], 'unconfirmed')
+        stop = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((stop['outcome'], stop['claudeEnded']), ('unconfirmed', True), 'Claude has gone: no buttons')
 
     def test_a_natural_exit_seen_only_in_the_ledger_is_no_evidence_about_the_tree(self):
         run_id, native = self.start()
@@ -1319,6 +1320,7 @@ class Fixture(unittest.TestCase):
         with patch.object(self.manager, 'status', side_effect=late):
             result = self.manager.stop(run_id, uid(), 'c:' + native)
         self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        self.assertIs(result['ownerStop']['claudeEnded'], True, 'Claude ended by itself: nothing more to try')
 
     def test_compatibility_words_are_only_for_what_this_stop_did(self):
         run_id, native = self.start()
@@ -1514,6 +1516,101 @@ class Fixture(unittest.TestCase):
         with self.manager._registry() as db:
             row = self.manager._row(db, run_id)
         self.assertEqual((row['state'], row['occupied']), ('exited', False))
+
+    # claudeEnded: the stop is unconfirmed, but Claude itself has exited, so neither Try again nor the Terminal
+    # command (which names Claude alone) can change the outcome; the page then offers neither.
+
+    def test_claude_ended_when_only_what_claude_started_keeps_the_stop_unconfirmed(self):
+        run_id, native = self.unconfirmed_with_a_survivor()       # Claude ended; something it started still runs
+        stop = self.manager.status(run_id)['ownerStop']
+        self.assertEqual((stop['outcome'], stop['claudeEnded']), ('unconfirmed', True))
+        again = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((again['outcome'], again['claudeEnded']), ('unconfirmed', True), 'Try again changes nothing')
+        self.manager._test = replace(self.dependencies, alive=lambda identities: False)
+        gone = self.manager.status(run_id)['ownerStop']               # each status read looks at the survivor again
+        self.assertEqual((gone['outcome'], gone['claudeEnded']), ('stopped', False))
+        other_run, other = self.start()
+        self.survivors = None                                     # the tree could not be seen at all
+        unseen = self.manager.stop(other_run, uid(), 'c:' + other)['ownerStop']
+        self.assertEqual((unseen['outcome'], unseen['claudeEnded']), ('unconfirmed', True))
+        self.assertIs(self.manager.status(other_run)['ownerStop']['claudeEnded'], True)
+
+    def test_claude_ended_without_its_supervisor(self):
+        run_id, native = self.start()
+        self.disconnected = True
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: False)
+        unseen = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((unseen['outcome'], unseen['claudeEnded']), ('unconfirmed', False),
+                         'Claude was not seen ending: it may still be running')
+        self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: True)
+        result = self.manager.stop(run_id, uid(), 'c:' + native)
+        if managed.ps.WIN:                                        # the job ended everything in it
+            self.assertEqual((result['ownerStop']['outcome'], result['ownerStop']['claudeEnded']), ('stopped', False))
+        else:                                                     # Claude ended; what it started cannot all be seen
+            self.assertEqual((result['state'], result['ownerStop']['outcome'], result['ownerStop']['claudeEnded']),
+                             ('exited', 'unconfirmed', True))
+            self.assertIs(self.manager.status(run_id)['ownerStop']['claudeEnded'], True)
+
+    def test_claude_ended_on_windows_too(self):
+        # The same field on Windows: the job leaves nothing once its supervisor has gone (stopped), and a Claude that
+        # ended by itself just before the stop leaves its tree unseen (unconfirmed, nothing more to try). Only the
+        # stop's own decisions see Windows here; the fixture's storage stays this machine's.
+        real = managed.ps
+
+        class Windows:
+            WIN = True
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+        run_id, native = self.start()
+        other_run, other = self.start()
+        with patch.object(managed, 'ps', Windows()):
+            self.disconnected = True
+            self.manager._test = replace(self.dependencies, unsupervised=lambda run_dir: True)
+            stop = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+            self.assertEqual((stop['outcome'], stop['claudeEnded']), ('stopped', False))
+            self.assertIn('Stop-Process', stop['terminalCommand'])
+            self.disconnected = False
+            self.manager._test = self.dependencies
+            self.survivors = None
+            unseen = self.manager.stop(other_run, uid(), 'c:' + other)['ownerStop']
+            self.assertEqual((unseen['outcome'], unseen['claudeEnded']), ('unconfirmed', True))
+
+    def test_claude_ended_is_false_while_claude_may_still_run(self):
+        run_id, native = self.start()
+        self.stubborn = True                                      # the supervisor could not confirm Claude ended
+        stop = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((stop['outcome'], stop['claudeEnded']), ('unconfirmed', False))
+        self.assertIs(self.manager.status(run_id)['ownerStop']['claudeEnded'], False)
+        self.refused_commands = ('stop',)                         # an older supervisor, just as stubborn
+        legacy = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((legacy['outcome'], legacy['claudeEnded']), ('unconfirmed', False))
+        self.stubborn, self.refused_commands = False, ()
+        other_run, other = self.start()
+        with self.manager._registry() as db:                      # Motet ended part-way through a stop
+            self.manager._save_stop(db, dict(runId=other_run, by='owner', outcome='stopping', requestedAt=1900000000,
+                                             lastAttemptAt=1900000000, stoppedAt=None, attempts=1))
+        cut = self.make().status(other_run)['ownerStop']
+        self.assertEqual((cut['outcome'], cut['claudeEnded']), ('unconfirmed', False))
+
+    def test_claude_ended_is_never_true_on_a_stopped_or_stopping_record(self):
+        run_id, native = self.start()
+        plain, during = self.request, []
+
+        def slow(path, command, params):
+            if command == 'stop' and not during:
+                during.append(self.manager.status(run_id)['ownerStop'])      # read while the stop is carried out
+            return plain(path, command, params)
+        self.manager._test = replace(self.dependencies, request=slow)
+        stopped = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((during[0]['outcome'], during[0]['claudeEnded']), ('stopping', False))
+        self.assertEqual((stopped['outcome'], stopped['claudeEnded']), ('stopped', False))
+        self.assertIs(self.manager.status(run_id)['ownerStop']['claudeEnded'], False)
+        self.assertIs(self.make().status(run_id)['ownerStop']['claudeEnded'], False, 'after a restart too')
+        exited = self.manager._public_stop(self.stored_stop(run_id), native, True)
+        self.assertIs(exited['claudeEnded'], False)
+        stopping = dict(self.stored_stop(run_id), outcome='stopping', stoppedAt=None)
+        self.assertIs(self.manager._public_stop(stopping, native, True)['claudeEnded'], False)
 
     def test_terminal_command_names_the_session_not_a_process(self):
         native = uid()

@@ -93,7 +93,8 @@ async function stoppedFlow(code){
 async function unconfirmedFlow(code){
   const h=harness(code),{api,$}=h;await ready(h);
   assert.equal(api.workspaceManagedStopBegin(h.cleo),true);
-  const record={by:'owner',outcome:'unconfirmed',requestedAt:600,lastAttemptAt:604,stoppedAt:null,terminalCommand:'pkill -KILL -f -- fictional'};
+  const record={by:'owner',outcome:'unconfirmed',requestedAt:600,lastAttemptAt:604,stoppedAt:null,terminalCommand:'pkill -KILL -f -- fictional',claudeEnded:false};
+  h.cleo.managedStop={outcome:'unconfirmed',requestedAt:600,lastAttemptAt:604,stoppedAt:null};      /* the room's copy of the same attempt: no command, no claudeEnded */
   h.status.state='uncertain';h.status.recoveryRequired=true;h.status.ownerStop=record;h.status.capabilities={permissions:false};h.status.permissions=[];
   h.reply().resolve({schemaVersion:1,requestId:h.reply().requestId,runId:RUN,agent:CLEO,state:'uncertain',ownerStop:record,already:false});await tick();await tick();await tick();
   api.workspaceManagedDeskPaint(h.cleo);api.workspaceManagedComposerPaint();const host=api.MCP.noticeHost;
@@ -110,6 +111,25 @@ async function unconfirmedFlow(code){
   return h;
 }
 
+/* Claude itself has exited and only what it left (or could not be seen) keeps the stop unconfirmed: neither button can
+   help, so the notice is its bold line alone. The same attempt seen with claudeEnded false gets both buttons back. */
+async function claudeEndedFlow(code){
+  const h=harness(code),{api}=h;await ready(h);
+  assert.equal(api.workspaceManagedStopBegin(h.cleo),true);
+  const record={by:'owner',outcome:'unconfirmed',requestedAt:700,lastAttemptAt:704,stoppedAt:null,terminalCommand:'pkill -KILL -f -- fictional',claudeEnded:true};
+  h.cleo.managedStop={outcome:'unconfirmed',requestedAt:700,lastAttemptAt:704,stoppedAt:null};
+  h.status.state='exited';h.status.recoveryRequired=false;h.status.ownerStop=record;h.status.capabilities={permissions:false};h.status.permissions=[];h.status.queued=0;
+  h.reply().resolve({schemaVersion:1,requestId:h.reply().requestId,runId:RUN,agent:CLEO,state:'exited',ownerStop:record,already:false});await tick();await tick();await tick();
+  api.workspaceManagedDeskPaint(h.cleo);const host=api.MCP.noticeHost;
+  assert.equal(api.workspaceManagedStatusPill(h.cleo),'may still be running','the label stays as it is');
+  assert.equal(host.hidden,false);assert.equal(host.children.length,1,'no buttons when Claude has ended: the bold line alone');
+  assert.equal(text(host.children[0]),'Motet could not confirm that Cleo stopped.');assert.equal(text(host),'Motet could not confirm that Cleo stopped.','no other words');
+  const again={...record,claudeEnded:false};api.MCP.stops.get(CLEO).result=again;api.MCP.sessions.get('desk:'+CLEO).snapshot.ownerStop=again;
+  api.workspaceManagedDeskPaint(h.cleo);assert.equal(host.children.length,2,'the field change repaints');
+  const [retry,copy]=host.children[1].children;assert.equal(text(retry),'Try again');assert.equal(text(copy),'Copy the Terminal command');
+  return h;
+}
+
 async function lostReply(code){
   const h=harness(code),{api}=h;await ready(h);api.workspaceManagedStopBegin(h.cleo);h.reply().reject(Error('network'));await tick();await tick();await tick();
   api.workspaceManagedDeskPaint(h.cleo);const host=api.MCP.noticeHost;assert.equal(api.workspaceManagedStatusPill(h.cleo),'may still be running','a lost reply is never shown as stopped');assert.equal(host.hidden,false);assert.equal(host.children[1].children.length,1,'no Terminal command without a server record');
@@ -118,11 +138,14 @@ async function lostReply(code){
 
 function statusShapes(h){
   const {api}=h,base={schemaVersion:1,runId:RUN,state:'exited',recoveryRequired:false,evidenceAvailable:true,serverTime:50,timeoutSeconds:120,capabilities:{permissions:false},permissions:[],queued:0},stop={by:'owner',outcome:'stopped',requestedAt:5,lastAttemptAt:5,stoppedAt:6,terminalCommand:'x'};
-  assert.equal(api.workspaceManagedValidStatus({...base,ownerStop:stop},RUN),true);assert.equal(api.workspaceManagedValidStatus({...base,ownerStop:null},RUN),true);
-  for(const bad of [{...base,state:'running',ownerStop:stop},{...base,ownerStop:{...stop,outcome:'unconfirmed'}},{...base,ownerStop:{...stop,by:'motet'}},{...base,ownerStop:{...stop,terminalCommand:'a\nb'}},{...base,ownerStop:{...stop,terminalCommand:'x'.repeat(513)}},{...base,ownerStop:{...stop,outcome:'restarted'}},{...base,ownerStop:{...stop,stoppedAt:null}},{...base,queued:-1},{...base,queued:1.5}])
+  assert.equal(api.workspaceManagedValidStatus({...base,ownerStop:stop},RUN),true);assert.equal(api.workspaceManagedValidStatus({...base,ownerStop:{...stop,claudeEnded:false}},RUN),true);
+  for(const v of [true,false])assert.equal(api.workspaceManagedStopValid({by:'owner',outcome:'unconfirmed',requestedAt:5,lastAttemptAt:9,stoppedAt:null,claudeEnded:v}),true);
+  for(const v of ['true','false',1,0,null,{}])assert.equal(api.workspaceManagedStopValid({by:'owner',outcome:'unconfirmed',requestedAt:5,lastAttemptAt:9,stoppedAt:null,claudeEnded:v}),false,'claudeEnded only as a boolean: '+JSON.stringify(v));assert.equal(api.workspaceManagedValidStatus({...base,ownerStop:null},RUN),true);
+  for(const bad of [{...base,state:'running',ownerStop:stop},{...base,ownerStop:{...stop,outcome:'unconfirmed'}},{...base,ownerStop:{...stop,by:'motet'}},{...base,ownerStop:{...stop,terminalCommand:'a\nb'}},{...base,ownerStop:{...stop,terminalCommand:'x'.repeat(513)}},{...base,ownerStop:{...stop,outcome:'restarted'}},{...base,ownerStop:{...stop,stoppedAt:null}},{...base,ownerStop:{...stop,claudeEnded:'true'}},{...base,ownerStop:{...stop,claudeEnded:1}},{...base,ownerStop:{...stop,claudeEnded:null}},{...base,queued:-1},{...base,queued:1.5}])
     assert.equal(api.workspaceManagedValidStatus({...bad,ownerStop:bad.ownerStop},RUN),false,JSON.stringify(bad.ownerStop||bad.queued));
   const older={outcome:'stopping',requestedAt:5,lastAttemptAt:5,stoppedAt:null},done={outcome:'stopped',requestedAt:5,lastAttemptAt:5,stoppedAt:6},retry={outcome:'unconfirmed',requestedAt:5,lastAttemptAt:9,stoppedAt:null};
   assert.equal(api.workspaceManagedStopNewer(done,older),done,'a confirmed stop is never replaced');assert.equal(api.workspaceManagedStopNewer(older,retry),retry);assert.equal(api.workspaceManagedStopNewer(retry,older),retry,'an older record is ignored');
+  const full={...retry,terminalCommand:'x',claudeEnded:true};assert.equal(api.workspaceManagedStopNewer(retry,full),full,'the same attempt: the later record, with its command and claudeEnded');
   assert.equal(api.workspaceManagedOutcome({decision:'deny',resolutionReason:'owner_stop',decisionState:'unknown'}).title,'Motet tried to deny this');
 }
 
@@ -165,7 +188,7 @@ function stage(){
 }
 
 (async()=>{
-  const h=await menuAndConfirm();statusShapes(h);await stoppedFlow();await unconfirmedFlow();await lostReply();stage();
+  const h=await menuAndConfirm();statusShapes(h);await stoppedFlow();await unconfirmedFlow();await claudeEndedFlow();await lostReply();stage();
   /* causal mutations: each must be caught */
   const mutants=[
     ['double click guard',"if(old?.inFlight)return false;",''],
@@ -173,8 +196,14 @@ function stage(){
     ['stopped words',"+' is stopped'","+' has ended'"],
     ['no hint under the box',"setHint('');return}","setHint('You stopped this chat.');return}"],
     ['contact-lost notice after stop',"MCP.noticeHost.hidden=stop.phase!=='unconfirmed';","MCP.noticeHost.hidden=false;"],
+    ['no buttons check removed',"if(!ended)node.append(row)}","node.append(row)}"],
+    ['no buttons check inverted',"if(!ended)node.append(row)}","if(ended)node.append(row)}"],
+    ['claudeEnded read loosely',"ended=stop.record?.claudeEnded===true,","ended=!!stop.record,"],
+    ['claudeEnded not in the repaint signature',"sig=JSON.stringify(['stop',name,when,command,ended]);","sig=JSON.stringify(['stop',name,when,command]);"],
+    ['claudeEnded accepted as any value',"if('claudeEnded' in s&&typeof s.claudeEnded!=='boolean')return false;",""],
+    ['the room copy wins a tie',"rank[next.outcome]>=rank[old.outcome]?next:old}","rank[next.outcome]>rank[old.outcome]?next:old}"],
     ['new id for Try again',"const requestId=globalThis.crypto?.randomUUID?.();if(!managedUUID(requestId))return false;const entry=","const requestId=old?.lastId||globalThis.crypto?.randomUUID?.();if(!managedUUID(requestId))return false;const entry="],
   ];
-  for(const [name,from,to] of mutants){const code=controllerSource.replace(from,to);assert.notEqual(code,controllerSource,name);let caught=false;try{const m=await menuAndConfirm(code);statusShapes(m);await stoppedFlow(code);await unconfirmedFlow(code.replace("entry={inFlight:requestId,","entry={lastId:requestId,inFlight:requestId,").replace("const old=MCP.stops.get(a.id);if(old?.inFlight)return false;","const old=MCP.stops.get(a.id);if(old?.inFlight)return false;"))}catch{caught=true}assert.ok(caught,'mutation detected: '+name)}
-  console.log('ok managed Stop page: menu only on chats Motet started, confirm words, stopping/stopped/could-not-confirm states, Try again and Copy, one POST per click, stage stopped and ended, Ended filter and Dismiss idle, step stopped before a result; '+mutants.length+' causal mutations detected');
+  for(const [name,from,to] of mutants){const code=controllerSource.replace(from,to);assert.notEqual(code,controllerSource,name);let caught=false;try{const m=await menuAndConfirm(code);statusShapes(m);await stoppedFlow(code);await claudeEndedFlow(code);await unconfirmedFlow(code.replace("entry={inFlight:requestId,","entry={lastId:requestId,inFlight:requestId,").replace("const old=MCP.stops.get(a.id);if(old?.inFlight)return false;","const old=MCP.stops.get(a.id);if(old?.inFlight)return false;"))}catch{caught=true}assert.ok(caught,'mutation detected: '+name)}
+  console.log('ok managed Stop page: menu only on chats Motet started, confirm words, stopping/stopped/could-not-confirm states, Try again and Copy, no buttons once Claude has ended, one POST per click, stage stopped and ended, Ended filter and Dismiss idle, step stopped before a result; '+mutants.length+' causal mutations detected');
 })().catch(error=>{console.error(error);process.exitCode=1});
