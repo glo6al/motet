@@ -9,6 +9,14 @@ const ENROLLMENT='55555555-5555-4555-8555-555555555555';
 const ENVELOPE='WATCH_REQUEST '+REQUEST+'\nThe owner asks through the Officer of the Watch:\nSay fictional progress.\nReply with WATCH_REPLY '+REQUEST+' on its own line. Preserve owner scope.';
 const ANSWER='WATCH_REPLY '+REQUEST+'\nFictional progress.';
 
+// The plugin's heartbeat skips a tick while its previous one is still at work (on a loaded machine that work can
+// outlast a mocked period), so these tests advance the clock until what they wait for has happened, within a bound,
+// instead of a fixed number of periods.
+async function advanceUntil(clock:any,ready:()=>boolean,label:string,limit=40){
+  for(let i=0;i<limit&&!ready();i++){await clock.advance(2000);await new Promise(r=>setTimeout(r,5));}
+  if(!ready())throw Error('Timed out waiting for: '+label);
+}
+
 test('one official mod submits attributed full owner envelope and observes its exactly wrapped main reply',async($,on)=>{
   const clock=mock.clock(on,{now:100000});
   const values=new Map();const submissions=[];const events=[];const heartbeats=[];
@@ -52,8 +60,7 @@ test('one official mod submits attributed full owner envelope and observes its e
   await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
   const connected=await $.command.run({command:'watch-connect',args:'8793:fictional_pair_code_1234',origin:{kind:'composer'}});
   expect(connected.text.includes('Motet connected')).toBe(true);
-  await clock.advance(2000);
-  await clock.advance(2000);
+  await advanceUntil(clock,()=>submissions.length>=1&&events.some(event=>event.kind==='answered'),'owner envelope submitted and answered');
   expect(submissions.length).toBe(1);
   expect(submissions[0].text).toBe(ENVELOPE);
   expect(submissions[0].origin.kind).toBe('plugin');
@@ -162,7 +169,7 @@ test('negotiated peer input retains plugin attribution and only its exact marked
   });
   on('turn.start',($,e)=>({turnId:e.turnId}));on('turn.complete',($,e)=>({text:e.answer}));
   await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
-  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  await advanceUntil(clock,()=>submissions.length>=1&&events.some(event=>event.kind==='answered'),'peer input submitted and answered');
   expect(submissions.length).toBe(1);expect(submissions[0].text).toBe(envelope);
   expect(submissions[0].origin.kind).toBe('plugin');expect(submissions[0].origin.name).toBe('watch-owner');expect(submissions[0].origin.asUser === true).toBe(false);
   expect(events.filter(event=>event.kind==='answered').length).toBe(1);
@@ -291,7 +298,7 @@ test('a negotiated notice claim is acknowledged as dropped and never reaches nat
  on('prompt.submit',(core,e)=>{submissions.push({text:e.text,origin:e.origin});return {text:e.text};});
  on('turn.start',($,e)=>({turnId:e.turnId}));on('turn.complete',($,e)=>({text:e.answer}));
  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
- await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+ await advanceUntil(clock,()=>events.length>=1&&[...values.values()].some(value=>value?.kind==='peer_reply_notice'&&value.requests?.[REQUEST]?.events?.length===0),'notice acknowledged as dropped');
  expect(registrations.length).toBe(2);expect(registrations[0].reply_notice_protocol).toBe(undefined);expect(registrations[1].connection_seq>registrations[0].connection_seq).toBe(true);
  expect(submissions.length).toBe(0);
  expect(events.length).toBe(1);expect(events[0].kind).toBe('dropped');expect(events[0].request_id).toBe(REQUEST);expect(events[0].attempt_id).toBe(ATTEMPT);
@@ -331,13 +338,13 @@ test('official host lifecycle v2 reconnect retains bound turn and observes addit
   on('turn.start',($,e)=>({turnId:e.turnId}));on('turn.complete',($,e)=>({text:e.answer}));
   on('session.receive',($,e)=>({text:e.text}));
   await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
-  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  await advanceUntil(clock,()=>submissions.length>=1&&events.some(e=>e.kind==='started'),'peer turn started');
   expect(submissions.length).toBe(1);expect(events.some(e=>e.kind==='started')).toBe(true);
-  stale=true;await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  stale=true;await advanceUntil(clock,()=>registrations.length>=4&&!stale,'reconnected after the stale poll');
   expect(registrations.length>=4).toBe(true);expect(events.some(e=>e.kind==='unknown')).toBe(false);
   await $.session.receive({text:'Private owner input during the turn',origin:{kind:'sdk'}});
   await $.turn.complete({turnId:'retained-native-turn',answer:ANSWER,isAborted:false,reason:'answer',durationMs:1});
-  await clock.advance(2000);
+  await advanceUntil(clock,()=>events.some(e=>e.kind==='completed'),'completion reported');
   const completed=events.filter(e=>e.kind==='completed');
   expect(completed.length).toBe(1);expect(completed[0].outcome).toBe('withheld');expect(completed[0].answer).toBe('');
   expect(submissions.length).toBe(1);
