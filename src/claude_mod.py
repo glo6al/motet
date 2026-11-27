@@ -330,6 +330,14 @@ class ClaudeMod:
         # opt-out cannot lift it.
         if 'decision_seq' not in {r[1] for r in self.db.execute('PRAGMA table_info(claude_mod_pairs)')}:
             self.db.execute('ALTER TABLE claude_mod_pairs ADD COLUMN decision_seq INTEGER NOT NULL DEFAULT 0')
+        # Tickets come from one counter for every chat, so a command can reserve its place before it knows which
+        # chat it is for. The counter starts above every ticket an earlier per-chat ledger issued or committed.
+        self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_decision_counter (
+            id INTEGER PRIMARY KEY CHECK (id = 1), issued INTEGER NOT NULL)''')
+        if not self.db.execute('SELECT 1 FROM claude_mod_decision_counter').fetchone():
+            start = max(self.db.execute('SELECT COALESCE(MAX(MAX(issued_seq,latest_seq)),0) FROM claude_mod_decisions').fetchone()[0],
+                        self.db.execute('SELECT COALESCE(MAX(decision_seq),0) FROM claude_mod_pairs').fetchone()[0])
+            self.db.execute('INSERT INTO claude_mod_decision_counter (id,issued) VALUES (1,?)', (start,))
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_setup_codes (
             code_hash TEXT PRIMARY KEY, expires REAL NOT NULL)''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_grants (
@@ -509,33 +517,37 @@ class ClaudeMod:
 
     # --- Owner decisions -------------------------------------------------------------------------------------
     # Each owner /watch-connect, /watch-setup or /watch-disconnect reserves a ticket here the moment it starts (its
-    # place in the owner's order), and commits its decision later under that ticket. Tickets increase per chat. A
-    # commit takes effect only if its ticket is newer than the last committed one, so a command that finishes late
+    # place in the owner's order), and commits its decision later under that ticket. Tickets come from one counter for
+    # every chat, so a command can reserve before it knows its chat; decisions are compared per chat. A commit takes
+    # effect only if its ticket is newer than the chat's last committed one, so a command that finishes late
     # cannot undo a decision the owner made after it began. While the chat is opted out, every new connection is
     # refused, ticketed or not, before any membership or lease exists; a later committed reconnect lifts it.
 
     def _decision(self, agent):
-        row = self.db.execute('SELECT latest_seq,opted_out,opted_out_seq,issued_seq FROM claude_mod_decisions '
-                              'WHERE agent=?', (agent,)).fetchone()
-        return (row[0], bool(row[1]), row[2], max(row[3], row[0])) if row else (0, False, 0, 0)
+        row = self.db.execute('SELECT latest_seq,opted_out,opted_out_seq FROM claude_mod_decisions WHERE agent=?',
+                              (agent,)).fetchone()
+        return (row[0], bool(row[1]), row[2]) if row else (0, False, 0)
 
-    def _store_decision(self, agent, latest, opted_out, opted_out_seq, issued):
-        self.db.execute('INSERT OR REPLACE INTO claude_mod_decisions (agent,latest_seq,opted_out,opted_out_seq,issued_seq) '
-                        'VALUES (?,?,?,?,?)', (agent, latest, int(opted_out), opted_out_seq, issued))
+    def _store_decision(self, agent, latest, opted_out, opted_out_seq):
+        self.db.execute('INSERT OR REPLACE INTO claude_mod_decisions (agent,latest_seq,opted_out,opted_out_seq) '
+                        'VALUES (?,?,?,?)', (agent, latest, int(opted_out), opted_out_seq))
 
-    def reserve(self, agent):
-        latest, opted_out, opted_out_seq, issued = self._decision(agent)
-        self._store_decision(agent, latest, opted_out, opted_out_seq, issued + 1)
-        return issued + 1
+    def _issued(self):
+        return self.db.execute('SELECT issued FROM claude_mod_decision_counter WHERE id=1').fetchone()[0]
+
+    def reserve(self, agent=None):
+        issued = self._issued() + 1
+        self.db.execute('UPDATE claude_mod_decision_counter SET issued=? WHERE id=1', (issued,))
+        return issued
 
     def _valid_ticket(self, agent, seq):
-        if seq is not None and (type(seq) is not int or not 0 < seq <= self._decision(agent)[3]):
+        if seq is not None and (type(seq) is not int or not 0 < seq <= self._issued()):
             raise ModError(400, 'Invalid Claude owner decision.')
 
     def decision_gate(self, agent, seq=None):
         """Refuse a new connection while the owner has this chat opted out; return the decision it stands on."""
         self._valid_ticket(agent, seq)
-        latest, opted_out, _, _ = self._decision(agent)
+        latest, opted_out, _ = self._decision(agent)
         if opted_out:
             raise ModError(409, 'This chat was disconnected by its owner.', 'decision_superseded')
         return latest
@@ -550,18 +562,20 @@ class ClaudeMod:
 
     def connection_decision(self, entry):
         """A connection made before the owner's latest opt-out is no longer the owner's: refuse its polls."""
-        _, opted_out, opted_out_seq, _ = self._decision(entry['agent'])
+        _, opted_out, opted_out_seq = self._decision(entry['agent'])
         if opted_out and opted_out_seq > entry['decision_seq']:
             raise ModError(409, 'This chat was disconnected by its owner after this connection.', 'decision_superseded')
 
     def decision_access(self, data, token):
-        """The chat named, for the chat's own enrollment token or the shared grant (which may set any chat's)."""
+        """The chat named (None for a reservation that names none), for the chat's own enrollment token or the
+        shared grant (which may set any chat's). A reservation names no chat: any active credential may take one."""
         reserve = isinstance(data, dict) and data.get('reserve') is True
-        schema(data, ('native_id', 'reserve') if reserve else
+        named = isinstance(data, dict) and 'native_id' in data
+        schema(data, (('reserve',) + (('native_id',) if named else ())) if reserve else
                ('native_id', 'opted_out') + (('decision_seq',) if isinstance(data, dict) and 'decision_seq' in data else ()))
-        if not ident(data['native_id']) or not reserve and type(data['opted_out']) is not bool:
+        if (named or not reserve) and not ident(data['native_id']) or not reserve and type(data['opted_out']) is not bool:
             raise ModError(400, 'Invalid Claude owner decision.')
-        agent = 'c:' + data['native_id']
+        agent = 'c:' + data['native_id'] if named else None
         if isinstance(token, str) and len(token) == 64:
             grant = self.db.execute('SELECT id FROM claude_mod_grants WHERE active=1 AND token_hash=?',
                                     (digest(token),)).fetchone()
@@ -569,7 +583,7 @@ class ClaudeMod:
                 return agent
         row = self.db.execute('SELECT agent FROM claude_mod_enrollments WHERE active=1 AND token_hash=?',
                               (digest(token if isinstance(token, str) else ''),)).fetchone()
-        if not row or row[0] != agent:
+        if not row or agent is not None and row[0] != agent:
             raise ModError(403, 'Claude owner decision access is invalid.', 'access_denied')
         return agent
 
@@ -578,14 +592,14 @@ class ClaudeMod:
         if seq is None:
             seq = self.reserve(agent)
         self._valid_ticket(agent, seq)
-        latest, _, opted_out_seq, issued = self._decision(agent)
+        latest, _, opted_out_seq = self._decision(agent)
         if seq <= latest:
             raise ModError(409, 'A newer owner decision for this chat was already made.', 'decision_superseded')
         if opted_out:
             opted_out_seq = seq
             self._end_connections(agent, 'Its owner disconnected this Claude chat. Earlier input may still run; '
                                          'nothing was resubmitted.')
-        self._store_decision(agent, seq, opted_out, opted_out_seq, issued)
+        self._store_decision(agent, seq, opted_out, opted_out_seq)
         return dict(version=1, decision_protocol=1, decision_seq=seq, opted_out=opted_out)
 
     def decision_call(self, data, token):
@@ -828,7 +842,7 @@ class ClaudeMod:
         # created it in Motet (the plugin's own ticket, when it sends one, has already been committed). A pairing
         # whose code is older than the chat's opt-out is refused before anything changes.
         self._valid_ticket(pair[0], data.get('decision_seq'))
-        latest, opted_out, opted_out_seq, _ = self._decision(pair[0])
+        latest, opted_out, opted_out_seq = self._decision(pair[0])
         if opted_out and pair[3] < opted_out_seq:
             raise ModError(409, 'This chat was disconnected by its owner after this pairing code was made.', 'decision_superseded')
         for eid, in self.db.execute('SELECT id FROM claude_mod_enrollments WHERE agent=? AND active=1', (pair[0],)).fetchall():

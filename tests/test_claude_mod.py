@@ -1271,6 +1271,45 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(status, 200, paired)
         self.assertEqual(self.store.db.execute('SELECT opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone()[0], 0)
 
+    def test_tickets_come_from_one_counter_and_a_reservation_needs_no_chat(self):
+        _, grant = self.global_setup(); token = grant['grant']
+        status, value = self.http('/claude-mod/decision', dict(reserve=True), token=token)
+        self.assertEqual((status, value['reserved']), (200, True))
+        first = value['decision_seq']
+        other = uid()
+        status, theirs = self.http('/claude-mod/decision', dict(native_id=other, reserve=True), token=token)
+        self.assertEqual(theirs['decision_seq'], first + 1)     # another chat's reservation takes the next number
+        # A ticket reserved before the command knew its chat commits for the chat it then names.
+        self.assertEqual(self.commit(first, True, token)[0], 200)
+        self.assertEqual(self.store.db.execute('SELECT latest_seq,opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone(), (first, 1))
+        # Decisions are still compared per chat: the other chat's newer number does not affect this one's.
+        status, _ = self.http('/claude-mod/decision', dict(native_id=other, opted_out=False, decision_seq=first + 1), token=token)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.store.db.execute('SELECT opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone()[0], 1)
+        # A manual pairing's own token may reserve without naming a chat; an unknown credential may not.
+        self.enroll()
+        status, manual = self.http('/claude-mod/decision', dict(reserve=True), token=self.token)
+        self.assertEqual((status, manual['decision_seq']), (200, self._issued_now()))
+        self.assertEqual(self.http('/claude-mod/decision', dict(reserve=True), token='0'*64)[1]['error_code'], 'access_denied')
+
+    def _issued_now(self):
+        return self.store.db.execute('SELECT issued FROM claude_mod_decision_counter').fetchone()[0]
+
+    def test_the_global_counter_starts_above_every_per_chat_ticket(self):
+        self.enroll()
+        status, pair = self.http('/claude-mod-pair', {'agent': self.aid}, owner=True)
+        self.store.close()
+        db = sqlite3.connect(self.base/'state'/'officer-messages.sqlite3')
+        db.execute('DROP TABLE claude_mod_decision_counter')
+        db.execute("INSERT OR REPLACE INTO claude_mod_decisions (agent,latest_seq,opted_out,opted_out_seq,issued_seq) VALUES ('c:x',7,1,7,40)")
+        db.execute("INSERT OR REPLACE INTO claude_mod_decisions (agent,latest_seq,opted_out,opted_out_seq,issued_seq) VALUES ('c:y',55,0,0,9)")
+        db.execute('UPDATE claude_mod_pairs SET decision_seq=61')
+        db.commit(); db.close()
+        self.store = messaging.MessagingStore(str(self.base/'state'), str(self.base/'sessions'))
+        self.store.codex_available = False; server.MESSAGING = self.store
+        self.assertEqual(self._issued_now(), 61)
+        self.assertEqual(self.reserve(), 62)
+
     def test_decision_migration_adds_the_ledger_and_keeps_existing_connections(self):
         _, enrollment = self.enroll(); payload, _ = self.request()
         old_token = self.token
@@ -1283,6 +1322,7 @@ class ClaudeModTests(unittest.TestCase):
         db.execute(create.replace(', decision_seq INTEGER NOT NULL DEFAULT 0', ''))
         db.executemany('INSERT INTO claude_mod_enrollments (' + ','.join(columns) + ') VALUES (' + ','.join('?' * len(columns)) + ')', legacy)
         db.execute('DROP TABLE claude_mod_decisions')
+        db.execute('DROP TABLE claude_mod_decision_counter')
         pairs = [r[1] for r in db.execute('PRAGMA table_info(claude_mod_pairs)') if r[1] != 'decision_seq']
         db.execute('DROP TABLE claude_mod_pairs')
         db.execute('CREATE TABLE claude_mod_pairs (code_hash TEXT PRIMARY KEY, agent TEXT NOT NULL, project TEXT NOT NULL, expires REAL NOT NULL)')

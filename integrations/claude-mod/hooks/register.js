@@ -915,6 +915,37 @@ async function decisionRequest($, state, id, body) {
 
 // A ticket reserved for an owner command that has just started; null where Motet cannot order it, or is unreachable
 // (the command then goes on as with an older Motet, and an opt-out is told to Motet later).
+// A command's place in the owner's order, reserved as its very first step, before it reads which chat it is for
+// (that read can be slow). Motet issues tickets from one counter for every chat, so a reservation names no chat;
+// the credential is the one this copy already holds: its manual pairing or grant, or the shared grant. Across
+// windows and copies the order is the order in which Motet receives the reservations, so commands from two
+// windows given within the same moment are ordered by when Motet receives them. Null when there is no such
+// credential or Motet cannot be reached; the command then reserves after reading its chat (reserveTicket), and
+// only that later moment places it.
+async function reserveEarly($, state) {
+  if (state.decisionProtocol === 0) return null;
+  try {
+    let credential = null;
+    const manual = state.data;
+    if (manual && manual.mode !== 'derived' && typeof manual.token === 'string' && Number.isInteger(manual.port) &&
+        !state.rejectedDecisionTokens.has(manual.token)) credential = {port:manual.port,token:manual.token};
+    else {
+      let config = globalConfiguration(state.config) && !state.rejectedGrants.has(configurationId(state.config)) ? state.config : null;
+      config ??= await currentGrant($,state,await $.store.get(GLOBAL_KEY));
+      if (config && !state.rejectedGrants.has(configurationId(config))) credential = {port:config.port,token:config.grant};
+    }
+    if (!credential) return null;
+    const response = await post($,state,'decision',{reserve:true},credential);
+    if (response?.decision_protocol !== 1 || response.reserved !== true || !Number.isSafeInteger(response.decision_seq) ||
+        response.decision_seq < 1) return null;
+    state.decisionProtocol = 1;
+    return response.decision_seq;
+  } catch (error) {
+    if (error.status === 403 && error.code === 'invalid_request' && state.decisionProtocol !== 1) state.decisionProtocol = 0;
+    return null;
+  }
+}
+
 // Tried a second time at once, so a single lost request does not leave a reconnect without its place.
 async function reserveTicket($, state, id) {
   for (let tries = 0; tries < 2; tries++) {
@@ -1125,10 +1156,11 @@ async function explicitDisconnect($, state) {
   state.disconnecting += 1;
   invalidateEligibility(state);
   try {
+    // Its place in the owner's order at Motet, taken before anything else this command waits on.
+    const early = await reserveEarly($,state);
     id = await $.session.id();
     if (overtaken(state,decision,id)) return false;
-    // Its place in the owner's order at Motet, taken before anything else this command waits on.
-    const ticket = UUID.test(id) ? await reserveTicket($,state,id) : null;
+    const ticket = early ?? (UUID.test(id) ? await reserveTicket($,state,id) : null);
     if (overtaken(state,decision,id)) return false;
     if (!reservedInOrder(state,decision,ticket,id)) {
       const earlier = state.yieldedOptOuts.get(id);
@@ -1327,12 +1359,13 @@ export function register(on) {
     // activation then refuses: an owner connect never connects a chat that has ended or changed conversation.
     const eligibilityEpoch = invalidateEligibility(state);
     try {
+      // Its place in the owner's order at Motet, taken before anything else this command waits on (its chat, the
+      // folder, Motet's setup answer, the pairing). If the command then fails, Motet has only the reserved ticket.
+      const early = await reserveEarly($,state);
       id = await $.session.id();
       if (overtaken(state,decision,id)) return {text:SUPERSEDED};
       if (!UUID.test(id)) throw Error('Native identity unavailable.');
-      // Its place in the owner's order at Motet, taken before anything else this command waits on (the folder,
-      // Motet's setup answer, the pairing). If the command then fails, Motet has only the reserved ticket.
-      const ticket = await reserveTicket($,state,id);
+      const ticket = early ?? await reserveTicket($,state,id);
       if (overtaken(state,decision,id) || !reservedInOrder(state,decision,ticket,id)) return {text:SUPERSEDED};
       const project = await sessionProject($);
       if (project === null) return {text:'This chat is working outside its project folder. Return to the project folder and try again.'};

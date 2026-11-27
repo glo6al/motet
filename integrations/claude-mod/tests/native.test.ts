@@ -596,9 +596,10 @@ test('official runtime: a manual reconnect overtaken by a disconnect sends no co
   let release=()=>{},entered=()=>{},holdRead=false,connects=0;
   const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
   on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
-  // The first read of the pairing finds the credential for Motet's decision ticket; the second is the reconnect's.
-  let reads=0;
-  on('store.get',async($,e)=>{const value=values.get(e.key);if(holdRead&&e.key===legacy&&++reads===2){holdRead=false;entered();await held;}return{value}});
+  // This Motet has no tickets (it refuses the first decision request), so the next read of the pairing is the
+  // reconnect's own.
+  let decisionAsked=false;
+  on('store.get',async($,e)=>{const value=values.get(e.key);if(holdRead&&decisionAsked&&e.key===legacy){holdRead=false;entered();await held;}return{value}});
   on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
   on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
   on('http.fetch',($,e)=>{
@@ -608,7 +609,7 @@ test('official runtime: a manual reconnect overtaken by a disconnect sends no co
     else if(e.url.endsWith('/connect')){connects++;data=s;}
     else if(e.url.endsWith('/disconnect'))data={disconnected:true};
     // An older Motet: no decision route.
-    else if(e.url.endsWith('/decision'))return{value:{ok:false,status:403,headers:{},text:JSON.stringify({error:'Invalid Claude mod service request.',error_code:'invalid_request'})}};
+    else if(e.url.endsWith('/decision')){if(holdRead)decisionAsked=true;return{value:{ok:false,status:403,headers:{},text:JSON.stringify({error:'Invalid Claude mod service request.',error_code:'invalid_request'})}};}
     else if(e.url.endsWith('/poll'))data={...s,claim:null,requests:[]};else throw Error('fictional path only');
     return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
   });
