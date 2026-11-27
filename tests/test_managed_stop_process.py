@@ -283,6 +283,17 @@ class MacStopTests(unittest.TestCase):
         manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)
         self.assertIsNone(bystander.poll(), 'never adopted from its command line, lock released')
 
+    def test_an_older_supervisors_stop_with_no_verified_claude_is_never_called_stopped(self):
+        self.legacy = ['legacy']
+        manager, run_id, native = self.start('fictional-detach')
+        with mock.patch.object(claude_managed.ManagedClaude, '_verified_claude',
+                               staticmethod(lambda run_dir: (None, None, None))):   # Claude not recognisable
+            result = manager.stop(run_id, str(uuid.uuid4()), 'c:' + native)
+        self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+        for name in ('grandchild', 'detached'):
+            self.assertTrue(alive(self.started[name]), name + ' still runs, unseen and unsignalled')
+        self.assertEqual(manager.status(run_id)['ownerStop']['outcome'], 'unconfirmed')
+
     def test_a_process_id_that_names_another_process_is_never_signalled(self):
         manager, run_id, native = self.start('fictional-linger')
         supervisor = self.supervisors[-1]

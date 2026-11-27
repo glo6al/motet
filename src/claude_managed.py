@@ -1888,14 +1888,15 @@ class ManagedClaude:
         return confirmed
 
     def _tree_before_legacy(self, run_id):
-        """POSIX: the identities of Claude's verified tree, seen before an older supervisor's shutdown: a list
-        (empty if Claude is not running), or None if it could not be seen. Windows: [] (the job ends it all)."""
+        """POSIX: the identities of Claude's verified tree, seen before an older supervisor's shutdown, or None if
+        it could not be seen: no Claude verified as this chat's (it may have ended, or not be recognisable) means
+        nothing of its tree was seen, never that there is none. Windows: [] (the job ends it all)."""
         if ps.WIN or not self._real_processes():
             return []
         try:
             import managed_process_tree as tree
             _, root, _ = self._verified_claude(self._run_dir(run_id))
-            return list(tree.members(tree.table(), root, {}).values()) if root is not None else []
+            return list(tree.members(tree.table(), root, {}).values()) if root is not None else None
         except Exception:
             return None
 
