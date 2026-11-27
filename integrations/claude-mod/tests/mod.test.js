@@ -2497,6 +2497,8 @@ test('a delayed preference write cannot reverse a newer owner decision, in eithe
     holdPref=true;
     const disconnecting=h.command('watch-disconnect');await bounded(gate.entered,'disconnect preference write');
     const connecting=h.command('watch-connect');
+    // Let the connect reach its own preference write, queued behind the held one.
+    for(let i=0;i<10;i++)await yieldWhileHeld();
     gate.release();
     assert.equal((await disconnecting).text,SUPERSEDED_TEXT);assert.match((await connecting).text,/reconnect scheduled/);
     assert.equal(storage.get(PREF).disconnected,false);
@@ -2649,22 +2651,39 @@ test('a late setup answer cannot leave the chats on a revoked grant: the copy th
 // refuses a connection made under a ticket older than the latest opt-out (and automatic registration while opted
 // out), and refuses the polls of a connection older than it.
 const OTHER_WINDOW_TEXT='This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.';
-function ticketMotet({offline=()=>false}={}){
-  const m={latest:0,optedOut:false,optedOutSeq:0,leases:new Map(),seqs:new Map(),refused:[],decisions:[]};
+function ticketMotet({offline=()=>false,refusedTokens=new Set()}={}){
+  // Two-phase tickets, as at Motet: a reserved ticket changes nothing; a commit applies only if no newer one was
+  // committed first; every new connection is refused while opted out; a pairing code holds the ticket taken when
+  // the owner made it.
+  const m={latest:0,issued:0,optedOut:false,optedOutSeq:0,codeSeq:0,leases:new Map(),seqs:new Map(),refused:[],decisions:[]};
   const session=extra=>({version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,folder_protocol:1,decision_protocol:1,...extra});
-  const refuse=what=>{m.refused.push(what);return responseJSON({error:'Disconnected by its owner after this request.',error_code:'decision_superseded'},409);};
-  m.fetch=(url,body)=>{
+  const refuse=what=>{m.refused.push(what);return responseJSON({error:'Disconnected by its owner.',error_code:'decision_superseded'},409);};
+  const commit=(seq,out)=>{
+    if(seq<=m.latest){m.refused.push('commit');return false;}
+    m.latest=seq;m.decisions.push({seq,opted_out:out});
+    if(out){m.optedOut=true;m.optedOutSeq=seq;m.leases.clear();}else m.optedOut=false;
+    return true;
+  };
+  m.makeCode=()=>{m.codeSeq=++m.issued;};
+  m.fetch=(url,body,init)=>{
     if(url.endsWith('/decision')){
       if(offline())throw Error('Motet unreachable');
-      m.latest++;m.decisions.push({seq:m.latest,opted_out:body.opted_out});
-      if(body.opted_out){m.optedOut=true;m.optedOutSeq=m.latest;m.leases.clear();}else m.optedOut=false;
-      return responseJSON({version:1,decision_protocol:1,decision_seq:m.latest,opted_out:body.opted_out});
+      if(refusedTokens.has(init?.headers?.Authorization))return responseJSON({error:'Refused.',error_code:'access_denied'},403);
+      if(body.reserve)return responseJSON({version:1,decision_protocol:1,decision_seq:++m.issued,reserved:true});
+      const seq=body.decision_seq??++m.issued;
+      if(!commit(seq,body.opted_out))return responseJSON({error:'A newer decision was made.',error_code:'decision_superseded'},409);
+      return responseJSON({version:1,decision_protocol:1,decision_seq:seq,opted_out:body.opted_out});
     }
-    if(url.endsWith('/enroll')){m.latest++;m.optedOut=false;m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return responseJSON({...session(),token:'fictional-watch-service-token',enrollment_id:ENROLLMENT});}
+    if(url.endsWith('/enroll')){
+      if(m.optedOut&&m.codeSeq<m.optedOutSeq)return refuse('enroll');
+      if(m.codeSeq>m.latest)commit(m.codeSeq,false);
+      m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);
+      return responseJSON({...session(),token:'fictional-watch-service-token',enrollment_id:ENROLLMENT});
+    }
+    if(url.endsWith('/setup'))return responseJSON(CONFIG);
     if(url.endsWith('/connect')){
-      const seq=body.decision_seq;
-      if(m.optedOut&&(seq===undefined||seq<m.optedOutSeq))return refuse('connect');
-      m.leases.set('manual',seq??m.latest);m.seqs.set('manual',seq??m.latest);return responseJSON(session());
+      if(m.optedOut)return refuse('connect');
+      m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return responseJSON(session());
     }
     if(url.endsWith('/register')){
       if(m.optedOut)return refuse('register');
@@ -2776,6 +2795,99 @@ test('the opt-out holds at Motet even when the copy that made it is gone before 
   assert.equal(c.calls.filter(c=>c.url.endsWith('/poll')).length,0);
   assert.equal(c.calls.filter(c=>c.url.endsWith('/register')).length,1);
   assert.equal((await statusOf(c)).error,OTHER_WINDOW_TEXT);
+});
+
+// R8-B1: a command reserves its ticket the moment it knows its chat, so one that finishes late cannot beat an
+// opt-out the owner gave after it began, across a reload or from another window.
+async function lateCommandAcrossOptOut({command,pause,shareStore=true,reload=true}){
+  const motet=ticketMotet(),gate=latch(),storage=new Map([[GLOBAL_KEY,CONFIG]]);let hold=true;
+  const old=await harness({storage,claimed:false,fetch:async(url,body,init)=>{
+    if(pause==='setup'&&hold&&url.endsWith('/setup')){hold=false;await gate.hold();}
+    return motet.fetch(url,body,init);}});
+  if(pause==='folder'){const cwd=old.$.session.cwd;old.$.session.cwd=async()=>{if(hold){hold=false;await gate.hold();}return cwd();};}
+  const pending=old.command(command,command==='watch-setup'?'8793:fictional_setup_code_1234':'');
+  await bounded(gate.entered,'the earlier command paused ('+pause+')');
+  if(reload)for(const timer of old.timers)timer.cancel();
+  const live=await harness({start:!reload,storage:shareStore?storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+  assert.match((await live.command('watch-disconnect')).text,/Motet disconnected/);
+  const optOut=motet.optedOutSeq;
+  gate.release();
+  const answer=(await pending).text;
+  await live.wait(()=>live.timers.length>=1,'live timer');
+  for(let i=0,now=100000;i<3;i++){await live.tick();if(!reload)await old.tick();now+=60000;live.setNow(now);old.setNow(now);}
+  return {motet,storage,live,old,answer,optOut};
+}
+
+test('a /watch-setup whose answer is delayed across a reload cannot lift the later opt-out (R8-B1)',async()=>{
+  const {motet,storage,live,answer,optOut}=await lateCommandAcrossOptOut({command:'watch-setup',pause:'setup'});
+  assert.match(answer,/authorized.*left as it is/);
+  assert.equal(motet.optedOut,true);assert.equal(motet.latest,optOut);
+  assert.equal(storage.get(PREF).disconnected,true);assert.equal(storage.get(PREF).decision_seq,optOut);
+  assert.equal((await statusOf(live)).connected,false);assert.equal(live.calls.filter(c=>c.url.endsWith('/register')).length,0);
+});
+
+test('a /watch-connect paused at its folder read across a reload cannot lift the later opt-out (R8-B1)',async()=>{
+  const {motet,storage,live,answer,optOut}=await lateCommandAcrossOptOut({command:'watch-connect',pause:'folder'});
+  assert.equal(answer,OTHER_WINDOW_TEXT);
+  assert.equal(motet.optedOut,true);assert.equal(motet.latest,optOut);
+  assert.equal(storage.get(PREF).disconnected,true);assert.equal(storage.get(PREF).decision_seq,optOut);
+  assert.equal((await statusOf(live)).connected,false);assert.equal(live.calls.filter(c=>c.url.endsWith('/register')).length,0);
+});
+
+test('two windows: a /watch-setup in one window delayed past an opt-out in the other leaves the chat opted out (R8-B1)',async()=>{
+  for(const shareStore of [true,false]){
+    const {motet,live,old,answer,optOut}=await lateCommandAcrossOptOut({command:'watch-setup',pause:'setup',reload:false,shareStore});
+    assert.match(answer,/authorized.*left as it is/,String(shareStore));
+    assert.equal(motet.optedOut,true);assert.equal(motet.latest,optOut);
+    for(const window of [live,old])assert.equal(window.calls.filter(c=>c.url.endsWith('/register')&&c.response?.ok).length,0,String(shareStore));
+    assert.equal(motet.ready(),false);
+  }
+});
+
+test('a pairing whose code was made before a later opt-out is refused by Motet, and the chat stays opted out (R8-S1)',async()=>{
+  const motet=ticketMotet(),gate=latch(),storage=new Map([[GLOBAL_KEY,CONFIG]]);let hold=true;
+  const old=await harness({storage,claimed:false,fetch:async(url,body,init)=>{if(hold&&url.endsWith('/enroll')){hold=false;await gate.hold();}return motet.fetch(url,body,init);}});
+  motet.makeCode();
+  const pairing=old.enroll();await bounded(gate.entered,'enroll on its way');
+  for(const timer of old.timers)timer.cancel();
+  const live=await harness({start:false,storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+  assert.match((await live.command('watch-disconnect')).text,/Motet disconnected/);
+  gate.release();
+  assert.equal((await pairing).text,OTHER_WINDOW_TEXT);
+  assert.deepEqual(motet.refused.filter(r=>r==='enroll'),['enroll']);
+  assert.equal(motet.optedOut,true);assert.equal(motet.ready(),false);
+  assert.equal(storage.get(PREF).disconnected,true);
+});
+
+test('once Motet has shown tickets, a refused decision request is an error, not a downgrade (R8-N1)',async()=>{
+  const motet=ticketMotet();let glitch=0;
+  const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>{
+    if(glitch&&url.endsWith('/decision')){glitch--;return responseJSON({error:'Invalid Claude mod service request.',error_code:'invalid_request'},403);}
+    return motet.fetch(url,body,init);}});
+  assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+  glitch=2;   // both the reservation and the commit of the next disconnect
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+  // Not told yet, so kept pending; the next disconnect still uses tickets.
+  assert.equal(h.storage.get(PREF).pending,true);
+  const before=h.calls.filter(c=>c.url.endsWith('/decision')).length;
+  await h.command('watch-connect');await h.command('watch-disconnect');
+  assert(h.calls.filter(c=>c.url.endsWith('/decision')).length>before+1);
+  assert.equal(motet.optedOut,true);
+});
+
+test('a pending opt-out refused for a revoked grant is told through the next credential (R8-N2)',async()=>{
+  const A={...CONFIG,grant_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',grant:'c'.repeat(64)};
+  const B={...CONFIG,grant_id:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',grant:'d'.repeat(64)};
+  let down=true;const motet=ticketMotet({offline:()=>down,refusedTokens:new Set(['Bearer '+A.grant])});
+  const storage=new Map([[GLOBAL_KEY,A],['watch-owner-grant-v1:fictional-other-copy',B]]);
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+  assert.equal(storage.get(PREF).pending,true);
+  down=false;h.setNow(200000);await h.tick();
+  assert.equal(motet.optedOut,true);assert.equal(storage.get(PREF).pending,undefined);
+  const used=h.calls.filter(c=>c.url.endsWith('/decision')).map(c=>c.init.headers.Authorization);
+  assert.deepEqual(used.slice(-2),['Bearer '+A.grant,'Bearer '+B.grant]);
+  assert.equal([...storage.values()].some(v=>v?.grant===A.grant&&v!==storage.get(GLOBAL_KEY)),false,'the refused grant\'s copies are dropped');
 });
 
 test('an opt-out made while Motet is unreachable is kept pending and told to Motet on the next contact',async()=>{

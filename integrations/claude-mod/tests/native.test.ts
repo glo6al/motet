@@ -600,6 +600,8 @@ test('official runtime: a manual reconnect overtaken by a disconnect sends no co
     if(e.url.endsWith('/enroll'))data={...s,token:'fictional-watch-token-only',enrollment_id:ENROLLMENT};
     else if(e.url.endsWith('/connect')){connects++;data=s;}
     else if(e.url.endsWith('/disconnect'))data={disconnected:true};
+    // An older Motet: no decision route.
+    else if(e.url.endsWith('/decision'))return{value:{ok:false,status:403,headers:{},text:JSON.stringify({error:'Invalid Claude mod service request.',error_code:'invalid_request'})}};
     else if(e.url.endsWith('/poll'))data={...s,claim:null,requests:[]};else throw Error('fictional path only');
     return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
   });
@@ -646,18 +648,31 @@ test('official runtime: a revoked shared grant gives way to the current grant an
   expect(values.get('watch-owner-global-v1')).toEqual(B);
 });
 
-// A Motet with decision protocol 1 (tickets), seen by this window; another window's opt-out is made on it directly.
+// A Motet with decision protocol 1 (two-phase tickets), seen by this window; another window's opt-out is made on it
+// directly. A reserved ticket changes nothing; a commit applies only if no newer one was committed first; every new
+// connection is refused while the chat is opted out.
 function ticketMotet(){
-  const m:any={latest:0,optedOut:false,optedOutSeq:0,leases:new Map<string,number>(),seqs:new Map<string,number>(),refused:[] as string[],registrations:0,polls:0};
+  const m:any={latest:0,issued:0,optedOut:false,optedOutSeq:0,leases:new Map<string,number>(),seqs:new Map<string,number>(),refused:[] as string[],registrations:0,polls:0};
   const json=(value:any,status=200)=>({value:{ok:status===200,status,headers:{},text:JSON.stringify(value)}});
   const session=(extra:any={})=>({version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,folder_protocol:1,decision_protocol:1,...extra});
   const refuse=(what:string)=>{m.refused.push(what);return json({error:'Disconnected by its owner.',error_code:'decision_superseded'},409);};
+  const commit=(seq:number,out:boolean)=>{
+    if(seq<=m.latest)return false;
+    m.latest=seq;if(out){m.optedOut=true;m.optedOutSeq=seq;m.leases.clear();}else m.optedOut=false;
+    return true;
+  };
   // As at Motet, an opt-out ends every connection of the chat at once.
-  m.optOutElsewhere=()=>{m.latest++;m.optedOut=true;m.optedOutSeq=m.latest;m.leases.clear();};
+  m.optOutElsewhere=()=>commit(++m.issued,true);
   m.fetch=(body:any,url:string)=>{
-    if(url.endsWith('/decision')){m.latest++;if(body.opted_out){m.optedOut=true;m.optedOutSeq=m.latest;m.leases.clear();}else m.optedOut=false;return json({version:1,decision_protocol:1,decision_seq:m.latest,opted_out:body.opted_out});}
-    if(url.endsWith('/enroll')){m.latest++;m.optedOut=false;m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return json({...session(),token:'fictional-watch-token-only',enrollment_id:ENROLLMENT});}
-    if(url.endsWith('/connect')){if(m.optedOut&&(body.decision_seq===undefined||body.decision_seq<m.optedOutSeq))return refuse('connect');m.leases.set('manual',body.decision_seq??m.latest);m.seqs.set('manual',body.decision_seq??m.latest);return json(session());}
+    if(url.endsWith('/decision')){
+      if(body.reserve)return json({version:1,decision_protocol:1,decision_seq:++m.issued,reserved:true});
+      const seq=body.decision_seq??++m.issued;
+      if(!commit(seq,body.opted_out))return refuse('commit');
+      return json({version:1,decision_protocol:1,decision_seq:seq,opted_out:body.opted_out});
+    }
+    if(url.endsWith('/setup'))return json({version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793});
+    if(url.endsWith('/enroll')){commit(++m.issued,false);m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return json({...session(),token:'fictional-watch-token-only',enrollment_id:ENROLLMENT});}
+    if(url.endsWith('/connect')){if(m.optedOut)return refuse('connect');m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return json(session());}
     if(url.endsWith('/register')){m.registrations++;if(m.optedOut)return refuse('register');m.leases.set(body.client_id,m.latest);m.seqs.set(body.client_id,m.latest);
       return json({...session(),grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:body.client_id,connection_seq:body.connection_seq});}
     if(url.endsWith('/poll')){m.polls++;const key=body.client_id??'manual';
@@ -714,4 +729,21 @@ test('official runtime: another window\'s newer opt-out ends this window\'s conn
   const registrations=motet.registrations;
   for(let i=0;i<4;i++)await clock.advance(30000);
   expect(motet.registrations).toBe(registrations);
+});
+
+test('official runtime: a /watch-setup whose answer arrives after another window\'s opt-out leaves the chat opted out (R8-B1)',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const pref='watch-owner-preferences-v1:'+NATIVE;
+  const values=new Map<string,any>([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]),motet=ticketMotet();
+  let release=()=>{},entered=()=>{};
+  const gate=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  hostWith(on,values,motet,{url:'/setup',gate,entered});
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  const setup=$.command.run({command:'watch-setup',args:'8793:fictional_setup_code_1234',origin:{kind:'composer'}});await inside;
+  motet.optOutElsewhere();const optOut=motet.latest;
+  release();
+  expect((await setup).text.includes('left as it is')).toBe(true);
+  expect(motet.optedOut).toBe(true);expect(motet.latest).toBe(optOut);expect(values.get(pref)?.disconnected===false).toBe(false);
+  for(let i=0;i<3;i++)await clock.advance(30000);
+  expect(motet.leases.size).toBe(0);expect(motet.polls).toBe(0);
 });

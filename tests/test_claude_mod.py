@@ -1227,6 +1227,50 @@ class ClaudeModTests(unittest.TestCase):
         row = self.store.db.execute('SELECT latest_seq,opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone()
         self.assertEqual(row, (24, int(newest['opted_out'])))
 
+    def reserve(self, token=None):
+        status, value = self.http('/claude-mod/decision', dict(native_id=self.sid, reserve=True), token=token or self.token)
+        self.assertEqual(status, 200, value)
+        self.assertTrue(value['reserved'])
+        return value['decision_seq']
+
+    def commit(self, seq, opted_out, token=None):
+        return self.http('/claude-mod/decision', dict(native_id=self.sid, opted_out=opted_out, decision_seq=seq), token=token or self.token)
+
+    def test_a_command_that_reserved_first_cannot_overrule_a_later_decision_committed_before_it(self):
+        _, grant = self.global_setup(); token = grant['grant']
+        status, registration, body = self.register_global(grant)
+        self.assertEqual(status, 200, registration)
+        early = self.reserve(token)                 # an old copy's setup or connect reserves, then waits
+        self.assertTrue(self.ready())               # reserving changes nothing
+        later = self.reserve(token)                 # the owner's later disconnect, in the live copy
+        self.assertEqual(self.commit(later, True, token)[0], 200)
+        status, refused = self.commit(early, False, token)
+        self.assertEqual((status, refused['error_code']), (409, 'decision_superseded'))
+        self.assertEqual(self.store.db.execute('SELECT opted_out,latest_seq FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone(), (1, later))
+        status, again, _ = self.register_global(grant, client=body['client_id'], seq=1)
+        self.assertEqual((status, again['error_code']), (409, 'decision_superseded'))
+        # A ticket never reserved, or a commit without one that comes later, behaves as before.
+        self.assertEqual(self.commit(later + 5, False, token)[0], 400)
+        status, back = self.decide(False, token=token)
+        self.assertEqual((status, back['opted_out']), (200, False))
+        self.assertEqual(self.register_global(grant, client=body['client_id'], seq=2)[0], 200)
+
+    def test_a_pairing_code_made_before_an_opt_out_cannot_lift_it(self):
+        _, enrollment = self.enroll()
+        status, pair = self.http('/claude-mod-pair', {'agent': self.aid}, owner=True)
+        self.assertEqual(status, 200, pair)
+        self.assertEqual(self.decide(True)[0], 200)   # the owner disconnects after making the code
+        status, refused = self.http('/claude-mod/enroll', {'code': pair['pair_code'], 'native_id': self.sid, 'project': self.project})
+        self.assertEqual((status, refused['error_code']), (409, 'decision_superseded'))
+        # Nothing changed: the earlier pairing is still the chat's, and the chat is still opted out.
+        self.assertEqual(self.store.mods.authenticate(self.token)['id'], enrollment['enrollment_id'])
+        self.assertEqual(self.store.db.execute('SELECT opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone()[0], 1)
+        # A code the owner makes after the opt-out is a newer reconnect.
+        status, fresh = self.http('/claude-mod-pair', {'agent': self.aid}, owner=True)
+        status, paired = self.http('/claude-mod/enroll', {'code': fresh['pair_code'], 'native_id': self.sid, 'project': self.project})
+        self.assertEqual(status, 200, paired)
+        self.assertEqual(self.store.db.execute('SELECT opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone()[0], 0)
+
     def test_decision_migration_adds_the_ledger_and_keeps_existing_connections(self):
         _, enrollment = self.enroll(); payload, _ = self.request()
         old_token = self.token
@@ -1239,6 +1283,10 @@ class ClaudeModTests(unittest.TestCase):
         db.execute(create.replace(', decision_seq INTEGER NOT NULL DEFAULT 0', ''))
         db.executemany('INSERT INTO claude_mod_enrollments (' + ','.join(columns) + ') VALUES (' + ','.join('?' * len(columns)) + ')', legacy)
         db.execute('DROP TABLE claude_mod_decisions')
+        pairs = [r[1] for r in db.execute('PRAGMA table_info(claude_mod_pairs)') if r[1] != 'decision_seq']
+        db.execute('DROP TABLE claude_mod_pairs')
+        db.execute('CREATE TABLE claude_mod_pairs (code_hash TEXT PRIMARY KEY, agent TEXT NOT NULL, project TEXT NOT NULL, expires REAL NOT NULL)')
+        self.assertEqual(pairs, ['code_hash', 'agent', 'project', 'expires'])
         db.commit(); db.close()
         self.store = messaging.MessagingStore(str(self.base/'state'), str(self.base/'sessions'))
         self.store.codex_available = False; server.MESSAGING = self.store
@@ -1252,6 +1300,22 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(self.poll()[1]['claim']['request_id'], payload['request_id'])
         self.assertEqual(self.decide(True)[1]['decision_seq'], 1)
         self.assertEqual(self.poll()[0], 409)
+        self.assertIn('decision_seq', {r[1] for r in self.store.db.execute('PRAGMA table_info(claude_mod_pairs)')})
+
+    def test_a_decision_ledger_from_before_two_phase_tickets_gains_its_reserved_column(self):
+        self.enroll(); self.assertEqual(self.decide(True)[0], 200)
+        self.store.close()
+        db = sqlite3.connect(self.base/'state'/'officer-messages.sqlite3')
+        rows = list(db.execute('SELECT agent,latest_seq,opted_out,opted_out_seq FROM claude_mod_decisions'))
+        db.execute('DROP TABLE claude_mod_decisions')
+        db.execute('CREATE TABLE claude_mod_decisions (agent TEXT PRIMARY KEY, latest_seq INTEGER NOT NULL, opted_out INTEGER NOT NULL, opted_out_seq INTEGER NOT NULL)')
+        db.executemany('INSERT INTO claude_mod_decisions VALUES (?,?,?,?)', rows)
+        db.commit(); db.close()
+        self.store = messaging.MessagingStore(str(self.base/'state'), str(self.base/'sessions'))
+        self.store.codex_available = False; server.MESSAGING = self.store
+        self.assertEqual(self.store.db.execute('SELECT opted_out,issued_seq FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone(), (1, 0))
+        # The next reserved ticket follows the last committed one.
+        self.assertEqual(self.reserve(), rows[0][1] + 1)
 
     def test_additive_legacy_database_migration_preserves_manual_token_and_requests(self):
         _,enrollment=self.enroll();payload,_=self.request()
