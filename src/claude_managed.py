@@ -1800,9 +1800,11 @@ class ManagedClaude:
                 if old:
                     already = bool(json.loads(db.execute('SELECT data FROM operations WHERE id=?',
                                                          (request_id,)).fetchone()[0]).get('already'))
-                elif busy or record is not None and record['outcome'] == 'stopped':
-                    # Accepted without acting (already stopped, or a stop is being carried out): the ID is bound to
-                    # this run all the same, so it can never name another run or operation later.
+                elif busy or record is not None and (record['outcome'] == 'stopped' or record['outcome'] == 'unconfirmed'
+                                                     and row['state'] == 'exited' and not row['occupied']):
+                    # Accepted without acting (already stopped, a stop is being carried out, or Claude has ended and
+                    # another attempt could only lose what is known of its tree): the ID is bound to this run all
+                    # the same, so it can never name another run or operation later.
                     if db.execute('SELECT count(*) FROM operations').fetchone()[0] >= MAX_MESSAGES:
                         _fail('capacity', 429)
                     already = not busy
@@ -1854,7 +1856,8 @@ class ManagedClaude:
         shutdown signals Claude alone, so Claude's tree is seen first (``_tree_before_legacy``). Afterwards its end
         is known only once Claude's process group is seen to have ended (``_still_running``); whatever of the tree
         still runs outside the group is recorded as surviving, and anything less is recorded as unknown: the stop is
-        then not confirmed. On Windows that shutdown ends the job."""
+        then not confirmed. On Windows that shutdown ends the job: the tree is known to have ended only when it
+        answers that Claude has exited, and unknown otherwise."""
         answered = False
         try:
             self._request(run_id, 'stop', dict(requestId=request_id, by='owner'), seconds=STOP_SECONDS)
@@ -1862,12 +1865,19 @@ class ManagedClaude:
         except ManagedError as error:
             if error.code == 'managed_not_ready':
                 before = self._tree_before_legacy(run_id)
+                ended = False
                 try:
-                    self._request(run_id, 'shutdown', dict(requestId=request_id), seconds=STOP_SECONDS)
+                    reply = self._request(run_id, 'shutdown', dict(requestId=request_id), seconds=STOP_SECONDS)
                     answered = True
+                    ended = isinstance(reply, dict) and reply.get('state') == 'exited'
                 except Exception:
                     pass
-                self._record_seen_survivors(run_id, self._still_running(before))
+                if ps.WIN:
+                    # Its shutdown ends the whole job, also when Claude had already ended (claude_managed_windows.
+                    # stop_tree), and answers 'exited' after it. Without that answer nothing shows the job ended.
+                    self._record_seen_survivors(run_id, [] if ended else None)
+                else:
+                    self._record_seen_survivors(run_id, self._still_running(before))
             elif error.code == 'request_conflict':
                 answered = True      # the supervisor knows this request ID differently; it did not act on it here
         except Exception:

@@ -145,7 +145,11 @@ function statusShapes(h){
     assert.equal(api.workspaceManagedValidStatus({...bad,ownerStop:bad.ownerStop},RUN),false,JSON.stringify(bad.ownerStop||bad.queued));
   const older={outcome:'stopping',requestedAt:5,lastAttemptAt:5,stoppedAt:null},done={outcome:'stopped',requestedAt:5,lastAttemptAt:5,stoppedAt:6},retry={outcome:'unconfirmed',requestedAt:5,lastAttemptAt:9,stoppedAt:null};
   assert.equal(api.workspaceManagedStopNewer(done,older),done,'a confirmed stop is never replaced');assert.equal(api.workspaceManagedStopNewer(older,retry),retry);assert.equal(api.workspaceManagedStopNewer(retry,older),retry,'an older record is ignored');
-  const full={...retry,terminalCommand:'x',claudeEnded:true};assert.equal(api.workspaceManagedStopNewer(retry,full),full,'the same attempt: the later record, with its command and claudeEnded');
+  const full={...retry,terminalCommand:'x',claudeEnded:true};assert.equal(api.workspaceManagedStopNewer(retry,full),full,'the same attempt: the record with the command and claudeEnded');
+  assert.equal(api.workspaceManagedStopNewer(full,retry),full,'whichever order the room copy comes in');
+  const again={...full,claudeEnded:false};assert.equal(api.workspaceManagedStopNewer(full,again),again,'two full records of one attempt: the later');
+  for(const outcome of ['stopping','stopped'])assert.equal(api.workspaceManagedStopValid({by:'owner',outcome,requestedAt:5,lastAttemptAt:9,stoppedAt:outcome==='stopped'?10:null,claudeEnded:true}),false,'claudeEnded true only on an unconfirmed stop: '+outcome);
+  assert.equal(api.workspaceManagedStopValid({by:'owner',outcome:'stopped',requestedAt:5,lastAttemptAt:9,stoppedAt:10,claudeEnded:false}),true);
   assert.equal(api.workspaceManagedOutcome({decision:'deny',resolutionReason:'owner_stop',decisionState:'unknown'}).title,'Motet tried to deny this');
 }
 
@@ -200,8 +204,10 @@ function stage(){
     ['no buttons check inverted',"if(!ended)node.append(row)}","if(ended)node.append(row)}"],
     ['claudeEnded read loosely',"ended=stop.record?.claudeEnded===true,","ended=!!stop.record,"],
     ['claudeEnded not in the repaint signature',"sig=JSON.stringify(['stop',name,when,command,ended]);","sig=JSON.stringify(['stop',name,when,command]);"],
-    ['claudeEnded accepted as any value',"if('claudeEnded' in s&&typeof s.claudeEnded!=='boolean')return false;",""],
-    ['the room copy wins a tie',"rank[next.outcome]>=rank[old.outcome]?next:old}","rank[next.outcome]>rank[old.outcome]?next:old}"],
+    ['claudeEnded accepted as any value',"if('claudeEnded' in s&&(typeof s.claudeEnded!=='boolean'||s.claudeEnded&&s.outcome!=='unconfirmed'))return false;",""],
+    ['claudeEnded true accepted on any outcome',"||s.claudeEnded&&s.outcome!=='unconfirmed'))return false;","))return false;"],
+    ['the room copy wins a tie',"return fields(next)>=fields(old)?next:old}","return old}"],
+    ['the fold order decides a tie',"return fields(next)>=fields(old)?next:old}","return next}"],
     ['new id for Try again',"const requestId=globalThis.crypto?.randomUUID?.();if(!managedUUID(requestId))return false;const entry=","const requestId=old?.lastId||globalThis.crypto?.randomUUID?.();if(!managedUUID(requestId))return false;const entry="],
   ];
   for(const [name,from,to] of mutants){const code=controllerSource.replace(from,to);assert.notEqual(code,controllerSource,name);let caught=false;try{const m=await menuAndConfirm(code);statusShapes(m);await stoppedFlow(code);await claudeEndedFlow(code);await unconfirmedFlow(code.replace("entry={inFlight:requestId,","entry={lastId:requestId,inFlight:requestId,").replace("const old=MCP.stops.get(a.id);if(old?.inFlight)return false;","const old=MCP.stops.get(a.id);if(old?.inFlight)return false;"))}catch{caught=true}assert.ok(caught,'mutation detected: '+name)}

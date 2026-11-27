@@ -1226,22 +1226,45 @@ class Fixture(unittest.TestCase):
         with self.manager._registry() as db:
             return self.manager._stop_record(db, run_id)
 
-    def test_a_try_again_during_the_survivor_check_is_not_overwritten_by_its_stale_result(self):
+    def test_a_record_rewritten_during_the_survivor_check_is_not_overwritten_by_its_stale_result(self):
         run_id, native = self.unconfirmed_with_a_survivor()
-        inside = []
+        inside, again = [], []
 
         def alive(identities):
             if inside:
-                return True                          # the new attempt's own checks: the survivor still runs
+                return True                          # the nested status's own check: the survivor still runs
             inside.append(True)
-            self.manager.stop(run_id, uid(), 'c:' + native)     # Try again lands while ps is being read
+            # Try again lands while ps is being read. Claude has ended, so it is accepted without acting.
+            again.append(self.manager.stop(run_id, uid(), 'c:' + native))
+            with self.manager._registry() as db:     # and the record is rewritten meanwhile, as an attempt would
+                record = self.manager._stop_record(db, run_id)
+                record.update(attempts=record['attempts'] + 1, lastAttemptAt=record['lastAttemptAt'] + 1)
+                self.manager._save_stop(db, record)
             return False                             # the stale read: nothing running
         self.manager._test = replace(self.dependencies, alive=alive)
         self.manager.status(run_id)
         record = self.stored_stop(run_id)
+        self.assertTrue(again[0]['already'])
         self.assertEqual(record['attempts'], 2)
         self.assertNotEqual(record['outcome'], 'stopped', 'the stale result was not applied')
         self.assertEqual(record['survivors'], [[4242, 1900000000.0]])
+
+    def test_a_retry_after_claude_ended_cannot_lose_what_is_known_of_its_tree(self):
+        run_id, native = self.unconfirmed_with_a_survivor()       # Claude ended; a program it started still runs
+        asked = len(self.stops())
+        self.survivors = None                                     # what a new attempt would now record
+        request = uid()
+        again = self.manager.stop(run_id, request, 'c:' + native)
+        self.assertTrue(again['already'], 'accepted without acting')
+        self.assertEqual(len(self.stops()), asked, 'the supervisor is not asked again')
+        record = self.stored_stop(run_id)
+        self.assertEqual((record['outcome'], record['attempts'], record['survivors']),
+                         ('unconfirmed', 1, [[4242, 1900000000.0]]))
+        self.assertEqual(self.manager.stop(run_id, request, 'c:' + native)['already'], True, 'its replay too')
+        with self.assertRaises(managed.ManagedError):
+            self.manager.enqueue(run_id, request, 'owner', 'Fictional note.')         # and the ID is bound
+        self.manager._test = replace(self.dependencies, alive=lambda identities: False)
+        self.assertEqual(self.manager.status(run_id)['ownerStop']['outcome'], 'stopped', 'still confirmed by itself')
 
     def test_a_survivor_merged_during_the_survivor_check_is_not_lost_to_its_stale_result(self):
         run_id, native = self.unconfirmed_with_a_survivor()
@@ -1690,6 +1713,67 @@ class Fixture(unittest.TestCase):
             self.survivors = None
             unseen = self.manager.stop(other_run, uid(), 'c:' + other)['ownerStop']
             self.assertEqual((unseen['outcome'], unseen['claudeEnded']), ('unconfirmed', True))
+
+    def windows_legacy(self, shutdown):
+        """A stop given to an older Windows supervisor (no 'stop'), whose answer to 'shutdown' is ``shutdown``'s;
+        the stop's own decisions see Windows, the fixture's storage stays this machine's."""
+        real = managed.ps
+
+        class Windows:
+            WIN = True
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+        plain = self.request
+
+        def request(path, command, params):
+            return shutdown(path, command, params) if command == 'shutdown' else plain(path, command, params)
+        run_id, native = self.start()
+        self.refused_commands = ('stop',)
+        self.manager._test = replace(self.dependencies, request=request, unsupervised=lambda run_dir: False)
+        with patch.object(managed, 'ps', Windows()):
+            result = self.manager.stop(run_id, uid(), 'c:' + native)
+            later = self.manager.status(run_id)['ownerStop']
+        self.refused_commands = ()
+        self.manager._test = self.dependencies
+        return result, later, self.stored_stop(run_id)
+
+    def exited(self, path):
+        snapshot = self.snapshots[path.name]
+        snapshot.update(state='exited', nativeExit=dict(confirmed=True, code=0, incarnation=snapshot['incarnation']))
+
+    def test_an_older_windows_supervisor_confirms_the_job_ended_only_by_its_answer(self):
+        def silent(path, command, params):                        # Claude's exit reaches the ledger; no answer
+            self.exited(path)
+            raise OSError('fictional: no answer')
+
+        def unsure(path, command, params):                        # it answers unknown, then Claude ends by itself
+            self.exited(path)
+            return dict(requestId=params['requestId'], state='unknown')
+
+        def ended(path, command, params):                         # it ended the job and says so
+            self.exited(path)
+            return dict(requestId=params['requestId'], state='exited')
+        for shutdown in (silent, unsure):
+            with self.subTest(shutdown=shutdown.__name__):
+                result, later, record = self.windows_legacy(shutdown)
+                self.assertEqual((result['state'], result['ownerStop']['outcome']), ('exited', 'unconfirmed'))
+                self.assertIsNone(record['survivors'], 'nothing showed the job ended: unknown')
+                self.assertEqual((later['outcome'], later['claudeEnded']), ('unconfirmed', True))
+        result, later, record = self.windows_legacy(ended)
+        self.assertEqual((result['ownerStop']['outcome'], later['claudeEnded']), ('stopped', False))
+        # The supervisor's own stop on Windows ends the job and is confirmed as before.
+        real = managed.ps
+
+        class Windows:
+            WIN = True
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+        run_id, native = self.start()
+        with patch.object(managed, 'ps', Windows()):
+            modern = self.manager.stop(run_id, uid(), 'c:' + native)['ownerStop']
+        self.assertEqual((modern['outcome'], modern['claudeEnded']), ('stopped', False))
 
     def test_claude_ended_is_false_while_claude_may_still_run(self):
         run_id, native = self.start()
