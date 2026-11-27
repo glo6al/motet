@@ -2174,6 +2174,19 @@ test('a session.start that arrives while a resume is still registering wins, and
   assert.equal((await statusOf(h)).timer_resumed,false);
 });
 
+test('a session.start that finishes after a resume installed its timer replaces it and is not reported as resumed',async()=>{
+  const gate=latch();let holdStart=false;
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+    commandRegister:()=>{if(holdStart){holdStart=false;return gate.hold();}}});
+  holdStart=true;
+  const starting=h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await bounded(gate.entered,'session.start registering');
+  await h.call('prompt.submit',{text:'fictional owner prompt'});await h.wait(()=>h.timers.length===1,'resumed timer');
+  gate.release();await starting;
+  assert.equal(h.timers.length,2);assert.equal(h.timers[0].cancelled,true);assert.equal(liveTimers(h).length,1);
+  const status=await statusOf(h);assert.equal(status.timer_resumed,false);assert.equal(status.start_seen,true);
+});
+
 test('a resume whose command registration fails tries again on a later event',async()=>{
   let fail=true;
   const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
@@ -2184,11 +2197,66 @@ test('a resume whose command registration fails tries again on a later event',as
   fail=false;
   await h.call('turn.start',{text:'fictional',turnId:'turn-c'});await h.wait(()=>h.timers.length===1,'resumed timer');
   assert.equal(liveTimers(h).length,1);
+  // The repaired registration clears its own failure.
+  assert.equal((await statusOf(h)).error,'');
 });
 
+test('a resume repairs a session.start whose command registration failed, and clears only that error',async()=>{
+  let fail=true;
+  const h=await harness({claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+    commandRegister:()=>{if(fail)throw Error('registration refused');}});
+  assert.equal(h.timers.length,0);
+  fail=false;
+  await h.call('prompt.submit',{text:'fictional owner prompt'});await h.wait(()=>h.timers.length===1,'resumed timer');
+  let status=await statusOf(h);assert.equal(status.error,'');assert.equal(status.timer_resumed,true);
+  await h.tick();assert(h.calls.some(c=>c.url.endsWith('/register')));
+  // Another error is not cleared by a later registration.
+  fail=true;await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  assert.equal((await statusOf(h)).error,'Motet command registration failed.');
+});
+
+// Claude Code refuses to load a module that reads a $ event as a value instead of calling it: 0.6.4 did, with
+// `typeof $.session.root`. This lexical check covers the forms of that mistake (typeof, typeof(...), optional calls,
+// bracket access, aliasing, destructuring, spreading); `claude plugin validate`, run below when it is installed, is
+// the host's own complete check.
+function hostApiMisuse(text){
+  // Comments are prose: drop them, keeping line numbers. A '//' after ':' is a URL inside a string, not a comment.
+  const source=text.replace(/\/\*[\s\S]*?\*\//g,comment=>comment.replace(/[^\n]/g,' ')).replace(/(^|[^:\\])\/\/.*$/gm,'$1');
+  const problems=[];
+  for(const match of source.matchAll(/(?<![\w$])\$(?![\w$])/g)){
+    const at=match.index,after=source.slice(at+1),before=source.slice(0,at);
+    const line=before.split('\n').length;
+    if(after.startsWith('/'))continue;                                        // a regular expression's end anchor
+    if(after.startsWith('.')){
+      if(!/^\.[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(/.test(after))problems.push(line+': $'+after.slice(0,24).split('\n')[0]);
+      continue;
+    }
+    // Bare $ only as a parameter or argument: between ( or , and , or ).
+    if(!/^\s*[,)]/.test(after)||!/[(,]\s*$/.test(before))problems.push(line+': bare $ '+after.slice(0,16).split('\n')[0]);
+  }
+  return problems;
+}
+
 test('the module calls every host API at its call site, so the official host loads it',async()=>{
-  // Claude Code refuses to load a module that reads a $ event as a value (typeof $.session.root, say): 0.6.4 did.
   const {readFile}=await import('node:fs/promises');
-  const source=await readFile(new URL('../hooks/register.js',import.meta.url),'utf8');
-  assert.equal(/typeof\s+\$\./.test(source),false);
+  for(const file of ['../hooks/register.js','../hooks/protocol.js']){
+    const source=await readFile(new URL(file,import.meta.url),'utf8');
+    assert.deepEqual(hostApiMisuse(source),[],file);
+  }
+  for(const bad of ["typeof $.session.root === 'function'","typeof($.session.info)","await $.session.root?.()","$['session'].id()",
+    "const id = $.session.id;","const {session} = $;","f(...$)","x = $;","$?.session.id()","$.session","$.session.id.call(null)",
+    "typeof $.session.root // a trailing comment"])
+    assert.notDeepEqual(hostApiMisuse('async function f($){ '+bad+' }'),[],bad);
+  for(const good of ["await $.session.root()","post($,state,'x')","async ($, e, next) => next(e)","/^[a-f0-9]{64}$/.test(x)","await $.clock.every (2000, f)"])
+    assert.deepEqual(hostApiMisuse('async function f($){ '+good+' }'),[],good);
+});
+
+test('claude plugin validate accepts the module, where Claude Code is installed',async t=>{
+  const {execFile}=await import('node:child_process');
+  const run=args=>new Promise(resolve=>execFile('claude',args,{timeout:120000},(error,stdout,stderr)=>resolve({error,output:String(stdout)+String(stderr)})));
+  const version=await run(['--version']);
+  if(version.error){t.skip('Claude Code is not installed here; the lexical check above still runs.');return;}
+  const {fileURLToPath}=await import('node:url');
+  const result=await run(['plugin','validate',fileURLToPath(new URL('..',import.meta.url))]);
+  assert.match(result.output,/Validation passed/,result.output);
 });

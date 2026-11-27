@@ -890,6 +890,12 @@ async function completeRecoveredTurns($, state) {
   }
 }
 
+const REGISTRATION_FAILED = 'Motet command registration failed.';
+// Only the registration failure is cleared by a later successful registration; any other error stays.
+function clearRegistrationError(state) {
+  if (state.error === REGISTRATION_FAILED) state.error = '';
+}
+
 async function registerCommands($) {
   await $.command.register({name:'watch-setup',description:'Authorize automatic Motet connections once for your local Claude chats.',argumentHint:'<port:setup-code>',immediate:true});
   await $.command.register({name:'watch-connect',description:'Reconnect this chat, or use a legacy Motet pairing code.',argumentHint:'[port:pair-code]',immediate:true});
@@ -919,10 +925,11 @@ async function resume($, state) {
   state.resuming = true;
   try {
     await registerCommands($);
+    clearRegistrationError(state);
     if (state.timer || state.starts !== starts) return;
     state.resumed = true;
     startTimer($,state);
-  } catch {state.error = 'Motet command registration failed.';}
+  } catch {state.error = REGISTRATION_FAILED;}
   finally {state.resuming = false;}
 }
 
@@ -946,8 +953,11 @@ export function register(on) {
       state.timer?.cancel();
       state.timer = null;
       await registerCommands($);
+      clearRegistrationError(state);
       startTimer($,state);
-    } catch {state.error = 'Motet command registration failed.';}
+      // A resume that installed its timer while this start was registering is replaced: this timer is the start's.
+      state.resumed = false;
+    } catch {state.error = REGISTRATION_FAILED;}
     return next(e);
   });
   on('command.run',async($,e,next)=>{

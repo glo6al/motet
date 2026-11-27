@@ -268,7 +268,7 @@ test('observed SDK Desktop continues exact identity heartbeats through an empty 
 test('observed SDK Desktop binding cannot transfer to a new identity or back without fresh Desktop evidence',async($,on)=>{await backgroundFixture($,on,true);});
 
 // Official native APIs only. Provider execution is mocked; a notice is admission-ACK-only.
-test('negotiated notice keeps attribution and requires no answer marker or turn tracking',async($,on)=>{
+test('a negotiated notice claim is acknowledged as dropped and never reaches native input',async($,on)=>{
  const clock=mock.clock(on,{now:100000}),values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
  const events=[],submissions=[],registrations=[];let claimed=false;
  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
@@ -287,20 +287,16 @@ test('negotiated notice keeps attribution and requires no answer marker or turn 
   else throw Error('unexpected notice fixture path');
   return {value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
  });
- on('prompt.submit',async(core,e)=>{
-  submissions.push({text:e.text,origin:e.origin});
-  const stored=[...values.values()].find(value=>value.kind==='peer_reply_notice');
-  expect(stored.requests[REQUEST].attempted).toBe(true);
-  await $.turn.start({text:e.text,turnId:'notice-main'});
-  await $.turn.complete({turnId:'notice-main',answer:'No marker or reply expected.',isAborted:false,reason:'answer',durationMs:1});
-  return {text:e.text};
- });
+ // Since 0.6.1 a notice is acknowledged as dropped and never submitted, including from a server that still offers one.
+ on('prompt.submit',(core,e)=>{submissions.push({text:e.text,origin:e.origin});return {text:e.text};});
  on('turn.start',($,e)=>({turnId:e.turnId}));on('turn.complete',($,e)=>({text:e.answer}));
  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
  expect(registrations.length).toBe(2);expect(registrations[0].reply_notice_protocol).toBe(undefined);expect(registrations[1].connection_seq>registrations[0].connection_seq).toBe(true);
- expect(submissions.length).toBe(1);expect(submissions[0].origin.kind).toBe('plugin');expect(submissions[0].origin.asUser===true).toBe(false);
- expect(events.length).toBe(1);expect(events[0].kind).toBe('submitted');
+ expect(submissions.length).toBe(0);
+ expect(events.length).toBe(1);expect(events[0].kind).toBe('dropped');expect(events[0].request_id).toBe(REQUEST);expect(events[0].attempt_id).toBe(ATTEMPT);
+ const notice=[...values.values()].find(value=>value?.kind==='peer_reply_notice');
+ expect(notice.requests[REQUEST].phase).toBe('dropped');expect(notice.requests[REQUEST].events.length).toBe(0);
  expect([...values.entries()].some(([key,value])=>key.startsWith('watch-owner-runtime-v3:')&&value.requests?.[REQUEST])).toBe(false);
 });
 
