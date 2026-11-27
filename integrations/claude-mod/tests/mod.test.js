@@ -59,6 +59,8 @@ async function harness({storage=new Map(), claimed=true, submit, fetch, nativeId
         else if(url.endsWith('/poll')){value={...response(),claim:claimed&&body.accept?claim:null,requests:[]};if(value.claim)claimed=false;}
         else if(url.endsWith('/event'))value={request_id:body.request_id,state:body.kind==='answered'?'answered':'queued',turn_id:body.turn_id||''};
         else if(url.endsWith('/disconnect'))value={disconnected:true};
+        // By default an older Motet, which has no decision route and refuses it as an unknown service request.
+        else if(url.endsWith('/decision')){call.response={ok:false,status:403,headers:{},text:JSON.stringify({error:'Invalid Claude mod service request.',error_code:'invalid_request'})};return call.response;}
         else throw Error('unexpected path');
         call.response={ok:true,status:200,headers:{},text:JSON.stringify(value)};return call.response;
       }catch(error){call.failed=true;throw error;}finally{call.settled=true;bus.notify();}
@@ -2576,8 +2578,9 @@ test('an earlier copy\'s command that crosses a reload never wins: the live copy
 
 test('a manual reconnect overtaken while it reads the pairing sends no connect request',async()=>{
   const h=await harness({claimed:false});await h.enroll();
-  const key='watch-owner-v1:'+NATIVE,gate=latch(),get=h.$.store.get;let held=false;
-  h.$.store.get=async k=>{const value=await get(k);if(k===key&&!held){held=true;await gate.hold();}return value;};
+  const key='watch-owner-v1:'+NATIVE,gate=latch(),get=h.$.store.get;let reads=0;
+  // The first read finds the credential for Motet's decision ticket; the second is the reconnect reading its pairing.
+  h.$.store.get=async k=>{const value=await get(k);if(k===key&&++reads===2)await gate.hold();return value;};
   const reconnect=h.command('watch-connect');await bounded(gate.entered,'manual reconnect reading its pairing');
   assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
   const since=h.calls.length;
@@ -2640,6 +2643,146 @@ test('a late setup answer cannot leave the chats on a revoked grant: the copy th
   assert.deepEqual(storage.get(GLOBAL_KEY),B);
   assert.equal(setups,2,'no further setup code');
   assert.equal([...storage.keys()].filter(k=>k.startsWith('watch-owner-grant-v1:')).map(k=>storage.get(k).grant_id).includes(A.grant_id),false,'the revoked grant is dropped');
+});
+
+// A Motet with decision protocol 1, shared by every plugin copy and Claude window of the chat: it issues tickets,
+// refuses a connection made under a ticket older than the latest opt-out (and automatic registration while opted
+// out), and refuses the polls of a connection older than it.
+const OTHER_WINDOW_TEXT='This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.';
+function ticketMotet({offline=()=>false}={}){
+  const m={latest:0,optedOut:false,optedOutSeq:0,leases:new Map(),seqs:new Map(),refused:[],decisions:[]};
+  const session=extra=>({version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,folder_protocol:1,decision_protocol:1,...extra});
+  const refuse=what=>{m.refused.push(what);return responseJSON({error:'Disconnected by its owner after this request.',error_code:'decision_superseded'},409);};
+  m.fetch=(url,body)=>{
+    if(url.endsWith('/decision')){
+      if(offline())throw Error('Motet unreachable');
+      m.latest++;m.decisions.push({seq:m.latest,opted_out:body.opted_out});
+      if(body.opted_out){m.optedOut=true;m.optedOutSeq=m.latest;m.leases.clear();}else m.optedOut=false;
+      return responseJSON({version:1,decision_protocol:1,decision_seq:m.latest,opted_out:body.opted_out});
+    }
+    if(url.endsWith('/enroll')){m.latest++;m.optedOut=false;m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return responseJSON({...session(),token:'fictional-watch-service-token',enrollment_id:ENROLLMENT});}
+    if(url.endsWith('/connect')){
+      const seq=body.decision_seq;
+      if(m.optedOut&&(seq===undefined||seq<m.optedOutSeq))return refuse('connect');
+      m.leases.set('manual',seq??m.latest);m.seqs.set('manual',seq??m.latest);return responseJSON(session());
+    }
+    if(url.endsWith('/register')){
+      if(m.optedOut)return refuse('register');
+      m.leases.set(body.client_id,m.latest);m.seqs.set(body.client_id,m.latest);return responseJSON({...registered(body),decision_protocol:1});
+    }
+    if(url.endsWith('/poll')){
+      const key=body.client_id??'manual';
+      // As at Motet: a connection older than the latest opt-out is refused first (its lease ended with the opt-out).
+      if(m.optedOut&&m.optedOutSeq>(m.seqs.get(key)??0))return refuse('poll');
+      if(!m.leases.has(key))return responseJSON({error:'Reconnect.',error_code:'stale_connection'},409);
+      return responseJSON({...session(),claim:null,requests:[]});
+    }
+    if(url.endsWith('/disconnect')){m.leases.delete(body.client_id??'manual');return responseJSON({disconnected:true});}
+    return null;
+  };
+  m.ready=()=>m.leases.size>0;
+  return m;
+}
+const motetCalls=(h,since=0)=>h.calls.slice(since).filter(c=>c.url.endsWith('/register')||c.url.endsWith('/poll')||c.url.endsWith('/connect'));
+
+test('Motet refuses an earlier copy\'s manual connect made under a ticket older than the live copy\'s opt-out',async()=>{
+  const storage=new Map(),motet=ticketMotet(),gate=latch();let holdConnect=false;
+  const old=await harness({storage,claimed:false,fetch:async(url,body)=>{if(holdConnect&&url.endsWith('/connect')){holdConnect=false;await gate.hold();}return motet.fetch(url,body);}});
+  assert.match((await old.enroll()).text,/connected/);
+  holdConnect=true;
+  const reconnecting=old.command('watch-connect');await bounded(gate.entered,'old copy connect on its way');
+  const oldTicket=motet.latest;
+  // The plugin reloads: the old copy's timer stops; the live copy receives the owner's opt-out.
+  for(const timer of old.timers)timer.cancel();
+  const live=await harness({start:false,storage,claimed:false,fetch:(url,body)=>motet.fetch(url,body)});
+  assert.match((await live.command('watch-disconnect')).text,/Motet disconnected/);
+  assert(motet.optedOutSeq>oldTicket);
+  gate.release();
+  assert.equal((await reconnecting).text,OTHER_WINDOW_TEXT);
+  assert.deepEqual(motet.refused,['connect']);assert.equal(motet.ready(),false);
+  assert.equal(storage.get(PREF).disconnected,true);
+  await live.wait(()=>live.timers.length===1,'live timer');await live.tick();await live.tick();
+  assert.equal(motetCalls(live).length,0);assert.equal(motet.ready(),false);
+});
+
+test('two windows of one chat: the newest decision wins at Motet, and the other window ends disconnected (R7-B1)',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]),motet=ticketMotet();
+  const fetch=(url,body)=>motet.fetch(url,body);
+  const b=await harness({storage,claimed:false,fetch});
+  assert.match((await b.command('watch-connect')).text,/reconnect scheduled/);
+  await b.tick();assert(b.calls.some(c=>c.url.endsWith('/register')));assert.equal((await statusOf(b)).connected,true);
+  const a=await harness({storage,claimed:false,fetch});
+  assert.match((await a.command('watch-disconnect')).text,/Motet disconnected/);
+  assert.equal(storage.get(PREF).disconnected,true);
+  await b.tick();
+  assert.equal((await statusOf(b)).connected,false);
+  const since=b.calls.length;await b.tick();await b.tick();
+  assert.equal(motetCalls(b,since).length,0);
+  assert.equal(storage.get(PREF).disconnected,true);assert.equal(motet.ready(),false);
+  // A fresh reconnect in B is now the newest decision: it wins, from either window.
+  assert.match((await b.command('watch-connect')).text,/reconnect scheduled/);
+  b.setNow(200000);await b.tick();assert.equal((await statusOf(b)).connected,true);
+});
+
+test('Motet alone ends the other window\'s connection when the windows share no stored preference',async()=>{
+  const motet=ticketMotet(),fetch=(url,body)=>motet.fetch(url,body);
+  const b=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch});
+  await b.command('watch-connect');await b.tick();assert.equal((await statusOf(b)).connected,true);
+  const a=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch});
+  assert.match((await a.command('watch-disconnect')).text,/Motet disconnected/);
+  await b.tick();
+  const status=await statusOf(b);
+  assert.equal(status.connected,false);assert.equal(status.error,OTHER_WINDOW_TEXT);assert.deepEqual(motet.refused,['poll']);
+  // B does not keep asking Motet: it waits for the owner's /watch-connect.
+  const since=b.calls.length;b.setNow(300000);await b.tick();await b.tick();
+  assert.equal(motetCalls(b,since).length,0);assert.equal(motet.ready(),false);
+  assert.match((await b.command('watch-connect')).text,/reconnect scheduled/);
+  b.setNow(400000);await b.tick();assert.equal((await statusOf(b)).connected,true);
+});
+
+test('with tickets, an earlier copy\'s late connect record is written back by the live copy\'s newer opt-out (R6-S1)',async()=>{
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]),motet=ticketMotet(),gate=latch();let holdPref=false;
+  const old=await harness({storage,claimed:false,fetch:(url,body)=>motet.fetch(url,body),
+    storeSet:async(key,value)=>{if(holdPref&&key===PREF&&value.disconnected===false){holdPref=false;await gate.hold();}}});
+  holdPref=true;
+  const connecting=old.command('watch-connect');await bounded(gate.entered,'old copy preference write');
+  for(const timer of old.timers)timer.cancel();
+  const live=await harness({start:false,storage,claimed:false,fetch:(url,body)=>motet.fetch(url,body)});
+  assert.match((await live.command('watch-disconnect')).text,/Motet disconnected/);
+  gate.release();await connecting;
+  assert.equal(storage.get(PREF).disconnected,false,'the old copy wrote last');
+  await live.wait(()=>live.timers.length===1,'live timer');await live.tick();
+  assert.equal(storage.get(PREF).disconnected,true);assert.equal(storage.get(PREF).decision_seq,motet.optedOutSeq);
+  await live.tick();assert.equal(motetCalls(live).length,0);
+});
+
+test('an opt-out made while Motet is unreachable is kept pending and told to Motet on the next contact',async()=>{
+  let down=true;const storage=new Map([[GLOBAL_KEY,CONFIG]]),motet=ticketMotet({offline:()=>down});
+  const h=await harness({storage,claimed:false,fetch:(url,body)=>motet.fetch(url,body)});
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+  assert.equal(storage.get(PREF).pending,true);assert.equal(motet.optedOut,false);
+  await h.tick();assert.equal(motetCalls(h).length,0);
+  down=false;h.setNow(200000);await h.tick();
+  assert.equal(motet.optedOut,true);assert.equal(storage.get(PREF).pending,undefined);assert.equal(storage.get(PREF).decision_seq,motet.optedOutSeq);
+  assert.equal(motetCalls(h).length,0);
+});
+
+test('with an older Motet, a foreign opt-out beats this window\'s reconnect, and a fresh connect says where it came from',async()=>{
+  // R7-B1 without tickets: B connects, A disconnects; B ends disconnected and the stored record stays an opt-out.
+  const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const b=await harness({storage,claimed:false,fetch:globalFetch});
+  await b.command('watch-connect');await b.tick();assert.equal((await statusOf(b)).connected,true);
+  const a=await harness({storage,claimed:false,fetch:globalFetch});
+  await a.command('watch-disconnect');
+  await b.tick();assert.equal((await statusOf(b)).connected,false);
+  assert.equal(storage.get(PREF).disconnected,true);
+  const since=b.calls.length;await b.tick();assert.equal(registrationsSince(b,since),0);
+  // An older copy's late opt-out over the live copy's reconnect leaves the chat disconnected (fail closed).
+  const live=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:globalFetch});
+  await live.command('watch-connect');
+  live.storage.set(PREF,{version:1,disconnected:true,writer:'fictional-earlier-copy'});
+  const before=live.calls.length;await live.tick();await live.tick();
+  assert.equal(registrationsSince(live,before),0);assert.equal(live.storage.get(PREF).disconnected,true);
 });
 
 test('an older start that registers successfully late does not clear a newer start\'s registration failure',async()=>{

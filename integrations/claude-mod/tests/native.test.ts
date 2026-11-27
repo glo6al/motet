@@ -589,7 +589,9 @@ test('official runtime: a manual reconnect overtaken by a disconnect sends no co
   let release=()=>{},entered=()=>{},holdRead=false,connects=0;
   const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
   on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
-  on('store.get',async($,e)=>{const value=values.get(e.key);if(holdRead&&e.key===legacy){holdRead=false;entered();await held;}return{value}});
+  // The first read of the pairing finds the credential for Motet's decision ticket; the second is the reconnect's.
+  let reads=0;
+  on('store.get',async($,e)=>{const value=values.get(e.key);if(holdRead&&e.key===legacy&&++reads===2){holdRead=false;entered();await held;}return{value}});
   on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
   on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
   on('http.fetch',($,e)=>{
@@ -642,4 +644,74 @@ test('official runtime: a revoked shared grant gives way to the current grant an
   expect(used[0]).toBe('Bearer '+A.grant);expect(used.at(-1)).toBe('Bearer '+B.grant);
   expect(polls>0).toBe(true);expect(setups).toBe(0);
   expect(values.get('watch-owner-global-v1')).toEqual(B);
+});
+
+// A Motet with decision protocol 1 (tickets), seen by this window; another window's opt-out is made on it directly.
+function ticketMotet(){
+  const m:any={latest:0,optedOut:false,optedOutSeq:0,leases:new Map<string,number>(),seqs:new Map<string,number>(),refused:[] as string[],registrations:0,polls:0};
+  const json=(value:any,status=200)=>({value:{ok:status===200,status,headers:{},text:JSON.stringify(value)}});
+  const session=(extra:any={})=>({version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,folder_protocol:1,decision_protocol:1,...extra});
+  const refuse=(what:string)=>{m.refused.push(what);return json({error:'Disconnected by its owner.',error_code:'decision_superseded'},409);};
+  // As at Motet, an opt-out ends every connection of the chat at once.
+  m.optOutElsewhere=()=>{m.latest++;m.optedOut=true;m.optedOutSeq=m.latest;m.leases.clear();};
+  m.fetch=(body:any,url:string)=>{
+    if(url.endsWith('/decision')){m.latest++;if(body.opted_out){m.optedOut=true;m.optedOutSeq=m.latest;m.leases.clear();}else m.optedOut=false;return json({version:1,decision_protocol:1,decision_seq:m.latest,opted_out:body.opted_out});}
+    if(url.endsWith('/enroll')){m.latest++;m.optedOut=false;m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return json({...session(),token:'fictional-watch-token-only',enrollment_id:ENROLLMENT});}
+    if(url.endsWith('/connect')){if(m.optedOut&&(body.decision_seq===undefined||body.decision_seq<m.optedOutSeq))return refuse('connect');m.leases.set('manual',body.decision_seq??m.latest);m.seqs.set('manual',body.decision_seq??m.latest);return json(session());}
+    if(url.endsWith('/register')){m.registrations++;if(m.optedOut)return refuse('register');m.leases.set(body.client_id,m.latest);m.seqs.set(body.client_id,m.latest);
+      return json({...session(),grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:body.client_id,connection_seq:body.connection_seq});}
+    if(url.endsWith('/poll')){m.polls++;const key=body.client_id??'manual';
+      if(m.optedOut&&m.optedOutSeq>(m.seqs.get(key)??0))return refuse('poll');
+      if(!m.leases.has(key))return json({error:'Reconnect.',error_code:'stale_connection'},409);
+      return json({...session(),claim:null,requests:[]});}
+    if(url.endsWith('/disconnect')){m.leases.delete(body.client_id??'manual');return json({disconnected:true});}
+    throw Error('fictional path only');
+  };
+  return m;
+}
+function hostWith(on:any,values:Map<string,any>,motet:any,hold?:{url:string,gate:Promise<void>,entered:()=>void}){
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($:any,e:any)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));
+  on('store.set',($:any,e:any)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('store.delete',($:any,e:any)=>{values.delete(e.key);return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($:any,e:any)=>({cwd:e.cwd}));
+  on('http.fetch',async($:any,e:any)=>{
+    if(hold&&e.url.endsWith(hold.url)){const h=hold;hold=undefined;h.entered();await h.gate;}
+    return motet.fetch(JSON.parse(e.init.body),e.url);
+  });
+}
+
+test('official runtime: Motet refuses a manual connect whose ticket is older than an opt-out made meanwhile in another window',async($,on)=>{
+  mock.clock(on,{now:100000});
+  const values=new Map<string,any>(),motet=ticketMotet();
+  let release=()=>{},entered=()=>{};
+  const gate=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  hostWith(on,values,motet,{url:'/connect',gate,entered});
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  expect((await $.command.run({command:'watch-connect',args:'8793:fictional_pair_code_1234',origin:{kind:'composer'}})).text.includes('Motet connected')).toBe(true);
+  const reconnect=$.command.run({command:'watch-connect',args:'',origin:{kind:'composer'}});await inside;
+  motet.optOutElsewhere();
+  release();
+  expect((await reconnect).text).toBe('This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.');
+  expect(motet.refused).toEqual(['connect']);expect(motet.leases.size).toBe(0);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.connected).toBe(false);
+});
+
+test('official runtime: another window\'s newer opt-out ends this window\'s connection at Motet, which then waits (R7-B1)',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map<string,any>([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]),motet=ticketMotet();
+  hostWith(on,values,motet);
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  expect((await $.command.run({command:'watch-connect',args:'',origin:{kind:'composer'}})).text.includes('reconnect scheduled')).toBe(true);
+  await clock.advance(2000);await clock.advance(2000);
+  expect(motet.registrations).toBe(1);
+  motet.optOutElsewhere();
+  await clock.advance(2000);
+  let status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.connected).toBe(false);expect(motet.refused).toEqual(['poll']);
+  expect(status.error).toBe('This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.');
+  const registrations=motet.registrations;
+  for(let i=0;i<4;i++)await clock.advance(30000);
+  expect(motet.registrations).toBe(registrations);
 });

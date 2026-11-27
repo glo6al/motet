@@ -1129,6 +1129,130 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(self.register_global(lost)[0],403)
         self.assertEqual(self.register_global(replacement)[0],200)
 
+    # --- Owner decisions: Motet orders connect and disconnect decisions for every plugin copy and window ---
+
+    def decide(self, opted_out, token=None):
+        return self.http('/claude-mod/decision', dict(native_id=self.sid, opted_out=opted_out), token=token or self.token)
+
+    def ready(self):
+        return self.store.owner_capabilities(self.aid, self.agents)['actions']['queue']['available']
+
+    def test_decision_tickets_increase_and_the_newest_decision_wins(self):
+        self.enroll()   # pairing is itself the owner's reconnect: ticket 1
+        status, first = self.decide(False)
+        self.assertEqual(status, 200, first)
+        self.assertEqual((first['decision_seq'], first['opted_out'], first['decision_protocol']), (2, False, 1))
+        status, out = self.decide(True)
+        self.assertEqual((status, out['decision_seq'], out['opted_out']), (200, 3, True))
+        self.assertFalse(self.ready())
+        status, back = self.decide(False)
+        self.assertEqual((status, back['decision_seq'], back['opted_out']), (200, 4, False))
+        # The newest decision (4) is a reconnect, so even a connect carrying the older ticket 2 is the owner's wish.
+        status, older = self.http('/claude-mod/connect', dict(native_id=self.sid, project=self.project, decision_seq=2), token=self.token)
+        self.assertEqual(status, 200, older)
+        # After a newer opt-out (5), the connect with ticket 4 is refused; one with a newer reconnect ticket is not.
+        self.assertEqual(self.decide(True)[1]['decision_seq'], 5)
+        status, refused = self.http('/claude-mod/connect', dict(native_id=self.sid, project=self.project, decision_seq=4), token=self.token)
+        self.assertEqual((status, refused['error_code']), (409, 'decision_superseded'))
+        self.assertEqual(self.decide(False)[1]['decision_seq'], 6)
+        status, value = self.http('/claude-mod/connect', dict(native_id=self.sid, project=self.project, decision_seq=6), token=self.token)
+        self.assertEqual(status, 200, value)
+        self.assertEqual(value['decision_protocol'], 1)
+
+    def test_a_stale_connect_is_refused_before_any_lease_and_admits_no_owner_work(self):
+        self.enroll()
+        status, ticket = self.decide(False)
+        payload, _ = self.request()
+        status, out = self.decide(True)
+        self.assertEqual(status, 200, out)
+        # The opt-out ended the lease at once, and the unclaimed message failed without being submitted.
+        self.assertFalse(self.ready())
+        row = self.row(payload['request_id'])
+        self.assertEqual(row['state'], 'failed')
+        self.assertIn('Nothing was submitted', row['error'])
+        for seq in (ticket['decision_seq'], None):
+            body = dict(native_id=self.sid, project=self.project, **({} if seq is None else {'decision_seq': seq}))
+            status, refused = self.http('/claude-mod/connect', body, token=self.token)
+            self.assertEqual((status, refused['error_code']), (409, 'decision_superseded'))
+            entry = self.store.mods.authenticate(self.token)
+            self.assertIsNone(entry['generation']); self.assertEqual(entry['last_seen'], 0)
+            self.assertFalse(self.ready())
+        self.assertEqual(self.http('/agent-message', dict(agent=self.aid, question='Fictional', request_id=uid()), owner=True)[0] != 200, True)
+        # A ticket that was never issued is not accepted either.
+        status, bad = self.http('/claude-mod/connect', dict(native_id=self.sid, project=self.project, decision_seq=99), token=self.token)
+        self.assertEqual(status, 400)
+
+    def test_automatic_registration_is_refused_while_the_chat_is_opted_out(self):
+        _, grant = self.global_setup()
+        status, registration, body = self.register_global(grant)
+        self.assertEqual(status, 200, registration)
+        self.assertEqual(registration['decision_protocol'], 1)
+        self.assertEqual(self.decide(True, token=grant['grant'])[0], 200)
+        self.assertFalse(self.ready())
+        self.assertEqual(self.global_poll(body['client_id'])[0], 409)
+        status, refused, _ = self.register_global(grant, client=body['client_id'], seq=1)
+        self.assertEqual((status, refused['error_code']), (409, 'decision_superseded'))
+        self.assertEqual(self.decide(False, token=grant['grant'])[0], 200)
+        status, again, _ = self.register_global(grant, client=body['client_id'], seq=2)
+        self.assertEqual(status, 200, again)
+        self.assertEqual(self.global_poll(body['client_id'])[0], 200)
+
+    def test_a_connection_older_than_the_opt_out_cannot_poll(self):
+        self.enroll()
+        self.assertEqual(self.decide(True)[0], 200)
+        # Even if a lease were left behind, its polls are refused by the newer opt-out.
+        self.store.db.execute('UPDATE claude_mod_enrollments SET generation=?,last_seen=? WHERE agent=?', (self.generation, time.time(), self.aid))
+        self.store.db.commit()
+        status, refused = self.poll()
+        self.assertEqual((status, refused['error_code']), (409, 'decision_superseded'))
+
+    def test_decision_access_needs_this_chats_credential(self):
+        self.enroll()
+        self.assertEqual(self.decide(True, token='0'*64)[1]['error_code'], 'access_denied')
+        other = uid()
+        status, value = self.http('/claude-mod/decision', dict(native_id=other, opted_out=True), token=self.token)
+        self.assertEqual((status, value['error_code']), (403, 'access_denied'))
+        self.assertEqual(self.http('/claude-mod/decision', dict(native_id=self.sid), token=self.token)[0], 400)
+        self.assertEqual(self.http('/claude-mod/decision', dict(native_id=self.sid, opted_out='yes'), token=self.token)[0], 400)
+
+    def test_concurrent_decisions_get_distinct_ordered_tickets(self):
+        _, grant = self.global_setup()
+        choices = [i % 2 == 0 for i in range(24)]
+        with ThreadPoolExecutor(8) as pool:
+            results = list(pool.map(lambda out: self.decide(out, token=grant['grant']), choices))
+        self.assertTrue(all(status == 200 for status, _ in results))
+        seqs = sorted(value['decision_seq'] for _, value in results)
+        self.assertEqual(seqs, list(range(1, 25)))
+        newest = max((value for _, value in results), key=lambda value: value['decision_seq'])
+        row = self.store.db.execute('SELECT latest_seq,opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone()
+        self.assertEqual(row, (24, int(newest['opted_out'])))
+
+    def test_decision_migration_adds_the_ledger_and_keeps_existing_connections(self):
+        _, enrollment = self.enroll(); payload, _ = self.request()
+        old_token = self.token
+        self.store.close()
+        db = sqlite3.connect(self.base/'state'/'officer-messages.sqlite3')
+        columns = [r[1] for r in db.execute('PRAGMA table_info(claude_mod_enrollments)') if r[1] != 'decision_seq']
+        legacy = list(db.execute('SELECT ' + ','.join(columns) + ' FROM claude_mod_enrollments'))
+        create = db.execute("SELECT sql FROM sqlite_master WHERE name='claude_mod_enrollments'").fetchone()[0]
+        db.execute('DROP TABLE claude_mod_enrollments')
+        db.execute(create.replace(', decision_seq INTEGER NOT NULL DEFAULT 0', ''))
+        db.executemany('INSERT INTO claude_mod_enrollments (' + ','.join(columns) + ') VALUES (' + ','.join('?' * len(columns)) + ')', legacy)
+        db.execute('DROP TABLE claude_mod_decisions')
+        db.commit(); db.close()
+        self.store = messaging.MessagingStore(str(self.base/'state'), str(self.base/'sessions'))
+        self.store.codex_available = False; server.MESSAGING = self.store
+        db_columns = {r[1] for r in self.store.db.execute('PRAGMA table_info(claude_mod_enrollments)')}
+        self.assertIn('decision_seq', db_columns)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM claude_mod_decisions').fetchone()[0], 0)
+        entry = self.store.mods.authenticate(old_token)
+        self.assertEqual((entry['id'], entry['decision_seq']), (enrollment['enrollment_id'], 0))
+        # Never opted out: the existing pairing reconnects and receives, as before.
+        self.reconnect()
+        self.assertEqual(self.poll()[1]['claim']['request_id'], payload['request_id'])
+        self.assertEqual(self.decide(True)[1]['decision_seq'], 1)
+        self.assertEqual(self.poll()[0], 409)
+
     def test_additive_legacy_database_migration_preserves_manual_token_and_requests(self):
         _,enrollment=self.enroll();payload,_=self.request()
         old_token=self.token
