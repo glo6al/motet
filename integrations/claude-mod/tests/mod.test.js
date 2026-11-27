@@ -41,7 +41,7 @@ async function harness({storage=new Map(), claimed=true, submit, fetch, nativeId
   const claim={request_id:REQUEST,attempt_id:ATTEMPT,native_id:nativeId,generation:GENERATION,envelope:ENVELOPE,expires_at:1000};
   const response=()=>({version:1,native_id:native,generation,heartbeat_interval_ms:2000,lease_seconds:12,...(folderProtocol?{folder_protocol:1}:{})});
   const $={session:{id:async()=>{if(failIdentity)throw Error('identity unavailable');return native;},cwd:async()=>cwd,...(root===undefined?{}:{root:async()=>{if(rootDir instanceof Error)throw rootDir;return rootDir;}}),...(platform===null?{}:{info:async()=>({platform})}),surfaces:async()=>{if(failSurfaces)throw Error('private surface read failure /fictional/private');return surfaceRead?surfaceRead():roster;}},command:{register:async spec=>{if(commandRegister)await commandRegister(spec);registeredCommands.push(spec.name);bus.notify();}},
-    store:{get:async key=>storage.has(key)?copy(storage.get(key)):undefined,keys:async()=>[...storage.keys()],
+    store:{get:async key=>storage.has(key)?copy(storage.get(key)):undefined,keys:async()=>[...storage.keys()],delete:async key=>{storage.delete(key);bus.notify();},
       set:async(key,value)=>{if(failStore)throw Error('disk');if(storeSet)await storeSet(key,copy(value));storage.set(key,copy(value));stores.push({key,value:copy(value)});bus.notify();}},
     clock:{now:async()=>now,every:(delay,fn)=>{const timer={delay,fn,cancelled:false,cancel(){this.cancelled=true;}};timers.push(timer);bus.notify();return timer;}},
     prompt:{submit:async value=>{
@@ -2548,6 +2548,98 @@ test('an earlier copy\'s connect that lands after the reloaded copy\'s disconnec
   await live.tick();
   assert.equal(storage.get(PREF).disconnected,true);
   await live.tick();await live.tick();assert.equal(connections(live),0);
+});
+
+test('an earlier copy\'s command that crosses a reload never wins: the live copy restores its opt-out before any connect',async()=>{
+  for(const held of ['write','identity']){
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);const gate=latch();let holdPref=held==='write';
+    const old=await harness({storage,claimed:false,fetch:globalFetch,
+      storeSet:async(key,value)=>{if(holdPref&&key===PREF&&value.disconnected===false){holdPref=false;await gate.hold();}}});
+    const identity=held==='identity'?(()=>{const g=latch(),original=old.$.session.id;let hold=true;old.$.session.id=async()=>{if(hold){hold=false;await g.hold();}return original();};return g;})():null;
+    const connecting=old.command('watch-connect');
+    await bounded((identity??gate).entered,'old copy paused ('+held+')');
+    // The reload stops the old copy's timer; its command is still pending.
+    for(const timer of old.timers)timer.cancel();
+    const fresh=await harness({start:false,storage,claimed:false,fetch:globalFetch});
+    assert.match((await fresh.command('watch-disconnect')).text,/Motet disconnected/,held);
+    assert.equal(storage.get(PREF).disconnected,true,held);
+    (identity??gate).release();await connecting;
+    assert.equal(storage.get(PREF).disconnected,false,held+': the old copy wrote last');
+    await fresh.wait(()=>fresh.timers.length===1,'fresh timer');
+    await fresh.tick();
+    assert.equal(storage.get(PREF).disconnected,true,held+': restored on the first tick');
+    assert.equal(storage.get(PREF).writer===undefined,false,held);
+    await fresh.tick();await fresh.tick();
+    assert.equal(connections(fresh),0,held);assert.equal(registrationsSince(old,0),0,held);
+  }
+});
+
+test('a manual reconnect overtaken while it reads the pairing sends no connect request',async()=>{
+  const h=await harness({claimed:false});await h.enroll();
+  const key='watch-owner-v1:'+NATIVE,gate=latch(),get=h.$.store.get;let held=false;
+  h.$.store.get=async k=>{const value=await get(k);if(k===key&&!held){held=true;await gate.hold();}return value;};
+  const reconnect=h.command('watch-connect');await bounded(gate.entered,'manual reconnect reading its pairing');
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+  const since=h.calls.length;
+  gate.release();
+  assert.equal((await reconnect).text,SUPERSEDED_TEXT);
+  assert.equal(h.calls.slice(since).filter(c=>c.url.endsWith('/connect')).length,0);
+  assert.equal(h.storage.get(PREF).disconnected,true);assert.equal(h.storage.get(key).active,false);
+  assert.equal((await statusOf(h)).connected,false);
+  await h.tick();await h.tick();assert.equal(h.calls.slice(since).length,0);
+});
+
+test('a disconnect that comes while a manual connect is on its way ends the connection Motet made',async()=>{
+  for(const path of ['connect','enroll']){
+    const gate=latch();let hold=false;
+    const h=await harness({claimed:false,fetch:async url=>{if(hold&&url.endsWith('/'+path)){hold=false;await gate.hold();}return null;}});
+    if(path==='connect'){await h.enroll();await h.command('watch-disconnect');}
+    hold=true;
+    const connecting=path==='connect'?h.command('watch-connect'):h.enroll();
+    await bounded(gate.entered,path+' in flight');
+    assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/,path);
+    const since=h.calls.length;
+    gate.release();
+    assert.equal((await connecting).text,SUPERSEDED_TEXT,path);
+    const ended=await h.waitCall('/disconnect',()=>true,{since,settled:true});
+    assert.equal(ended.body.generation,GENERATION,path);
+    assert.equal((await statusOf(h)).connected,false,path);
+    assert.equal(h.calls.filter(c=>c.url.endsWith('/poll')).length,0,path);
+  }
+});
+
+test('a late setup answer cannot leave the chats on a revoked grant: the copy that registers finds the current one',async()=>{
+  const storage=new Map(),gate=latch();let setups=0;
+  const A={...CONFIG,grant_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',grant:'c'.repeat(64)};
+  const B={...CONFIG,grant_id:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',grant:'d'.repeat(64)};
+  // Motet holds one active grant: B's setup revoked A.
+  const backend=async(url,body,init)=>{
+    if(url.endsWith('/register')){
+      if(init.headers.Authorization!=='Bearer '+B.grant)return responseJSON({error_code:'access_denied'},403);
+      return responseJSON({...registered(body),grant_id:B.grant_id});
+    }
+    return null;
+  };
+  const older=await harness({storage,claimed:false,fetch:async(url,body,init)=>{
+    if(url.endsWith('/setup')){setups++;await gate.hold();return responseJSON(A);}return backend(url,body,init);}});
+  const pending=older.command('watch-setup','8793:fictional_setup_code_first');await bounded(gate.entered,'setup A answer delayed');
+  for(const timer of older.timers)timer.cancel();
+  const newer=await harness({storage,claimed:false,fetch:async(url,body,init)=>{
+    if(url.endsWith('/setup')){setups++;return responseJSON(B);}return backend(url,body,init);}});
+  assert.match((await newer.command('watch-setup','8793:fictional_setup_code_second')).text,/authorized/);
+  for(const timer of newer.timers)timer.cancel();
+  gate.release();await pending;
+  assert.equal(storage.get(GLOBAL_KEY).grant_id,A.grant_id,'the late answer overwrote the shared grant');
+  // A fresh copy starts and registers: A is refused once, B is found and used, and shared again.
+  const fresh=await harness({storage,claimed:false,fetch:backend});
+  // The refusal backs off as usual; time moves on between ticks.
+  for(let i=0,now=100000;i<6&&!fresh.calls.some(c=>c.url.endsWith('/poll'));i++){await fresh.tick();now+=60000;fresh.setNow(now);for(let j=0;j<5;j++)await yieldWhileHeld();}
+  assert(fresh.calls.some(c=>c.url.endsWith('/poll')),'registered with the current grant');
+  const registrations=fresh.calls.filter(c=>c.url.endsWith('/register'));
+  assert.equal(registrations.at(-1).init.headers.Authorization,'Bearer '+B.grant);
+  assert.deepEqual(storage.get(GLOBAL_KEY),B);
+  assert.equal(setups,2,'no further setup code');
+  assert.equal([...storage.keys()].filter(k=>k.startsWith('watch-owner-grant-v1:')).map(k=>storage.get(k).grant_id).includes(A.grant_id),false,'the revoked grant is dropped');
 });
 
 test('an older start that registers successfully late does not clear a newer start\'s registration failure',async()=>{

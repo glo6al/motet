@@ -581,3 +581,65 @@ test('official runtime: a record an earlier copy writes over this copy\'s opt-ou
   await clock.advance(2000);await clock.advance(2000);
   expect({registrations,polls}).toEqual({registrations:0,polls:0});
 });
+
+test('official runtime: a manual reconnect overtaken by a disconnect sends no connect request',async($,on)=>{
+  mock.clock(on,{now:100000});
+  const legacy='watch-owner-v1:'+NATIVE,pref='watch-owner-preferences-v1:'+NATIVE;
+  const values=new Map<string,any>();
+  let release=()=>{},entered=()=>{},holdRead=false,connects=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',async($,e)=>{const value=values.get(e.key);if(holdRead&&e.key===legacy){holdRead=false;entered();await held;}return{value}});
+  on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',($,e)=>{
+    let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/enroll'))data={...s,token:'fictional-watch-token-only',enrollment_id:ENROLLMENT};
+    else if(e.url.endsWith('/connect')){connects++;data=s;}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};
+    else if(e.url.endsWith('/poll'))data={...s,claim:null,requests:[]};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  expect((await $.command.run({command:'watch-connect',args:'8793:fictional_pair_code_1234',origin:{kind:'composer'}})).text.includes('Motet connected')).toBe(true);
+  holdRead=true;
+  const reconnect=$.command.run({command:'watch-connect',args:'',origin:{kind:'composer'}});await inside;
+  expect((await $.command.run({command:'watch-disconnect',args:'',origin:{kind:'composer'}})).text.includes('Motet disconnected')).toBe(true);
+  release();
+  expect((await reconnect).text).toBe('A newer Motet command replaced this one; nothing was changed.');
+  expect(connects).toBe(0);expect(values.get(pref).disconnected).toBe(true);expect(values.get(legacy).active).toBe(false);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.connected).toBe(false);
+});
+
+test('official runtime: a revoked shared grant gives way to the current grant another copy saved, with no new setup',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const A={version:1,grant_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',grant:'c'.repeat(64),port:8793};
+  const B={version:1,grant_id:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',grant:'d'.repeat(64),port:8793};
+  // Another copy's setup saved B; a late answer for the older setup A then overwrote the shared grant.
+  const values=new Map<string,any>([['watch-owner-global-v1',A],['watch-owner-grant-v1:fictional-other-copy',B]]);
+  const used:string[]=[];let setups=0,polls=0;
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));
+  on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('store.delete',($,e)=>{values.delete(e.key);return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/setup')){setups++;throw Error('no setup expected');}
+    if(e.url.endsWith('/register')){
+      used.push(e.init.headers.Authorization);
+      if(e.init.headers.Authorization!=='Bearer '+B.grant)return{value:{ok:false,status:403,headers:{},text:JSON.stringify({error_code:'access_denied'})}};
+      return{value:{ok:true,status:200,headers:{},text:JSON.stringify({...s,grant_id:B.grant_id,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq})}};
+    }
+    if(e.url.endsWith('/poll')){polls++;return{value:{ok:true,status:200,headers:{},text:JSON.stringify({...s,claim:null,requests:[]})}};}
+    throw Error('fictional path only');
+  });
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  for(let i=0;i<8&&polls===0;i++)await clock.advance(30000);
+  expect(used[0]).toBe('Bearer '+A.grant);expect(used.at(-1)).toBe('Bearer '+B.grant);
+  expect(polls>0).toBe(true);expect(setups).toBe(0);
+  expect(values.get('watch-owner-global-v1')).toEqual(B);
+});

@@ -1,6 +1,10 @@
 import {UUID, LIMITATION, TRANSITIONS, MAX_RECEIPT_REJECTIONS, pairing, sessionResponse, validClaim, matchingPrompt, matchingAnswer, turnIdentifier, publicStatus, globalConfiguration, receiptRecord, surfaceRoster, validNoticeClaim, noticeReceipt, lifecycleReceipt} from './protocol.js';
 
 const GLOBAL_KEY = 'watch-owner-global-v1';
+// Each copy of the plugin also keeps the latest grant its own /watch-setup received, under its own key, so no copy
+// ever overwrites another's. Motet holds one active grant at a time (a setup revokes the others), so when the shared
+// grant is refused as revoked, another copy's newer grant can be found here and used, without another setup.
+const grantPrefix = 'watch-owner-grant-v1:';
 const legacyKey = id => 'watch-owner-v1:' + id;
 const preferenceKey = id => 'watch-owner-preferences-v1:' + id;
 const legacyShardPrefix = id => 'watch-owner-runtime-v2:' + id + ':';
@@ -722,7 +726,8 @@ async function supervisor($, state) {
     }
     const raw = await $.store.get(GLOBAL_KEY);
     checkEligibility(state,eligibilityEpoch);
-    const config = globalConfiguration(raw) ? raw : null;
+    const config = await currentGrant($,state,raw);
+    checkEligibility(state,eligibilityEpoch);
     const preference = UUID.test(id) ? await currentPreference($,state,id) : null;
     checkEligibility(state,eligibilityEpoch);
     const changed = state.data && (id !== state.data.native_id || project !== state.data.project && !state.receiptOnly ||
@@ -778,7 +783,7 @@ async function supervisor($, state) {
         }
       }
       if (state.data?.mode === 'derived' || (!state.data && config)) {
-        if (!config || state.rejectedGrant === configurationId(config) || state.rejectedIdentity === await refusalKey($,state,id,project,config)) return;
+        if (!config || state.rejectedGrants.has(configurationId(config)) || state.rejectedIdentity === await refusalKey($,state,id,project,config)) return;
         // Report an earlier folder's retained outcomes first (receipts only, no claims); then move.
         const earlier = await earlierReceipts($,state,id,project,config);
         checkEligibility(state,eligibilityEpoch);
@@ -789,6 +794,8 @@ async function supervisor($, state) {
         attempt = await refusalKey($,state,id,project,config);
         checkEligibility(state,eligibilityEpoch);
         await connectDerived($,state,id,earlier ?? project,config,eligibilityEpoch);
+        // Another copy's grant worked where the shared one was refused: share it, so the other chats use it too.
+        if (configurationId(config) !== configurationId(raw)) await $.store.set(GLOBAL_KEY,config).catch(() => {});
       } else {
         const stored = state.data ?? await $.store.get(legacyKey(id));
         checkEligibility(state,eligibilityEpoch);
@@ -811,7 +818,11 @@ async function supervisor($, state) {
   } catch (error) {
     if (state.eligibilityEpoch !== eligibilityEpoch) return;
     stop(state);
-    if (error.status === 403 && state.config) state.rejectedGrant = configurationId(state.config);
+    if (error.status === 403 && state.config) {
+      const refused = configurationId(state.config);
+      state.rejectedGrants.add(refused);
+      forgetGrant($,refused).catch(() => {});
+    }
     // Never re-read the folder here: the chat may have moved while the request was in flight, and the refusal
     // belongs to the folder the attempt was made from.
     if (error.code === 'identity_rejected' && attempt !== null) state.rejectedIdentity = attempt;
@@ -867,6 +878,29 @@ async function savePreference($, state, id, disconnected, decision) {
 // After a plugin reload only the live copy receives owner commands, so its own latest decision is the newest one.
 // An earlier copy may still finish a command and write over it (the store cannot compare and set): the supervisor
 // then writes this copy's decision back, and follows it, before it connects anything.
+// The grant to use: the shared one, unless Motet refused it in this runtime; then another copy's grant that Motet
+// has not refused. Motet decides which grant is current, so no ordering is needed between the copies' writes.
+async function currentGrant($, state, raw) {
+  const shared = globalConfiguration(raw) ? raw : null;
+  if (!shared || !state.rejectedGrants.has(configurationId(shared))) return shared;
+  const keys = await $.store.keys();
+  if (!Array.isArray(keys) || keys.length > 4096) return shared;
+  for (const key of keys.filter(key => typeof key === 'string' && key.startsWith(grantPrefix)).slice(0, 32)) {
+    const candidate = await $.store.get(key);
+    if (globalConfiguration(candidate) && !state.rejectedGrants.has(configurationId(candidate))) return candidate;
+  }
+  return shared;
+}
+
+// A grant Motet refused stays revoked: its copies are dropped, so they are not tried again.
+async function forgetGrant($, id) {
+  const keys = await $.store.keys();
+  if (!Array.isArray(keys) || keys.length > 4096) return;
+  for (const key of keys.filter(key => typeof key === 'string' && key.startsWith(grantPrefix))) {
+    if (configurationId(await $.store.get(key)) === id) await $.store.delete(key);
+  }
+}
+
 async function currentPreference($, state, id) {
   const stored = await $.store.get(preferenceKey(id));
   if (!state.ownDecisions.has(id)) return stored;
@@ -880,6 +914,42 @@ async function currentPreference($, state, id) {
 }
 
 const SUPERSEDED = 'A newer Motet command replaced this one; nothing was changed.';
+
+const CONNECT_FAILED = 'Motet connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.';
+
+// Whether an owner connect's decision still stands just before it acts on Motet: no newer decision in this copy,
+// the stored preference not set to disconnected since (by another copy, say), and no end, transition or opt-out.
+// The answer is null while it stands, else the reply for the owner.
+async function decisionStands($, state, id, decision, eligibilityEpoch) {
+  const stored = overtaken(state,decision) ? null : await $.store.get(preferenceKey(id));
+  if (overtaken(state,decision) || stored?.disconnected === true) return {text:SUPERSEDED};
+  return state.eligibilityEpoch === eligibilityEpoch ? null : {text:CONNECT_FAILED};
+}
+
+// Makes a connection Motet accepted for an owner connect current, only while that decision still stands. If a
+// disconnect came while the request was on its way, the connection Motet just made is ended at once, so the chat
+// is not left ready for work it will never receive. Returns whether the connection stands.
+async function ownerActivate($, state, response, id, decision, eligibilityEpoch) {
+  const data = state.data;
+  let refusal = null;
+  try {
+    refusal = await decisionStands($,state,id,decision,eligibilityEpoch);
+    if (refusal) throw Error('Owner decision no longer stands.');
+    await activate($,state,response,eligibilityEpoch);
+    refusal = await decisionStands($,state,id,decision,eligibilityEpoch);
+    if (refusal) throw Error('Owner decision no longer stands.');
+    return null;
+  } catch (error) {
+    refusal ??= await decisionStands($,state,id,decision,eligibilityEpoch).catch(() => ({text:CONNECT_FAILED}));
+    if (!refusal) throw error;
+    if (state.connected && state.data === data) suspend($,state);
+    else if (data?.token && typeof response?.generation === 'string') {
+      post($,state,'disconnect',identityBody(state,data,response.generation),{port:data.port,token:data.token}).catch(() => {});
+    }
+    stop(state);
+    return refusal;
+  }
+}
 
 async function explicitDisconnect($, state) {
   const decision = reserveDecision(state);
@@ -1019,7 +1089,7 @@ export function register(on) {
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrant:'',rejectedIdentity:'',decision:0,appliedDecision:0,ownDecisions:new Map(),preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrants:new Set(),rejectedIdentity:'',decision:0,appliedDecision:0,ownDecisions:new Map(),preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
     state.lifecycle += 1;
@@ -1085,8 +1155,9 @@ export function register(on) {
         if (!globalConfiguration(config) || config.port !== pair.port) throw Error('Invalid Motet setup response.');
         // The one-use code is spent: its grant is kept even if a /watch-disconnect came meanwhile, and the setup is
         // never repeated. (No second connect or setup can run in this copy while this one does.)
+        await $.store.set(grantPrefix + state.clientId,config);
         await $.store.set(GLOBAL_KEY,config);
-        state.rejectedGrant = ''; state.rejectedIdentity = '';
+        state.rejectedGrants.delete(configurationId(config)); state.rejectedIdentity = '';
         // A later decision about this chat stands: the grant serves the other chats, and this one stays as it is.
         if (!await savePreference($,state,id,false,decision)) {
           state.config = config; state.retryAt = 0; state.failures = 0;
@@ -1102,14 +1173,17 @@ export function register(on) {
       state.rejectedIdentity = ''; state.retryAt = 0; state.failures = 0;
       stop(state);
       if (pair) {
+        // Checked before the one-use code is sent: a superseded command sends nothing.
+        const before = await decisionStands($,state,id,decision,eligibilityEpoch);
+        if (before) return before;
         state.key = legacyKey(id);
         state.data = {native_id:id,project,port:pair.port,requests:{},active:false};
         const response = await post($,state,'enroll',{code:pair.code,native_id:id,project},{anonymous:true});
         if (typeof response.token !== 'string' || response.token.length < 16 || !UUID.test(response.enrollment_id)) throw Error('Invalid enrollment.');
-        if (overtaken(state,decision)) return {text:SUPERSEDED};
         state.data.token = response.token; state.data.enrollment_id = response.enrollment_id;
         state.flight = null; state.envelope = null; state.bound.clear();
-        await activate($,state,response,eligibilityEpoch);
+        const refusal = await ownerActivate($,state,response,id,decision,eligibilityEpoch);
+        if (refusal) return refusal;
         return {text:'Motet connected to this existing chat. ' + LIMITATION};
       }
       if (state.data?.mode !== 'derived') {
@@ -1118,11 +1192,18 @@ export function register(on) {
         // subfolder: it offers the project folder on the same manual credential, and Motet moves it only to the
         // proven launch folder. It stays manual; nothing is saved unless Motet accepts.
         if (stored?.native_id === id && (stored.project === project || insideFolder(stored.project, project, await pathRules($)))) {
-          state.receiptKey = receiptContext('manual', stored.project);
-          state.receiptOnly = stored.project !== project && !state.abandonedReceipts.has(state.receiptKey) &&
+          const receiptKey = receiptContext('manual', stored.project);
+          const receiptOnly = stored.project !== project && !state.abandonedReceipts.has(receiptKey) &&
             await pendingReceipts([stored]);
+          // Checked after every awaited step and before anything changes or is sent: a superseded command sends
+          // no connect request, so Motet never becomes ready for it.
+          const before = await decisionStands($,state,id,decision,eligibilityEpoch);
+          if (before) return before;
+          state.receiptKey = receiptKey; state.receiptOnly = receiptOnly;
           state.key = legacyKey(id); state.data = {...stored, project:state.receiptOnly ? stored.project : project, active:true};
-          await activate($,state,await post($,state,'connect',{native_id:id,project:state.data.project,...state.receiptOnly?{receipt_only:true}:{}}),eligibilityEpoch);
+          const response = await post($,state,'connect',{native_id:id,project:state.data.project,...state.receiptOnly?{receipt_only:true}:{}});
+          const refusal = await ownerActivate($,state,response,id,decision,eligibilityEpoch);
+          if (refusal) return refusal;
           return {text:state.receiptOnly ? 'Motet reconnected this chat to report its earlier replies; it then moves to this project folder. ' + LIMITATION :
             'Motet connected to this existing chat. ' + LIMITATION};
         }
@@ -1132,7 +1213,7 @@ export function register(on) {
       }
       if (overtaken(state,decision)) return {text:SUPERSEDED};
       return {text:'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
-    } catch {stop(state); return {text:'Motet connection failed. If setup was interrupted, get a fresh setup command. No request was resubmitted.'};}
+    } catch {stop(state); return {text:CONNECT_FAILED};}
     finally {state.connecting = false;}
   }).catch(($,e,next)=>{stop(state); return ['watch-connect','watch-disconnect','watch-status','watch-setup','watch-retry-receipts'].includes(e.command)?{text:'Motet command failed; no automatic request retry.'}:next(e);});
   on('prompt.submit',async($,e,next)=>{
