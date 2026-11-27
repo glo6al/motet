@@ -2938,40 +2938,61 @@ test('an out-of-order pair cannot move the newer reconnect above another window\
   assert.equal(h.calls.filter(c=>c.url.endsWith('/register')&&c.response?.ok).length,0);
 });
 
-test('a disconnect that gave way to a newer connect still applies when that connect fails (R12-S1)',async()=>{
-  for(const when of ['connect fails before the disconnect reserves','connect fails after the disconnect gave way']){
-    const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
-    const h=await harness({storage,claimed:false,root:'/fictional/project',fetch:(url,body,init)=>motet.fetch(url,body,init)});
-    assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
-    await h.tick();assert.equal((await statusOf(h)).connected,true,when);
-    const idGate=latch(),cwdGate=latch(),id=h.$.session.id,cwd=h.$.session.cwd;let holdId=true,holdCwd=false;
-    h.$.session.id=async()=>{if(holdId){holdId=false;await idGate.hold();}return id();};
-    h.$.session.cwd=async()=>{if(holdCwd){holdCwd=false;await cwdGate.hold();}return cwd();};
-    const disconnecting=h.command('watch-disconnect');await bounded(idGate.entered,'disconnect at its identity read');
-    h.setCwd('/fictional/elsewhere');
-    let failed;
-    if(when.startsWith('connect fails before')){
-      failed=await h.command('watch-connect');
-      idGate.release();
-      assert.match((await disconnecting).text,/Motet disconnected/,when);
-    }else{
-      holdCwd=true;
-      const connecting=h.command('watch-connect');await bounded(cwdGate.entered,'connect reserved, at its folder');
-      idGate.release();
-      assert.equal((await disconnecting).text,YIELDED_TEXT,when);
-      cwdGate.release();failed=await connecting;
-      await h.wait(()=>motet.optedOut,'the yielded disconnect applied');
-    }
-    assert.match(failed.text,/outside its project folder/,when);
-    h.setCwd('/fictional/project');
-    await h.wait(()=>storage.get(PREF)?.disconnected===true,'stored opt-out');
-    assert.equal(motet.optedOut,true,when);assert.equal(motet.ready(),false,when);
-    // The applied disconnect ends this copy's connection too (it sends Motet's /disconnect for it).
-    await h.waitCall('/disconnect');
-    assert.equal((await statusOf(h)).connected,false,when);
-    const since=h.calls.length;await h.tick();await h.tick();assert.equal(motetCalls(h,since).length,0,when);
+// R12-S1 / F6: an earlier /watch-disconnect whose reservation comes back after a later command's, and that later
+// command then ends without deciding. The opt-out must still take effect.
+const LATER_COMMANDS={
+  'outside the project folder':{command:'watch-connect',args:'',before:h=>h.setCwd('/fictional/elsewhere'),after:h=>h.setCwd('/fictional/project'),reply:/outside its project folder/},
+  'an invalid pairing argument':{command:'watch-connect',args:'not-a-pairing',reply:/exact port:code command/},
+  'a failed /watch-setup':{command:'watch-setup',args:'8793:fictional_setup_code_1234',failSetup:true,reply:/Motet connection failed/},
+  'a successful reconnect':{command:'watch-connect',args:'',reply:/reconnect scheduled/,succeeds:true},
+};
+async function earlierDisconnectThenLater(name,ordering){
+  const later=LATER_COMMANDS[name],motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await harness({storage,claimed:false,root:'/fictional/project',fetch:(url,body,init)=>{
+    if(later.failSetup&&url.endsWith('/setup'))return responseJSON({error:'Claude setup code is expired or used.',error_code:'access_denied'},403);
+    return motet.fetch(url,body,init);}});
+  assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+  await h.tick();assert.equal((await statusOf(h)).connected,true);
+  const idGate=latch(),cwdGate=latch(),id=h.$.session.id,cwd=h.$.session.cwd;let holdId=true,holdCwd=false;
+  h.$.session.id=async()=>{if(holdId){holdId=false;await idGate.hold();}return id();};
+  h.$.session.cwd=async()=>{if(holdCwd){holdCwd=false;await cwdGate.hold();}return cwd();};
+  const disconnecting=h.command('watch-disconnect');await bounded(idGate.entered,'earlier disconnect at its identity read');
+  later.before?.(h);
+  let reply,laterReply;
+  if(ordering==='later command ends before the disconnect resumes'){
+    laterReply=(await h.command(later.command,later.args)).text;
+    idGate.release();reply=(await disconnecting).text;
+  }else{
+    holdCwd=true;
+    const pending=h.command(later.command,later.args);await bounded(cwdGate.entered,'later command reserved, at its folder');
+    idGate.release();reply=(await disconnecting).text;
+    assert.equal(reply,YIELDED_TEXT,name);
+    cwdGate.release();laterReply=(await pending).text;
   }
-});
+  later.after?.(h);
+  return {later,motet,storage,h,reply,laterReply};
+}
+for(const ordering of ['later command ends before the disconnect resumes','disconnect gives way while the later command runs']){
+  for(const name of Object.keys(LATER_COMMANDS)){
+    test(`an earlier disconnect, then a later command (${name}); ${ordering} (R12-S1, F6)`,async()=>{
+      const {later,motet,storage,h,reply,laterReply}=await earlierDisconnectThenLater(name,ordering);
+      assert.match(laterReply,later.reply,name);
+      if(later.succeeds){
+        // The owner's later reconnect stands, and the earlier disconnect does not apply, in either ordering.
+        if(ordering.startsWith('later command ends'))assert.equal(reply,SUPERSEDED_TEXT);
+        await h.tick();await h.tick();
+        assert.equal(motet.optedOut,false);assert.equal(storage.get(PREF).disconnected,false);
+        assert.equal((await statusOf(h)).connected,true);
+        return;
+      }
+      if(ordering.startsWith('later command ends'))assert.match(reply,/Motet disconnected/,name);
+      await h.wait(()=>motet.optedOut&&storage.get(PREF)?.disconnected===true,'the earlier opt-out took effect');
+      await h.waitCall('/disconnect');
+      assert.equal(motet.ready(),false,name);assert.equal((await statusOf(h)).connected,false,name);
+      const since=h.calls.length;await h.tick();await h.tick();assert.equal(motetCalls(h,since).length,0,name);
+    });
+  }
+}
 
 test('a command that gives up takes its own ticket with it, so an older opt-out cannot move above a later reconnect (R10-S1)',async()=>{
   const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]),gate=latch();let holdPref=false;

@@ -1410,7 +1410,8 @@ export function register(on) {
       }
       if (overtaken(state,decision)) return {text:SUPERSEDED};
       return {text:'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
-    } catch {stop(state); return {text:CONNECT_FAILED};}
+    // A failed command ends this copy's connection, and tells Motet, so no lease is left that nobody renews.
+    } catch {suspend($,state); return {text:CONNECT_FAILED};}
     finally {state.connecting = false; settleYieldedOptOut($,state,id,decision);}
   }).catch(($,e,next)=>{stop(state); return ['watch-connect','watch-disconnect','watch-status','watch-setup','watch-retry-receipts'].includes(e.command)?{text:'Motet command failed; no automatic request retry.'}:next(e);});
   on('prompt.submit',async($,e,next)=>{
