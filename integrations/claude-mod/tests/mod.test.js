@@ -2660,7 +2660,7 @@ test('a late setup answer cannot leave the chats on a revoked grant: the copy th
 // refuses a connection made under a ticket older than the latest opt-out (and automatic registration while opted
 // out), and refuses the polls of a connection older than it.
 const OTHER_WINDOW_TEXT='This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.';
-function ticketMotet({offline=()=>false,refusedTokens=new Set()}={}){
+function ticketMotet({offline=()=>false,refusedTokens=new Set(),limit=Infinity}={}){
   // Two-phase tickets, as at Motet: a reserved ticket changes nothing; a commit applies only if no newer one was
   // committed first; every new connection is refused while opted out; a pairing code holds the ticket taken when
   // the owner made it.
@@ -2683,6 +2683,8 @@ function ticketMotet({offline=()=>false,refusedTokens=new Set()}={}){
         if(body.command_id&&m.reservations.has(body.command_id))return responseJSON({version:1,decision_protocol:1,decision_seq:m.reservations.get(body.command_id),reserved:true});
         if(body.recover)return responseJSON({error:'Motet holds no reservation for this command.',error_code:'not_reserved'},409);
         const seq=++m.issued;if(body.command_id)m.reservations.set(body.command_id,seq);
+        // Bounded, as at Motet: past the limit the oldest reservations are forgotten.
+        while(m.reservations.size>limit)m.reservations.delete(m.reservations.keys().next().value);
         return responseJSON({version:1,decision_protocol:1,decision_seq:seq,reserved:true});
       }
       if(body.query)return responseJSON({version:1,decision_protocol:1,decision_seq:m.latest,opted_out:m.optedOut,query:true});
@@ -3155,6 +3157,49 @@ for(const later of ['reconnect','disconnect']){
   });
 }
 
+// F10: a repair of a stale opt-out, checked before another copy's offline disconnect was saved and written after it,
+// cannot erase that disconnect: it is kept under its own key, which the repair never writes, and holds whatever the
+// shared record says until it is delivered.
+test('a held repair write cannot erase a newer offline disconnect saved by another copy before a reload (F10)',async()=>{
+  const motet=ticketMotet();
+  motet.fetch('x/decision',{opted_out:true});motet.fetch('x/decision',{opted_out:false});   // Motet: opt-out 1, reconnect 2
+  const storage=new Map([[GLOBAL_KEY,CONFIG],[PREF,{version:1,disconnected:true,writer:'fictional-earlier-copy',decision_seq:1,decision_port:CONFIG.port}]]);
+  const pendingKeys=()=>[...storage.keys()].filter(k=>k.startsWith('watch-owner-pending-v1:'+NATIVE+':'));
+  // Copy C checks the stale opt-out against Motet and starts its repair; the write is held after the check.
+  const gate=latch();let hold=true;
+  const c=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init),
+    storeSet:async(key,value)=>{if(hold&&key===PREF&&value.writer==='motet'){hold=false;await gate.hold();}}});
+  const repairing=c.tick();await bounded(gate.entered,'repair write held after its check');
+  // Copy A cannot reach Motet: its disconnect is saved pending and acknowledged; then A is reloaded away.
+  const a=await harness({storage,claimed:false,fetch:(url,body,init)=>{if(url.endsWith('/decision'))throw Error('Motet unreachable');return motet.fetch(url,body,init);}});
+  assert.match((await a.command('watch-disconnect')).text,/Motet disconnected/);
+  assert.equal(storage.get(PREF).pending,true);
+  for(const timer of [...a.timers,...c.timers])timer.cancel();
+  // The held repair lands over A's record.
+  gate.release();await repairing;
+  assert.equal(storage.get(PREF).disconnected,false,'the repair overwrote the shared record');
+  // A fresh copy stays off and delivers the disconnect.
+  const d=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+  for(let i=0,now=100000;i<4;i++){await d.tick();now+=40000;d.setNow(now);}
+  assert.equal(d.calls.filter(x=>x.url.endsWith('/register')||x.url.endsWith('/poll')).length,0,'the fresh copy never connected');
+  assert.equal(motet.optedOut,true,'the disconnect reached Motet');assert.equal(motet.ready(),false);
+  assert.deepEqual(pendingKeys(),[],'delivered, so no longer pending');
+  assert.equal(storage.get(PREF).disconnected,true);assert.equal(storage.get(PREF).decision_seq,motet.optedOutSeq);
+  assert.equal((await statusOf(d)).connected,false);
+});
+
+test('a copy\'s own newer reconnect replaces its own pending disconnect (F10)',async()=>{
+  let down=true;const motet=ticketMotet({offline:()=>down}),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const pendingKeys=()=>[...storage.keys()].filter(k=>k.startsWith('watch-owner-pending-v1:'));
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);assert.equal(pendingKeys().length,1);
+  down=false;
+  assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+  assert.deepEqual(pendingKeys(),[]);assert.equal(storage.get(PREF).disconnected,false);
+  h.setNow(200000);await h.tick();
+  assert.equal((await statusOf(h)).connected,true);assert.equal(motet.optedOut,false);
+});
+
 test('an old pairing code run as a new command after a disconnect is accepted, placed as that command',async()=>{
   const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
   const h=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
@@ -3280,14 +3325,76 @@ test('a grant another copy rewrites during this copy\'s registration is kept',as
   assert.deepEqual(storage.get(key),B);
 });
 
-test('once Motet accepts a grant, the other copies\' stored grants are removed',async()=>{
-  const A={...CONFIG,grant_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',grant:'c'.repeat(64)};
-  const storage=new Map([[GLOBAL_KEY,CONFIG],['watch-owner-grant-v1:fictional-older-copy',A],['watch-owner-grant-v1:fictional-this-grant',CONFIG]]);
-  const h=await harness({storage,claimed:false,fetch:globalFetch});
-  await h.tick();await new Promise(resolve=>setImmediate(resolve));
-  assert(h.calls.some(c=>c.url.endsWith('/register')));
-  await h.wait(()=>!storage.has('watch-owner-grant-v1:fictional-older-copy'),'older grant removed');
-  assert(storage.has('watch-owner-grant-v1:fictional-this-grant'));
+// Grants are kept one key per grant, and a key is removed only for its own grant, so no delete can remove a grant
+// another copy saved after the delete looked (F4). The service holds one active grant: each setup revokes the rest.
+function oneGrantService(){
+  const g=(n,c)=>({...CONFIG,grant_id:`${n.repeat(8)}-${n.repeat(4)}-4${n.repeat(3)}-8${n.repeat(3)}-${n.repeat(12)}`,grant:c.repeat(64)});
+  const svc={A:g('a','1'),B:g('b','2'),C:g('c','3'),D:g('d','4'),active:null,setups:0,held:[]};
+  svc.backend=async(url,body,init)=>{
+    if(url.endsWith('/register')){
+      if(init.headers.Authorization!=='Bearer '+svc.active?.grant)return responseJSON({error_code:'access_denied'},403);
+      return responseJSON({...registered(body),grant_id:svc.active.grant_id});
+    }
+    return null;
+  };
+  // A copy whose setup issues the given grant (making it the active one); its answer may be held.
+  svc.copy=async(storage,{gate}={})=>{
+    let next=[];
+    const h=await harness({storage,claimed:false,fetch:async(url,body,init)=>{
+      if(url.endsWith('/setup')){svc.setups++;const grant=next.shift();svc.active=grant;if(gate)await gate.hold();return responseJSON(grant);}
+      return svc.backend(url,body,init);}});
+    // Every grant-key delete in this copy is held after the plugin has decided to make it, until released.
+    const del=h.$.store.delete;
+    h.$.store.delete=key=>key.startsWith('watch-owner-grant-v1:')?new Promise(resolve=>svc.held.push(()=>resolve(del(key)))):del(key);
+    h.setup=(grant,code)=>{next.push(grant);return h.command('watch-setup','8793:'+code);};
+    return h;
+  };
+  svc.releaseDeletes=async()=>{for(const release of svc.held.splice(0))await release();};
+  return svc;
+}
+const grantKeyOf=g=>'watch-owner-grant-v1:'+g.port+':'+g.grant_id;
+
+test('a newer grant saved while an older grant\'s delete is held survives a late older setup answer and a reload (F4)',async()=>{
+  const svc=oneGrantService(),storage=new Map();
+  const tick=async(h,n=3)=>{for(let i=0,now=100000;i<n;i++){now+=60000;h.setNow(now);await h.tick();for(let j=0;j<5;j++)await yieldWhileHeld();}};
+  // Copy X sets up (grant A); copy Y sets up later (grant B) and registers, so A is no longer the active grant.
+  const x=await svc.copy(storage);assert.match((await x.setup(svc.A,'fictional_setup_code_a')).text,/authorized/);
+  const y=await svc.copy(storage);assert.match((await y.setup(svc.B,'fictional_setup_code_b')).text,/authorized/);
+  await tick(y);await tick(x);
+  // Copy Z starts a setup (grant D); its answer is held. X then sets up again (grant C, now the only valid one).
+  const gate=latch(),z=await svc.copy(storage,{gate});
+  const late=z.setup(svc.D,'fictional_setup_code_d');await bounded(gate.entered,'older setup answer held');
+  assert.match((await x.setup(svc.C,'fictional_setup_code_c')).text,/authorized/);
+  // Z's older answer arrives and overwrites the shared grant; then every held delete completes.
+  gate.release();await late;
+  assert.equal(storage.get(GLOBAL_KEY).grant_id,svc.D.grant_id);
+  await svc.releaseDeletes();
+  for(const h of [x,y,z])for(const timer of h.timers)timer.cancel();
+  // After a reload, a fresh copy finds and uses grant C, with no further setup code.
+  const fresh=await harness({storage,claimed:false,fetch:svc.backend});
+  await tick(fresh,6);
+  assert(fresh.calls.some(c=>c.url.endsWith('/poll')),'registered with the valid grant');
+  assert.equal(fresh.calls.filter(c=>c.url.endsWith('/register')).at(-1).init.headers.Authorization,'Bearer '+svc.C.grant);
+  assert.deepEqual(storage.get(grantKeyOf(svc.C)),svc.C);
+  assert.equal(svc.setups,4,'no further setup code');
+});
+
+test('stored grants do not pile up: a newer setup drops only its own older grant, and a refused grant only its own key',async()=>{
+  const svc=oneGrantService(),storage=new Map();
+  const x=await svc.copy(storage);
+  await x.setup(svc.A,'fictional_setup_code_a');await svc.releaseDeletes();
+  await x.setup(svc.B,'fictional_setup_code_b');await svc.releaseDeletes();
+  // X's earlier grant, revoked by its own later setup, is dropped; another copy's grant key is left alone.
+  storage.set(grantKeyOf(svc.D),svc.D);
+  await x.setup(svc.C,'fictional_setup_code_c');await svc.releaseDeletes();
+  assert.deepEqual([...storage.keys()].filter(k=>k.startsWith('watch-owner-grant-v1:')).sort(),[grantKeyOf(svc.C),grantKeyOf(svc.D)].sort());
+  // A fresh copy given D as the shared grant is refused: D's key, and only it, goes; C is found and used.
+  for(const timer of x.timers)timer.cancel();
+  storage.set(GLOBAL_KEY,svc.D);
+  const fresh=await harness({storage,claimed:false,fetch:svc.backend});
+  for(let i=0,now=100000;i<6&&!fresh.calls.some(c=>c.url.endsWith('/poll'));i++){now+=60000;fresh.setNow(now);await fresh.tick();for(let j=0;j<5;j++)await yieldWhileHeld();}
+  assert(fresh.calls.some(c=>c.url.endsWith('/poll')));
+  assert.deepEqual([...storage.keys()].filter(k=>k.startsWith('watch-owner-grant-v1:')),[grantKeyOf(svc.C)]);
 });
 
 test('a freshly loaded copy in a manually paired chat reserves early with a stored pairing, past a refused one (R15-N1)',async()=>{
@@ -3334,6 +3441,39 @@ for(const how of ['answer lost','dropped']){
       assert.equal(motet.optedOut,true);assert.equal(storage.get(PREF).pending,undefined);
       assert.deepEqual(motet.decisions.map(d=>d.opted_out),[false,true]);
     }
+  });
+}
+
+// F8 across the reservation's lifetime: an older reconnect whose first reservation had no clear answer retries
+// recover-only, so when Motet no longer holds it (its record dropped at the cap, or expired) or never received it,
+// the reconnect is not given a fresh, later place: it ends with nothing changed, and another window's newer
+// disconnect stands.
+for(const how of ['evicted at the cap','expired','never arrived']){
+  test(`an older reconnect whose reservation was ${how} cannot overtake a newer disconnect (F8)`,async()=>{
+    const motet=ticketMotet({limit:how==='evicted at the cap'?1:Infinity}),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const gate=latch();let first=true,oldCommand=null;
+    const a=await harness({storage,claimed:false,fetch:async(url,body,init)=>{
+      if(first&&url.endsWith('/decision')&&body.reserve){
+        first=false;oldCommand=body.command_id;
+        if(how!=='never arrived')await motet.fetch(url,body,init);   // Motet issues ticket 1; the answer is lost
+        await gate.hold();throw Error('reservation answer lost');
+      }
+      return motet.fetch(url,body,init);}});
+    const connecting=a.command('watch-connect');await bounded(gate.entered,'older reconnect reservation in flight');
+    // Window B's disconnect, meanwhile: reserved and committed.
+    const b=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+    assert.match((await b.command('watch-disconnect')).text,/Motet disconnected/);
+    if(how==='expired')motet.reservations.delete(oldCommand);
+    assert.equal(motet.reservations.has(oldCommand),false);
+    const issued=motet.issued;
+    gate.release();
+    assert.equal((await connecting).text,'Motet could not confirm when this command was given, so nothing was changed. Run it again.');
+    assert.equal(motet.issued,issued,'no later place was made for the older reconnect');
+    assert(a.calls.filter(c=>c.url.endsWith('/decision')&&c.body.reserve).slice(1).every(c=>c.body.recover===true),'every retry is recover-only');
+    assert.equal(motet.optedOut,true);assert.deepEqual(motet.decisions.map(d=>d.opted_out),[true]);
+    for(let i=0,now=100000;i<3;i++){now+=40000;a.setNow(now);await a.tick();}
+    assert.equal(motet.ready(),false);assert.equal(a.calls.filter(c=>c.url.endsWith('/poll')).length,0);
+    assert.equal((await statusOf(a)).connected,false);
   });
 }
 
@@ -3457,14 +3597,27 @@ test('a command that gives up takes its own ticket with it, so an older opt-out 
   assert.equal(motet.optedOut,false);assert.equal(motet.latest,3);
 });
 
-test('a reconnect retries a reservation that failed once, and one that cannot be placed changes nothing (R9-N2)',async()=>{
-  // A single failed reservation is retried, and the reconnect is committed in its place.
+test('a reconnect recovers a reservation whose answer was lost, and one that cannot be placed changes nothing (R9-N2, F8)',async()=>{
+  // A reservation whose answer was lost is retried as recover-only: Motet returns the ticket it issued, and the
+  // reconnect is committed in its place.
+  {
+    let fail=1;const motet=ticketMotet();
+    const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:async(url,body,init)=>{
+      if(fail&&url.endsWith('/decision')&&body.reserve){fail--;await motet.fetch(url,body,init);throw Error('answer lost');}return motet.fetch(url,body,init);}});
+    assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+    assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[1,false]]);
+    assert.equal(h.calls.filter(c=>c.url.endsWith('/decision')&&c.body.reserve&&c.body.recover).length,1);
+    await h.tick();assert.equal((await statusOf(h)).connected,true);
+  }
+  // A reservation that never reached Motet is not placed afresh by the retry: the reconnect ends with nothing
+  // changed, and running it again works.
   {
     let fail=1;const motet=ticketMotet();
     const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>{
       if(fail&&url.endsWith('/decision')&&body.reserve){fail--;throw Error('lost request');}return motet.fetch(url,body,init);}});
+    assert.equal((await h.command('watch-connect')).text,'Motet could not confirm when this command was given, so nothing was changed. Run it again.');
+    assert.equal(motet.issued,0);assert.deepEqual(motet.decisions,[]);
     assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
-    assert.deepEqual(motet.decisions.map(d=>d.opted_out),[false]);
     await h.tick();assert.equal((await statusOf(h)).connected,true);
   }
   // A reconnect that cannot be placed at all ends with nothing changed: an opt-out another window made stands.

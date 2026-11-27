@@ -1402,6 +1402,37 @@ class ClaudeModTests(unittest.TestCase):
             status, gone = self.http('/claude-mod/decision', dict(reserve=True, command_id=commands[0], recover=True), token=token)
             self.assertEqual((status, gone['error_code']), (409, 'not_reserved'))
 
+    def test_a_lost_reservation_answer_cannot_win_a_later_place_once_its_record_is_gone(self):
+        # The plugin retries an unclear reservation as recover-only. Across the real cap and the day's expiry, an old
+        # command whose record is gone gets no new, later place, so it cannot overtake a newer committed opt-out.
+        _, grant = self.global_setup(); token = grant['grant']
+        status, registration, body = self.register_global(grant)
+        self.assertEqual(status, 200, registration)
+        ask = lambda payload: self.http('/claude-mod/decision', payload, token=token)
+        for round, gone in enumerate(('evicted', 'expired')):
+            old = uid() + ':1'
+            status, first = ask(dict(reserve=True, command_id=old))   # an old reconnect; its answer is lost
+            self.assertEqual(status, 200, first)
+            if gone == 'evicted':
+                for n in range(mod.RESERVATION_LIMIT):
+                    self.store.mods.reserve(uid() + ':%d' % n)
+            else:
+                self.store.db.execute('UPDATE claude_mod_reservations SET created=0 WHERE command_id=?', (old,))
+            self.store.db.commit()
+            status, later = ask(dict(reserve=True, command_id=uid() + ':2', native_id=self.sid))   # a newer disconnect
+            self.assertEqual(self.commit(later['decision_seq'], True, token)[0], 200)
+            self.assertIsNone(self.store.db.execute('SELECT 1 FROM claude_mod_reservations WHERE command_id=?', (old,)).fetchone(), gone)
+            issued = self._issued_now()
+            status, refused = ask(dict(reserve=True, command_id=old, native_id=self.sid, recover=True))
+            self.assertEqual((status, refused['error_code']), (409, 'not_reserved'), gone)
+            self.assertEqual(self._issued_now(), issued, gone)             # no later place was made for it
+            self.assertLessEqual(self.store.db.execute('SELECT COUNT(*) FROM claude_mod_reservations').fetchone()[0], mod.RESERVATION_LIMIT)
+            status, again, _ = self.register_global(grant, client=body['client_id'], seq=2 * round + 1)
+            self.assertEqual((status, again['error_code']), (409, 'decision_superseded'), gone)
+            self.assertFalse(self.ready())
+            self.assertEqual(self.decide(False, token=token)[0], 200)       # the owner reconnects for the next round
+            self.assertEqual(self.register_global(grant, client=body['client_id'], seq=2 * round + 2)[0], 200)
+
     def test_a_chat_s_latest_decision_can_be_read(self):
         _, grant = self.global_setup(); token = grant['grant']
         status, value = self.http('/claude-mod/decision', dict(native_id=self.sid, query=True), token=token)

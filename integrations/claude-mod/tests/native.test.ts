@@ -24,7 +24,7 @@ test('one official mod submits attributed full owner envelope and observes its e
   on('session.id',()=>({value:NATIVE}));
   on('session.cwd',()=>({value:'/fictional/project'}));
   on('session.surfaces',()=>({value:['desktop']}));
-  on('store.get',($,e)=>({value:values.get(e.key)}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));
   on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return {value:undefined};});
   on('command.register',()=>({value:undefined}));
   on('session.start',($,e)=>({cwd:e.cwd}));
