@@ -147,6 +147,28 @@ async function save($, state, change) {
   return operation;
 }
 
+function motetAnswer(response) {
+  if (!response.ok) {
+    const error = Error('Motet service unavailable.');
+    let value;
+    try {if (typeof response.text === 'string' && response.text.length <= 650000) value = JSON.parse(response.text);}
+    catch { /* The HTTP status still distinguishes a request rejection. */ }
+    error.code = typeof value?.error_code === 'string' ? value.error_code : '';
+    error.status = response.status;
+    throw error;
+  }
+  if (typeof response.text !== 'string' || response.text.length > 650000) throw Error('Invalid Motet response.');
+  return JSON.parse(response.text);
+}
+
+// A ticket reservation goes straight to Motet, outside the queue below: it changes no connection state, and its
+// moment of arrival is the command's place in the owner's order, so it must not wait behind a poll, a registration
+// or a receipt. (Two reservations from one copy that arrive out of order are handled by the per-chat yield.)
+async function reservationPost($, body, credential) {
+  return motetAnswer(await $.http.fetch('http://127.0.0.1:' + credential.port + '/claude-mod/decision',
+    {method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer ' + credential.token},body:JSON.stringify(body)}));
+}
+
 async function post($, state, path, body, options = {}) {
   const port = options.port ?? state.data?.port;
   const token = options.anonymous ? null : (options.token ?? state.data?.token);
@@ -157,19 +179,8 @@ async function post($, state, path, body, options = {}) {
   const operation = state.network.then(async () => {
     state.networkBusy = true;
     try {
-      const response = await $.http.fetch('http://127.0.0.1:' + port + '/claude-mod/' + path,
-        {method:'POST',headers,body:JSON.stringify(body)});
-      if (!response.ok) {
-        const error = Error('Motet service unavailable.');
-        let value;
-        try {if (typeof response.text === 'string' && response.text.length <= 650000) value = JSON.parse(response.text);}
-        catch { /* The HTTP status still distinguishes a request rejection. */ }
-        error.code = typeof value?.error_code === 'string' ? value.error_code : '';
-        error.status = response.status;
-        throw error;
-      }
-      if (typeof response.text !== 'string' || response.text.length > 650000) throw Error('Invalid Motet response.');
-      return JSON.parse(response.text);
+      return motetAnswer(await $.http.fetch('http://127.0.0.1:' + port + '/claude-mod/' + path,
+        {method:'POST',headers,body:JSON.stringify(body)}));
     } finally {state.networkBusy = false;}
   });
   state.network = operation.catch(() => {});
@@ -892,7 +903,8 @@ async function decisionRequest($, state, id, body) {
     if (!credential) return null;
     let response;
     try {
-      response = await post($,state,'decision',{native_id:id,...body},{port:credential.port,token:credential.token});
+      response = body.reserve ? await reservationPost($,{native_id:id,...body},credential) :
+        await post($,state,'decision',{native_id:id,...body},{port:credential.port,token:credential.token});
     } catch (error) {
       // An older Motet refuses the route itself; once this Motet has shown tickets, a refusal is only an error.
       if (error.status === 403 && error.code === 'invalid_request' && state.decisionProtocol !== 1) {state.decisionProtocol = 0; return null;}
@@ -917,33 +929,53 @@ async function decisionRequest($, state, id, body) {
 // (the command then goes on as with an older Motet, and an opt-out is told to Motet later).
 // A command's place in the owner's order, reserved as its very first step, before it reads which chat it is for
 // (that read can be slow). Motet issues tickets from one counter for every chat, so a reservation names no chat;
-// the credential is the one this copy already holds: its manual pairing or grant, or the shared grant. Across
-// windows and copies the order is the order in which Motet receives the reservations, so commands from two
-// windows given within the same moment are ordered by when Motet receives them. Null when there is no such
-// credential or Motet cannot be reached; the command then reserves after reading its chat (reserveTicket), and
-// only that later moment places it.
+// the credential is any this computer holds: this copy's manual pairing or grant, the shared grant, or a stored
+// manual pairing. Across windows and copies the order is the order in which Motet receives the reservations, so
+// commands from two windows given within the same moment are ordered by when Motet receives them. Null when no
+// sign-in is stored at all (then no opt-out can exist at Motet to misorder) or Motet cannot be reached; the
+// command then reserves after reading its chat (reserveTicket), and only that later moment places it.
 async function reserveEarly($, state) {
   if (state.decisionProtocol === 0) return null;
-  try {
-    let credential = null;
+  const tried = new Set();
+  // The credentials this copy can reserve with before it knows its chat, best first: what it holds in memory, then
+  // the shared grant, then any manual pairing stored on this computer. One Motet refuses is set aside and the next
+  // is tried. With none at all, no opt-out can exist at Motet for this computer's chats to be misordered against.
+  async function* candidates() {
     const manual = state.data;
-    if (manual && manual.mode !== 'derived' && typeof manual.token === 'string' && Number.isInteger(manual.port) &&
-        !state.rejectedDecisionTokens.has(manual.token)) credential = {port:manual.port,token:manual.token};
-    else {
-      let config = globalConfiguration(state.config) && !state.rejectedGrants.has(configurationId(state.config)) ? state.config : null;
-      config ??= await currentGrant($,state,await $.store.get(GLOBAL_KEY));
-      if (config && !state.rejectedGrants.has(configurationId(config))) credential = {port:config.port,token:config.grant};
+    if (manual && manual.mode !== 'derived') yield {port:manual.port,token:manual.token};
+    if (globalConfiguration(state.config)) yield {port:state.config.port,token:state.config.grant,grant:state.config};
+    const shared = await currentGrant($,state,await $.store.get(GLOBAL_KEY));
+    if (shared) yield {port:shared.port,token:shared.grant,grant:shared};
+    const keys = await $.store.keys();
+    if (!Array.isArray(keys) || keys.length > 4096) return;
+    for (const key of keys.filter(key => typeof key === 'string' && key.startsWith(legacyKey(''))).slice(0, 32)) {
+      const record = await $.store.get(key);
+      if (record && typeof record.token === 'string') yield {port:record.port,token:record.token};
     }
-    if (!credential) return null;
-    const response = await post($,state,'decision',{reserve:true},credential);
-    if (response?.decision_protocol !== 1 || response.reserved !== true || !Number.isSafeInteger(response.decision_seq) ||
-        response.decision_seq < 1) return null;
-    state.decisionProtocol = 1;
-    return response.decision_seq;
-  } catch (error) {
-    if (error.status === 403 && error.code === 'invalid_request' && state.decisionProtocol !== 1) state.decisionProtocol = 0;
-    return null;
   }
+  try {
+    for await (const credential of candidates()) {
+      if (typeof credential.token !== 'string' || !Number.isInteger(credential.port) || tried.has(credential.token)) continue;
+      tried.add(credential.token);
+      if (credential.grant ? state.rejectedGrants.has(configurationId(credential.grant)) : state.rejectedDecisionTokens.has(credential.token)) continue;
+      let response;
+      try {response = await reservationPost($,{reserve:true},credential);}
+      catch (error) {
+        if (error.status === 403 && error.code === 'access_denied') {
+          if (credential.grant) {const refused = configurationId(credential.grant); state.rejectedGrants.add(refused); forgetGrant($,refused).catch(() => {});}
+          else state.rejectedDecisionTokens.add(credential.token);
+          continue;
+        }
+        if (error.status === 403 && error.code === 'invalid_request' && state.decisionProtocol !== 1) state.decisionProtocol = 0;
+        return null;
+      }
+      if (response?.decision_protocol !== 1 || response.reserved !== true || !Number.isSafeInteger(response.decision_seq) ||
+          response.decision_seq < 1) return null;
+      state.decisionProtocol = 1;
+      return response.decision_seq;
+    }
+  } catch { /* Reserved after reading its chat instead. */ }
+  return null;
 }
 
 // Tried a second time at once, so a single lost request does not leave a reconnect without its place.
