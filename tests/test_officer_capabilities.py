@@ -24,7 +24,7 @@ import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(1, str(Path(__file__).resolve().parent))
 import server
 import officer_capabilities
 import officer_request
@@ -93,7 +93,6 @@ class OfficerCapabilityTests(unittest.TestCase):
     def tearDown(self):
         if self.http:
             self.http.shutdown(); self.http_thread.join(2); self.http.server_close()
-        deck_log_settle.close(self.history)
         self.env_patch.stop(); self.routing_patch.stop(); self.model_patch.stop()
         for name, value in self.saved.items():
             setattr(server, name, value)
@@ -101,7 +100,7 @@ class OfficerCapabilityTests(unittest.TestCase):
         server.LOG[:] = self.old_log
         server.KNOWN_NAMES.clear(); server.KNOWN_NAMES.update(self.old_names)
         server.OFFICER_ASKS[:] = self.old_asks
-        self.tmp.cleanup()
+        deck_log_settle.close_and_clean(self.history, self.tmp.cleanup)
 
     def add(self, text, *, chat='x:demo-ada', name='Ada', stamp=None):
         self.number += 1

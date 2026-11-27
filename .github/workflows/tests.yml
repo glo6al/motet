@@ -162,6 +162,9 @@ jobs:
         if: ${{ !cancelled() }}
       - run: python tests/test_deck_log.py
         if: ${{ !cancelled() }}
+      - run: python tests/test_deck_log_settle.py
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
       - run: python tests/test_deck_log_integration.py
         if: ${{ !cancelled() }}
         timeout-minutes: 5

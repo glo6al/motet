@@ -29,8 +29,7 @@ class DeckTests(unittest.TestCase):
         self.number = 0
 
     def tearDown(self):
-        deck_log_settle.close(self.store)
-        self.temp.cleanup()
+        deck_log_settle.close_and_clean(self.store, self.temp.cleanup)
 
     def record(self, *, chat='x:chat-one', provider='codex', project=None, ts=None, key=None):
         self.number += 1

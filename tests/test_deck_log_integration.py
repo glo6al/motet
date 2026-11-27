@@ -40,11 +40,11 @@ class IntegrationTests(unittest.TestCase):
         self.aid = 'c:' + self.sid
 
     def cleanup(self):
-        deck_log_settle.close(server.HISTORY)
+        history = server.HISTORY
         for k, v in self.saved.items(): setattr(server, k, v)
         server.AGENTS.clear(); server.AGENTS.update(self.agents)
         server.LOG[:] = self.log; server.BASE = self.base
-        self.tmp.cleanup()
+        deck_log_settle.close_and_clean(history, self.tmp.cleanup, 'Synthetic archive')
 
     def append(self, text='future prose', *, timestamp=True, path=None, extra=None):
         row = {'type': 'user', 'cwd': self.home, 'message': {'role': 'user', 'content': text}}

@@ -57,25 +57,47 @@ def settle(history, label='Fictional archive', *, stall=None, ceiling=None, slic
         if state != seen:
             seen, changed = state, now
         elif now - changed >= stall:
-            return _describe(history, label, started, 'made no progress for %.0fs' % stall)
+            return _describe(history, label, started, 'made no progress for %gs' % stall)
         if now - started >= ceiling:
-            return _describe(history, label, started, 'was still saving at the %.0fs ceiling' % ceiling)
+            return _describe(history, label, started, 'was still saving at the %gs ceiling' % ceiling)
         history.flush(slice_seconds)
 
 
-def close(history, *, stall=None):
-    """Close the archive and its file even if a write was still in flight.
+def close(history, label='Fictional archive', *, stall=None, timeout=2.0):
+    """Close the archive and release its file, or fail saying why not.
 
     DeckLog.close leaves the database open when its writer does not stop in
     time, which on Windows keeps the temporary folder locked. Closing marks the
     archive closed, so the writer exits after its current record; wait for that
-    while it is alive, then close again so the file is released.
+    while it is alive, then close again so the file is released. A writer that
+    is still alive, or a database still open, after that is an AssertionError
+    with the archive's state, never a silent leak.
     """
-    history.close()
+    started = time.monotonic()
+    history.close(timeout)
     thread = getattr(history, 'thread', None)
-    if history.db is None or thread is None:
-        return
-    deadline = time.monotonic() + (STALL_SECONDS if stall is None else stall)
-    while thread.is_alive() and time.monotonic() < deadline:
-        thread.join(SLICE_SECONDS)
-    history.close()
+    if history.db is not None and thread is not None:
+        deadline = time.monotonic() + (STALL_SECONDS if stall is None else stall)
+        while thread.is_alive() and time.monotonic() < deadline:
+            thread.join(SLICE_SECONDS)
+        history.close(timeout)
+    if history.db is not None or (thread is not None and thread.is_alive()):
+        raise AssertionError(_describe(history, label, started,
+                                       'could not be closed (database open=%r)' % (history.db is not None)))
+
+
+def close_and_clean(history, cleanup, label='Fictional archive', **options):
+    """Close the archive, then always run `cleanup` (usually removing its folder).
+
+    When the close fails, the open archive keeps its folder locked on Windows;
+    that folder error is only a consequence, so the close failure is reported.
+    """
+    try:
+        close(history, label, **options)
+    except AssertionError:
+        try:
+            cleanup()
+        except OSError:
+            pass
+        raise
+    cleanup()
