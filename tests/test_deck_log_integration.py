@@ -15,6 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import server
 from deck_log import DeckLog
+import deck_log_settle
 
 
 class IntegrationTests(unittest.TestCase):
@@ -39,11 +40,11 @@ class IntegrationTests(unittest.TestCase):
         self.aid = 'c:' + self.sid
 
     def cleanup(self):
-        server.HISTORY.close()
+        history = server.HISTORY
         for k, v in self.saved.items(): setattr(server, k, v)
         server.AGENTS.clear(); server.AGENTS.update(self.agents)
         server.LOG[:] = self.log; server.BASE = self.base
-        self.tmp.cleanup()
+        deck_log_settle.close_and_clean(history, self.tmp.cleanup, 'Synthetic archive')
 
     def append(self, text='future prose', *, timestamp=True, path=None, extra=None):
         row = {'type': 'user', 'cwd': self.home, 'message': {'role': 'user', 'content': text}}
@@ -58,12 +59,11 @@ class IntegrationTests(unittest.TestCase):
         server.history_arm()
 
     def events(self):
-        # Bulk synthetic batches retain per-record private-file checks. Allow
-        # slower Windows runners to drain them without changing runtime limits.
-        self.assertTrue(server.HISTORY.flush(30 if os.name == 'nt' else 10),
-                        'Synthetic archive writes did not settle: reason=%r, queued=%d, inflight=%d, last_error=%r' %
-                        (server.HISTORY.reason, len(server.HISTORY.queue), server.HISTORY.inflight,
-                         getattr(server.HISTORY, 'last_error', None)))
+        # Bulk synthetic batches retain per-record private-file checks. Wait
+        # while the writer keeps saving; fail only on a failure or a stall.
+        problem = deck_log_settle.settle(server.HISTORY, 'Synthetic archive')
+        if problem:
+            self.fail(problem)
         return server.HISTORY.search(limit=100)['events']
 
     def test_future_fence_old_first_poll_and_recreation_receipt(self):

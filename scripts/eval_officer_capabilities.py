@@ -99,8 +99,10 @@ def build_corpus(fixture):
     old_stamp = time.mktime(time.strptime(yesterday, '%Y-%m-%d')) + 12 * 3600
     fixture.add('YESTERDAY ONLY: Ada reports an old deployment succeeded. This statement is outside today\'s recorded work.',
                 chat='x:capability-01', name='Ada', stamp=old_stamp)
-    if not fixture.history.flush(10):
-        raise RuntimeError('Fictional corpus could not be retained')
+    try:
+        fixture.settle_archive('Fictional corpus')
+    except AssertionError as error:
+        raise RuntimeError('Fictional corpus could not be retained: %s' % error) from error
     return {'today': today, 'yesterday': yesterday, 'observation_time': fixture.now,
             'retained_events_today': 1314, 'retained_events_all_time': 1315,
             'retained_chats_today': 39, 'chat_names': names, 'projects': ['Orchard'],
