@@ -271,6 +271,12 @@ class DeckLog(OfficerHistoryMixin):
         existing = {r['key']: json.loads(r['value']) for r in self.db.execute('SELECT * FROM settings')}
         if existing.get('schema_version', 1) not in range(1, SCHEMA_VERSION + 1):
             raise ValueError('unsupported archive schema')
+        if existing.get('schema_version') != SCHEMA_VERSION:
+            # Label first, in its own commit: each ALTER below commits at once, so an upgrade stopped part-way must
+            # leave a version 0.1.0 refuses, never a 22-column table still labelled 4. This build adds any missing
+            # column on its next open whatever the label says.
+            self._save_setting('schema_version', SCHEMA_VERSION)
+            self.db.commit()
         if 'certainty' not in {r[1] for r in self.db.execute('PRAGMA table_info(events)')}:
             self.db.execute("ALTER TABLE events ADD COLUMN certainty TEXT NOT NULL DEFAULT 'recorded'")
         if 'attribution' not in {r[1] for r in self.db.execute('PRAGMA table_info(events)')}:

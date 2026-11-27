@@ -482,6 +482,41 @@ class DeckTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_upgrade_stopped_after_the_column_is_added_still_shuts_out_0_1_0(self):
+        """The ALTER commits at once; an error before the rest of the upgrade commits must not leave label 4."""
+        old = released_0_1_0()
+        root = os.path.join(os.path.realpath(self.temp.name), 'stopped-upgrade')
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(self.cross_record(store, 'before'))
+        finally:
+            store.close()
+        path = os.path.join(root, 'deck-log.sqlite3')
+        with patch.object(d.DeckLog, '_officer_schema', side_effect=sqlite3.OperationalError('fictional disk error')):
+            store = d.DeckLog(root, clock=lambda: self.now)
+            try:
+                self.assertFalse(store.available)
+            finally:
+                store.close()
+        database = sqlite3.connect(path)
+        try:
+            self.assertIn('attribution', [r[1] for r in database.execute('PRAGMA table_info(events)')])
+        finally:
+            database.close()
+        self.assertEqual(self.stored_version(path), 5)
+        store = old.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertFalse(store.available, 'the reported hazard: 0.1.0 would open it and lose every write')
+        finally:
+            store.close()
+        store = d.DeckLog(root, clock=lambda: self.now)
+        try:
+            self.assertTrue(store.available, store.reason)
+            self.assertEqual([e['text'] for e in store.search()['events']], ['entry before'])
+            self.assertTrue(self.cross_record(store, 'after'), store.status())
+        finally:
+            store.close()
+
     def test_newer_archive_is_refused_before_anything_is_written(self):
         self.offer(candidates=[self.prose('kept as it is')])
         self.store.close()
@@ -757,6 +792,7 @@ class MutationTests(unittest.TestCase):
             ('certainty preservation', "int(redacted), c.get('certainty', 'recorded')", "int(redacted), 'recorded'", 'test_certainty_persists_independently_of_outcome'),
             ('schema version bump', 'SCHEMA_VERSION = 5', 'SCHEMA_VERSION = 4', 'test_released_0_1_0_archive_upgrades_and_0_1_0_then_refuses_it_untouched'),
             ('relabel unreleased layout', 'SCHEMA_VERSION = 5', 'SCHEMA_VERSION = 4', 'test_unreleased_22_column_schema_4_archive_is_relabelled_so_0_1_0_stops_cleanly'),
+            ('label before the column', "self._save_setting('schema_version', SCHEMA_VERSION)\n            self.db.commit()", 'pass', 'test_upgrade_stopped_after_the_column_is_added_still_shuts_out_0_1_0'),
             ('newer version gate', "        self._stored_version()\n        self.db.executescript", "        self.db.executescript", 'test_newer_archive_is_refused_before_anything_is_written'),
             ('newer version reason', "'archive_from_newer_motet' if isinstance", "'private_storage_unavailable' if isinstance", 'test_newer_archive_is_refused_before_anything_is_written'),
         ]
