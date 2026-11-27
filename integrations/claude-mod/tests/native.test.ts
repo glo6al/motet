@@ -459,3 +459,59 @@ test('official runtime: a reloaded plugin that resumes between /clear and its se
   status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
   expect(status.timer_ticks).toBe(3);expect(status.timer_resumed).toBe(false);
 });
+
+// A session.start still registering its commands when the chat ends installs nothing; a later real start owns it.
+for (const reason of ['prompt_input_exit','clear']) test('official runtime: a pending session.start stays inactive after session.end '+reason,async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let release=()=>{},entered=()=>{},first=true,forwarded=false,registrations=0,polls=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,e.value);return{value:undefined}});
+  on('command.register',async()=>{if(first){first=false;entered();await held}return{value:undefined}});
+  on('turn.start',($,e)=>({turnId:e.turnId}));
+  on('session.start',($,e)=>{forwarded=true;return{cwd:e.cwd}});on('session.end',()=>({sessionId:NATIVE}));on('command.run',()=>({text:'fictional transition'}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  const input=$.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});await inside;
+  await $.session.end({reason,sessionId:NATIVE});
+  release();await input;await clock.advance(2000);await clock.advance(2000);
+  expect(forwarded).toBe(true);expect(registrations).toBe(0);expect(polls).toBe(0);
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  expect(registrations).toBe(1);expect(polls>0).toBe(true);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  // One timer: three periods after the later start were three supervisor dispatches.
+  expect(status.timer_ticks).toBe(3);
+});
+
+test('official runtime: an earlier session.start that finishes late cannot replace a later one',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let release=()=>{},entered=()=>{},first=true,registrations=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,e.value);return{value:undefined}});
+  on('command.register',async()=>{if(first){first=false;entered();await held}return{value:undefined}});
+  on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll'))data={...s,claim:null,requests:[]};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  const earlier=$.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:false});await inside;
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  release();await earlier;
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  // The later start's facts and its single timer stand.
+  expect(status.startup_interactive).toBe(true);expect(status.timer_ticks).toBe(3);expect(registrations).toBe(1);
+});

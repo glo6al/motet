@@ -2350,6 +2350,81 @@ test('/branch ending with an unexpected reason fails closed',async()=>{
   assert.equal(started.timers.length,1);assert.equal(liveTimers(started).length,1);
 });
 
+// A session.start still registering its commands when the chat ends, or changes conversation, installs nothing.
+// After an end that keeps the process (clear, resume) the started module is repaired by its next event, as after a
+// start whose registration failed (the same rule); after an exit, logout or other end it stays off.
+async function pendingStart(extra={}){
+  const gate=latch();let hold=true;
+  const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,...extra,
+    commandRegister:()=>{if(hold){hold=false;return gate.hold();}}});
+  const starting=h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await bounded(gate.entered,'session.start registering');
+  return {h,gate,starting};
+}
+for(const [reason,repaired] of [['prompt_input_exit',false],['logout',false],['other',false],['clear',true],['resume',true]]){
+  test(`a session.start pending across session.end (${reason}) installs nothing${repaired?', and the next event repairs it':''}`,async()=>{
+    const {h,gate,starting}=await pendingStart();
+    await h.call('session.end',{reason,sessionId:NATIVE});
+    gate.release();await starting;for(let i=0;i<5;i++)await yieldWhileHeld();
+    assert.equal(h.timers.length,0);await h.tick();assert.equal(connections(h),0);
+    assert(h.passed.some(p=>p.name==='session.start'),'the start itself was passed on');
+    await h.call('prompt.submit',{text:'fictional input after the end'});
+    if(repaired){
+      await h.wait(()=>h.timers.length===1,'repair after '+reason);
+      assert.equal(liveTimers(h).length,1);
+    }else{
+      await lateEvents(h);
+      assert.equal(h.timers.length,0);assert.equal(connections(h),0);
+    }
+    // A later real start owns the module, with exactly one live timer.
+    await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+    assert.equal(liveTimers(h).length,1);
+    await h.tick();assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1);
+  });
+}
+
+test('a session.start pending across a transition command installs nothing; a cancelled one lets the next event resume',async()=>{
+  const {h,gate,starting}=await pendingStart();
+  await h.command('resume');
+  gate.release();await starting;for(let i=0;i<5;i++)await yieldWhileHeld();
+  assert.equal(h.timers.length,0);
+  await h.call('prompt.submit',{text:'fictional input after a cancelled picker'});
+  await h.wait(()=>h.timers.length===1,'resume after the cancelled transition');
+  assert.equal(liveTimers(h).length,1);
+});
+
+test('an earlier session.start finishing late cannot replace a later start, nor report its own failure',async()=>{
+  for(const outcome of ['succeeds','fails']){
+    const gate=latch();let calls=0;
+    const h=await harness({start:false,claimed:false,storage:new Map([[GLOBAL_KEY,CONFIG]]),fetch:globalFetch,
+      commandRegister:()=>{if(++calls===1)return gate.hold();}});
+    const earlier=h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:false});
+    await bounded(gate.entered,'earlier start registering');
+    await h.call('session.start',{cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+    assert.equal(h.timers.length,1);const later=h.timers[0];
+    if(outcome==='succeeds')gate.release();else gate.reject(Error('registration refused'));
+    await earlier;for(let i=0;i<5;i++)await yieldWhileHeld();
+    assert.equal(h.timers.length,1,outcome);assert.equal(later.cancelled,false,outcome);
+    const status=await statusOf(h);assert.equal(status.error,'',outcome);assert.equal(status.startup_interactive,true,outcome);
+    await h.tick();assert.equal(h.calls.filter(c=>c.url.endsWith('/register')).length,1,outcome);
+  }
+});
+
+test('an owner /watch-connect waiting on Motet when the chat ends does not connect it',async()=>{
+  for(const boundary of ['session.end','clear']){
+    const gate=latch();
+    const h=await harness({claimed:false,fetch:async url=>{if(url.endsWith('/enroll'))await gate.hold();return null;}});
+    const connecting=h.enroll();
+    await bounded(gate.entered,'enroll in flight');
+    if(boundary==='session.end')await h.call('session.end',{reason:'prompt_input_exit',sessionId:NATIVE});
+    else await h.command('clear');
+    gate.release();
+    assert.match((await connecting).text,/connection failed/,boundary);
+    const status=await statusOf(h);assert.equal(status.connected,false,boundary);
+    assert.equal(h.calls.filter(c=>c.url.endsWith('/poll')).length,0,boundary);
+  }
+});
+
 test('a real start whose registration failed is repaired after /clear by its next event, but not after an exit',async()=>{
   for(const [reason,repaired] of [['clear',true],['resume',true],['prompt_input_exit',false],['logout',false],['other',false]]){
     let fail=true;

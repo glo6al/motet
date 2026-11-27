@@ -925,6 +925,12 @@ async function registerCommands($) {
   await $.command.register({name:'watch-disconnect',description:'Keep this chat disconnected until explicit reconnect.',immediate:true});
 }
 
+// Whether an awaited start or resume still owns the module: no session.start, session.end or transition command
+// has come since it began. A continuation that lost ownership installs nothing and records nothing about itself.
+function ownsLifecycle(state, lifecycle) {
+  return state.lifecycle === lifecycle && !state.ended;
+}
+
 // The one supervisor timer: any earlier one is cancelled first, so at most one ever runs.
 function startTimer($, state) {
   state.timer?.cancel();
@@ -950,11 +956,11 @@ async function resume($, state) {
   try {
     await registerCommands($);
     clearRegistrationError(state);
-    if (state.timer || state.ended || state.lifecycle !== lifecycle) return;
+    if (state.timer || !ownsLifecycle(state,lifecycle)) return;
     state.resumed = true;
     state.resumedLifecycle = lifecycle;
     startTimer($,state);
-  } catch {state.error = REGISTRATION_FAILED;}
+  } catch {if (ownsLifecycle(state,lifecycle)) state.error = REGISTRATION_FAILED;}
   finally {state.resuming = false;}
 }
 
@@ -967,6 +973,7 @@ export function register(on) {
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
     state.lifecycle += 1;
+    const lifecycle = state.lifecycle;
     state.ended = false;
     state.resumed = false;
     state.interactive = e.isInteractive === true;
@@ -980,10 +987,14 @@ export function register(on) {
       state.timer = null;
       await registerCommands($);
       clearRegistrationError(state);
+      // A later start, a session.end or a transition command that came while this start was registering owns the
+      // module now: this start installs nothing. After a /clear or a resume, a started module is then repaired by
+      // its next event, as after a start that failed to register; after an exit it stays off.
+      if (!ownsLifecycle(state,lifecycle)) return next(e);
       startTimer($,state);
       // A resume that installed its timer while this start was registering is replaced: this timer is the start's.
       state.resumed = false;
-    } catch {state.error = REGISTRATION_FAILED;}
+    } catch {if (ownsLifecycle(state,lifecycle)) state.error = REGISTRATION_FAILED;}
     return next(e);
   });
   on('command.run',async($,e,next)=>{
@@ -1007,7 +1018,9 @@ export function register(on) {
     }
     if (state.connecting || state.submitting || (state.connected && state.flight && ['pending','claimed','submitted','started'].includes(state.flight.phase))) return {text:'An existing Motet attempt is unresolved; nothing was resubmitted.'};
     state.connecting = true;
-    invalidateEligibility(state);
+    // A session.end, transition or opt-out that comes while this command waits on Motet changes this epoch, and
+    // activation then refuses: an owner connect never connects a chat that has ended or changed conversation.
+    const eligibilityEpoch = invalidateEligibility(state);
     try {
       const id = await $.session.id(), project = await sessionProject($);
       if (!UUID.test(id)) throw Error('Native identity unavailable.');
@@ -1037,7 +1050,7 @@ export function register(on) {
         if (typeof response.token !== 'string' || response.token.length < 16 || !UUID.test(response.enrollment_id)) throw Error('Invalid enrollment.');
         state.data.token = response.token; state.data.enrollment_id = response.enrollment_id;
         state.flight = null; state.envelope = null; state.bound.clear();
-        await activate($,state,response);
+        await activate($,state,response,eligibilityEpoch);
         return {text:'Motet connected to this existing chat. ' + LIMITATION};
       }
       if (state.data?.mode !== 'derived') {
@@ -1050,7 +1063,7 @@ export function register(on) {
           state.receiptOnly = stored.project !== project && !state.abandonedReceipts.has(state.receiptKey) &&
             await pendingReceipts([stored]);
           state.key = legacyKey(id); state.data = {...stored, project:state.receiptOnly ? stored.project : project, active:true};
-          await activate($,state,await post($,state,'connect',{native_id:id,project:state.data.project,...state.receiptOnly?{receipt_only:true}:{}}));
+          await activate($,state,await post($,state,'connect',{native_id:id,project:state.data.project,...state.receiptOnly?{receipt_only:true}:{}}),eligibilityEpoch);
           return {text:state.receiptOnly ? 'Motet reconnected this chat to report its earlier replies; it then moves to this project folder. ' + LIMITATION :
             'Motet connected to this existing chat. ' + LIMITATION};
         }
