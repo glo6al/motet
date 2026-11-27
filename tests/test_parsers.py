@@ -37,8 +37,15 @@ def test_release_version():
     check('--version prints the page version and exits before startup',
           result.returncode == 0 and result.stdout == 'Motet ' + version + '\n' and not result.stderr)
     changelog = (root / 'CHANGELOG.md').read_text(encoding='utf-8')
-    newest = next((line for line in changelog.splitlines() if line.startswith('## ')), '')
-    check('newest changelog entry agrees with the page',
+    headings = [line for line in changelog.splitlines() if line.startswith('## ')]
+    # One entry may wait above the release, for the next version only; it gets its date when the page moves to it.
+    upcoming = re.fullmatch(r'## ([0-9]+)\.([0-9]+)\.([0-9]+) — Unreleased', headings[0]) if headings else None
+    if upcoming:
+        check('an unreleased changelog entry is for a later version than the page',
+              tuple(map(int, upcoming.groups())) > tuple(map(int, version.split('.'))))
+        headings = headings[1:]
+    newest = headings[0] if headings else ''
+    check('newest released changelog entry agrees with the page',
           re.fullmatch(r'## ' + re.escape(version) + r' — [0-9]{4}-[0-9]{2}-[0-9]{2}', newest))
     readme = (root / 'README.md').read_text(encoding='utf-8')
     check('README links to the current changelog version',
