@@ -2484,7 +2484,12 @@ test('a delayed preference write cannot reverse a newer owner decision, in eithe
     await h.command('watch-disconnect');
     holdPref=true;
     const connecting=h.command('watch-connect');await bounded(gate.entered,'connect preference write');
+    // The disconnect reads its chat just before it queues its preference write; from there to the queue is promise
+    // steps only, so one macrotask later it is queued behind the held write.
+    let idRead;const reachedId=new Promise(resolve=>{idRead=resolve;});
+    const id=h.$.session.id;h.$.session.id=async()=>{idRead();return id();};
     const disconnecting=h.command('watch-disconnect');
+    await bounded(reachedId,'disconnect read its chat');await new Promise(resolve=>setImmediate(resolve));
     gate.release();
     assert.equal((await connecting).text,SUPERSEDED_TEXT);assert.match((await disconnecting).text,/Motet disconnected/);
     assert.equal(storage.get(PREF).disconnected,true);
@@ -2659,7 +2664,7 @@ function ticketMotet({offline=()=>false,refusedTokens=new Set()}={}){
   // Two-phase tickets, as at Motet: a reserved ticket changes nothing; a commit applies only if no newer one was
   // committed first; every new connection is refused while opted out; a pairing code holds the ticket taken when
   // the owner made it.
-  const m={latest:0,issued:0,optedOut:false,optedOutSeq:0,codeSeq:0,leases:new Map(),seqs:new Map(),refused:[],decisions:[]};
+  const m={latest:0,issued:0,optedOut:false,optedOutSeq:0,codeSeq:0,leases:new Map(),seqs:new Map(),refused:[],decisions:[],reservations:new Map()};
   const session=extra=>({version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,folder_protocol:1,decision_protocol:1,...extra});
   const refuse=what=>{m.refused.push(what);return responseJSON({error:'Disconnected by its owner.',error_code:'decision_superseded'},409);};
   const commit=(seq,out)=>{
@@ -2673,7 +2678,14 @@ function ticketMotet({offline=()=>false,refusedTokens=new Set()}={}){
     if(url.endsWith('/decision')){
       if(offline())throw Error('Motet unreachable');
       if(refusedTokens.has(init?.headers?.Authorization))return responseJSON({error:'Refused.',error_code:'access_denied'},403);
-      if(body.reserve)return responseJSON({version:1,decision_protocol:1,decision_seq:++m.issued,reserved:true});
+      if(body.reserve){
+        // Repeatable: one command identity always gets the same ticket; recover only asks for it.
+        if(body.command_id&&m.reservations.has(body.command_id))return responseJSON({version:1,decision_protocol:1,decision_seq:m.reservations.get(body.command_id),reserved:true});
+        if(body.recover)return responseJSON({error:'Motet holds no reservation for this command.',error_code:'not_reserved'},409);
+        const seq=++m.issued;if(body.command_id)m.reservations.set(body.command_id,seq);
+        return responseJSON({version:1,decision_protocol:1,decision_seq:seq,reserved:true});
+      }
+      if(body.query)return responseJSON({version:1,decision_protocol:1,decision_seq:m.latest,opted_out:m.optedOut,query:true});
       const seq=body.decision_seq??++m.issued;
       if(!commit(seq,body.opted_out))return responseJSON({error:'A newer decision was made.',error_code:'decision_superseded'},409);
       return responseJSON({version:1,decision_protocol:1,decision_seq:seq,opted_out:body.opted_out});
@@ -2890,29 +2902,37 @@ test('a pending opt-out refused for a revoked grant is told through the next cre
   down=false;h.setNow(200000);await h.tick();
   assert.equal(motet.optedOut,true);assert.equal(storage.get(PREF).pending,undefined);
   const used=h.calls.filter(c=>c.url.endsWith('/decision')).map(c=>c.init.headers.Authorization);
-  assert.deepEqual(used.slice(-2),['Bearer '+A.grant,'Bearer '+B.grant]);
+  // Reserved under the refused grant, then under the next one, and committed there.
+  assert.deepEqual(used.slice(-3),['Bearer '+A.grant,'Bearer '+B.grant,'Bearer '+B.grant]);
   assert.equal([...storage.values()].some(v=>v?.grant===A.grant&&v!==storage.get(GLOBAL_KEY)),false,'the refused grant\'s copies are dropped');
 });
 
 // Two commands in one copy whose identity reads finish out of order: the newer command reserved first. Tickets stay
 // with the command that reserved them; the older one gives up once its own reservation returns.
-// Fails a command's early reservation (the one made before it reads its chat), as when this copy holds no credential
-// yet or Motet cannot be reached for it: the command then reserves after reading its chat.
-const withoutEarlyReservations=motet=>(url,body,init)=>{
-  if(url.endsWith('/decision')&&body.reserve&&body.native_id===undefined)throw Error('no early reservation');
+// A command's early reservation is lost, on its first try and on its retry: either it never reaches Motet
+// ('dropped'), or Motet issues the ticket but its answer never comes back ('answer lost'). Later requests (the one
+// the command makes once it knows its chat) go through.
+const loseFirstEarly=(motet,how)=>{let lost=0;return (url,body,init)=>{
+  if(lost<2&&url.endsWith('/decision')&&body.reserve&&body.native_id===undefined){
+    lost++;
+    if(how==='answer lost')motet.fetch(url,body,init);
+    throw Error('reservation '+how);
+  }
   return motet.fetch(url,body,init);
-};
-async function outOfOrderPair({foreignOptOutBetween}){
+};};
+async function outOfOrderPair({foreignOptOutBetween,how='dropped'}){
   const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
-  const h=await harness({storage,claimed:false,fetch:withoutEarlyReservations(motet)});
+  // Only the older command's first request is lost; its retry and every later request go through.
+  let first=true;const lose=loseFirstEarly(motet,how);
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>first&&url.endsWith('/decision')&&body.reserve?lose(url,body,init):motet.fetch(url,body,init)});
   // The older command (a disconnect) has a slow identity read; the newer one (a connect) is then held at its folder.
   const idGate=latch(),cwdGate=latch(),id=h.$.session.id,cwd=h.$.session.cwd;let holdId=true,holdCwd=false;
   h.$.session.id=async()=>{if(holdId){holdId=false;await idGate.hold();}return id();};
   h.$.session.cwd=async()=>{if(holdCwd){holdCwd=false;await cwdGate.hold();}return cwd();};
   const disconnecting=h.command('watch-disconnect');await bounded(idGate.entered,'older identity read');
+  first=false;
   holdCwd=true;
   const connecting=h.command('watch-connect');await bounded(cwdGate.entered,'newer command reserved, at its folder');
-  assert.equal(motet.issued,1,'the newer command reserved first');
   if(foreignOptOutBetween)assert.equal(motet.fetch('/decision',{opted_out:true}).status,200);  // another window's later disconnect
   idGate.release();
   const older=(await disconnecting).text;
@@ -2923,24 +2943,21 @@ async function outOfOrderPair({foreignOptOutBetween}){
 }
 
 const YIELDED_TEXT='A newer Motet command is still running; this disconnect applies if that one does not complete.';
-test('without an early reservation, two commands whose identity reads finish out of order end on the owner\'s last command (R9-N1)',async()=>{
+const UNPLACED_TEXT='Motet could not confirm when this command was given, so nothing was changed. Run it again.';
+test('an older command whose first reservation never reached Motet ends with nothing changed, and the newer one stands',async()=>{
   const {motet,storage,older,newer}=await outOfOrderPair({foreignOptOutBetween:false});
-  assert.equal(older,YIELDED_TEXT);
+  assert.equal(older,UNPLACED_TEXT);
   assert.match(newer,/reconnect scheduled/);
   assert.equal(motet.optedOut,false);
-  assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[1,false]]);
+  assert.deepEqual(motet.decisions.map(d=>d.opted_out),[false]);
   assert.equal(storage.get(PREF).disconnected,false);
 });
 
-test('without an early reservation, an out-of-order pair cannot move the newer reconnect above another window\'s later disconnect (F5)',async()=>{
+test('an older command whose first reservation never reached Motet cannot be placed after another window\'s later disconnect',async()=>{
   const {motet,h,older,newer}=await outOfOrderPair({foreignOptOutBetween:true});
-  assert.equal(older,YIELDED_TEXT);
+  assert.equal(older,UNPLACED_TEXT);
   assert.equal(newer,OTHER_WINDOW_TEXT);
-  // Motet stays opted out: the reconnect kept its own ticket (1), older than the other window's opt-out (2); it was
-  // refused, so the disconnect that gave way to it then applied under its own ticket (3).
-  await h.wait(()=>motet.latest===3,'the yielded disconnect applied');
-  assert.equal(motet.optedOut,true);
-  assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[2,true],[3,true]]);
+  assert.equal(motet.optedOut,true);assert.deepEqual(motet.decisions.map(d=>d.opted_out),[true]);
   assert.equal(motet.ready(),false);assert.equal((await statusOf(h)).connected,false);
   assert.equal(h.calls.filter(c=>c.url.endsWith('/register')&&c.response?.ok).length,0);
 });
@@ -3018,6 +3035,172 @@ test('a reservation does not wait behind a poll in flight, so another window\'s 
   assert.equal(motet.ready(),false);
 });
 
+// One copy's reservations go out one at a time in the order the owner gave the commands, so a slow first request
+// cannot let a later command take the earlier place (B1). Both orders. The first command's reservation is slow to
+// reach Motet, and the second command's identity read is slow.
+for(const [first,second] of [['watch-connect','watch-disconnect'],['watch-disconnect','watch-connect']]){
+  test(`within one window, /${first} then /${second} ends on /${second} even when the first reservation is slow (B1)`,async()=>{
+    const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]),gate=latch();
+    let armed=false,reserves=0,secondReserved=false;
+    const h=await harness({storage,claimed:false,fetch:async(url,body,init)=>{
+      if(armed&&url.endsWith('/decision')&&body.reserve){
+        const n=++reserves;
+        if(n===1)await gate.hold();
+        const answer=motet.fetch(url,body,init);
+        if(n===2)secondReserved=true;
+        return answer;
+      }
+      return motet.fetch(url,body,init);}});
+    await h.command('watch-connect');await h.tick();
+    armed=true;
+    const idGate=latch(),id=h.$.session.id;let held=false;
+    // Hold the identity read that follows the second command's reservation (the second command's own).
+    h.$.session.id=async()=>{if(secondReserved&&!held){held=true;await idGate.hold();}return id();};
+    const one=h.command(first);await bounded(gate.entered,'first reservation in flight');
+    const two=h.command(second);
+    gate.release();
+    const firstReply=(await one).text;
+    if(held)idGate.release();else await bounded(idGate.entered,'second command at its identity read').then(()=>idGate.release());
+    const secondReply=(await two).text;
+    const wantsOut=second==='watch-disconnect';
+    assert.match(secondReply,wantsOut?/Motet disconnected/:/reconnect scheduled/,firstReply);
+    assert.equal(motet.optedOut,wantsOut);
+    assert.equal(motet.decisions.at(-1).opted_out,wantsOut);
+    assert.equal(storage.get(PREF).disconnected,wantsOut);
+    h.setNow(200000);await h.tick();assert.equal((await statusOf(h)).connected,!wantsOut);
+  });
+}
+
+// A lost answer gives the same command its original ticket, never a newer one (F8).
+test('a reconnect whose first reservation answer was lost recovers its ticket and cannot undo another window\'s later disconnect (F8)',async()=>{
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]),gate=latch();let lose=true;
+  const a=await harness({storage,claimed:false,fetch:async(url,body,init)=>{
+    if(lose&&url.endsWith('/decision')&&body.reserve){lose=false;motet.fetch(url,body,init);await gate.hold();throw Error('answer lost');}
+    return motet.fetch(url,body,init);}});
+  const connecting=a.command('watch-connect');await bounded(gate.entered,'A reserved, its answer delayed');
+  assert.equal(motet.issued,1);
+  const b=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+  assert.match((await b.command('watch-disconnect')).text,/Motet disconnected/);
+  gate.release();
+  assert.equal((await connecting).text,OTHER_WINDOW_TEXT);
+  assert.equal(motet.optedOut,true);assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[2,true]]);
+  const since=a.calls.length;a.setNow(200000);await a.tick();await a.tick();
+  assert.equal(motetCalls(a,since).length,0);assert.equal(motet.ready(),false);
+});
+
+// Two Motets: an early ticket is only used on the Motet that issued it (S1), and a lost answer when the command
+// reserves again on the right Motet still returns its original ticket there (F8).
+async function twoMotets({loseOnCommitPort=false}={}){
+  const real=ticketMotet(),spare=ticketMotet(),gate=latch();
+  spare.issued=50;   // a spare Motet whose counter is far ahead
+  const OTHER='66666666-6666-4666-8666-666666666666';
+  const storage=new Map([
+    ['watch-owner-v1:'+OTHER,{native_id:OTHER,project:'/fictional/other',port:9999,token:'e'.repeat(64),requests:{},active:false}],
+    ['watch-owner-v1:'+NATIVE,{native_id:NATIVE,project:'/fictional/project',port:8793,token:'f'.repeat(64),requests:{},active:true}]]);
+  let lose=loseOnCommitPort;
+  const route=async(url,body,init)=>{
+    const motet=url.includes(':9999/')?spare:real;
+    if(lose&&motet===real&&url.endsWith('/decision')&&body.reserve){lose=false;motet.fetch(url,body,init);await gate.hold();throw Error('answer lost');}
+    return motet.fetch(url,body,init);
+  };
+  const h=await harness({start:false,storage,claimed:false,fetch:route});
+  return {real,spare,storage,h,gate};
+}
+
+test('an early ticket from another Motet is not used: the command reserves again on the chat\'s own Motet (S1)',async()=>{
+  const {real,spare,h}=await twoMotets();
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+  assert.equal(spare.issued,51);assert.deepEqual(spare.decisions,[]);
+  assert.deepEqual(real.decisions.map(d=>[d.seq,d.opted_out]),[[1,true]]);assert.equal(real.optedOut,true);
+});
+
+test('a lost answer when the command reserves on the chat\'s own Motet returns the original ticket there (F8)',async()=>{
+  const {real,h,gate}=await twoMotets({loseOnCommitPort:true});
+  const connecting=h.command('watch-connect');await bounded(gate.entered,'reservation on the chat\'s Motet, answer delayed');
+  assert.equal(real.issued,1);
+  // Another window disconnects the chat on that Motet meanwhile.
+  real.fetch('/decision',{opted_out:true});
+  gate.release();
+  assert.equal((await connecting).text,OTHER_WINDOW_TEXT);
+  assert.equal(real.optedOut,true);assert.deepEqual(real.decisions.map(d=>[d.seq,d.opted_out]),[[2,true]]);
+});
+
+// A fresh copy with no decision of its own checks a stored opt-out against Motet (F9), and never lets a stored
+// reconnect past a newer opt-out (the inverse).
+for(const later of ['reconnect','disconnect']){
+  test(`a fresh copy follows Motet's newer ${later} over an older copy's late preference write (F9)`,async()=>{
+    const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]),gate=latch();let hold=false;
+    const older=later==='reconnect'?'watch-disconnect':'watch-connect',newer=later==='reconnect'?'watch-connect':'watch-disconnect';
+    const a=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init),
+      storeSet:async key=>{if(hold&&key===PREF){hold=false;await gate.hold();}}});
+    hold=true;
+    const first=a.command(older);await bounded(gate.entered,'older preference write held');
+    const b=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+    await b.command(newer);
+    // Both copies go away (a reload) before any repair; then the old write lands.
+    for(const timer of [...a.timers,...b.timers])timer.cancel();
+    gate.release();await first;
+    assert.equal(storage.get(PREF).disconnected,later==='reconnect','the older write landed last');
+    const c=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+    for(let i=0,now=100000;i<3;i++){await c.tick();now+=60000;c.setNow(now);}
+    if(later==='reconnect'){
+      assert.equal(motet.optedOut,false);assert.equal(storage.get(PREF).disconnected,false);
+      assert(c.calls.some(x=>x.url.endsWith('/poll')),'the fresh copy registered and polls');
+    }else{
+      assert.equal(motet.optedOut,true);assert.equal(motet.ready(),false);
+      assert.equal(c.calls.filter(x=>x.url.endsWith('/poll')).length,0);
+    }
+  });
+}
+
+test('a pairing code Motet refuses leaves the chat\'s earlier decision exactly as it was',async()=>{
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>{
+    if(url.endsWith('/enroll'))return responseJSON({error:'Claude pairing code is expired, used, or does not match this chat.',error_code:'invalid_request'},403);
+    return motet.fetch(url,body,init);}});
+  assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
+  const before={decisions:motet.decisions.length,pref:{...storage.get(PREF)}};
+  assert.equal((await h.command('watch-connect','8793:fictional_wrong_code_1234')).text,
+    'Motet did not accept this pairing code, so nothing was changed. Get a fresh code from Motet.');
+  assert.equal(motet.optedOut,true);assert.equal(motet.decisions.length,before.decisions);
+  assert.deepEqual(storage.get(PREF),before.pref);
+  h.setNow(200000);await h.tick();assert.equal(motetCalls(h).length,0);
+});
+
+test('a /watch-disconnect that changes nothing keeps the chat\'s Desktop evidence',async()=>{
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const h=await harness({startup:{surface:null,isInteractive:false},surfaces:['desktop'],storage,claimed:false,fetch:loseFirstEarly(motet,'dropped')});
+  // Desktop shows the chat once; the plugin keeps it connected after Desktop moves to another chat.
+  await h.tick();assert.equal((await statusOf(h)).connected,true);
+  h.setSurfaces([]);
+  // A disconnect whose place Motet cannot confirm changes nothing.
+  assert.equal((await h.command('watch-disconnect')).text,UNPLACED_TEXT);
+  const since=h.calls.length;h.setNow(200000);await h.tick();
+  assert(h.calls.slice(since).some(c=>c.url.endsWith('/poll')||c.url.endsWith('/register')),'still connected through the kept evidence');
+});
+
+test('a window that waits after another window\'s disconnect follows Motet once that chat is reconnected',async()=>{
+  const motet=ticketMotet();
+  const b=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+  await b.command('watch-connect');await b.tick();
+  motet.fetch('/decision',{opted_out:true});          // another window disconnects the chat
+  b.setNow(110000);await b.tick();assert.equal((await statusOf(b)).error,OTHER_WINDOW_TEXT);
+  b.setNow(120000);await b.tick();assert.equal((await statusOf(b)).connected,false);
+  motet.fetch('/decision',{opted_out:false});         // and later reconnects it
+  b.setNow(200000);await b.tick();await b.tick();
+  assert.equal((await statusOf(b)).connected,true);
+});
+
+test('once Motet accepts a grant, the other copies\' stored grants are removed',async()=>{
+  const A={...CONFIG,grant_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',grant:'c'.repeat(64)};
+  const storage=new Map([[GLOBAL_KEY,CONFIG],['watch-owner-grant-v1:fictional-older-copy',A],['watch-owner-grant-v1:fictional-this-grant',CONFIG]]);
+  const h=await harness({storage,claimed:false,fetch:globalFetch});
+  await h.tick();await new Promise(resolve=>setImmediate(resolve));
+  assert(h.calls.some(c=>c.url.endsWith('/register')));
+  await h.wait(()=>!storage.has('watch-owner-grant-v1:fictional-older-copy'),'older grant removed');
+  assert(storage.has('watch-owner-grant-v1:fictional-this-grant'));
+});
+
 test('a freshly loaded copy in a manually paired chat reserves early with a stored pairing, past a refused one (R15-N1)',async()=>{
   const OTHER='66666666-6666-4666-8666-666666666666';
   const motet=ticketMotet({refusedTokens:new Set(['Bearer '+'e'.repeat(64)])});
@@ -3037,21 +3220,27 @@ test('a freshly loaded copy in a manually paired chat reserves early with a stor
   assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[1,true]]);
 });
 
-test('the remaining window: without an early reservation, an older disconnect reserved after another window\'s reconnect is placed after it (F7)',async()=>{
-  // When this copy holds no credential before a command reads its chat (or Motet cannot be reached for that
-  // first request), the command reserves only after the read, and Motet places it then. Here the older
-  // disconnect's identity read is slow, another window reconnects meanwhile, and the disconnect is placed last.
-  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
-  const h=await harness({storage,claimed:false,fetch:withoutEarlyReservations(motet)});
-  const idGate=latch(),id=h.$.session.id;let holdId=true;
-  h.$.session.id=async()=>{if(holdId){holdId=false;await idGate.hold();}return id();};
-  const disconnecting=h.command('watch-disconnect');await bounded(idGate.entered,'older disconnect at its identity read');
-  const window=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
-  assert.match((await window.command('watch-connect')).text,/reconnect scheduled/);
-  idGate.release();
-  assert.match((await disconnecting).text,/Motet disconnected/);
-  assert.equal(motet.optedOut,true);
-});
+// A lost first reservation never gives an older command a later place: if Motet issued the ticket, the command
+// recovers that same ticket; if the request never arrived, the command ends with nothing changed.
+for(const how of ['answer lost','dropped']){
+  test(`an older disconnect whose first reservation was ${how} is not placed after another window's later reconnect (F7, F8)`,async()=>{
+    const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const h=await harness({storage,claimed:false,fetch:loseFirstEarly(motet,how)});
+    const idGate=latch(),id=h.$.session.id;let holdId=true;
+    h.$.session.id=async()=>{if(holdId){holdId=false;await idGate.hold();}return id();};
+    const disconnecting=h.command('watch-disconnect');await bounded(idGate.entered,'older disconnect at its identity read');
+    const window=await harness({storage,claimed:false,fetch:(url,body,init)=>motet.fetch(url,body,init)});
+    assert.match((await window.command('watch-connect')).text,/reconnect scheduled/);
+    idGate.release();
+    const reply=(await disconnecting).text;
+    if(how==='answer lost'){
+      // It recovered ticket 1, older than the other window's reconnect (2): Motet refuses it.
+      assert.equal(reply,'A newer Motet command from another Claude window replaced this one; nothing was changed.');
+    }else assert.equal(reply,UNPLACED_TEXT);
+    // Only the other window's reconnect was committed (ticket 2 after a ticket issued but unanswered, else 1).
+    assert.equal(motet.optedOut,false);assert.deepEqual(motet.decisions.map(d=>[d.seq,d.opted_out]),[[how==='answer lost'?2:1,false]]);
+  });
+}
 
 // R12-S1 / F6: an earlier /watch-disconnect whose reservation comes back after a later command's, and that later
 // command then ends without deciding. The opt-out must still take effect.
@@ -3173,7 +3362,7 @@ test('a command that gives up takes its own ticket with it, so an older opt-out 
   assert.equal(motet.optedOut,false);assert.equal(motet.latest,3);
 });
 
-test('a reconnect retries a reservation that failed once, and one that could not reserve is not placed at Motet (R9-N2)',async()=>{
+test('a reconnect retries a reservation that failed once, and one that cannot be placed changes nothing (R9-N2)',async()=>{
   // A single failed reservation is retried, and the reconnect is committed in its place.
   {
     let fail=1;const motet=ticketMotet();
@@ -3183,23 +3372,23 @@ test('a reconnect retries a reservation that failed once, and one that could not
     assert.deepEqual(motet.decisions.map(d=>d.opted_out),[false]);
     await h.tick();assert.equal((await statusOf(h)).connected,true);
   }
-  // With no reservation at all, a reconnect is not committed: an opt-out another window made stands at Motet.
+  // A reconnect that cannot be placed at all ends with nothing changed: an opt-out another window made stands.
   {
     const motet=ticketMotet();motet.fetch(`${'x'}/decision`,{opted_out:true});   // another window's opt-out
-    const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>{
+    const storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const h=await harness({storage,claimed:false,fetch:(url,body,init)=>{
       if(url.endsWith('/decision')&&body.reserve)throw Error('Motet unreachable for reservations');return motet.fetch(url,body,init);}});
-    assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
-    assert.equal(motet.optedOut,true);assert.equal(motet.decisions.length,1);
-    await h.tick();
-    const status=await statusOf(h);assert.equal(status.connected,false);assert.equal(status.error,OTHER_WINDOW_TEXT);
+    assert.equal((await h.command('watch-connect')).text,'Motet could not be reached to place this command, so nothing was changed. Try again.');
+    assert.equal(motet.optedOut,true);assert.equal(motet.decisions.length,1);assert.equal(storage.get(PREF),undefined);
   }
-  // An opt-out without a reservation is still committed: it can only make the chat safer.
+  // An opt-out that cannot be placed still holds here, kept pending until Motet can be told.
   {
-    const motet=ticketMotet();
-    const h=await harness({storage:new Map([[GLOBAL_KEY,CONFIG]]),claimed:false,fetch:(url,body,init)=>{
+    const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+    const h=await harness({storage,claimed:false,fetch:(url,body,init)=>{
       if(url.endsWith('/decision')&&body.reserve)throw Error('Motet unreachable for reservations');return motet.fetch(url,body,init);}});
     assert.match((await h.command('watch-disconnect')).text,/Motet disconnected/);
-    assert.equal(motet.optedOut,true);
+    assert.equal(storage.get(PREF).disconnected,true);assert.equal(storage.get(PREF).pending,true);
+    assert.equal((await statusOf(h)).connected,false);
   }
 });
 

@@ -538,6 +538,8 @@ for (const older of ['watch-connect','watch-setup']) test('official runtime: a d
     const b=JSON.parse(e.init.body);let data;
     const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
     if(e.url.endsWith('/setup')){setups++;entered();await held;data=config;}
+    // An older Motet, with no decision route.
+    else if(e.url.endsWith('/decision'))return{value:{ok:false,status:403,headers:{},text:JSON.stringify({error:'Invalid Claude mod service request.',error_code:'invalid_request'})}};
     else if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
     else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
     else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
@@ -660,7 +662,7 @@ test('official runtime: a revoked shared grant gives way to the current grant an
 // directly. A reserved ticket changes nothing; a commit applies only if no newer one was committed first; every new
 // connection is refused while the chat is opted out.
 function ticketMotet(){
-  const m:any={latest:0,issued:0,optedOut:false,optedOutSeq:0,leases:new Map<string,number>(),seqs:new Map<string,number>(),refused:[] as string[],registrations:0,polls:0};
+  const m:any={latest:0,issued:0,optedOut:false,optedOutSeq:0,leases:new Map<string,number>(),seqs:new Map<string,number>(),reservations:new Map<string,number>(),refused:[] as string[],registrations:0,polls:0};
   const json=(value:any,status=200)=>({value:{ok:status===200,status,headers:{},text:JSON.stringify(value)}});
   const session=(extra:any={})=>({version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,folder_protocol:1,decision_protocol:1,...extra});
   const refuse=(what:string)=>{m.refused.push(what);return json({error:'Disconnected by its owner.',error_code:'decision_superseded'},409);};
@@ -673,7 +675,13 @@ function ticketMotet(){
   m.optOutElsewhere=()=>commit(++m.issued,true);
   m.fetch=(body:any,url:string)=>{
     if(url.endsWith('/decision')){
-      if(body.reserve)return json({version:1,decision_protocol:1,decision_seq:++m.issued,reserved:true});
+      if(body.reserve){
+        if(body.command_id&&m.reservations.has(body.command_id))return json({version:1,decision_protocol:1,decision_seq:m.reservations.get(body.command_id),reserved:true});
+        if(body.recover)return json({error:'Motet holds no reservation for this command.',error_code:'not_reserved'},409);
+        const seq=++m.issued;if(body.command_id)m.reservations.set(body.command_id,seq);
+        return json({version:1,decision_protocol:1,decision_seq:seq,reserved:true});
+      }
+      if(body.query)return json({version:1,decision_protocol:1,decision_seq:m.latest,opted_out:m.optedOut,query:true});
       const seq=body.decision_seq??++m.issued;
       if(!commit(seq,body.opted_out))return refuse('commit');
       return json({version:1,decision_protocol:1,decision_seq:seq,opted_out:body.opted_out});

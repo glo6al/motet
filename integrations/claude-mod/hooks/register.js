@@ -161,9 +161,10 @@ function motetAnswer(response) {
   return JSON.parse(response.text);
 }
 
-// A ticket reservation goes straight to Motet, outside the queue below: it changes no connection state, and its
-// moment of arrival is the command's place in the owner's order, so it must not wait behind a poll, a registration
-// or a receipt. (Two reservations from one copy that arrive out of order are handled by the per-chat yield.)
+// A ticket reservation, or a read of a chat's latest decision, goes to Motet outside the queue below: neither changes
+// connection state, and a reservation's moment of arrival is the command's place in the owner's order, so it must
+// not wait behind a poll, a registration or a receipt. One copy's reservations go out one at a time, in the order
+// the owner gave the commands, on a chain of their own (queueReservation).
 async function reservationPost($, body, credential) {
   return motetAnswer(await $.http.fetch('http://127.0.0.1:' + credential.port + '/claude-mod/decision',
     {method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer ' + credential.token},body:JSON.stringify(body)}));
@@ -781,8 +782,14 @@ async function supervisor($, state) {
       return;
     }
     if (now < state.retryAt) return;
-    // Motet refused this chat because its owner opted it out in another window or copy: wait for /watch-connect.
-    if (!state.connected && state.serverOptedOut.has(id)) return;
+    // Motet refused this chat because its owner opted it out in another window or copy: wait for /watch-connect, or
+    // until Motet shows a newer reconnect from another window.
+    if (!state.connected && state.serverOptedOut.has(id)) {
+      const latest = await motetDecision($,state,id);
+      checkEligibility(state,eligibilityEpoch);
+      if (!latest || latest.optedOut) return;
+      state.serverOptedOut.delete(id);
+    }
     if (!state.connected) {
       if (state.submitting) return;
       if (!state.data) {
@@ -809,7 +816,9 @@ async function supervisor($, state) {
         // The place this attempt is made from, taken before any network call: a refusal is remembered for it only.
         attempt = await refusalKey($,state,id,project,config);
         checkEligibility(state,eligibilityEpoch);
+        const grantKeys = await $.store.keys();
         await connectDerived($,state,id,earlier ?? project,config,eligibilityEpoch);
+        pruneGrants($,config,Array.isArray(grantKeys) ? grantKeys : []).catch(() => {});
         // Another copy's grant worked where the shared one was refused: share it, so the other chats use it too.
         if (configurationId(config) !== configurationId(raw)) await $.store.set(GLOBAL_KEY,config).catch(() => {});
       } else {
@@ -844,6 +853,7 @@ async function supervisor($, state) {
     if (error.code === 'identity_rejected' && attempt !== null) state.rejectedIdentity = attempt;
     if (error.code === 'decision_superseded' && UUID.test(decidedFor ?? '')) {
       state.serverOptedOut.add(decidedFor);
+      state.decisionReads.delete(decidedFor);
       state.error = OTHER_WINDOW;
       return;
     }
@@ -896,11 +906,13 @@ async function decisionCredential($, state, id) {
 
 // Motet's answer to one decision request, or null where Motet cannot order decisions (no credential it accepts,
 // or an older Motet). Throws when Motet cannot be reached, and with decision_superseded when a newer decision won.
-async function decisionRequest($, state, id, body) {
+async function decisionRequest($, state, id, body, port = null) {
   if (state.decisionProtocol === 0) return null;
   for (let tries = 0; tries < 4; tries++) {
     const credential = await decisionCredential($,state,id);
     if (!credential) return null;
+    // A ticket is valid only on the Motet that issued it.
+    if (port !== null && credential.port !== port) throw Error('The ticket was issued by another Motet.');
     let response;
     try {
       response = body.reserve ? await reservationPost($,{native_id:id,...body},credential) :
@@ -925,21 +937,37 @@ async function decisionRequest($, state, id, body) {
   return null;
 }
 
-// A ticket reserved for an owner command that has just started; null where Motet cannot order it, or is unreachable
-// (the command then goes on as with an older Motet, and an opt-out is told to Motet later).
+// Each owner command has a fixed identity: this copy and the command's number here. Motet gives one identity the
+// same ticket however often it is asked, so a lost answer and a retry return the original place, never a newer one.
+const commandId = (state, decision) => state.clientId + ':' + decision;
+
+function queueReservation(state, task) {
+  const operation = state.reservationChain.then(task);
+  state.reservationChain = operation.catch(() => {});
+  return operation;
+}
+
+function refuseCredential($, state, credential) {
+  if (credential.grant) {const refused = configurationId(credential.grant); state.rejectedGrants.add(refused); forgetGrant($,refused).catch(() => {});}
+  else state.rejectedDecisionTokens.add(credential.token);
+}
+
+function reservedTicket(response) {
+  return response?.decision_protocol === 1 && response.reserved === true && Number.isSafeInteger(response.decision_seq) &&
+    response.decision_seq >= 1 ? response.decision_seq : null;
+}
+
 // A command's place in the owner's order, reserved as its very first step, before it reads which chat it is for
-// (that read can be slow). Motet issues tickets from one counter for every chat, so a reservation names no chat;
-// the credential is any this computer holds: this copy's manual pairing or grant, the shared grant, or a stored
-// manual pairing. Across windows and copies the order is the order in which Motet receives the reservations, so
-// commands from two windows given within the same moment are ordered by when Motet receives them. Null when no
-// sign-in is stored at all (then no opt-out can exist at Motet to misorder) or Motet cannot be reached; the
-// command then reserves after reading its chat (reserveTicket), and only that later moment places it.
-async function reserveEarly($, state) {
+// (that read can be slow), on this copy's reservation chain. Motet issues tickets from one counter for every chat, so
+// a reservation names no chat; the credential is any this computer holds: this copy's manual pairing or grant, the
+// shared grant, or a stored manual pairing. The ticket records the Motet (its port) that issued it. Across windows
+// and copies the order is the order in which Motet receives the reservations, so commands from two windows given
+// within the same moment are ordered by when Motet receives them. Answers {seq, port}; {failed, port} when the
+// request was made but no answer came (Motet may hold a ticket for it); null with no sign-in stored at all (then no
+// opt-out can exist at Motet to misorder) or an older Motet.
+async function reserveEarly($, state, decision) {
   if (state.decisionProtocol === 0) return null;
   const tried = new Set();
-  // The credentials this copy can reserve with before it knows its chat, best first: what it holds in memory, then
-  // the shared grant, then any manual pairing stored on this computer. One Motet refuses is set aside and the next
-  // is tried. With none at all, no opt-out can exist at Motet for this computer's chats to be misordered against.
   async function* candidates() {
     const manual = state.data;
     if (manual && manual.mode !== 'derived') yield {port:manual.port,token:manual.token};
@@ -958,83 +986,97 @@ async function reserveEarly($, state) {
       if (typeof credential.token !== 'string' || !Number.isInteger(credential.port) || tried.has(credential.token)) continue;
       tried.add(credential.token);
       if (credential.grant ? state.rejectedGrants.has(configurationId(credential.grant)) : state.rejectedDecisionTokens.has(credential.token)) continue;
-      let response;
-      try {response = await reservationPost($,{reserve:true},credential);}
-      catch (error) {
-        if (error.status === 403 && error.code === 'access_denied') {
-          if (credential.grant) {const refused = configurationId(credential.grant); state.rejectedGrants.add(refused); forgetGrant($,refused).catch(() => {});}
-          else state.rejectedDecisionTokens.add(credential.token);
-          continue;
+      for (let tries = 0; ; tries++) {
+        try {
+          const seq = reservedTicket(await reservationPost($,{reserve:true,command_id:commandId(state,decision)},credential));
+          if (!seq) return null;
+          state.decisionProtocol = 1;
+          return {seq,port:credential.port};
+        } catch (error) {
+          if (error.status === 403 && error.code === 'access_denied') {refuseCredential($,state,credential); break;}
+          if (error.status === 403 && error.code === 'invalid_request' && state.decisionProtocol !== 1) {state.decisionProtocol = 0; return null;}
+          if (tries >= 1) return {failed:true,port:credential.port};
         }
-        if (error.status === 403 && error.code === 'invalid_request' && state.decisionProtocol !== 1) state.decisionProtocol = 0;
-        return null;
       }
-      if (response?.decision_protocol !== 1 || response.reserved !== true || !Number.isSafeInteger(response.decision_seq) ||
-          response.decision_seq < 1) return null;
-      state.decisionProtocol = 1;
-      return response.decision_seq;
     }
-  } catch { /* Reserved after reading its chat instead. */ }
+  } catch { /* No stored sign-in could be read. */ }
   return null;
 }
 
-// Tried a second time at once, so a single lost request does not leave a reconnect without its place.
-async function reserveTicket($, state, id) {
-  for (let tries = 0; tries < 2; tries++) {
-    try {return (await decisionRequest($,state,id,{reserve:true}))?.decision_seq ?? null;}
-    catch { /* Unreachable this time. */ }
+// The command's place on the Motet its decision is committed to, once it knows its chat. An early ticket from that
+// Motet stands. If the early request got no answer, only the ticket Motet already holds for this command is asked
+// for (recover); Motet holding none means the request never arrived, and the command is not given a later place:
+// {unplaced}. If the early ticket came from another Motet, or none was reserved before, the command reserves here,
+// as the same command. {unreachable} when Motet cannot be reached; {ticket:null} where Motet orders nothing (no
+// credential for this chat, or an older Motet).
+async function placeCommand($, state, id, decision, early) {
+  for (let tries = 0; tries < 4; tries++) {
+    if (state.decisionProtocol === 0) return {ticket:null};
+    const credential = await decisionCredential($,state,id);
+    if (!credential) return {ticket:null};
+    if (early?.seq && early.port === credential.port) return {ticket:{seq:early.seq,port:early.port}};
+    const recover = early?.failed && early.port === credential.port;
+    const body = {reserve:true,native_id:id,command_id:commandId(state,decision),...recover ? {recover:true} : {}};
+    let lost = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const seq = reservedTicket(await queueReservation(state,() => reservationPost($,body,credential)));
+        if (!seq) return {ticket:null};
+        state.decisionProtocol = 1;
+        return {ticket:{seq,port:credential.port}};
+      } catch (error) {
+        if (error.code === 'not_reserved') return {ticket:null,unplaced:true};
+        if (error.status === 403 && error.code === 'access_denied') {refuseCredential($,state,credential); lost = false; break;}
+        if (error.status === 403 && error.code === 'invalid_request' && state.decisionProtocol !== 1) {state.decisionProtocol = 0; return {ticket:null};}
+        lost = true;
+      }
+    }
+    if (lost) return {ticket:null,unreachable:true};
   }
-  return null;
+  return {ticket:null};
 }
 
-// A ticket stays with the command that reserved it. If the host answered two commands' first reads out of order, so
-// that a newer command in this copy reserved before an older one and is still running, the older one gives way
-// once its own reservation returns, and the newer command stands as the owner's later one. An older reconnect then
-// changes nothing. An older opt-out is kept with its own ticket, and applies if the newer command ends without
-// deciding (a failed connect, say): it is committed then, under its own ticket, so it can never move above a newer
-// decision from another window. No command waits for another, and no ticket ever moves to another command.
-// All of this is kept per chat: a command still running for a chat that /clear has since replaced does not affect
-// the new chat's commands, nor they its.
-function runningFor(state, id) {
-  if (!state.runningReservations.has(id)) state.runningReservations.set(id, new Set());
-  return state.runningReservations.get(id);
-}
-
+// A ticket stays with the command that reserved it. One copy's reservations go out in the order the owner gave the
+// commands, so their tickets follow that order. Should an older command still end up with a later ticket than a
+// newer one (its first request never reached Motet, say), it gives way to every newer command of this copy that has
+// reserved and is still running for the same chat (or for a chat not yet read), and the newer command stands as the
+// owner's later one. An older reconnect then changes nothing. An older opt-out is kept with its own ticket, and
+// applies if the newer command ends without deciding (a failed connect, say): it is committed then, under its own
+// ticket, so it can never move above a newer decision from another window. No command waits for another, and no
+// ticket ever moves to another command. A command running for a chat that /clear has since replaced does not hold
+// back the new chat's commands once its chat is known.
 function reservedInOrder(state, decision, ticket, id) {
-  for (const running of runningFor(state,id)) if (running > decision) return false;
-  if (ticket) runningFor(state,id).add(decision);
+  for (const [running, chat] of state.runningReservations) if (running > decision && (chat === null || chat === id)) return false;
+  if (ticket) state.runningReservations.set(decision, id);
   return true;
 }
 
 // Called as each owner command ends: an opt-out that gave way to it (or to a newer command that has since ended)
 // applies now unless a newer decision did.
 function settleYieldedOptOut($, state, id, decision) {
-  if (!UUID.test(id ?? '')) return;
-  const running = runningFor(state,id);
-  running.delete(decision);
-  if (!running.size) state.runningReservations.delete(id);
-  const yielded = state.yieldedOptOuts.get(id);
-  if (!yielded || yielded.decision > decision) return;
-  for (const other of running) if (other > yielded.decision) return;   // that one settles it
-  state.yieldedOptOuts.delete(id);
-  if (overtaken(state,yielded.decision,id)) return;
-  savePreference($,state,id,true,yielded.decision,yielded.ticket).then(saved => {
-    if (saved !== true || overtaken(state,yielded.decision,id)) return;
-    const data = state.data;
-    suspend($,state);
-    if (data && data.mode !== 'derived') save($,state,()=>{data.active = false;}).catch(() => {});
-  }).catch(() => {});
+  state.runningReservations.delete(decision);
+  for (const [chat, yielded] of [...state.yieldedOptOuts]) {
+    let blocked = false;
+    for (const [running, of] of state.runningReservations) if (running > yielded.decision && (of === null || of === chat)) blocked = true;
+    if (blocked) continue;
+    state.yieldedOptOuts.delete(chat);
+    if (overtaken(state,yielded.decision,chat)) continue;
+    savePreference($,state,chat,true,yielded.decision,yielded.ticket).then(saved => {
+      if (saved !== true || overtaken(state,yielded.decision,chat)) return;
+      const data = state.data;
+      suspend($,state);
+      if (data && data.mode !== 'derived') save($,state,()=>{data.active = false;}).catch(() => {});
+    }).catch(() => {});
+  }
 }
 
-// Commits this decision at Motet: under its reserved ticket, or, for an opt-out only, under a new one when it has
-// none. A reconnect that could not reserve its place is not committed: placing it now could put it after an opt-out
-// the owner gave later. Motet then decides by the chat's current decision (a chat it holds opted out stays so, and
-// the owner runs /watch-connect again). Answers the ticket, null where Motet does not order this decision, or
-// 'superseded' when a decision with a newer ticket was committed.
+// Commits this decision at Motet under the ticket its command reserved, on the Motet that issued it. A decision with
+// no ticket is not committed: Motet then decides by the chat's current decision. Answers the ticket number, null
+// where Motet does not order this decision, or 'superseded' when a decision with a newer ticket was committed.
 async function commitDecision($, state, id, optedOut, ticket) {
-  if (!ticket && !optedOut) return null;
+  if (!ticket) return null;
   try {
-    const response = await decisionRequest($,state,id,{opted_out:optedOut,...ticket ? {decision_seq:ticket} : {}});
+    const response = await decisionRequest($,state,id,{opted_out:optedOut,decision_seq:ticket.seq},ticket.port);
     return response ? response.decision_seq : null;
   } catch (error) {
     if (error.code === 'decision_superseded') return 'superseded';
@@ -1043,24 +1085,33 @@ async function commitDecision($, state, id, optedOut, ticket) {
 }
 
 // Preference writes run one at a time, and a write is skipped when a newer decision was already written, so a slow
-// write cannot land after a newer one; each commits its decision at Motet first. Each record names the copy of the
-// plugin that wrote it and carries its ticket. An opt-out Motet could not be told is kept as pending, with its
-// reserved ticket, and told on a later contact. The answer is true while this decision stands once the writes
-// queued behind it have run, false when a newer one in this copy replaced it, and 'elsewhere' when Motet holds a
-// newer decision from another window or copy.
-async function savePreference($, state, id, disconnected, decision, reserved = null) {
+// write cannot land after a newer one; each commits its decision at Motet first (unless Motet committed it already,
+// as a pairing does). Each record names the copy of the plugin that wrote it and carries its ticket and the Motet
+// that issued it. An opt-out Motet could not be told is kept as pending, with its ticket or its command's identity,
+// and told on a later contact. The answer is true while this decision stands once the writes queued behind it have
+// run, false when a newer one in this copy replaced it, and 'elsewhere' when Motet holds a newer decision from
+// another window or copy.
+async function savePreference($, state, id, disconnected, decision, ticket = null, {offline = false, committed = false} = {}) {
   const operation = state.preferenceWrites.then(async () => {
     if (overtaken(state,decision,id)) return false;
-    let ticket = null, pending = false;
-    try {
-      ticket = await commitDecision($,state,id,disconnected,reserved);
-      if (ticket === 'superseded') return 'elsewhere';
-    } catch {pending = disconnected; ticket = disconnected ? reserved : null;}
+    let seq = null, pending = false;
+    if (committed) seq = ticket?.seq ?? null;
+    else if (offline) pending = disconnected;
+    else {
+      try {
+        const result = await commitDecision($,state,id,disconnected,ticket);
+        if (result === 'superseded') return 'elsewhere';
+        seq = result;
+      } catch {pending = disconnected;}
+    }
     await $.store.set(preferenceKey(id),{version:1,disconnected,writer:state.clientId,
-      ...ticket ? {decision_seq:ticket} : {},...pending ? {pending:true} : {}});
+      ...seq ? {decision_seq:seq,decision_port:ticket.port} : {},
+      ...pending ? {pending:true,command_id:commandId(state,decision),...ticket ? {decision_seq:ticket.seq,decision_port:ticket.port} : {}} : {}});
     state.appliedDecisions.set(id, Math.max(state.appliedDecisions.get(id) ?? 0, decision));
     state.ownDecisions.set(id, disconnected);
-    if (ticket) state.tickets.set(id, ticket); else state.tickets.delete(id);
+    const kept = seq ?? (pending && ticket ? ticket.seq : null);
+    if (kept) state.tickets.set(id, kept); else state.tickets.delete(id);
+    if (pending) state.ownCommands.set(id, commandId(state,decision)); else state.ownCommands.delete(id);
     if (!disconnected) state.serverOptedOut.delete(id);
     return true;
   });
@@ -1085,6 +1136,16 @@ async function currentGrant($, state, raw) {
   return shared;
 }
 
+// Motet holds one active grant, so once it accepts one, every other copy's stored grant is revoked: those stored
+// before this registration are removed, so the per-copy keys do not pile up across reloads. One written meanwhile,
+// by a setup that may be newer, is kept.
+async function pruneGrants($, accepted, keysBefore) {
+  for (const key of keysBefore.filter(key => typeof key === 'string' && key.startsWith(grantPrefix)).slice(0, 4096)) {
+    const value = await $.store.get(key);
+    if (globalConfiguration(value) && value.grant_id !== accepted.grant_id) await $.store.delete(key);
+  }
+}
+
 // A grant Motet refused stays revoked: its copies are dropped, so they are not tried again.
 async function forgetGrant($, id) {
   const keys = await $.store.keys();
@@ -1102,13 +1163,14 @@ async function forgetGrant($, id) {
 // over this copy's reconnect stands, since it may be a newer decision made in another window. Both fail closed.
 async function currentPreference($, state, id) {
   const stored = await $.store.get(preferenceKey(id));
-  if (!state.ownDecisions.has(id)) return stored;
+  if (!state.ownDecisions.has(id)) return reconcilePreference($,state,id,stored);
   const own = state.ownDecisions.get(id), ticket = state.tickets.get(id);
   let wins;
   if (ticket && Number.isSafeInteger(stored?.decision_seq)) wins = ticket > stored.decision_seq;
   else wins = own === true && stored?.disconnected !== true;
   if (!wins) return stored;
-  const record = {version:1,disconnected:own,writer:state.clientId,...ticket ? {decision_seq:ticket} : own ? {pending:true} : {}};
+  const record = {version:1,disconnected:own,writer:state.clientId,...ticket ? {decision_seq:ticket} : {},
+    ...own && (!ticket || state.ownCommands.has(id)) ? {pending:true,...state.ownCommands.has(id) ? {command_id:state.ownCommands.get(id)} : {}} : {}};
   const operation = state.preferenceWrites.then(() =>
     state.ownDecisions.get(id) === own && state.tickets.get(id) === ticket ? $.store.set(preferenceKey(id),record) : undefined);
   state.preferenceWrites = operation.catch(() => {});
@@ -1116,8 +1178,28 @@ async function currentPreference($, state, id) {
   return record;
 }
 
+// A copy with no decision of its own for this chat does not trust a stored opt-out blindly: an older copy's late write
+// may have put it over a newer reconnect. It checks the opt-out's ticket against the latest decision Motet holds
+// for the chat, and follows Motet's when that is newer. A pending opt-out (not yet told to Motet) and one without
+// a ticket (an older Motet's) stand, failing closed; a stored reconnect is never trusted over a newer opt-out
+// either, since Motet refuses the connection.
+async function reconcilePreference($, state, id, stored) {
+  if (stored?.disconnected !== true || stored.pending === true || !Number.isSafeInteger(stored.decision_seq)) return stored;
+  const latest = await motetDecision($,state,id);
+  if (!latest || latest.seq <= stored.decision_seq || latest.optedOut) return stored;
+  const record = {version:1,disconnected:false,writer:'motet',decision_seq:latest.seq,decision_port:latest.port};
+  const operation = state.preferenceWrites.then(async () => {
+    const current = await $.store.get(preferenceKey(id));
+    if (current?.decision_seq === stored.decision_seq && current?.disconnected === true) await $.store.set(preferenceKey(id),record);
+  });
+  state.preferenceWrites = operation.catch(() => {});
+  try {await operation;} catch { /* Followed here; written again later. */ }
+  return record;
+}
+
 // An opt-out Motet has not been told yet (it was made while Motet could not be reached) is told on the next
-// contact, at most every 30 seconds.
+// contact, at most every 30 seconds, under its own ticket if Motet issued one on that same Motet, else under its
+// command's identity (Motet returns the original ticket if the first request did arrive).
 async function deliverPendingOptOut($, state, id) {
   const now = await $.clock.now();
   if (now < state.pendingRetryAt) return;
@@ -1127,17 +1209,54 @@ async function deliverPendingOptOut($, state, id) {
   const operation = state.preferenceWrites.then(async () => {
     const current = await $.store.get(preferenceKey(id));
     if (current?.disconnected !== true || current.pending !== true) return;
-    const reserved = Number.isSafeInteger(current.decision_seq) ? current.decision_seq : null;
-    const ticket = await commitDecision($,state,id,true,reserved);
+    let ticket = null;
+    for (let tries = 0; tries < 4 && !ticket; tries++) {
+      const credential = await decisionCredential($,state,id);
+      if (!credential) return;
+      if (Number.isSafeInteger(current.decision_seq) && current.decision_port === credential.port) {ticket = {seq:current.decision_seq,port:credential.port}; break;}
+      const command = typeof current.command_id === 'string' ? current.command_id : state.clientId + ':' + (1e12 + ++state.pendingCommands);
+      try {
+        const seq = reservedTicket(await queueReservation(state,() => reservationPost($,{reserve:true,native_id:id,command_id:command},credential)));
+        if (!seq) return;
+        ticket = {seq,port:credential.port};
+      } catch (error) {
+        if (error.status === 403 && error.code === 'access_denied') {refuseCredential($,state,credential); continue;}
+        throw error;
+      }
+    }
+    if (!ticket) return;
+    const committed = await commitDecision($,state,id,true,ticket);
     // A decision with a newer ticket won at Motet: this opt-out is no longer the owner's latest, there.
-    if (ticket === 'superseded') await $.store.set(preferenceKey(id),{...current,pending:undefined});
-    else if (ticket) await $.store.set(preferenceKey(id),{...current,pending:undefined,decision_seq:ticket});
+    if (committed === 'superseded') await $.store.set(preferenceKey(id),{...current,pending:undefined,command_id:undefined});
+    else if (committed) await $.store.set(preferenceKey(id),{...current,pending:undefined,command_id:undefined,decision_seq:committed,decision_port:ticket.port});
   });
   state.preferenceWrites = operation.catch(() => {});
   try {await operation; state.pendingRetryAt = 0;} catch { /* Told on a later contact. */ }
 }
 
+// The latest decision Motet holds for this chat (decision protocol 1), read at most every 30 seconds; null when it
+// cannot be read.
+async function motetDecision($, state, id) {
+  if (state.decisionProtocol === 0) return null;
+  const now = await $.clock.now(), last = state.decisionReads.get(id);
+  if (last && now - last.at < 30000) return last.value;
+  let value = null;
+  try {
+    const credential = await decisionCredential($,state,id);
+    if (credential) {
+      const response = await reservationPost($,{native_id:id,query:true},credential);
+      if (response?.decision_protocol === 1 && response.query === true && Number.isSafeInteger(response.decision_seq) &&
+          typeof response.opted_out === 'boolean') value = {seq:response.decision_seq,optedOut:response.opted_out,port:credential.port};
+    }
+  } catch { /* Read again later. */ }
+  state.decisionReads.set(id,{at:now,value});
+  return value;
+}
+
 const YIELDED_OPT_OUT = 'A newer Motet command is still running; this disconnect applies if that one does not complete.';
+const UNPLACED = 'Motet could not confirm when this command was given, so nothing was changed. Run it again.';
+const UNREACHABLE = 'Motet could not be reached to place this command, so nothing was changed. Try again.';
+const PAIRING_REFUSED = 'Motet did not accept this pairing code, so nothing was changed. Get a fresh code from Motet.';
 const NEWER_ELSEWHERE = 'A newer Motet command from another Claude window replaced this one; nothing was changed.';
 const OTHER_WINDOW = 'This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.';
 
@@ -1184,29 +1303,38 @@ async function ownerActivate($, state, response, id, decision, eligibilityEpoch)
 
 async function explicitDisconnect($, state) {
   const decision = reserveDecision(state);
-  let id = null;
+  let id = null, result = false;
+  // Kept, so a disconnect that ends up changing nothing does not cost a Desktop chat its evidence.
+  const binding = state.desktopBinding;
   state.disconnecting += 1;
   invalidateEligibility(state);
   try {
-    // Its place in the owner's order at Motet, taken before anything else this command waits on.
-    const early = await reserveEarly($,state);
+    // Its place in the owner's order at Motet, the command's first step, on this copy's reservation chain.
+    const early = await queueReservation(state,() => reserveEarly($,state,decision));
+    if (early?.seq) state.runningReservations.set(decision, null);
     id = await $.session.id();
-    if (overtaken(state,decision,id)) return false;
-    const ticket = early ?? (UUID.test(id) ? await reserveTicket($,state,id) : null);
-    if (overtaken(state,decision,id)) return false;
+    if (overtaken(state,decision,id)) return result = false;
+    const placement = UUID.test(id) ? await placeCommand($,state,id,decision,early) : {ticket:null};
+    if (placement.unplaced) return result = 'unplaced';
+    const ticket = placement.ticket;
+    if (overtaken(state,decision,id)) return result = false;
     if (!reservedInOrder(state,decision,ticket,id)) {
       const earlier = state.yieldedOptOuts.get(id);
       if (!earlier || earlier.decision < decision) state.yieldedOptOuts.set(id,{decision,ticket});
-      return 'yielded';
+      return result = 'yielded';
     }
-    const saved = UUID.test(id) ? await savePreference($,state,id,true,decision,ticket) : true;
-    if (saved !== true) return saved;
-    if (overtaken(state,decision,id)) return false;
+    const saved = UUID.test(id) ? await savePreference($,state,id,true,decision,ticket,{offline:placement.unreachable === true}) : true;
+    if (saved !== true) return result = saved;
+    if (overtaken(state,decision,id)) return result = false;
     const data = state.data;
     suspend($,state);
     if (data && data.mode !== 'derived') await save($,state,()=>{data.active = false;});
-    return true;
-  } finally {state.disconnecting -= 1; settleYieldedOptOut($,state,id,decision);}
+    return result = true;
+  } finally {
+    state.disconnecting -= 1;
+    if (result !== true && binding && !state.desktopBinding && (!id || binding.native_id === id)) state.desktopBinding = binding;
+    settleYieldedOptOut($,state,id,decision);
+  }
 }
 
 async function retryHeldReceipts($, state, id) {
@@ -1332,7 +1460,7 @@ export function register(on) {
     timer:null,peerProtocol:0,lifecycleProtocol:0,folderProtocol:0,receiptOnly:false,receiptKey:null,abandonedReceipts:new Set(),bound:new Map(),noticeProtocol:0,noticeData:null,noticeKey:null,noticeFlushing:false,writes:Promise.resolve(),network:Promise.resolve(),networkBusy:false,flushing:false,supervising:false,
     submitting:false,flight:null,envelope:null,error:'',connecting:false,interactive:false,failures:0,retryAt:0,recoverAt:0,
     observedCompletions:new Map(),recoverableTurns:[],shardKeys:new Map(),transientReceiptRetries:new WeakMap(),recovering:false,
-    rejectedGrants:new Set(),rejectedDecisionTokens:new Set(),runningReservations:new Map(),yieldedOptOuts:new Map(),rejectedIdentity:'',decision:0,appliedDecisions:new Map(),ownDecisions:new Map(),decisionProtocol:undefined,tickets:new Map(),serverOptedOut:new Set(),pendingRetryAt:0,preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
+    rejectedGrants:new Set(),rejectedDecisionTokens:new Set(),runningReservations:new Map(),yieldedOptOuts:new Map(),rejectedIdentity:'',decision:0,appliedDecisions:new Map(),ownDecisions:new Map(),decisionProtocol:undefined,tickets:new Map(),serverOptedOut:new Set(),pendingRetryAt:0,reservationChain:Promise.resolve(),pendingCommands:0,decisionReads:new Map(),ownCommands:new Map(),preferenceWrites:Promise.resolve(),lifecycle:0,transitionLifecycle:null,resumedLifecycle:null,ended:false,resuming:false,resumed:false,startSeen:false,startupInteractive:null,startupSurface:null,timerTicks:0,currentSurfaces:null};
   on('session.start',async($,e,next)=>{
     invalidateEligibility(state);
     state.lifecycle += 1;
@@ -1379,7 +1507,7 @@ export function register(on) {
       try {
         const done = await explicitDisconnect($,state);
         return {text:done === true ? 'Motet disconnected. ' + LIMITATION : done === 'elsewhere' ? NEWER_ELSEWHERE :
-          done === 'yielded' ? YIELDED_OPT_OUT : SUPERSEDED};
+          done === 'yielded' ? YIELDED_OPT_OUT : done === 'unplaced' ? UNPLACED : SUPERSEDED};
       }
       catch {return {text:'Motet disconnect could not be saved; readiness expires when its heartbeat stops.'};}
     }
@@ -1393,11 +1521,16 @@ export function register(on) {
     try {
       // Its place in the owner's order at Motet, taken before anything else this command waits on (its chat, the
       // folder, Motet's setup answer, the pairing). If the command then fails, Motet has only the reserved ticket.
-      const early = await reserveEarly($,state);
+      const early = await queueReservation(state,() => reserveEarly($,state,decision));
+      if (early?.seq) state.runningReservations.set(decision, null);
       id = await $.session.id();
       if (overtaken(state,decision,id)) return {text:SUPERSEDED};
       if (!UUID.test(id)) throw Error('Native identity unavailable.');
-      const ticket = early ?? await reserveTicket($,state,id);
+      const placement = await placeCommand($,state,id,decision,early);
+      // A command whose place Motet cannot confirm ends here, with nothing changed: it is never given a later one.
+      if (placement.unplaced) return {text:UNPLACED};
+      if (placement.unreachable) return {text:UNREACHABLE};
+      const ticket = placement.ticket;
       if (overtaken(state,decision,id) || !reservedInOrder(state,decision,ticket,id)) return {text:SUPERSEDED};
       const project = await sessionProject($);
       if (project === null) return {text:'This chat is working outside its project folder. Return to the project folder and try again.'};
@@ -1424,34 +1557,44 @@ export function register(on) {
         state.retryAt = 0; state.failures = 0;
         return {text:'Motet automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
       }
+      if (pair) {
+        // A pairing is checked by Motet before anything changes: the code is sent first, and Motet commits the
+        // reconnect (under this command's ticket) only once it accepts the code. A refused code leaves the chat's
+        // decision, here and at Motet, exactly as it was. A superseded command sends nothing.
+        if (overtaken(state,decision,id)) return {text:SUPERSEDED};
+        if (state.eligibilityEpoch !== eligibilityEpoch) return {text:CONNECT_FAILED};
+        let response;
+        try {
+          response = await post($,state,'enroll',{code:pair.code,native_id:id,project,
+            ...state.decisionProtocol === 1 && ticket && ticket.port === pair.port ? {decision_seq:ticket.seq} : {}},{port:pair.port,anonymous:true});
+        } catch (error) {
+          if (error.code === 'decision_superseded') return {text:OTHER_WINDOW};
+          if (error.status === 403) return {text:PAIRING_REFUSED};
+          throw error;
+        }
+        if (typeof response.token !== 'string' || response.token.length < 16 || !UUID.test(response.enrollment_id)) throw Error('Invalid enrollment.');
+        const enrolled = {native_id:id,project,port:pair.port,requests:{},active:false,token:response.token,enrollment_id:response.enrollment_id};
+        const saved = await savePreference($,state,id,false,decision,ticket && ticket.port === pair.port ? ticket : null,{committed:true});
+        if (saved !== true) {
+          // A newer command replaced this one while Motet paired it: end the connection Motet just made.
+          post($,state,'disconnect',{generation:response.generation,native_id:id},{port:pair.port,token:response.token}).catch(() => {});
+          return {text:ENDED_SUPERSEDED};
+        }
+        state.rejectedIdentity = ''; state.retryAt = 0; state.failures = 0;
+        changed = true;
+        stop(state);
+        state.key = legacyKey(id); state.data = enrolled;
+        state.flight = null; state.envelope = null; state.bound.clear();
+        const refusal = await ownerActivate($,state,response,id,decision,eligibilityEpoch);
+        if (refusal) return refusal;
+        return {text:'Motet connected to this existing chat. ' + LIMITATION};
+      }
       const saved = await savePreference($,state,id,false,decision,ticket);
       if (saved === 'elsewhere') return {text:OTHER_WINDOW};
       if (!saved) return {text:SUPERSEDED};
       state.rejectedIdentity = ''; state.retryAt = 0; state.failures = 0;
       changed = true;
       stop(state);
-      if (pair) {
-        // Checked before the one-use code is sent: a superseded command sends nothing.
-        const before = await decisionStands($,state,id,decision,eligibilityEpoch);
-        if (before) return before;
-        state.key = legacyKey(id);
-        state.data = {native_id:id,project,port:pair.port,requests:{},active:false};
-        let response;
-        try {
-          response = await post($,state,'enroll',{code:pair.code,native_id:id,project,
-            ...state.decisionProtocol === 1 && state.tickets.has(id) ? {decision_seq:state.tickets.get(id)} : {}},{anonymous:true});
-        } catch (error) {
-          // Motet refused it before anything changed: the chat was opted out after this pairing code was made.
-          if (error.code === 'decision_superseded') {stop(state); state.data = null; state.key = null; return {text:OTHER_WINDOW};}
-          throw error;
-        }
-        if (typeof response.token !== 'string' || response.token.length < 16 || !UUID.test(response.enrollment_id)) throw Error('Invalid enrollment.');
-        state.data.token = response.token; state.data.enrollment_id = response.enrollment_id;
-        state.flight = null; state.envelope = null; state.bound.clear();
-        const refusal = await ownerActivate($,state,response,id,decision,eligibilityEpoch);
-        if (refusal) return refusal;
-        return {text:'Motet connected to this existing chat. ' + LIMITATION};
-      }
       if (state.data?.mode !== 'derived') {
         const stored = await $.store.get(legacyKey(id));
         // An owner-requested reconnect of this chat's manual pairing, including one an earlier plugin made from a

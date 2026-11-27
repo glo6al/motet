@@ -1342,20 +1342,76 @@ class ClaudeModTests(unittest.TestCase):
         self.assertEqual(self.poll()[0], 409)
         self.assertIn('decision_seq', {r[1] for r in self.store.db.execute('PRAGMA table_info(claude_mod_pairs)')})
 
-    def test_a_decision_ledger_from_before_two_phase_tickets_gains_its_reserved_column(self):
+    def test_a_decision_ledger_from_before_two_phase_tickets_upgrades_and_the_next_ticket_follows_it(self):
         self.enroll(); self.assertEqual(self.decide(True)[0], 200)
         self.store.close()
+        # The database as it stood before two-phase tickets: a ledger without issued_seq, no shared counter, no
+        # repeatable reservations, and pairing codes without tickets.
         db = sqlite3.connect(self.base/'state'/'officer-messages.sqlite3')
         rows = list(db.execute('SELECT agent,latest_seq,opted_out,opted_out_seq FROM claude_mod_decisions'))
-        db.execute('DROP TABLE claude_mod_decisions')
+        for table in ('claude_mod_decisions', 'claude_mod_decision_counter', 'claude_mod_reservations'):
+            db.execute('DROP TABLE ' + table)
         db.execute('CREATE TABLE claude_mod_decisions (agent TEXT PRIMARY KEY, latest_seq INTEGER NOT NULL, opted_out INTEGER NOT NULL, opted_out_seq INTEGER NOT NULL)')
         db.executemany('INSERT INTO claude_mod_decisions VALUES (?,?,?,?)', rows)
+        db.execute('UPDATE claude_mod_pairs SET decision_seq=0')
         db.commit(); db.close()
         self.store = messaging.MessagingStore(str(self.base/'state'), str(self.base/'sessions'))
         self.store.codex_available = False; server.MESSAGING = self.store
         self.assertEqual(self.store.db.execute('SELECT opted_out,issued_seq FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone(), (1, 0))
         # The next reserved ticket follows the last committed one.
         self.assertEqual(self.reserve(), rows[0][1] + 1)
+
+    def test_a_reservation_is_repeatable_for_one_command(self):
+        _, grant = self.global_setup(); token = grant['grant']
+        command = uid() + ':7'
+        ask = lambda body: self.http('/claude-mod/decision', body, token=token)
+        status, first = ask(dict(reserve=True, command_id=command))
+        self.assertEqual(status, 200, first)
+        # A lost answer and a retry: the same command gets the same ticket, never a newer one.
+        status, again = ask(dict(reserve=True, command_id=command, native_id=self.sid))
+        self.assertEqual((status, again['decision_seq']), (200, first['decision_seq']))
+        status, other = ask(dict(reserve=True, command_id=uid() + ':7'))
+        self.assertEqual(other['decision_seq'], first['decision_seq'] + 1)
+        # Recover asks only for the ticket the command already holds.
+        status, recovered = ask(dict(reserve=True, command_id=command, recover=True))
+        self.assertEqual((status, recovered['decision_seq']), (200, first['decision_seq']))
+        status, missing = ask(dict(reserve=True, command_id=uid() + ':1', recover=True))
+        self.assertEqual((status, missing['error_code']), (409, 'not_reserved'))
+        self.assertEqual(self._issued_now(), other['decision_seq'])          # recovery issued nothing
+        for bad in ('not-a-command', uid(), uid() + ':x'):
+            self.assertEqual(ask(dict(reserve=True, command_id=bad))[0], 400)
+        self.assertEqual(ask(dict(reserve=True, recover=True))[0], 400)
+        # Reservations are kept for a day, then forgotten.
+        self.store.db.execute('UPDATE claude_mod_reservations SET created=0 WHERE command_id=?', (command,)); self.store.db.commit()
+        self.assertEqual(ask(dict(reserve=True, command_id=uid() + ':2'))[0], 200)
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM claude_mod_reservations WHERE command_id=?', (command,)).fetchone())
+
+    def test_a_chat_s_latest_decision_can_be_read(self):
+        _, grant = self.global_setup(); token = grant['grant']
+        status, value = self.http('/claude-mod/decision', dict(native_id=self.sid, query=True), token=token)
+        self.assertEqual((status, value['decision_seq'], value['opted_out'], value['query']), (200, 0, False, True))
+        self.assertEqual(self.decide(True, token=token)[0], 200)
+        status, value = self.http('/claude-mod/decision', dict(native_id=self.sid, query=True), token=token)
+        self.assertEqual((value['opted_out'], value['decision_seq']), (True, self._issued_now()))
+        self.assertEqual(self.http('/claude-mod/decision', dict(native_id=self.sid, query=True), token='0'*64)[1]['error_code'], 'access_denied')
+
+    def test_a_refused_pairing_code_leaves_the_chat_s_decision_as_it_was(self):
+        _, grant = self.global_setup(); token = grant['grant']
+        self.assertEqual(self.decide(True, token=token)[0], 200)
+        before = self.store.db.execute('SELECT latest_seq,opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone()
+        ticket = self.reserve(token)
+        status, refused = self.http('/claude-mod/enroll', {'code': 'fictional_wrong_code_123456', 'native_id': self.sid,
+                                                           'project': self.project, 'decision_seq': ticket})
+        self.assertEqual(status, 403, refused)
+        self.assertEqual(self.store.db.execute('SELECT latest_seq,opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone(), before)
+        # A code Motet accepts commits the reconnect under the command's ticket.
+        status, pair = self.http('/claude-mod-pair', {'agent': self.aid}, owner=True)
+        status, paired = self.http('/claude-mod/enroll', {'code': pair['pair_code'], 'native_id': self.sid,
+                                                          'project': self.project, 'decision_seq': ticket})
+        self.assertEqual(status, 200, paired)
+        latest, opted_out = self.store.db.execute('SELECT latest_seq,opted_out FROM claude_mod_decisions WHERE agent=?', (self.aid,)).fetchone()
+        self.assertEqual(opted_out, 0)
+        self.assertGreaterEqual(latest, ticket)
 
     def test_additive_legacy_database_migration_preserves_manual_token_and_requests(self):
         _,enrollment=self.enroll();payload,_=self.request()
