@@ -1160,8 +1160,11 @@ async function savePreference($, state, id, disconnected, decision, ticket = nul
     await $.store.set(preferenceKey(id),{version:1,disconnected,writer:state.clientId,
       ...seq ? {decision_seq:seq,decision_port:ticket.port} : {},
       ...pending ? {pending:true,command_id:commandId(state,decision),...ticket ? {decision_seq:ticket.seq,decision_port:ticket.port} : {}} : {}});
-    // This copy's own older pending opt-outs for the chat give way to this newer decision of the owner's.
-    for (const [key, older] of own) if (older < decision) {try {await $.store.delete(key); own.delete(key);} catch { /* Removed on its next decision. */ }}
+    // This copy's own older pending opt-outs for the chat give way to a newer opt-out, or to a reconnect only once
+    // Motet has committed it (a pairing is committed by Motet itself; an older Motet orders nothing). One Motet has
+    // not committed leaves the older opt-out pending, to be placed as usual, and the chat stays disconnected.
+    if (!disconnected && !seq && !committed && state.decisionProtocol !== 0) {if ([...own.values()].some(older => older < decision)) outcome.heldOff = true;}
+    else for (const [key, older] of own) if (older < decision) {try {await $.store.delete(key); own.delete(key);} catch { /* Removed on its next decision. */ }}
     state.appliedDecisions.set(id, Math.max(state.appliedDecisions.get(id) ?? 0, decision));
     state.ownDecisions.set(id, disconnected);
     if (seq) recordCommitted(state,id,seq,ticket.port);
@@ -1321,7 +1324,9 @@ const AFTER_PENDING = 1e12;
 async function placeAfterPending($, state, id, decision, ticket) {
   const foreign = key => !state.pendingOptOuts.get(id)?.has(key);
   const before = (await pendingOptOuts($,id)).filter(({key}) => foreign(key)).map(({key}) => key);
-  if (!before.length) return {ticket};
+  // A reconnect that has no place yet (it began before this computer had a sign-in Motet accepts, a setup say) takes
+  // one now, under its second identity, so it is committed at Motet once a sign-in exists.
+  if (!before.length) return ticket ? {ticket} : placeCommand($,state,id,AFTER_PENDING + decision,null);
   state.pendingRetryAt = 0;
   const placed = await deliverPendingOptOut($,state,id,{skipOwn:true});
   const left = new Set((await pendingOptOuts($,id)).map(({key}) => key));
@@ -1401,6 +1406,7 @@ const UNREACHABLE = 'Motet could not be reached to place this command, so nothin
 const PENDING_UNDELIVERED = 'An earlier /watch-disconnect from another window could not be told to Motet yet, so this chat stays disconnected and this command changed nothing. Try again once Motet can be reached.';
 const SETUP_KEPT_OFF = 'Motet automatic connections authorized. This chat stays disconnected: an earlier /watch-disconnect from another window could not be told to Motet yet, or this chat could not be placed after it. Run /watch-connect here once Motet can be reached. ';
 const PAIRING_KEPT_OFF = 'Motet accepted the pairing, but this chat stays disconnected: an earlier /watch-disconnect from another window could not be told to Motet yet, or this chat could not be placed after it. Run /watch-connect here once Motet can be reached.';
+const HELD_OFF = 'This chat stays disconnected: an earlier /watch-disconnect here has not been told to Motet yet, and Motet did not record this reconnect. Run /watch-connect again once Motet can be reached.';
 const UNCONFIRMED = 'Motet stopped answering before it confirmed this reconnect. It takes effect only if Motet received it: check /watch-status, or run /watch-connect again.';
 const PAIRING_REFUSED = 'Motet did not accept this pairing code, so nothing was changed. Get a fresh code from Motet.';
 const NEWER_ELSEWHERE = 'A newer Motet command from another Claude window replaced this one; nothing was changed.';
@@ -1717,6 +1723,7 @@ export function register(on) {
         state.data = null; state.key = null; state.config = config; state.receiptOnly = false;
         state.flight = null; state.envelope = null; state.bound.clear();
         state.retryAt = 0; state.failures = 0;
+        if (outcome.heldOff) return {text:'Motet automatic connections authorized. ' + HELD_OFF + ' ' + LIMITATION};
         if (outcome.unconfirmed) return {text:'Motet automatic connections authorized. Motet stopped answering before it confirmed this chat\'s reconnect: check /watch-status, or run /watch-connect here again. ' + LIMITATION};
         return {text:'Motet automatic connections authorized. Loaded eligible chats will connect automatically. ' + LIMITATION};
       }
@@ -1755,7 +1762,7 @@ export function register(on) {
           state.key = legacyKey(id); state.data = {...enrolled,active:true};
           await $.store.set(legacyKey(id),state.data);
           state.flight = null; state.envelope = null; state.bound.clear();
-          return {text:outcome.unconfirmed ? UNCONFIRMED : 'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
+          return {text:outcome.heldOff ? HELD_OFF : outcome.unconfirmed ? UNCONFIRMED : 'Motet reconnect scheduled for this existing chat. ' + LIMITATION};
         }
         const saved = await savePreference($,state,id,false,decision,ticket && ticket.port === pair.port ? ticket : null,{committed:true});
         if (saved !== true) {
@@ -1781,6 +1788,7 @@ export function register(on) {
       const saved = await savePreference($,state,id,false,decision,after.ticket,{outcome});
       if (saved === 'elsewhere') return {text:OTHER_WINDOW};
       if (!saved) return {text:SUPERSEDED};
+      if (outcome.heldOff) return {text:HELD_OFF};
       state.rejectedIdentity = ''; state.retryAt = 0; state.failures = 0;
       changed = true;
       stop(state);
@@ -1804,8 +1812,9 @@ export function register(on) {
             response = await post($,state,'connect',{native_id:id,project:state.data.project,...state.receiptOnly?{receipt_only:true}:{},
               ...state.decisionProtocol === 1 && state.tickets.has(id) ? {decision_seq:state.tickets.get(id)} : {}});
           } catch (error) {
-            // Motet refused it before any connection existed: a newer opt-out came from another window or copy.
-            if (error.code === 'decision_superseded') {stop(state); recordSuperseded(state,id); return {text:OTHER_WINDOW};}
+            // Motet refused it before any connection existed: a newer opt-out came from another window or copy, or
+            // (when this command's own commit got no answer) Motet never recorded this reconnect.
+            if (error.code === 'decision_superseded') {stop(state); recordSuperseded(state,id); return {text:outcome.unconfirmed ? UNCONFIRMED : OTHER_WINDOW};}
             throw error;
           }
           const refusal = await ownerActivate($,state,response,id,decision,eligibilityEpoch);
