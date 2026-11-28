@@ -8,8 +8,8 @@ Changes since 0.1.0 and its follow-up fixes.
 
 1. Stop Motet. If you might go back to 0.1.0 and keep your Memory, save a copy of the Memory archive now, as [rolling back the Memory archive](docs/MOTET.md#rolling-back-the-memory-archive) describes. 0.2.0 upgrades it the first time it starts.
 2. Update and start the Motet server first.
-3. Then update the Claude plugin to 0.6.4 in Claude Code's plugin manager ([plugin guide](integrations/claude-mod/README.md)).
-4. Fully restart every open Claude chat: close it and open it again. Reloading the plugin alone is not enough for 0.6.4.
+3. Then update the Claude plugin to 0.6.5 in Claude Code's plugin manager ([plugin guide](integrations/claude-mod/README.md)). Go straight to 0.6.5 from 0.6.1 or 0.6.4: current Claude Code does not load 0.6.4.
+4. Run `/reload-plugins` in each open Claude chat. In Claude Desktop that is all: the chat reconnects by itself at its next activity. A chat in a terminal reconnects only if Claude starts the plugin again; if `/watch-status` does not show it connected, close that chat and open it again.
 5. If you use Motet file reading, replace your policy with this release's one. Keep `usdLimit`, `scopeId` and `scopeRevision` exactly as they were, so your budget carries forward ([Motet file reading](docs/MOTET_FILE_READING.md)).
 
 ### Going back to 0.1.0
@@ -23,12 +23,12 @@ Changes since 0.1.0 and its follow-up fixes.
 - **Windows does much more.** Besides watching, Motet now answers, and it can message Claude chats through the plugin, answer Allow and Deny, run the bridge with Claude chats as recipients, start a Claude chat from New chat, read a PDF or PNG, send files to Claude chats (with Git for Windows), and show previews with their files. All of this is checked by automated tests only, not yet on a real PC. Codex messaging and file sending stay Mac-only ([Windows](docs/WINDOWS.md), [trial guide](docs/WINDOWS_TRIAL.md)).
 - **Linux:** Claude messaging, and the bridge with Claude chats as recipients, checked by automated tests.
 - **Who wrote it.** Each message records who wrote it. Motet no longer describes a message it, another chat or an automatic prompt wrote as yours ([messaging](docs/MESSAGING.md#asking-an-agent)).
-- **Claude plugin 0.6.4.** A Claude chat keeps receiving messages after it moves into a subfolder of its own project.
+- **Claude plugin 0.6.5.** It loads in current Claude Code again and reconnects by itself after a plugin reload. `/watch-connect`, `/watch-setup` and `/watch-disconnect` take effect in the order you give them, from any Claude window, with Motet keeping the decision. A disconnect Motet has not heard of yet stays in force until Motet has it. A Claude chat keeps receiving messages after it moves into a subfolder of its own project.
 - **Codex.** Controls and New chat now work with Codex Desktop `26.1103.60933`, build `25894`. Sending files to Codex still needs `26.1029.61003`, build `24614`. Large Codex records are read instead of withholding the reply, and an idle Codex chat gives a truthful reason.
 - **Plan approvals** go to the agent's app instead of offering Allow.
 - **Memory** refuses an archive from a newer Motet and leaves it unchanged.
 - **Motet file reading** accepts this release's policy from 2026-11-24 to 2026-12-24.
-- Stop for chats Motet started: entry added when it merges.
+- **Stop a chat Motet started.** A Claude chat that New chat started can be stopped from **Stop this chat** in the menu under its name, on macOS and Windows. Motet ends Claude and what it started, denies its waiting request, keeps its history, and the chat takes no new messages; if Motet cannot confirm the end, the desk says the chat may still be running and offers **Try again** or a Terminal command, both hidden once Claude itself has ended ([New chat](docs/PROVIDER_SUPPORT.md)).
 
 ## 0.1.0 — 2026-11-18
 
