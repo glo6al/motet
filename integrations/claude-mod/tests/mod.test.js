@@ -3345,6 +3345,51 @@ async function externallyDeliveredPending({legacy=false}={}){
   return {a,b,key,storage,motet,setDown(value){down=value;}};
 }
 
+// F11 S1: a disconnect made while this computer has no usable Motet sign-in (before any setup, or after the stored
+// grant was refused) is kept pending like an offline one. Once another window has a sign-in, it is placed before the
+// owner's later reconnect, the origin follows that reconnect, and nothing is held only in a window's memory.
+for(const how of ['setup, then a later connect','setup, then an immediate connect','a refused grant, then a new setup','a manual pairing, then a connect']){
+  test(`a disconnect with no usable sign-in does not override a later reconnect in another window (${how}) (F11 S1)`,async()=>{
+    // The refused variant: the stored grant is an old one Motet no longer accepts; the new setup gives the current one.
+    const OLD={...CONFIG,grant:'c'.repeat(64),grant_id:'66666666-6666-4666-8666-666666666666'};
+    const refused=how.startsWith('a refused')?new Set(['Bearer '+OLD.grant]):new Set();
+    const storage=new Map(refused.size?[[GLOBAL_KEY,OLD]]:[]),motet=ticketMotet({refusedTokens:refused});
+    const fetch=(url,body,init)=>url.endsWith('/setup')?responseJSON(CONFIG):motet.fetch(url,body,init);
+    const rounds=async(hs,from,count)=>{let now=from;for(let i=0;i<count;i++){now+=40000;for(const h of hs)h.setNow(now);for(const h of hs){await h.tick();await h.tick();}}return now;};
+    const a=await harness({storage,claimed:false,fetch}),b=await harness({storage,claimed:false,fetch});
+    assert.match((await a.command('watch-disconnect')).text,/^Motet disconnected/);
+    const keptPending=[...storage.keys()].filter(k=>k.startsWith('watch-owner-pending-v1:'+NATIVE+':')).length;
+    let now=await rounds([a,b],100000,1);
+    if(how.includes('pairing')){motet.makeCode();await b.enroll();}
+    else assert.match((await b.command('watch-setup','8793:fictional_setup_code_1234')).text,/authorized/);
+    if(!how.includes('immediate'))now=await rounds([a,b],now,2);
+    assert.match((await b.command('watch-connect')).text,/reconnect scheduled|connected/);
+    now=await rounds([a,b],now,3);
+    const c=await harness({storage,claimed:false,fetch});
+    now=await rounds([a,b,c],now,2);
+    assert.equal(motet.optedOut,false,'Motet holds the reconnect');
+    assert.equal(storage.get(PREF).disconnected,false);assert.equal(storage.get(PREF).pending,undefined);
+    assert(Number.isSafeInteger(storage.get(PREF).decision_seq));
+    for(const [name,h] of [['B',b],['A',a],['fresh C',c]])assert.equal((await statusOf(h)).connected,true,name+' connected');
+    assert.equal((await statusOf(b)).error,'');
+    assert.deepEqual(motet.decisions.filter(d=>d.opted_out).length,1,'the disconnect was placed once, before the reconnect');
+    assert.equal(keptPending,1,'the disconnect was kept pending, not only in memory');
+  });
+}
+
+test('a reconnect whose commit gets no answer says it is unconfirmed, not scheduled',async()=>{
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);let fail=false;
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>{
+    if(fail&&url.endsWith('/decision')&&body.opted_out===false)throw Error('Motet stopped answering');return motet.fetch(url,body,init);}});
+  assert.match((await h.command('watch-disconnect')).text,/^Motet disconnected/);
+  fail=true;
+  assert.equal((await h.command('watch-connect')).text,'Motet stopped answering before it confirmed this reconnect. It takes effect only if Motet received it: check /watch-status, or run /watch-connect again.');
+  assert.equal(motet.optedOut,true);
+  fail=false;
+  assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
+  h.setNow(200000);await h.tick();assert.equal((await statusOf(h)).connected,true);
+});
+
 test('foreign legacy delivery without an ordered result preserves the origin opt-out (F11)',async()=>{
   const {a,b,storage}=await externallyDeliveredPending({legacy:true});
   assert.equal(storage.get(PREF).decision_seq,undefined);

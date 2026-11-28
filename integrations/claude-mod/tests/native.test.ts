@@ -532,7 +532,7 @@ for (const older of ['watch-connect','watch-setup']) test('official runtime: a d
   const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
   on('session.id',async()=>{if(holdIdentity){holdIdentity=false;entered();await held;}return{value:NATIVE}});
   on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
-  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});on('store.delete',($,e)=>{values.delete(e.key);return{value:undefined}});
   on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
   on('http.fetch',async($,e)=>{
     const b=JSON.parse(e.init.body);let data;
