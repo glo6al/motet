@@ -3293,8 +3293,9 @@ for(const outcome of ['committed','superseded']){
     unavailable=false;
     const b=await harness({storage,claimed:false,fetch});
     if(outcome==='superseded'){
-      // The owner reconnects before B delivers A's older ticket; delivery is then refused as superseded.
-      assert.match((await b.command('watch-connect')).text,/reconnect scheduled/);
+      // The owner reconnects, in a window with its own store, before B delivers A's older ticket; delivery is then
+      // refused as superseded. (A reconnect in B itself would tell A's disconnect first and be placed after it.)
+      motet.fetch('x/decision',{opted_out:false});
     }
     await b.tick();
     assert.equal(pendingKeys().length,0,"B delivered and removed A's pending entry");
@@ -3376,6 +3377,70 @@ for(const how of ['setup, then a later connect','setup, then an immediate connec
     assert.equal(keptPending,1,'the disconnect was kept pending, not only in memory');
   });
 }
+
+// R2-S1: the owner's first /watch-setup or pairing after a disconnect made with no sign-in, in another copy (another
+// window, or the same window after a reload), tells that disconnect to Motet first and is placed after it, so the
+// owner's later command comes out last and the chat connects.
+for(const how of ['setup in another copy','setup after a reload in the same window','manual pairing in another copy']){
+  test(`the first ${how} after a no-sign-in disconnect is placed after it, and the chat connects (R2-S1)`,async()=>{
+    const storage=new Map(),motet=ticketMotet();
+    const fetch=(url,body,init)=>url.endsWith('/setup')?responseJSON(CONFIG):motet.fetch(url,body,init);
+    const rounds=async(hs,from,count)=>{let now=from;for(let i=0;i<count;i++){now+=40000;for(const h of hs)h.setNow(now);for(const h of hs){await h.tick();await h.tick();}}return now;};
+    const a=await harness({storage,claimed:false,fetch});
+    assert.match((await a.command('watch-disconnect')).text,/^Motet disconnected/);
+    const open=[a];
+    if(how.includes('reload')){for(const timer of a.timers)timer.cancel();open.pop();}
+    const b=await harness({storage,claimed:false,fetch});open.push(b);
+    if(how.includes('pairing')){motet.makeCode();assert.match((await b.enroll()).text,/reconnect scheduled|connected/);}
+    else assert.match((await b.command('watch-setup','8793:fictional_setup_code_1234')).text,/authorized\. Loaded eligible chats will connect automatically/);
+    let now=await rounds(open,100000,3);
+    const c=await harness({storage,claimed:false,fetch});
+    now=await rounds([...open,c],now,2);
+    assert.equal(motet.optedOut,false,'Motet holds the reconnect');
+    const outs=motet.decisions.filter(d=>d.opted_out);
+    assert.equal(outs.length,1,'exactly one opt-out placed');
+    assert.equal(motet.decisions.at(-1).opted_out,false);assert(outs[0].seq<motet.decisions.at(-1).seq,'the opt-out is placed before the reconnect');
+    assert.equal(storage.get(PREF).disconnected,false);assert.equal(storage.get(PREF).pending,undefined);
+    for(const h of [...open,c])assert.equal((await statusOf(h)).connected,true);
+    assert.equal((await statusOf(b)).error,'');
+  });
+}
+
+// When the earlier disconnect cannot be told to Motet, the owner's reconnect does not jump ahead of it.
+test('a reconnect does not jump ahead of another window\'s pending disconnect that cannot be told yet (R2-S1)',async()=>{
+  let refuseOptOut=false,down=true;
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
+  const fetch=(url,body,init)=>{
+    if(url.endsWith('/decision')&&(down||refuseOptOut&&body.opted_out===true))throw Error('Motet unreachable');
+    return url.endsWith('/setup')?responseJSON(CONFIG):motet.fetch(url,body,init);};
+  const a=await harness({storage,claimed:false,fetch});
+  assert.match((await a.command('watch-disconnect')).text,/^Motet disconnected/);
+  for(const timer of a.timers)timer.cancel();
+  down=false;refuseOptOut=true;
+  const b=await harness({storage,claimed:false,fetch});
+  assert.equal((await b.command('watch-connect')).text,'An earlier /watch-disconnect from another window could not be told to Motet yet, so this chat stays disconnected and this command changed nothing. Try again once Motet can be reached.');
+  assert.match((await b.command('watch-setup','8793:fictional_setup_code_1234')).text,/^Motet automatic connections authorized\. This chat stays disconnected/);
+  assert.deepEqual(motet.decisions,[]);
+  assert.equal([...storage.keys()].filter(k=>k.startsWith('watch-owner-pending-v1:')).length,1,'the disconnect is still pending');
+  b.setNow(100000);await b.tick();assert.equal((await statusOf(b)).connected,false);
+  // Once it can be told, it is placed, and the owner's next reconnect comes after it.
+  refuseOptOut=false;b.setNow(200000);await b.tick();
+  assert.equal(motet.optedOut,true);
+  assert.match((await b.command('watch-connect')).text,/reconnect scheduled/);
+  b.setNow(260000);await b.tick();assert.equal((await statusOf(b)).connected,true);
+  assert.deepEqual(motet.decisions.map(d=>d.opted_out),[true,false]);
+});
+
+test('a /watch-setup whose reconnect commit gets no answer says so',async()=>{
+  const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);let fail=false;
+  const h=await harness({storage,claimed:false,fetch:(url,body,init)=>{
+    if(url.endsWith('/setup'))return responseJSON(CONFIG);
+    if(fail&&url.endsWith('/decision')&&body.opted_out===false)throw Error('Motet stopped answering');return motet.fetch(url,body,init);}});
+  assert.match((await h.command('watch-disconnect')).text,/^Motet disconnected/);
+  fail=true;
+  assert.match((await h.command('watch-setup','8793:fictional_setup_code_1234')).text,/^Motet automatic connections authorized\. Motet stopped answering before it confirmed this chat's reconnect/);
+  assert.equal(motet.optedOut,true);
+});
 
 test('a reconnect whose commit gets no answer says it is unconfirmed, not scheduled',async()=>{
   const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);let fail=false;
