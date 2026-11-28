@@ -11,12 +11,16 @@ import os
 import peer_bridge
 import peer_lifecycle
 import peer_progress
+import re
 import secrets
 import threading
 import time
 import uuid
 
 LEASE, PAIR_TTL, TTL, RETENTION = 12, 300, 900, 86400
+RESERVATION_TTL = 86400           # how long a reservation's answer can be asked for again
+RESERVATION_LIMIT = 4096          # the most reservations kept; the oldest go first
+COMMAND_ID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9]{1,15}$')
 TRANSPORT = 'claude_mod'
 PEER_UNAVAILABLE = 'Agent receiving requires explicit Motet setup and a compatible live official plugin in this exact Claude chat.'
 MAX_ENROLLMENTS = 256
@@ -310,11 +314,40 @@ class ClaudeMod:
                            ('lifecycle_protocol', 'INTEGER NOT NULL DEFAULT 0'),
                            ('peer_envelope_limit', 'INTEGER NOT NULL DEFAULT 4000'),
                            # Connected for an earlier folder's retained outcomes only: never given a claim.
-                           ('receipt_only', 'INTEGER NOT NULL DEFAULT 0')):
+                           ('receipt_only', 'INTEGER NOT NULL DEFAULT 0'),
+                           # The owner decision this connection was made under (claude_mod_decisions.latest_seq).
+                           ('decision_seq', 'INTEGER NOT NULL DEFAULT 0')):
             if name not in columns:
                 self.db.execute(f'ALTER TABLE claude_mod_enrollments ADD COLUMN {name} {kind}')
         self.db.execute('CREATE INDEX IF NOT EXISTS claude_mod_agents ON claude_mod_enrollments(agent,active)')
         self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS claude_mod_active_agent ON claude_mod_enrollments(agent) WHERE active=1')
+        # The owner's connect and disconnect decisions for each chat, ordered here, whichever plugin copy or Claude
+        # window sent them: one row per chat, written only inside the store's transactions. Absent means never
+        # opted out, which is how every chat stood before this table existed.
+        # latest_seq is the chat's last committed ticket. issued_seq is left from the earlier per-chat ledger: it is
+        # no longer written, and is read only once, to start the shared counter above every ticket it issued.
+        self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_decisions (
+            agent TEXT PRIMARY KEY, latest_seq INTEGER NOT NULL, opted_out INTEGER NOT NULL,
+            opted_out_seq INTEGER NOT NULL, issued_seq INTEGER NOT NULL DEFAULT 0)''')
+        if 'issued_seq' not in {r[1] for r in self.db.execute('PRAGMA table_info(claude_mod_decisions)')}:
+            self.db.execute('ALTER TABLE claude_mod_decisions ADD COLUMN issued_seq INTEGER NOT NULL DEFAULT 0')
+        # A pairing code holds the ticket reserved when the owner created it, so a pairing made before a later
+        # opt-out cannot lift it.
+        if 'decision_seq' not in {r[1] for r in self.db.execute('PRAGMA table_info(claude_mod_pairs)')}:
+            self.db.execute('ALTER TABLE claude_mod_pairs ADD COLUMN decision_seq INTEGER NOT NULL DEFAULT 0')
+        # Tickets come from one counter for every chat, so a command can reserve its place before it knows which
+        # chat it is for. The counter starts above every ticket an earlier per-chat ledger issued or committed.
+        self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_decision_counter (
+            id INTEGER PRIMARY KEY CHECK (id = 1), issued INTEGER NOT NULL)''')
+        if not self.db.execute('SELECT 1 FROM claude_mod_decision_counter').fetchone():
+            start = max(self.db.execute('SELECT COALESCE(MAX(MAX(issued_seq,latest_seq)),0) FROM claude_mod_decisions').fetchone()[0],
+                        self.db.execute('SELECT COALESCE(MAX(decision_seq),0) FROM claude_mod_pairs').fetchone()[0])
+            self.db.execute('INSERT INTO claude_mod_decision_counter (id,issued) VALUES (1,?)', (start,))
+        # A reservation is repeatable: the same owner command (its plugin copy and its number there) always gets the
+        # same ticket back, so a lost answer and a retry never give an old command a newer place.
+        self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_reservations (
+            command_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, created REAL NOT NULL)''')
+        self.db.execute('CREATE INDEX IF NOT EXISTS claude_mod_reservations_created ON claude_mod_reservations(created)')
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_setup_codes (
             code_hash TEXT PRIMARY KEY, expires REAL NOT NULL)''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS claude_mod_grants (
@@ -360,6 +393,7 @@ class ClaudeMod:
         now = time.time()
         self.db.execute('DELETE FROM claude_mod_pairs WHERE expires<=?', (now,))
         self.db.execute('DELETE FROM claude_mod_setup_codes WHERE expires<=?', (now,))
+        self.db.execute('DELETE FROM claude_mod_reservations WHERE created<=?', (now - RESERVATION_TTL,))
         for eid, in self.db.execute('SELECT id FROM claude_mod_enrollments WHERE generation IS NOT NULL AND last_seen<?', (now - LEASE,)).fetchall():
             self.uncertain(eid, 'The Claude mod disconnected. Delivery is unknown; nothing was resubmitted.')
             self.db.execute('UPDATE claude_mod_enrollments SET generation=NULL WHERE id=?', (eid,))
@@ -385,7 +419,8 @@ class ClaudeMod:
             if self.db.execute('SELECT COUNT(*) FROM claude_mod_pairs').fetchone()[0] >= 32:
                 raise ModError(429, 'Too many pending Claude pairing codes.')
             self.db.execute('DELETE FROM claude_mod_pairs WHERE agent=?', (agent,))
-            self.db.execute('INSERT INTO claude_mod_pairs VALUES (?,?,?,?)', (digest(code), agent, item['cwd'], expiry))
+            self.db.execute('INSERT INTO claude_mod_pairs (code_hash,agent,project,expires,decision_seq) VALUES (?,?,?,?,?)',
+                            (digest(code), agent, item['cwd'], expiry, self.reserve()))
         return dict(agent=agent, port=port, pair_code=code, expires_at=expiry, command=f'/watch-connect {port}:{code}')
 
     def session(self, entry):
@@ -395,13 +430,13 @@ class ClaudeMod:
                       reply_notice_protocol=entry['reply_notice_protocol'], supported_reply_notice_protocol=1,
                       lifecycle_protocol=entry['lifecycle_protocol'], supported_lifecycle_protocol=2,
                       peer_envelope_limit=entry['peer_envelope_limit'], supported_peer_envelope_limit=100000,
-                      folder_protocol=1)
+                      folder_protocol=1, decision_protocol=1)
         if entry['grant_id']:
             result.update(grant_id=entry['grant_id'], client_id=entry['client_id'], connection_seq=entry['connection_seq'])
         return result
 
     def get(self, eid):
-        fields = ('id', 'agent', 'project', 'generation', 'last_seen', 'active', 'grant_id', 'client_id', 'connection_seq', 'peer_protocol', 'reply_notice_protocol', 'lifecycle_protocol', 'peer_envelope_limit', 'receipt_only')
+        fields = ('id', 'agent', 'project', 'generation', 'last_seen', 'active', 'grant_id', 'client_id', 'connection_seq', 'peer_protocol', 'reply_notice_protocol', 'lifecycle_protocol', 'peer_envelope_limit', 'receipt_only', 'decision_seq')
         row = self.db.execute('SELECT '+','.join(fields)+' FROM claude_mod_enrollments WHERE id=?', (eid,)).fetchone()
         return dict(zip(fields, row)) if row else None
 
@@ -491,6 +526,129 @@ class ClaudeMod:
                         (gid, digest(grant), time.time(), row[1]))
         return dict(version=1, grant_id=gid, grant=grant, port=port)
 
+    # --- Owner decisions -------------------------------------------------------------------------------------
+    # Each owner /watch-connect, /watch-setup or /watch-disconnect reserves a ticket here the moment it starts (its
+    # place in the owner's order), and commits its decision later under that ticket. Tickets come from one counter for
+    # every chat, so a command can reserve before it knows its chat; decisions are compared per chat. A commit takes
+    # effect only if its ticket is newer than the chat's last committed one, so a command that finishes late
+    # cannot undo a decision the owner made after it began. While the chat is opted out, every new connection is
+    # refused, ticketed or not, before any membership or lease exists; a later committed reconnect lifts it.
+
+    def _decision(self, agent):
+        row = self.db.execute('SELECT latest_seq,opted_out,opted_out_seq FROM claude_mod_decisions WHERE agent=?',
+                              (agent,)).fetchone()
+        return (row[0], bool(row[1]), row[2]) if row else (0, False, 0)
+
+    def _store_decision(self, agent, latest, opted_out, opted_out_seq):
+        self.db.execute('INSERT OR REPLACE INTO claude_mod_decisions (agent,latest_seq,opted_out,opted_out_seq) '
+                        'VALUES (?,?,?,?)', (agent, latest, int(opted_out), opted_out_seq))
+
+    def _issued(self):
+        return self.db.execute('SELECT issued FROM claude_mod_decision_counter WHERE id=1').fetchone()[0]
+
+    def reserve(self, command_id=None):
+        if command_id is not None:
+            row = self.db.execute('SELECT seq FROM claude_mod_reservations WHERE command_id=?', (command_id,)).fetchone()
+            if row:
+                return row[0]
+        issued = self._issued() + 1
+        self.db.execute('UPDATE claude_mod_decision_counter SET issued=? WHERE id=1', (issued,))
+        if command_id is not None:
+            self.db.execute('INSERT INTO claude_mod_reservations (command_id,seq,created) VALUES (?,?,?)',
+                            (command_id, issued, time.time()))
+            # Bounded: past the limit the oldest are forgotten (a forgotten command can then only be placed afresh).
+            self.db.execute('DELETE FROM claude_mod_reservations WHERE command_id IN (SELECT command_id FROM '
+                            'claude_mod_reservations ORDER BY created DESC, seq DESC LIMIT -1 OFFSET ?)', (RESERVATION_LIMIT,))
+        return issued
+
+    def _valid_ticket(self, seq):
+        if seq is not None and (type(seq) is not int or not 0 < seq <= self._issued()):
+            raise ModError(400, 'Invalid Claude owner decision.')
+
+    def decision_gate(self, agent, seq=None):
+        """Refuse a new connection while the owner has this chat opted out; return the decision it stands on."""
+        self._valid_ticket(seq)
+        latest, opted_out, _ = self._decision(agent)
+        if opted_out:
+            raise ModError(409, 'This chat was disconnected by its owner.', 'decision_superseded')
+        return latest
+
+    def _end_connections(self, agent, reason):
+        rows = self.db.execute('SELECT id FROM claude_mod_enrollments WHERE agent=? AND active=1', (agent,)).fetchall()
+        for eid, in rows:
+            self.uncertain(eid, reason)
+            self.db.execute('UPDATE claude_mod_enrollments SET generation=NULL,last_seen=0 WHERE id=?', (eid,))
+        self._fail_unclaimed({eid for eid, in rows}, 'Its owner disconnected this Claude chat before the message was '
+                                                     'claimed. Nothing was submitted.')
+
+    def connection_decision(self, entry):
+        """A connection made before the owner's latest opt-out is no longer the owner's: refuse its polls."""
+        _, opted_out, opted_out_seq = self._decision(entry['agent'])
+        if opted_out and opted_out_seq > entry['decision_seq']:
+            raise ModError(409, 'This chat was disconnected by its owner after this connection.', 'decision_superseded')
+
+    def decision_access(self, data, token):
+        """The chat named (None for a reservation that names none), for the chat's own enrollment token or the
+        shared grant (which may set any chat's). A reservation names no chat: any active credential may take one."""
+        reserve = isinstance(data, dict) and data.get('reserve') is True
+        query = isinstance(data, dict) and data.get('query') is True
+        named = isinstance(data, dict) and 'native_id' in data
+        if reserve:
+            schema(data, ('reserve',) + tuple(k for k in ('native_id', 'command_id', 'recover') if k in data))
+            if 'command_id' in data and not (isinstance(data['command_id'], str) and COMMAND_ID.match(data['command_id'])):
+                raise ModError(400, 'Invalid Claude owner decision.')
+            if 'recover' in data and (data['recover'] is not True or 'command_id' not in data):
+                raise ModError(400, 'Invalid Claude owner decision.')
+        elif query:
+            schema(data, ('native_id', 'query'))
+        else:
+            schema(data, ('native_id', 'opted_out') + (('decision_seq',) if isinstance(data, dict) and 'decision_seq' in data else ()))
+        if (named or not reserve) and not ident(data['native_id']) or not (reserve or query) and type(data['opted_out']) is not bool:
+            raise ModError(400, 'Invalid Claude owner decision.')
+        agent = 'c:' + data['native_id'] if named else None
+        if isinstance(token, str) and len(token) == 64:
+            grant = self.db.execute('SELECT id FROM claude_mod_grants WHERE active=1 AND token_hash=?',
+                                    (digest(token),)).fetchone()
+            if grant:
+                return agent
+        row = self.db.execute('SELECT agent FROM claude_mod_enrollments WHERE active=1 AND token_hash=?',
+                              (digest(token if isinstance(token, str) else ''),)).fetchone()
+        if not row or agent is not None and row[0] != agent:
+            raise ModError(403, 'Claude owner decision access is invalid.', 'access_denied')
+        return agent
+
+    def decide(self, agent, opted_out, seq=None):
+        """Commit a decision under its reserved ticket (or a fresh one); refused when a newer one was committed."""
+        if seq is None:
+            seq = self.reserve()
+        self._valid_ticket(seq)
+        latest, _, opted_out_seq = self._decision(agent)
+        if seq <= latest:
+            raise ModError(409, 'A newer owner decision for this chat was already made.', 'decision_superseded')
+        if opted_out:
+            opted_out_seq = seq
+            self._end_connections(agent, 'Its owner disconnected this Claude chat. Earlier input may still run; '
+                                         'nothing was resubmitted.')
+        self._store_decision(agent, seq, opted_out, opted_out_seq)
+        return dict(version=1, decision_protocol=1, decision_seq=seq, opted_out=opted_out)
+
+    def decision_call(self, data, token):
+        agent = self.decision_access(data, token)
+        if data.get('reserve') is True:
+            if data.get('recover') is True:
+                # Only the ticket this command already holds: a command whose first request never arrived is not
+                # given a new, later place under the same identity.
+                row = self.db.execute('SELECT seq FROM claude_mod_reservations WHERE command_id=?', (data['command_id'],)).fetchone()
+                if not row:
+                    raise ModError(409, 'Motet holds no reservation for this command.', 'not_reserved')
+                return dict(version=1, decision_protocol=1, decision_seq=row[0], reserved=True)
+            return dict(version=1, decision_protocol=1, decision_seq=self.reserve(data.get('command_id')), reserved=True)
+        if data.get('query') is True:
+            # The chat's latest committed decision, so a plugin copy with no decision of its own can check a stored one.
+            latest, opted_out, _ = self._decision(agent)
+            return dict(version=1, decision_protocol=1, decision_seq=latest, opted_out=opted_out, query=True)
+        return self.decide(agent, data['opted_out'], data.get('decision_seq'))
+
     def registration_access(self, data, token):
         fields = ('native_id', 'project', 'client_id', 'connection_seq')
         schema(data, fields + tuple(k for k in ('peer_protocol', 'reply_notice_protocol', 'lifecycle_protocol', 'peer_envelope_limit', 'receipt_only') if isinstance(data, dict) and k in data))
@@ -522,6 +680,8 @@ class ClaudeMod:
 
     def register(self, data, token, agents, proof=None):
         grant = self.registration_access(data, token)
+        # Automatic registration carries no ticket: refused while the owner has this chat opted out.
+        decision = self.decision_gate('c:' + data['native_id'])
         protocol, seq = data.get('peer_protocol', 0), data['connection_seq']
         aid, gid = 'c:'+data['native_id'], grant[0]
         item = agents.get(aid) if isinstance(agents, dict) else None
@@ -606,6 +766,7 @@ class ClaudeMod:
                                                time.time(), gid, data['client_id'], seq, protocol, data.get('reply_notice_protocol', 0), data.get('lifecycle_protocol', 0), data.get('peer_envelope_limit', 4000)))
             entry = self.get(eid)
         self._receipt_only(entry['id'], receipts)
+        self.db.execute('UPDATE claude_mod_enrollments SET decision_seq=? WHERE id=?', (decision, entry['id']))
         entry = self.get(entry['id'])
         peer_lifecycle.record_event(self.db, 'enrollment:' + entry['id'], 'registered', 'connection_episode', '', entry['generation'],
                                     event_id='register:' + entry['id'] + ':' + entry['generation'])
@@ -700,11 +861,11 @@ class ClaudeMod:
 
     def _pair(self, data):
         """The unexpired pairing for this code and chat, checked before any discovery; no filesystem work."""
-        schema(data, ('code', 'native_id', 'project'))
+        schema(data, ('code', 'native_id', 'project') + (('decision_seq',) if isinstance(data, dict) and 'decision_seq' in data else ()))
         if (not isinstance(data['code'], str) or len(data['code']) > 100 or not ident(data['native_id'])
                 or not project_text(data['project'])):
             raise ModError(400, 'Invalid Claude enrollment identity.')
-        pair = self.db.execute('SELECT agent,project,expires FROM claude_mod_pairs WHERE code_hash=?', (digest(data['code']),)).fetchone()
+        pair = self.db.execute('SELECT agent,project,expires,decision_seq FROM claude_mod_pairs WHERE code_hash=?', (digest(data['code']),)).fetchone()
         if not pair or pair[2] <= time.time() or pair[0] != 'c:'+data['native_id']:
             raise ModError(403, 'Claude pairing code is expired, used, or does not match this chat.')
         return pair
@@ -718,13 +879,23 @@ class ClaudeMod:
         if pair[1] != data['project'] and not (_textually_inside(pair[1], data['project'])
                                                and self._launch_proven(pair[0], data['project'], proof)):
             raise ModError(403, 'Claude pairing code is expired, used, or does not match this chat.')
+        # Pairing is the owner's reconnect. It takes its place from the plugin command's reserved ticket when one is
+        # sent, else from the ticket its code took when the owner created it in Motet, and it is committed here, only
+        # once the code has been accepted above: a code Motet refuses leaves the chat's decision exactly as it was.
+        # A pairing placed before the chat's latest opt-out is refused before anything changes.
+        self._valid_ticket(data.get('decision_seq'))
+        place = max(pair[3], data.get('decision_seq') or 0)
+        latest, opted_out, opted_out_seq = self._decision(pair[0])
+        if opted_out and place < opted_out_seq:
+            raise ModError(409, 'This chat was disconnected by its owner after this pairing code was made.', 'decision_superseded')
         for eid, in self.db.execute('SELECT id FROM claude_mod_enrollments WHERE agent=? AND active=1', (pair[0],)).fetchall():
             self.uncertain(eid, 'This Claude enrollment was replaced. Earlier input may still run; nothing was resubmitted.')
         self.db.execute('UPDATE claude_mod_enrollments SET active=0,generation=NULL WHERE agent=?', (pair[0],))
         if self.db.execute('SELECT COUNT(*) FROM claude_mod_enrollments WHERE active=1').fetchone()[0] >= MAX_ENROLLMENTS:
             raise ModError(429, 'Too many active Claude connections.', 'connection_limit')
         eid, token, generation = str(uuid.uuid4()), secrets.token_hex(32), str(uuid.uuid4())
-        self.db.execute('INSERT INTO claude_mod_enrollments (id,token_hash,agent,project,generation,last_seen,active) VALUES (?,?,?,?,?,?,1)', (eid, digest(token), pair[0], data['project'], generation, time.time()))
+        decision = self.decide(pair[0], False, place)['decision_seq'] if place > latest else latest
+        self.db.execute('INSERT INTO claude_mod_enrollments (id,token_hash,agent,project,generation,last_seen,active,decision_seq) VALUES (?,?,?,?,?,?,1,?)', (eid, digest(token), pair[0], data['project'], generation, time.time(), decision))
         self.db.execute('DELETE FROM claude_mod_pairs WHERE code_hash=?', (digest(data['code']),))
         result = self.session(self.get(eid))
         return dict(result, enrollment_id=eid, token=token)
@@ -845,6 +1016,7 @@ class ClaudeMod:
         with self.store.lock, self.db:
             self.maintain()
             entry = self.authenticate(token)
+            self.connection_decision(entry)
             self.validate_poll(entry, data)
             if data['accept'] and entry['receipt_only']:
                 data = dict(data, accept=False)     # receipts only: heartbeats and outcomes, never a new claim
@@ -881,6 +1053,7 @@ class ClaudeMod:
             # Connection or grant replacement during preparation invalidates this
             # poll; retained original attempts can still recover after reconnect.
             entry = self.authenticate(token)
+            self.connection_decision(entry)
             if entry['receipt_only']:
                 data = dict(data, accept=False)
             result = self.poll(entry, data, snapshot, prepared, observed=observed)
@@ -1123,6 +1296,10 @@ class ClaudeMod:
             self.room_snapshot = agents
         if method == 'poll':
             return self.poll_call(data, token, agents)
+        if method == 'decision':
+            with self.store.lock, self.db:
+                self.maintain()
+                return self.decision_call(data, token)
         if method == 'register':
             with self.store.lock, self.db:
                 self.maintain()
@@ -1199,8 +1376,11 @@ class ClaudeMod:
             if method == 'connect':
                 if entry['grant_id']:
                     raise ModError(409, 'Automatic Claude connections reconnect through registration.', 'register_required')
-                schema(data, ('native_id', 'project') + (('receipt_only',) if isinstance(data, dict) and 'receipt_only' in data else ()))
+                schema(data, ('native_id', 'project') + tuple(k for k in ('receipt_only', 'decision_seq')
+                                                               if isinstance(data, dict) and k in data))
                 self.native(entry, data, connected=False)
+                # Refused before any lease exists when the owner disconnected this chat after the command's ticket.
+                decision = self.decision_gate(entry['agent'], data.get('decision_seq'))
                 receipts = data.get('receipt_only', False)
                 if receipts not in (True, False) or 'receipt_only' in data and receipts is not True:
                     raise ModError(400, 'Invalid Claude receipt-only connection.')
@@ -1217,7 +1397,7 @@ class ClaudeMod:
                     self._move_ready(entry)
                 self.uncertain(entry['id'], 'Claude reconnected after an earlier claim. Delivery remains unknown; it will not resubmit.')
                 generation = str(uuid.uuid4())
-                self.db.execute('UPDATE claude_mod_enrollments SET generation=?,last_seen=? WHERE id=?', (generation, time.time(), entry['id']))
+                self.db.execute('UPDATE claude_mod_enrollments SET generation=?,last_seen=?,decision_seq=? WHERE id=?', (generation, time.time(), decision, entry['id']))
                 if moved:
                     self.db.execute('UPDATE claude_mod_enrollments SET project=? WHERE id=?', (data['project'], entry['id']))
                 self._receipt_only(entry['id'], receipts)
@@ -1239,7 +1419,7 @@ def handle_http(handler, store, agents):
     try:
         port = handler.server.server_address[1]
         method = handler.path.removeprefix('/claude-mod/')
-        if (method not in ('setup', 'register', 'enroll', 'connect', 'poll', 'event', 'disconnect')
+        if (method not in ('setup', 'register', 'enroll', 'connect', 'poll', 'event', 'disconnect', 'decision')
                 or handler.headers.get_all('Host') != [f'127.0.0.1:{port}']
                 or handler.headers.get('Origin') is not None or handler.headers.get('Transfer-Encoding') is not None
                 or len(handler.headers.get_all('Content-Length') or []) != 1):

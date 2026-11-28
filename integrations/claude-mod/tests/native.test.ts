@@ -9,6 +9,14 @@ const ENROLLMENT='55555555-5555-4555-8555-555555555555';
 const ENVELOPE='WATCH_REQUEST '+REQUEST+'\nThe owner asks through the Officer of the Watch:\nSay fictional progress.\nReply with WATCH_REPLY '+REQUEST+' on its own line. Preserve owner scope.';
 const ANSWER='WATCH_REPLY '+REQUEST+'\nFictional progress.';
 
+// The plugin's heartbeat skips a tick while its previous one is still at work (on a loaded machine that work can
+// outlast a mocked period), so these tests advance the clock until what they wait for has happened, within a bound,
+// instead of a fixed number of periods.
+async function advanceUntil(clock:any,ready:()=>boolean,label:string,limit=40){
+  for(let i=0;i<limit&&!ready();i++){await clock.advance(2000);await new Promise(r=>setTimeout(r,5));}
+  if(!ready())throw Error('Timed out waiting for: '+label);
+}
+
 test('one official mod submits attributed full owner envelope and observes its exactly wrapped main reply',async($,on)=>{
   const clock=mock.clock(on,{now:100000});
   const values=new Map();const submissions=[];const events=[];const heartbeats=[];
@@ -16,7 +24,7 @@ test('one official mod submits attributed full owner envelope and observes its e
   on('session.id',()=>({value:NATIVE}));
   on('session.cwd',()=>({value:'/fictional/project'}));
   on('session.surfaces',()=>({value:['desktop']}));
-  on('store.get',($,e)=>({value:values.get(e.key)}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));
   on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return {value:undefined};});
   on('command.register',()=>({value:undefined}));
   on('session.start',($,e)=>({cwd:e.cwd}));
@@ -52,8 +60,7 @@ test('one official mod submits attributed full owner envelope and observes its e
   await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
   const connected=await $.command.run({command:'watch-connect',args:'8793:fictional_pair_code_1234',origin:{kind:'composer'}});
   expect(connected.text.includes('Motet connected')).toBe(true);
-  await clock.advance(2000);
-  await clock.advance(2000);
+  await advanceUntil(clock,()=>submissions.length>=1&&events.some(event=>event.kind==='answered'),'owner envelope submitted and answered');
   expect(submissions.length).toBe(1);
   expect(submissions[0].text).toBe(ENVELOPE);
   expect(submissions[0].origin.kind).toBe('plugin');
@@ -162,7 +169,7 @@ test('negotiated peer input retains plugin attribution and only its exact marked
   });
   on('turn.start',($,e)=>({turnId:e.turnId}));on('turn.complete',($,e)=>({text:e.answer}));
   await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
-  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  await advanceUntil(clock,()=>submissions.length>=1&&events.some(event=>event.kind==='answered'),'peer input submitted and answered');
   expect(submissions.length).toBe(1);expect(submissions[0].text).toBe(envelope);
   expect(submissions[0].origin.kind).toBe('plugin');expect(submissions[0].origin.name).toBe('watch-owner');expect(submissions[0].origin.asUser === true).toBe(false);
   expect(events.filter(event=>event.kind==='answered').length).toBe(1);
@@ -268,7 +275,7 @@ test('observed SDK Desktop continues exact identity heartbeats through an empty 
 test('observed SDK Desktop binding cannot transfer to a new identity or back without fresh Desktop evidence',async($,on)=>{await backgroundFixture($,on,true);});
 
 // Official native APIs only. Provider execution is mocked; a notice is admission-ACK-only.
-test('negotiated notice keeps attribution and requires no answer marker or turn tracking',async($,on)=>{
+test('a negotiated notice claim is acknowledged as dropped and never reaches native input',async($,on)=>{
  const clock=mock.clock(on,{now:100000}),values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
  const events=[],submissions=[],registrations=[];let claimed=false;
  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
@@ -287,20 +294,16 @@ test('negotiated notice keeps attribution and requires no answer marker or turn 
   else throw Error('unexpected notice fixture path');
   return {value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
  });
- on('prompt.submit',async(core,e)=>{
-  submissions.push({text:e.text,origin:e.origin});
-  const stored=[...values.values()].find(value=>value.kind==='peer_reply_notice');
-  expect(stored.requests[REQUEST].attempted).toBe(true);
-  await $.turn.start({text:e.text,turnId:'notice-main'});
-  await $.turn.complete({turnId:'notice-main',answer:'No marker or reply expected.',isAborted:false,reason:'answer',durationMs:1});
-  return {text:e.text};
- });
+ // Since 0.6.1 a notice is acknowledged as dropped and never submitted, including from a server that still offers one.
+ on('prompt.submit',(core,e)=>{submissions.push({text:e.text,origin:e.origin});return {text:e.text};});
  on('turn.start',($,e)=>({turnId:e.turnId}));on('turn.complete',($,e)=>({text:e.answer}));
  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
- await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+ await advanceUntil(clock,()=>events.length>=1&&[...values.values()].some(value=>value?.kind==='peer_reply_notice'&&value.requests?.[REQUEST]?.events?.length===0),'notice acknowledged as dropped');
  expect(registrations.length).toBe(2);expect(registrations[0].reply_notice_protocol).toBe(undefined);expect(registrations[1].connection_seq>registrations[0].connection_seq).toBe(true);
- expect(submissions.length).toBe(1);expect(submissions[0].origin.kind).toBe('plugin');expect(submissions[0].origin.asUser===true).toBe(false);
- expect(events.length).toBe(1);expect(events[0].kind).toBe('submitted');
+ expect(submissions.length).toBe(0);
+ expect(events.length).toBe(1);expect(events[0].kind).toBe('dropped');expect(events[0].request_id).toBe(REQUEST);expect(events[0].attempt_id).toBe(ATTEMPT);
+ const notice=[...values.values()].find(value=>value?.kind==='peer_reply_notice');
+ expect(notice.requests[REQUEST].phase).toBe('dropped');expect(notice.requests[REQUEST].events.length).toBe(0);
  expect([...values.entries()].some(([key,value])=>key.startsWith('watch-owner-runtime-v3:')&&value.requests?.[REQUEST])).toBe(false);
 });
 
@@ -335,14 +338,428 @@ test('official host lifecycle v2 reconnect retains bound turn and observes addit
   on('turn.start',($,e)=>({turnId:e.turnId}));on('turn.complete',($,e)=>({text:e.answer}));
   on('session.receive',($,e)=>({text:e.text}));
   await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
-  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  await advanceUntil(clock,()=>submissions.length>=1&&events.some(e=>e.kind==='started'),'peer turn started');
   expect(submissions.length).toBe(1);expect(events.some(e=>e.kind==='started')).toBe(true);
-  stale=true;await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  stale=true;await advanceUntil(clock,()=>registrations.length>=4&&!stale,'reconnected after the stale poll');
   expect(registrations.length>=4).toBe(true);expect(events.some(e=>e.kind==='unknown')).toBe(false);
   await $.session.receive({text:'Private owner input during the turn',origin:{kind:'sdk'}});
   await $.turn.complete({turnId:'retained-native-turn',answer:ANSWER,isAborted:false,reason:'answer',durationMs:1});
-  await clock.advance(2000);
+  await advanceUntil(clock,()=>events.some(e=>e.kind==='completed'),'completion reported');
   const completed=events.filter(e=>e.kind==='completed');
   expect(completed.length).toBe(1);expect(completed[0].outcome).toBe('withheld');expect(completed[0].answer).toBe('');
   expect(submissions.length).toBe(1);
+});
+
+test('official runtime: a reloaded module that gets no session.start resumes its commands and one heartbeat on its first event',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const config={version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793};
+  const values=new Map([['watch-owner-global-v1',config]]);const registrations=[];const polls=[];const commands=[];
+  on('session.id',()=>({value:NATIVE}));
+  on('session.cwd',()=>({value:'/fictional/project'}));
+  on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));
+  on('store.keys',()=>({value:[...values.keys()]}));
+  on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return {value:undefined};});
+  on('command.register',($,e)=>{commands.push(e.name);return {value:undefined};});
+  on('turn.start',($,e)=>({turnId:e.turnId}));
+  on('http.fetch',($,e)=>{
+    const body=JSON.parse(e.init.body);let data;
+    const session={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,peer_protocol:1};
+    if(e.url.endsWith('/register')){
+      registrations.push(body);
+      data={...session,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:body.client_id,connection_seq:body.connection_seq};
+    }else if(e.url.endsWith('/poll')){polls.push(body);data={...session,claim:null,requests:[]};}
+    else throw Error('unexpected reload fixture path');
+    return {value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  // No $.session.start: the module was loaded again into a session that is already running.
+  await clock.advance(2000);await clock.advance(2000);
+  expect(registrations.length).toBe(0);expect(commands.length).toBe(0);
+  await $.turn.start({text:'fictional owner prompt',turnId:'owner-turn'});
+  await $.turn.start({text:'another fictional prompt',turnId:'owner-turn-2'});
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  expect(commands).toEqual(['watch-setup','watch-connect','watch-status','watch-retry-receipts','watch-disconnect']);
+  expect(registrations.length).toBe(1);expect(polls.length>0).toBe(true);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.start_seen).toBe(false);expect(status.timer_resumed).toBe(true);expect(status.connected).toBe(true);
+  // One timer: three periods after the resume were three supervisor dispatches, not six.
+  expect(status.timer_ticks).toBe(3);
+});
+
+// A resume still registering when the chat ends or is cleared must stay inactive, while native input still passes.
+for (const boundary of ['end','clear','cancelled resume']) test('official runtime: a pending reload resume stays inactive after '+boundary,async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let release=()=>{},entered=()=>{},first=true,forwarded=false,registrations=0,polls=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,e.value);return{value:undefined}});
+  on('command.register',async()=>{if(first){first=false;entered();await held}return{value:undefined}});
+  on('turn.start',($,e)=>{forwarded=true;return{turnId:e.turnId}});
+  on('turn.complete',($,e)=>({text:e.answer}));
+  on('session.start',($,e)=>({cwd:e.cwd}));
+  on('session.end',($,e)=>({sessionId:e.sessionId}));on('command.run',()=>({text:'fictional transition'}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  const input=$.turn.start({text:'fictional input',turnId:'fixture-turn'});await inside;
+  if(boundary==='end')await $.session.end({reason:'prompt_input_exit',sessionId:NATIVE});
+  else await $.command.run({command:boundary==='clear'?'clear':'resume',args:'',origin:{kind:'composer'}});
+  release();await input;await clock.advance(2000);await clock.advance(2000);
+  expect(forwarded).toBe(true);expect({registrations,polls}).toEqual({registrations:0,polls:0});
+  // The host ends the session when /clear goes through; a /resume picker that is cancelled ends nothing.
+  if(boundary==='clear')await $.session.end({reason:'clear',sessionId:NATIVE});
+  await $.turn.complete({turnId:'late-fixture-turn',answer:'fictional',isAborted:false,reason:'answer',durationMs:1});
+  await clock.advance(2000);await clock.advance(2000);
+  if(boundary==='cancelled resume'){
+    // The same chat goes on, so its next event resumes it, with one heartbeat.
+    expect(registrations).toBe(1);expect(polls>0).toBe(true);
+    const resumed=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+    expect(resumed.timer_resumed).toBe(true);expect(resumed.timer_ticks).toBe(2);
+    return;
+  }
+  // After an end, a late event does not re-arm it; a genuine start does, with one heartbeat.
+  expect({registrations,polls}).toEqual({registrations:0,polls:0});
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  expect(registrations).toBe(1);expect(polls>0).toBe(true);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.timer_ticks).toBe(3);expect(status.timer_resumed).toBe(false);
+});
+
+test('official runtime: a reloaded plugin that resumes between /clear and its session.end stays off until a real start',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let registrations=0,polls=0;
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,e.value);return{value:undefined}});
+  let commands=0;
+  on('command.register',()=>{commands++;return{value:undefined}});
+  on('turn.start',($,e)=>({turnId:e.turnId}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('session.end',($,e)=>({sessionId:e.sessionId}));on('command.run',()=>({text:'fictional transition'}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  await $.command.run({command:'clear',args:'',origin:{kind:'composer'}});
+  await $.turn.start({text:'fictional input inside the transition',turnId:'inside-turn'});
+  // Let that event's resume finish inside the transition: all five commands registered, then its timer installed.
+  for(let i=0;i<200&&commands<5;i++)await new Promise(r=>setTimeout(r,5));
+  expect(commands).toBe(5);
+  let status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.timer_installed).toBe(true);expect(status.timer_resumed).toBe(true);
+  await $.session.end({reason:'clear',sessionId:NATIVE});
+  await clock.advance(2000);await clock.advance(2000);
+  expect({registrations,polls}).toEqual({registrations:0,polls:0});
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  expect(registrations).toBe(1);expect(polls>0).toBe(true);
+  status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.timer_ticks).toBe(3);expect(status.timer_resumed).toBe(false);
+});
+
+// A session.start still registering its commands when the chat ends installs nothing; a later real start owns it.
+for (const reason of ['prompt_input_exit','clear']) test('official runtime: a pending session.start stays inactive after session.end '+reason,async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let release=()=>{},entered=()=>{},first=true,forwarded=false,registrations=0,polls=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,e.value);return{value:undefined}});
+  on('command.register',async()=>{if(first){first=false;entered();await held}return{value:undefined}});
+  on('turn.start',($,e)=>({turnId:e.turnId}));
+  on('session.start',($,e)=>{forwarded=true;return{cwd:e.cwd}});on('session.end',()=>({sessionId:NATIVE}));on('command.run',()=>({text:'fictional transition'}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  const input=$.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});await inside;
+  await $.session.end({reason,sessionId:NATIVE});
+  release();await input;await clock.advance(2000);await clock.advance(2000);
+  expect(forwarded).toBe(true);expect(registrations).toBe(0);expect(polls).toBe(0);
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  expect(registrations).toBe(1);expect(polls>0).toBe(true);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  // One timer: three periods after the later start were three supervisor dispatches.
+  expect(status.timer_ticks).toBe(3);
+});
+
+test('official runtime: an earlier session.start that finishes late cannot replace a later one',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let release=()=>{},entered=()=>{},first=true,registrations=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,e.value);return{value:undefined}});
+  on('command.register',async()=>{if(first){first=false;entered();await held}return{value:undefined}});
+  on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll'))data={...s,claim:null,requests:[]};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  const earlier=$.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:false});await inside;
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  release();await earlier;
+  await clock.advance(2000);await clock.advance(2000);await clock.advance(2000);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  // The later start's facts and its single timer stand.
+  expect(status.startup_interactive).toBe(true);expect(status.timer_ticks).toBe(3);expect(registrations).toBe(1);
+});
+
+// An older owner command that finishes after a later /watch-disconnect leaves the chat disconnected.
+for (const older of ['watch-connect','watch-setup']) test('official runtime: a delayed /'+older+' does not undo a later /watch-disconnect',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const pref='watch-owner-preferences-v1:'+NATIVE,config={version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793};
+  const values=new Map<string,any>(older==='watch-connect'?[['watch-owner-global-v1',config]]:[]);
+  let release=()=>{},entered=()=>{},holdIdentity=false,registrations=0,polls=0,setups=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',async()=>{if(holdIdentity){holdIdentity=false;entered();await held;}return{value:NATIVE}});
+  on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});on('store.delete',($,e)=>{values.delete(e.key);return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',async($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/setup')){setups++;entered();await held;data=config;}
+    // An older Motet, with no decision route.
+    else if(e.url.endsWith('/decision'))return{value:{ok:false,status:403,headers:{},text:JSON.stringify({error:'Invalid Claude mod service request.',error_code:'invalid_request'})}};
+    else if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  if(older==='watch-connect')holdIdentity=true;
+  const pending=$.command.run({command:older,args:older==='watch-setup'?'8793:fictional_setup_code_1234':'',origin:{kind:'composer'}});await inside;
+  const disconnected=await $.command.run({command:'watch-disconnect',args:'',origin:{kind:'composer'}});
+  expect(disconnected.text.includes('Motet disconnected')).toBe(true);expect(values.get(pref).disconnected).toBe(true);
+  release();const result=await pending;
+  expect(values.get(pref).disconnected).toBe(true);
+  if(older==='watch-setup'){expect(values.get('watch-owner-global-v1')).toEqual(config);expect(setups).toBe(1);expect(result.text.includes('left as it is')).toBe(true);}
+  else expect(result.text).toBe('A newer Motet command replaced this one; nothing was changed.');
+  const before=registrations+polls;
+  await clock.advance(2000);await clock.advance(2000);
+  expect(registrations+polls).toBe(before);
+  // A fresh owner reconnect still works.
+  await $.command.run({command:'watch-connect',args:'',origin:{kind:'composer'}});
+  expect(values.get(pref).disconnected).toBe(false);
+  await clock.advance(2000);await clock.advance(2000);
+  expect(registrations).toBe(1);expect(polls>0).toBe(true);
+});
+
+test('official runtime: a record an earlier copy writes over this copy\'s opt-out is written back before any connect',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const pref='watch-owner-preferences-v1:'+NATIVE;
+  const values=new Map<string,any>([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]);
+  let registrations=0,polls=0;
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/register')){registrations++;data={...s,grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq}}
+    else if(e.url.endsWith('/poll')){polls++;data={...s,claim:null,requests:[]}}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  await $.command.run({command:'watch-disconnect',args:'',origin:{kind:'composer'}});
+  const own=values.get(pref);expect(own.disconnected).toBe(true);
+  // An earlier copy of the plugin, still finishing a /watch-connect after the reload, writes last.
+  values.set(pref,{version:1,disconnected:false,writer:'fictional-earlier-copy'});
+  await clock.advance(2000);
+  expect(values.get(pref)).toEqual(own);
+  await clock.advance(2000);await clock.advance(2000);
+  expect({registrations,polls}).toEqual({registrations:0,polls:0});
+});
+
+test('official runtime: a manual reconnect overtaken by a disconnect sends no connect request',async($,on)=>{
+  mock.clock(on,{now:100000});
+  const legacy='watch-owner-v1:'+NATIVE,pref='watch-owner-preferences-v1:'+NATIVE;
+  const values=new Map<string,any>();
+  let release=()=>{},entered=()=>{},holdRead=false,connects=0;
+  const held=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  // This Motet has no tickets (it refuses the first decision request), so the next read of the pairing is the
+  // reconnect's own.
+  let decisionAsked=false;
+  on('store.get',async($,e)=>{const value=values.get(e.key);if(holdRead&&decisionAsked&&e.key===legacy){holdRead=false;entered();await held;}return{value}});
+  on('store.keys',()=>({value:[...values.keys()]}));on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',($,e)=>{
+    let data;
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/enroll'))data={...s,token:'fictional-watch-token-only',enrollment_id:ENROLLMENT};
+    else if(e.url.endsWith('/connect')){connects++;data=s;}
+    else if(e.url.endsWith('/disconnect'))data={disconnected:true};
+    // An older Motet: no decision route.
+    else if(e.url.endsWith('/decision')){if(holdRead)decisionAsked=true;return{value:{ok:false,status:403,headers:{},text:JSON.stringify({error:'Invalid Claude mod service request.',error_code:'invalid_request'})}};}
+    else if(e.url.endsWith('/poll'))data={...s,claim:null,requests:[]};else throw Error('fictional path only');
+    return{value:{ok:true,status:200,headers:{},text:JSON.stringify(data)}};
+  });
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  expect((await $.command.run({command:'watch-connect',args:'8793:fictional_pair_code_1234',origin:{kind:'composer'}})).text.includes('Motet connected')).toBe(true);
+  holdRead=true;
+  const reconnect=$.command.run({command:'watch-connect',args:'',origin:{kind:'composer'}});await inside;
+  expect((await $.command.run({command:'watch-disconnect',args:'',origin:{kind:'composer'}})).text.includes('Motet disconnected')).toBe(true);
+  release();
+  expect((await reconnect).text).toBe('A newer Motet command replaced this one; nothing was changed.');
+  expect(connects).toBe(0);expect(values.get(pref).disconnected).toBe(true);expect(values.get(legacy).active).toBe(false);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.connected).toBe(false);
+});
+
+test('official runtime: a revoked shared grant gives way to the current grant another copy saved, with no new setup',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const A={version:1,grant_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',grant:'c'.repeat(64),port:8793};
+  const B={version:1,grant_id:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',grant:'d'.repeat(64),port:8793};
+  // Another copy's setup saved B; a late answer for the older setup A then overwrote the shared grant.
+  const values=new Map<string,any>([['watch-owner-global-v1',A],['watch-owner-grant-v1:fictional-other-copy',B]]);
+  const used:string[]=[];let setups=0,polls=0;
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($,e)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));
+  on('store.set',($,e)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('store.delete',($,e)=>{values.delete(e.key);return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($,e)=>({cwd:e.cwd}));
+  on('http.fetch',($,e)=>{
+    const b=JSON.parse(e.init.body);
+    const s={version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12};
+    if(e.url.endsWith('/setup')){setups++;throw Error('no setup expected');}
+    if(e.url.endsWith('/register')){
+      used.push(e.init.headers.Authorization);
+      if(e.init.headers.Authorization!=='Bearer '+B.grant)return{value:{ok:false,status:403,headers:{},text:JSON.stringify({error_code:'access_denied'})}};
+      return{value:{ok:true,status:200,headers:{},text:JSON.stringify({...s,grant_id:B.grant_id,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:b.client_id,connection_seq:b.connection_seq})}};
+    }
+    if(e.url.endsWith('/poll')){polls++;return{value:{ok:true,status:200,headers:{},text:JSON.stringify({...s,claim:null,requests:[]})}};}
+    throw Error('fictional path only');
+  });
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  for(let i=0;i<8&&polls===0;i++)await clock.advance(30000);
+  expect(used[0]).toBe('Bearer '+A.grant);expect(used.at(-1)).toBe('Bearer '+B.grant);
+  expect(polls>0).toBe(true);expect(setups).toBe(0);
+  expect(values.get('watch-owner-global-v1')).toEqual(B);
+});
+
+// A Motet with decision protocol 1 (two-phase tickets), seen by this window; another window's opt-out is made on it
+// directly. A reserved ticket changes nothing; a commit applies only if no newer one was committed first; every new
+// connection is refused while the chat is opted out.
+function ticketMotet(){
+  const m:any={latest:0,issued:0,optedOut:false,optedOutSeq:0,leases:new Map<string,number>(),seqs:new Map<string,number>(),reservations:new Map<string,number>(),refused:[] as string[],registrations:0,polls:0};
+  const json=(value:any,status=200)=>({value:{ok:status===200,status,headers:{},text:JSON.stringify(value)}});
+  const session=(extra:any={})=>({version:1,native_id:NATIVE,generation:GENERATION,heartbeat_interval_ms:2000,lease_seconds:12,folder_protocol:1,decision_protocol:1,...extra});
+  const refuse=(what:string)=>{m.refused.push(what);return json({error:'Disconnected by its owner.',error_code:'decision_superseded'},409);};
+  const commit=(seq:number,out:boolean)=>{
+    if(seq<=m.latest)return false;
+    m.latest=seq;if(out){m.optedOut=true;m.optedOutSeq=seq;m.leases.clear();}else m.optedOut=false;
+    return true;
+  };
+  // As at Motet, an opt-out ends every connection of the chat at once.
+  m.optOutElsewhere=()=>commit(++m.issued,true);
+  m.fetch=(body:any,url:string)=>{
+    if(url.endsWith('/decision')){
+      if(body.reserve){
+        if(body.command_id&&m.reservations.has(body.command_id))return json({version:1,decision_protocol:1,decision_seq:m.reservations.get(body.command_id),reserved:true});
+        if(body.recover)return json({error:'Motet holds no reservation for this command.',error_code:'not_reserved'},409);
+        const seq=++m.issued;if(body.command_id)m.reservations.set(body.command_id,seq);
+        return json({version:1,decision_protocol:1,decision_seq:seq,reserved:true});
+      }
+      if(body.query)return json({version:1,decision_protocol:1,decision_seq:m.latest,opted_out:m.optedOut,query:true});
+      const seq=body.decision_seq??++m.issued;
+      if(!commit(seq,body.opted_out))return refuse('commit');
+      return json({version:1,decision_protocol:1,decision_seq:seq,opted_out:body.opted_out});
+    }
+    if(url.endsWith('/setup'))return json({version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793});
+    if(url.endsWith('/enroll')){commit(++m.issued,false);m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return json({...session(),token:'fictional-watch-token-only',enrollment_id:ENROLLMENT});}
+    if(url.endsWith('/connect')){if(m.optedOut)return refuse('connect');m.leases.set('manual',m.latest);m.seqs.set('manual',m.latest);return json(session());}
+    if(url.endsWith('/register')){m.registrations++;if(m.optedOut)return refuse('register');m.leases.set(body.client_id,m.latest);m.seqs.set(body.client_id,m.latest);
+      return json({...session(),grant_id:ENROLLMENT,enrollment_id:ENROLLMENT,token:'b'.repeat(64),client_id:body.client_id,connection_seq:body.connection_seq});}
+    if(url.endsWith('/poll')){m.polls++;const key=body.client_id??'manual';
+      if(m.optedOut&&m.optedOutSeq>(m.seqs.get(key)??0))return refuse('poll');
+      if(!m.leases.has(key))return json({error:'Reconnect.',error_code:'stale_connection'},409);
+      return json({...session(),claim:null,requests:[]});}
+    if(url.endsWith('/disconnect')){m.leases.delete(body.client_id??'manual');return json({disconnected:true});}
+    throw Error('fictional path only');
+  };
+  return m;
+}
+function hostWith(on:any,values:Map<string,any>,motet:any,hold?:{url:string,gate:Promise<void>,entered:()=>void}){
+  on('session.id',()=>({value:NATIVE}));on('session.cwd',()=>({value:'/fictional/project'}));on('session.surfaces',()=>({value:['desktop']}));
+  on('store.get',($:any,e:any)=>({value:values.get(e.key)}));on('store.keys',()=>({value:[...values.keys()]}));
+  on('store.set',($:any,e:any)=>{values.set(e.key,JSON.parse(JSON.stringify(e.value)));return{value:undefined}});
+  on('store.delete',($:any,e:any)=>{values.delete(e.key);return{value:undefined}});
+  on('command.register',()=>({value:undefined}));on('session.start',($:any,e:any)=>({cwd:e.cwd}));
+  on('http.fetch',async($:any,e:any)=>{
+    if(hold&&e.url.endsWith(hold.url)){const h=hold;hold=undefined;h.entered();await h.gate;}
+    return motet.fetch(JSON.parse(e.init.body),e.url);
+  });
+}
+
+test('official runtime: Motet refuses a manual connect whose ticket is older than an opt-out made meanwhile in another window',async($,on)=>{
+  mock.clock(on,{now:100000});
+  const values=new Map<string,any>(),motet=ticketMotet();
+  let release=()=>{},entered=()=>{};
+  const gate=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  hostWith(on,values,motet,{url:'/connect',gate,entered});
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  expect((await $.command.run({command:'watch-connect',args:'8793:fictional_pair_code_1234',origin:{kind:'composer'}})).text.includes('Motet connected')).toBe(true);
+  const reconnect=$.command.run({command:'watch-connect',args:'',origin:{kind:'composer'}});await inside;
+  motet.optOutElsewhere();
+  release();
+  expect((await reconnect).text).toBe('This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.');
+  expect(motet.refused).toEqual(['connect']);expect(motet.leases.size).toBe(0);
+  const status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.connected).toBe(false);
+});
+
+test('official runtime: another window\'s newer opt-out ends this window\'s connection at Motet, which then waits (R7-B1)',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const values=new Map<string,any>([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]),motet=ticketMotet();
+  hostWith(on,values,motet);
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  expect((await $.command.run({command:'watch-connect',args:'',origin:{kind:'composer'}})).text.includes('reconnect scheduled')).toBe(true);
+  await clock.advance(2000);await clock.advance(2000);
+  expect(motet.registrations).toBe(1);
+  motet.optOutElsewhere();
+  await clock.advance(2000);
+  let status=JSON.parse((await $.command.run({command:'watch-status',args:'',origin:{kind:'composer'}})).text);
+  expect(status.connected).toBe(false);expect(motet.refused).toEqual(['poll']);
+  expect(status.error).toBe('This chat was disconnected from another Claude window. Run /watch-connect here to reconnect it, or close the other window.');
+  const registrations=motet.registrations;
+  for(let i=0;i<4;i++)await clock.advance(30000);
+  expect(motet.registrations).toBe(registrations);
+});
+
+test('official runtime: a /watch-setup whose answer arrives after another window\'s opt-out leaves the chat opted out (R8-B1)',async($,on)=>{
+  const clock=mock.clock(on,{now:100000});
+  const pref='watch-owner-preferences-v1:'+NATIVE;
+  const values=new Map<string,any>([['watch-owner-global-v1',{version:1,grant_id:ENROLLMENT,grant:'a'.repeat(64),port:8793}]]),motet=ticketMotet();
+  let release=()=>{},entered=()=>{};
+  const gate=new Promise<void>(r=>{release=r}),inside=new Promise<void>(r=>{entered=r});
+  hostWith(on,values,motet,{url:'/setup',gate,entered});
+  await $.session.start({cwd:'/fictional/project',surface:'desktop',isInteractive:true});
+  const setup=$.command.run({command:'watch-setup',args:'8793:fictional_setup_code_1234',origin:{kind:'composer'}});await inside;
+  motet.optOutElsewhere();const optOut=motet.latest;
+  release();
+  expect((await setup).text.includes('left as it is')).toBe(true);
+  expect(motet.optedOut).toBe(true);expect(motet.latest).toBe(optOut);expect(values.get(pref)?.disconnected===false).toBe(false);
+  for(let i=0;i<3;i++)await clock.advance(30000);
+  expect(motet.leases.size).toBe(0);expect(motet.polls).toBe(0);
 });
