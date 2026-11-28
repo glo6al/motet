@@ -3465,19 +3465,59 @@ test('a setup after a refused grant commits its reconnect at Motet over an earli
   assert.equal((await statusOf(a)).connected,true);assert.equal((await statusOf(a)).error,'');
 });
 
-// A reconnect Motet did not record leaves this copy's earlier pending disconnect in place, and says so.
-test('a reconnect Motet did not record does not replace this copy\'s own pending disconnect',async()=>{
+// A reconnect Motet did not confirm leaves this copy's earlier pending disconnect in place, and says so.
+test('a reconnect Motet did not confirm does not replace this copy\'s own pending disconnect',async()=>{
   let down=true,failCommit=false;const motet=ticketMotet(),storage=new Map([[GLOBAL_KEY,CONFIG]]);
   const h=await harness({storage,claimed:false,fetch:(url,body,init)=>{
     if(url.endsWith('/decision')&&(down||failCommit&&body.opted_out===false))throw Error('Motet unreachable');return motet.fetch(url,body,init);}});
   assert.match((await h.command('watch-disconnect')).text,/^Motet disconnected/);
   down=false;failCommit=true;
-  assert.equal((await h.command('watch-connect')).text,'This chat stays disconnected: an earlier /watch-disconnect here has not been told to Motet yet, and Motet did not record this reconnect. Run /watch-connect again once Motet can be reached.');
+  assert.equal((await h.command('watch-connect')).text,'This chat stays disconnected: an earlier /watch-disconnect here has not been told to Motet yet, and Motet did not confirm this reconnect. Run /watch-connect again once Motet can be reached.');
   assert.equal([...storage.keys()].filter(k=>k.startsWith('watch-owner-pending-v1:')).length,1);
   failCommit=false;h.setNow(200000);await h.tick();
   assert.equal(motet.optedOut,true,'the pending disconnect is told to Motet');assert.equal((await statusOf(h)).connected,false);
   assert.match((await h.command('watch-connect')).text,/reconnect scheduled/);
   h.setNow(260000);await h.tick();assert.equal((await statusOf(h)).connected,true);
+});
+
+// A /watch-connect with no sign-in Motet accepts (none stored yet, or the stored grant refused, with or without an
+// earlier opt-out) cannot be recorded at Motet, so it changes nothing here either and says what is needed.
+const NO_SIGN_IN_TEXT='This computer has no Motet sign-in that Motet accepts, so nothing was changed. Run /watch-setup with a fresh setup code from Motet, or pair this chat with a pairing code from Motet.';
+for(const how of ['before the first setup','after the grant was refused','after the grant was refused, over an earlier opt-out']){
+  test(`a reconnect with no accepted sign-in changes nothing and says setup is needed (${how})`,async()=>{
+    const refused=new Set(),motet=ticketMotet({refusedTokens:refused});
+    const storage=new Map(how.startsWith('before')?[]:[[GLOBAL_KEY,CONFIG]]);
+    const fetch=(url,body,init)=>{
+      if(url.endsWith('/register')&&refused.has(init?.headers?.Authorization))return responseJSON({error:'Revoked.',error_code:'access_denied'},403);
+      return motet.fetch(url,body,init);};
+    const a=await harness({storage,claimed:false,fetch});
+    if(!how.startsWith('before')){a.setNow(100000);await a.tick();assert.equal((await statusOf(a)).connected,true);}
+    if(how.includes('opt-out'))assert.match((await a.command('watch-disconnect')).text,/^Motet disconnected/);
+    if(!how.startsWith('before'))refused.add('Bearer '+CONFIG.grant);   // the owner turns automatic connections off
+    const before=storage.get(PREF);
+    assert.equal((await a.command('watch-connect')).text,NO_SIGN_IN_TEXT);
+    assert.deepEqual(storage.get(PREF),before,'the earlier decision stands');
+    for(let i=0,now=200000;i<3;i++){now+=40000;a.setNow(now);await a.tick();await a.tick();}
+    // (With no opt-out, the connection made before the refusal is Motet's to end; this test Motet keeps it.)
+    const status=await statusOf(a);
+    if(how!=='after the grant was refused'){assert.equal(status.connected,false);assert.equal(status.error,NO_SIGN_IN_TEXT);}
+    assert.equal(a.calls.filter(c=>c.url.endsWith('/register')&&c.response?.status===200).length,how.startsWith('before')?0:1,'no new registration');
+    assert.deepEqual(motet.decisions.map(d=>d.opted_out),how.includes('opt-out')?[true]:[]);
+  });
+}
+
+// A reconnect committed at Motet whose answer was lost is unconfirmed, not unrecorded.
+test('a reconnect whose committed answer was lost says Motet did not confirm it',async()=>{
+  let down=true,drop=false;const storage=new Map([[GLOBAL_KEY,CONFIG]]),motet=ticketMotet();
+  const a=await harness({storage,claimed:false,fetch:(url,body,init)=>{
+    if(url.endsWith('/decision')&&down)throw Error('offline');
+    const response=motet.fetch(url,body,init);
+    if(url.endsWith('/decision')&&body.opted_out===false&&drop)throw Error('answer lost after the commit');
+    return response;}});
+  assert.match((await a.command('watch-disconnect')).text,/^Motet disconnected/);
+  down=false;drop=true;
+  assert.equal((await a.command('watch-connect')).text,'This chat stays disconnected: an earlier /watch-disconnect here has not been told to Motet yet, and Motet did not confirm this reconnect. Run /watch-connect again once Motet can be reached.');
+  assert.equal(motet.decisions.at(-1).opted_out,false);
 });
 
 test('a manual-pairing reconnect whose commit gets no answer says it is unconfirmed',async()=>{

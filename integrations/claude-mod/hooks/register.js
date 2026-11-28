@@ -1404,9 +1404,11 @@ const STORED_OFF = 'This chat is disconnected (by /watch-disconnect, here or in 
 const UNPLACED = 'Motet could not confirm when this command was given, so nothing was changed. Run it again.';
 const UNREACHABLE = 'Motet could not be reached to place this command, so nothing was changed. Try again.';
 const PENDING_UNDELIVERED = 'An earlier /watch-disconnect from another window could not be told to Motet yet, so this chat stays disconnected and this command changed nothing. Try again once Motet can be reached.';
-const SETUP_KEPT_OFF = 'Motet automatic connections authorized. This chat stays disconnected: an earlier /watch-disconnect from another window could not be told to Motet yet, or this chat could not be placed after it. Run /watch-connect here once Motet can be reached. ';
+const SETUP_KEPT_OFF = 'Motet automatic connections authorized. This chat stays disconnected: an earlier /watch-disconnect from another window could not be told to Motet yet. Run /watch-connect here once Motet can be reached. ';
+const SETUP_UNPLACED = 'Motet automatic connections authorized. Motet stopped answering before this chat\'s reconnect could be placed, so this chat was not reconnected. Run /watch-connect here once Motet can be reached. ';
+const NO_SIGN_IN = 'This computer has no Motet sign-in that Motet accepts, so nothing was changed. Run /watch-setup with a fresh setup code from Motet, or pair this chat with a pairing code from Motet.';
 const PAIRING_KEPT_OFF = 'Motet accepted the pairing, but this chat stays disconnected: an earlier /watch-disconnect from another window could not be told to Motet yet, or this chat could not be placed after it. Run /watch-connect here once Motet can be reached.';
-const HELD_OFF = 'This chat stays disconnected: an earlier /watch-disconnect here has not been told to Motet yet, and Motet did not record this reconnect. Run /watch-connect again once Motet can be reached.';
+const HELD_OFF = 'This chat stays disconnected: an earlier /watch-disconnect here has not been told to Motet yet, and Motet did not confirm this reconnect. Run /watch-connect again once Motet can be reached.';
 const UNCONFIRMED = 'Motet stopped answering before it confirmed this reconnect. It takes effect only if Motet received it: check /watch-status, or run /watch-connect again.';
 const PAIRING_REFUSED = 'Motet did not accept this pairing code, so nothing was changed. Get a fresh code from Motet.';
 const NEWER_ELSEWHERE = 'A newer Motet command from another Claude window replaced this one; nothing was changed.';
@@ -1709,7 +1711,7 @@ export function register(on) {
         const after = overtaken(state,decision,id) ? {ticket} : await placeAfterPending($,state,id,decision,ticket);
         if (!after.ticket && (after.undelivered || after.unplaced || after.unreachable)) {
           state.config = config; state.retryAt = 0; state.failures = 0;
-          return {text:SETUP_KEPT_OFF + LIMITATION};
+          return {text:(after.undelivered ? SETUP_KEPT_OFF : SETUP_UNPLACED) + LIMITATION};
         }
         const outcome = {};
         const saved = await savePreference($,state,id,false,decision,after.ticket,{outcome});
@@ -1784,6 +1786,9 @@ export function register(on) {
       if (after.undelivered) return {text:PENDING_UNDELIVERED};
       if (after.unplaced) return {text:UNPLACED};
       if (after.unreachable) return {text:UNREACHABLE};
+      // No sign-in Motet accepts (none stored, or every one refused): the reconnect cannot be recorded at Motet, so it
+      // is not written here either. The chat's earlier decision stands, and /watch-status says what is needed.
+      if (!after.ticket && state.decisionProtocol !== 0 && !await decisionCredential($,state,id)) {state.error = NO_SIGN_IN; return {text:NO_SIGN_IN};}
       const outcome = {};
       const saved = await savePreference($,state,id,false,decision,after.ticket,{outcome});
       if (saved === 'elsewhere') return {text:OTHER_WINDOW};
